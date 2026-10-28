@@ -201,21 +201,23 @@
  #define G4_FB_MAP ((G4_FB_BYTES + 4095u) & ~4095u)
  #define G4_WIDTH 256u
  #define G4_FB_HEIGHT 64u
-@@ -1420,6 +1465,13 @@
+@@ -1420,6 +1465,15 @@
   if (d[62]) return 0xe06;
   return d[56] ? 0xe0b : 1;
  }
 +/* g4_copy took SSPP0 +0x14/+0x24/+0x00/+0x30 into d[50..53] with fault-contained
-+ * reads; hand those words to the shared ABL-scanout guard. */
++ * reads; hand those words to the shared ABL-scanout guard. Any other offset
++ * (salami's VIG1 and +0x0c/+0x34/+0x170) was never read: 0xffffffff fails it. */
 +static uint32_t g4_sspp_word(const void *ctx, uint32_t off)
 +{
 + const uint32_t *d = ctx;
-+ return off == 0x14 ? d[50] : off == 0x24 ? d[51] : off == 0x00 ? d[52] : d[53];
++ return off == 0x14 ? d[50] : off == 0x24 ? d[51] : off == 0x00 ? d[52] :
++        off == 0x30 ? d[53] : 0xffffffffu;
 +}
  static int g4_copy(unsigned panel, uint32_t *d)
  {
   unsigned height = panel ? G4_FB_HEIGHT : 256u;
-@@ -1450,7 +1502,7 @@
+@@ -1450,7 +1504,7 @@
    d[50] = g3_read(0x0ae05014); d[51] = g3_read(0x0ae05024);
    d[52] = g3_read(0x0ae05000); d[53] = g3_read(0x0ae05030);
    if (gpu_extra[5][116]) return 0xe01;
@@ -224,7 +226,7 @@
   }
   d[3] = 2;
   if (panel) {
-@@ -1527,8 +1579,8 @@
+@@ -1527,8 +1581,8 @@
     * Baseline is probe.c's volatile byte memcpy, MMU/caches off. */
    d[3] = 7; start = g4_counter();
    for (unsigned y = 0; y < height; y++)
@@ -235,6 +237,19 @@
    __asm__ volatile("dsb sy" ::: "memory");
    elapsed = g4_counter()-start; d[40] = elapsed; d[41] = elapsed>>32;
    d[43] |= G4_CPU_VALID;
+@@ -1544,6 +1598,12 @@
+ {
+  for (unsigned stage = 14; stage <= 15 && stage <= limit; stage++) {
+   uint32_t *d = gpu_extra[stage-3];
++#if defined(FUXI_SALAMI)
++  /* GS 15 blits into the live ABL splash, which salami scans through VIG0
++   * and VIG1 behind an unproven kick: refused. Its page records 0xe0c, and
++   * stage 15 reads no SSPP, maps nothing and submits nothing. */
++  if (stage == 15 && !d[1]) { d[0] = 0xa7400009; d[1] = stage; d[2] = 0xe0cu; }
++#endif
+   if (!d[1]) {
+    g_enter(stage); d[0] = 0xa7400009; d[1] = stage;
+    d[2] = g4_copy(stage == 15, d); g4_snapshot(d);
 --- a/bsd/dev/gpu-handoff.h
 +++ b/bsd/dev/gpu-handoff.h
 @@ -1,4 +1,5 @@
@@ -244,21 +259,28 @@
  #ifndef FUXI_GPU_HANDOFF_H
  #define FUXI_GPU_HANDOFF_H
  #define FG_BANK_SIZE 0x140000000ULL
-@@ -21,4 +22,32 @@
+@@ -21,4 +22,62 @@
   for (unsigned i = 0; i < n; i++) h = (h ^ p[i]) * 16777619u;
   return h;
  }
-+/* ABL splash (live FDT /reserved-memory/splash_region, same on both boards).
-+ * Fuxi panel 1080x2400. OnePlus 11 "salami" (FUXI_SALAMI) timing@fhd_sa_60 is
-+ * 1080x2412 (panel-height 0x96c). Stride 4320 and format 0x237ff are what Fuxi
-+ * ABL programs; salami's are unknown until a probe boot reads SSPP0, so the
-+ * format can be overridden at build time (-DFG_ABL_SSPP_FORMAT=...). */
++/* ABL splash (live FDT /reserved-memory/splash_region, same on both boards):
++ * one 1080-wide ARGB8888 buffer at 0xb8000000, stride 4320, SSPP format 0x237ff.
++ * Fuxi panel 1080x2400, scanned by SSPP0 alone. OnePlus 11 "salami"
++ * (FUXI_SALAMI) timing@fhd_sa_60 is 1080x2412 (panel-height 0x96c); a salami
++ * probe boot measured the ABL handoff: the same buffer, stride and format,
++ * unpack 0x03020001, scanned by TWO pipes, VIG0 0xae05000 and VIG1 0xae07000,
++ * each 540x2412 (source and output size 0x096c021c), multirect off. The format
++ * can still be overridden at build time (-DFG_ABL_SSPP_FORMAT=...). */
 +#define FG_SPLASH_PA   0xb8000000ULL
 +#define FG_SPLASH_SIZE 0x2b00000ULL
 +#define FG_SSPP0       0x0ae05000UL
 +#define FG_FB_W 1080
 +#if defined(FUXI_SALAMI)
 +#define FG_FB_H 2412
++#define FG_ABL_PIPES   2u          /* VIG0, VIG1 */
++#define FG_ABL_PIPE_W  540u        /* columns per pipe */
++#define FG_SSPP_STRIDE 0x2000u     /* VIG1 = FG_SSPP0 + FG_SSPP_STRIDE */
++#define FG_ABL_UNPACK  0x03020001u /* B, G, R, A: DRM ARGB8888 */
 +#else
 +#define FG_FB_H 2400
  #endif
@@ -266,6 +288,28 @@
 +#ifndef FG_ABL_SSPP_FORMAT
 +#define FG_ABL_SSPP_FORMAT 0x237ffu
 +#endif
++#if defined(FUXI_SALAMI)
++/* The ABL-scanout guard (salami): nonzero only while VIG0 and then VIG1 both
++ * still scan the splash exactly as measured. rd(ctx, off) returns the register
++ * at FG_SSPP0 + off, so off + FG_SSPP_STRIDE is the same register of VIG1.
++ * Per pipe, reads stop at the first mismatch: +0x14 address, +0x24 stride,
++ * +0x00 source size, +0x0c output size, +0x30 format, +0x34 unpack, +0x170
++ * multirect (0). */
++static inline __attribute__((unused)) int
++fg_abl_scanout_ok(uint32_t (*rd)(const void *ctx, uint32_t off), const void *ctx)
++{
++ const uint32_t size = (uint32_t)FG_FB_H << 16 | FG_ABL_PIPE_W;
++ for (uint32_t p = 0; p < FG_ABL_PIPES; p++) {
++  const uint32_t b = p * FG_SSPP_STRIDE;
++  if (rd(ctx, b + 0x14) != (uint32_t)FG_SPLASH_PA || rd(ctx, b + 0x24) != (uint32_t)FG_FB_STRIDE ||
++      rd(ctx, b + 0x00) != size || rd(ctx, b + 0x0c) != size ||
++      rd(ctx, b + 0x30) != (uint32_t)FG_ABL_SSPP_FORMAT || rd(ctx, b + 0x34) != FG_ABL_UNPACK ||
++      rd(ctx, b + 0x170) != 0)
++   return 0;
++ }
++ return 1;
++}
++#else
 +/* The ABL-scanout guard: nonzero only while SSPP0 still scans the splash with
 + * exactly this geometry. rd(ctx, off) returns SSPP0 register off; reads stop at
 + * the first mismatch: +0x14 address, +0x24 stride, +0x00 source size, +0x30 format. */
@@ -276,6 +320,7 @@
 +        rd(ctx, 0x00) == ((uint32_t)FG_FB_H << 16 | (uint32_t)FG_FB_W) &&
 +        rd(ctx, 0x30) == (uint32_t)FG_ABL_SSPP_FORMAT;
 +}
++#endif
 +#endif
 --- a/bsd/dev/fuxi_adreno.c
 +++ b/bsd/dev/fuxi_adreno.c
@@ -665,7 +710,7 @@
     fg_fail("firmware size/checksum", i); goto out;
    }
   }
-@@ -385,15 +597,31 @@
+@@ -385,15 +597,47 @@
       "fence=%#x TRUST=%#x zap=%#x pixels=%#x\n", fg_limit == 13 ? 13 : 16,
       g_bank, g3_bank, g3_asid, g3_read(G3_FENCE_PA), g3_gr(0xf400),
       gpu_extra[13][2], gpu_extra[11][2]);
@@ -679,9 +724,25 @@
 +  * checked at the top), so a -DFG_ABL_SSPP_FORMAT build agrees with the
 +  * loader. Written out, not through a reader callback, so fg_thread stays
 +  * self-contained (host tests lift it alone) and double mode can skip the
-+  * SRC0 read: it validates SRC0 under display ownership, failing closed there. */
-+ if ((!fg_scanout_double_requested && g3_read(0xae05014) != G4_FB_PA) || g3_read(0xae05024) != FG_FB_STRIDE ||
-+     g3_read(0xae05000) != (FUXI_PANEL_H<<16 | 1080u) || g3_read(0xae05030) != FG_ABL_SSPP_FORMAT ||
++  * SRC0 read: it validates SRC0 under display ownership, failing closed there.
++  * A flag, not an early exit, so both boards share the tail below. */
++#if defined(FUXI_SALAMI)
++ /* salami: ABL scans the splash through VIG0 and VIG1, FG_ABL_PIPE_W columns
++  * each, VIG1 at +FG_SSPP_STRIDE (0xae07000, inside the 0xae04000 window).
++  * Per pipe, VIG0 first, in the two-pipe guard's order: +0x14 (skipped in
++  * double mode), +0x24, +0x00, +0x30 (the loader's guard also checks +0x0c,
++  * +0x34 and +0x170); reads stop at the first mismatch. */
++ int abl_bad = 0;
++ for (uint32_t p = 0; p < FG_ABL_PIPES && !abl_bad; p++) {
++  uint64_t sspp = FG_SSPP0 + p*FG_SSPP_STRIDE;
++  abl_bad = (!fg_scanout_double_requested && g3_read(sspp+0x14) != G4_FB_PA) || g3_read(sspp+0x24) != FG_FB_STRIDE ||
++      g3_read(sspp) != (FUXI_PANEL_H<<16 | FG_ABL_PIPE_W) || g3_read(sspp+0x30) != FG_ABL_SSPP_FORMAT;
++ }
++#else
++ int abl_bad = (!fg_scanout_double_requested && g3_read(0xae05014) != G4_FB_PA) || g3_read(0xae05024) != FG_FB_STRIDE ||
++     g3_read(0xae05000) != (FUXI_PANEL_H<<16 | 1080u) || g3_read(0xae05030) != FG_ABL_SSPP_FORMAT;
++#endif
++ if (abl_bad ||
 +     !g_map_at(G3_PT, &g3_next, G4_FB_VA, G4_FB_PA, (4320*FUXI_PANEL_H+4095)&~4095u, 1u<<6) ||
 +     (fg_scanout_double_requested && !g_map_at(G3_PT, &g3_next, G4_FB_VA+0xa00000u, 0xb8a00000u, (4320*FUXI_PANEL_H+4095)&~4095u, 1u<<6)) ||
 +     (fg_scanout_triple_requested && !g_map_at(G3_PT, &g3_next, G4_FB_VA+0x1400000u, 0xb9400000u, (4320*FUXI_PANEL_H+4095)&~4095u, 1u<<6)) ||
@@ -701,7 +762,7 @@
   out: return;
  }
  void fuxi_gpu_start(uint64_t fb, unsigned width, unsigned height, unsigned pitch)
-@@ -402,10 +630,32 @@
+@@ -402,10 +646,32 @@
   (void)PE_parse_boot_argn("fuxigpu", &enable, sizeof(enable));
   if (enable != 1 || fg_started) return;
   fg_started = 1; fg_limit = 17;
@@ -735,7 +796,7 @@
    fg_fail("unsupported boot framebuffer/stage", fg_limit); return;
   }
   /* Static storage avoids kernel_thread_start's NOFAIL thread/stack allocation
-@@ -451,16 +701,50 @@
+@@ -451,16 +717,50 @@
   }
   if (end) CleanPoC_DcacheRegion_Force(begin, end-begin);
  }
@@ -787,7 +848,7 @@
    return 1;
   }
   if (!err && !fg_expired()) return 0;
-@@ -468,6 +752,7 @@
+@@ -468,6 +768,7 @@
   /* Only fault containment has bounded register polling; no scheduler wait. */
   int drained = fg_isolate();
   fg_busy = 0;
@@ -795,7 +856,7 @@
   t->wait += mach_absolute_time()-fg_submit_time;
   return drained ? -1 : -2;
  }
-@@ -475,41 +760,72 @@
+@@ -475,41 +776,72 @@
      unsigned pitch, unsigned sx, unsigned sy, unsigned dx, unsigned dy,
      unsigned width, unsigned height, struct fg_times *t)
  {

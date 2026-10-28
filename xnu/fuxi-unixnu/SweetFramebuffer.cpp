@@ -21,6 +21,9 @@
  *      button / auto-lock), else on. Off fades the panel out over a few
  *      vsyncs (halving each pixel) and keeps it black until on again;
  *      the panel itself stays powered (AMOLED black pixels are off).
+ *      Boot-arg sweetfb_bootoff=N (0..8, default 1 on salami, else 0)
+ *      drops the first N offs since boot: backboardd turns the display off
+ *      once while it brings up the GUI, the boot logo stays on screen.
  *   18 IsMainDisplay,
  *   28 GetDotPitch, 72 Enable/DisableNotifications [func, refcon, type, 0]
  * Everything else is accepted and logged once.
@@ -311,6 +314,28 @@ static void sweet_fb_refresh_publish(AppleCLCD *fb)
  OSSafeReleaseNULL(refresh);
 }
 
+#if defined(FUXI_SALAMI)
+/* salami ABL scans the splash through VIG0 and VIG1; GPU scanout flips VIG0
+ * only and owns INTF1/CTL0, unproven on this board. fuxigpuscanout=1 is refused
+ * unless fuxiscansalami=1. Logs the scanout decision and the pe_serial display
+ * kick mode (fuxikick, same clamp: above 3 is 0) once, from AppleCLCD::start. */
+static uint32_t sweet_fb_salami_scanout(uint32_t scanout)
+{
+ uint32_t fuxiscansalami = 0, fuxikick = 0;
+ PE_parse_boot_argn("fuxiscansalami", &fuxiscansalami, sizeof(fuxiscansalami));
+ if (scanout == 1 && fuxiscansalami != 1) {
+  IOLog("FUXI SCANOUT: refused on salami (VIG0-only flips, INTF1 ownership unproven); fuxiscansalami=1 overrides\n");
+  scanout = 0;
+ } else {
+  IOLog("FUXI SCANOUT: salami %s (fuxigpuscanout=%u fuxiscansalami=%u)\n",
+      scanout == 1 ? "override, GPU scanout allowed" : "off", scanout, fuxiscansalami);
+ }
+ PE_parse_boot_argn("fuxikick", &fuxikick, sizeof(fuxikick));
+ IOLog("FUXI KICK: mode %u (0 none, 1 AR once, 2 AR every kick, 3 START only)\n", fuxikick <= 3 ? fuxikick : 0);
+ return scanout;
+}
+#endif
+
 static void sweet_fb_te_configure(AppleCLCD *fb)
 {
  unsigned enabled = 0, offset = 7800; /* 7.3 ms transfer + 0.5 ms margin */
@@ -389,6 +414,44 @@ void AppleCLCD::teVsyncLog(uint64_t now)
  fTePeriodSum = 0;
 }
 #endif
+
+/*
+ * sweetfb_bootoff=N (0..8; default 1 on salami, 0 otherwise): drop the first
+ * N RequestPowerChange(0) since boot. backboardd sends one off after drawing
+ * the Apple logo, before SpringBoard turns the display on again; honoring it
+ * blacks the panel for that gap. A dropped off never reaches the power path:
+ * fPowerOff, sweet_fb_display_off (touch, keys) and the backlight interests
+ * stay on, the panel keeps the last frame, and the matching on finds the
+ * display already on (no state change). Every later off (auto-lock, power
+ * button) takes the unchanged path. Set once in start before registerService,
+ * so before any user client can send a request.
+ */
+static uint32_t sweet_fb_bootoff_max, sweet_fb_bootoff_done;
+
+static void sweet_fb_bootoff_configure(void)
+{
+#if defined(FUXI_SALAMI)
+ uint32_t n = 1;
+#else
+ uint32_t n = 0;
+#endif
+ PE_parse_boot_argn("sweetfb_bootoff", &n, sizeof(n));
+ if (n > 8) n = 8;
+ sweet_fb_bootoff_max = n;
+ if (n) IOLog("SWEET FB: boot display off hold %u (sweetfb_bootoff, 0..8)\n", n);
+}
+
+/* True: drop this display-off request. fLock orders it with concurrent requests. */
+static bool sweet_fb_bootoff_ignored(AppleCLCD *fb)
+{
+ uint32_t n = 0;
+ if (sweet_fb_bootoff_max == 0) return false;
+ IOLockLock(fb->fLock);
+ if (sweet_fb_bootoff_done < sweet_fb_bootoff_max) n = ++sweet_fb_bootoff_done;
+ IOLockUnlock(fb->fLock);
+ if (n) IOLog("SWEET FB: boot display off ignored (%u/%u)\n", n, sweet_fb_bootoff_max);
+ return n != 0;
+}
 
 bool
 AppleCLCD::start(IOService *provider)
@@ -480,6 +543,7 @@ AppleCLCD::start(IOService *provider)
 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
 	setProperty("external", false);
 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+	sweet_fb_bootoff_configure();
 #if defined(FUXI)
 	int backlight = 0;
 	PE_parse_boot_argn("fuxibacklight", &backlight, sizeof(backlight));
@@ -494,6 +558,9 @@ AppleCLCD::start(IOService *provider)
 #if defined(FUXI)
  uint32_t scanout = 0, check = 0, log = 0;
  PE_parse_boot_argn("fuxigpuscanout", &scanout, sizeof(scanout));
+#if defined(FUXI_SALAMI)
+ scanout = sweet_fb_salami_scanout(scanout);
+#endif
  PE_parse_boot_argn("fuxigpuscanoutcheck", &check, sizeof(check));
  PE_parse_boot_argn("fuxigpuscanoutlog", &log, sizeof(log));
  int quiet = 0;
@@ -1569,7 +1636,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		}
 		break;
 	case kSweetFBRequestPowerChange:
-		if (args->scalarInputCount >= 1) {
+		/* A boot-held off (sweetfb_bootoff) returns success and changes nothing. */
+		if (args->scalarInputCount >= 1 &&
+		    (args->scalarInput[0] != 0 || !sweet_fb_bootoff_ignored(fFB))) {
 			ret = fFB->requestPowerChange(args->scalarInput[0]);
 		}
 		break;

@@ -272,9 +272,10 @@ def scripts(extents_json, writer, hasher, file, helper, stage, part_sectors):
     w += [f'w {s} {p} {c}' for s, p, c in rows]
     w += ['sync', 'echo 3 > /proc/sys/vm/drop_caches', 'echo SALAMI-WRITE-OK']
     h = head + ['set -o pipefail', 'sync', 'echo 3 > /proc/sys/vm/drop_caches',
-                'r() { ok "$@"; dd if="$DEV" bs=4096 skip=$2 count=$3 2>/dev/null; }',
+                # not r(): mksh aliases r to 'fc -e -'
+                'rd() { ok "$@"; dd if="$DEV" bs=4096 skip=$2 count=$3 2>/dev/null; }',
                 '{']
-    h += [f'  r {s} {p} {c}' for s, p, c in rows]
+    h += [f'  rd {s} {p} {c}' for s, p, c in rows]
     h += ['} | sha256sum']
     for path, lines in ((writer, w), (hasher, h)):
         with open(path, 'w', newline='\n') as f:

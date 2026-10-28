@@ -12,6 +12,21 @@ uint32_t probe_fdt_bytes(void);
 const char *probe_splash_overlap(void);
 #endif
 
+#if defined(FUXI_BOOT_LOGO)
+#if !defined(FUXI_SALAMI)
+#error "FUXI_BOOT_LOGO is a salami (FUXI_SALAMI) loader option"
+#endif
+#if !defined(FUXI_BOOT_LOGO_W) || !defined(FUXI_BOOT_LOGO_H) || FUXI_BOOT_LOGO_W < 1 || \
+    FUXI_BOOT_LOGO_H < 1 || FUXI_BOOT_LOGO_W > FB_W || FUXI_BOOT_LOGO_H > FB_H
+#error "FUXI_BOOT_LOGO needs FUXI_BOOT_LOGO_W and FUXI_BOOT_LOGO_H inside the FB_W x FB_H splash"
+#endif
+/* Logo boot: the progress lines below are never drawn, so the panel shows only
+ * the logo until XNU's GUI. A failed boot still gets the console back. */
+#define con_info(call) ((void)0)
+#else
+#define con_info(call) call
+#endif
+
 #define BOOT_LINE_LENGTH	608
 #define PAGE_16K		0x4000UL
 
@@ -150,9 +165,9 @@ static const char *loader_boot(void)
  }
  monitor_report[MON_STAGE]=5;
 	uint64_t pa_of_va_base = p->phys_base - p->virt_base;	/* pa = va + this */
-	con_hex2("PHYS", "base=", p->phys_base, "size=", p->mem_size);
-	con_hex("VIRT", p->virt_base);
-	con_hex("ENTRY", p->entry_va);
+	con_info(con_hex2("PHYS", "base=", p->phys_base, "size=", p->mem_size));
+	con_info(con_hex("VIRT", p->virt_base));
+	con_info(con_hex("ENTRY", p->entry_va));
 
 	/* The payload must not overlap where the kernel goes. */
 	if (rd_end > p->phys_base && rd_start < p->phys_base + p->mem_size)
@@ -166,7 +181,7 @@ static const char *loader_boot(void)
 		if (s->vmsize > s->file_size)
 			zero64(dst + ((s->file_size + 7) & ~7UL), s->vmsize - ((s->file_size + 7) & ~7UL));
 	}
-	con_hex2("SEGS", "n=", p->nsegs, "end=", p->kernel_end + pa_of_va_base);
+	con_info(con_hex2("SEGS", "n=", p->nsegs, "end=", p->kernel_end + pa_of_va_base));
 
  monitor_report[MON_STAGE]=6;
 	/* ADT, then boot_args, behind the kernel; everything below topOfKernelData is ours. */
@@ -194,14 +209,14 @@ static const char *loader_boot(void)
 	for (int i = 0; i < BOOT_LINE_LENGTH; i++)
 		ba->CommandLine[i] = p->cmdline[i];
 	ba->memSizeActual = p->mem_size;
-	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
+	con_info(con_hex2("BOOTARG", "pa=", ba_pa, "top=", top));
 
  monitor_report[MON_BOOT_ARGS]=ba_pa;
  monitor_report[MON_STAGE]=7;
 	uintptr_t entry_pa = p->entry_va + pa_of_va_base;
  monitor_report[MON_ENTRY]=entry_pa;
-	con_hex("JUMP", entry_pa);
-	con_str("XNU", "jumping (fbcon clears screen)");
+	con_info(con_hex("JUMP", entry_pa));
+	con_info(con_str("XNU", "jumping (fbcon clears screen)"));
 
 	/* Everything was written with the MMU and caches off; drop any stale I-cache lines too. */
 	__asm__ volatile("dsb sy; ic iallu; dsb sy; isb" ::: "memory");
@@ -218,21 +233,63 @@ static uint32_t sspp0_rd(const void *ctx, uint32_t off)
  return *(volatile uint32_t *)(FG_SSPP0 + off);
 }
 
+#if defined(FUXI_BOOT_LOGO)
+/* Salami boot logo, drawn like iBoot's. ABL leaves one 1080x2412 ARGB buffer
+ * (stride 4320) that its INTF1 autorefresh keeps scanning out, so plain stores
+ * show up with no MDSS access. The buffer is filled black, then the W x H 8-bit
+ * coverage mask (255 = logo; build.sh incbin, Apple artwork kept out of git)
+ * goes in the centre as opaque grey: coverage m is the word
+ * 0xff000000 | m * 0x010101, the byte order of the console's WHITE (B, G, R, A
+ * in memory). MMU off: every store is a 32-bit Device write. con_fb is 0 unless
+ * the splash-overlap check and the two-pipe ABL scanout guard passed. Nothing
+ * is drawn when the linked mask is not exactly W x H bytes. */
+#define LOGO_X0		((FB_W - FUXI_BOOT_LOGO_W) / 2)
+#define LOGO_Y0		((FB_H - FUXI_BOOT_LOGO_H) / 2)
+#define LOGO_BLACK	0xff000000U
+/* tools/run-ios-salami.py looks for this string in the loader Image. */
+static const char boot_logo_marker[] __attribute__((used)) =
+ "FUXI BOOT LOGO: loader-drawn, no loader text";
+
+static void boot_logo_draw(void)
+{
+ extern const uint8_t _boot_logo_start[], _boot_logo_end[];
+ if (!con_fb || (uintptr_t)_boot_logo_end - (uintptr_t)_boot_logo_start !=
+     (uintptr_t)FUXI_BOOT_LOGO_W * FUXI_BOOT_LOGO_H)
+  return;
+ con_clear(LOGO_BLACK);
+ for (unsigned y = 0; y < FUXI_BOOT_LOGO_H; y++) {
+  volatile uint32_t *line = con_fb + (LOGO_Y0 + y) * (FB_STRIDE / 4) + LOGO_X0;
+  const uint8_t *m = _boot_logo_start + y * FUXI_BOOT_LOGO_W;
+  for (unsigned x = 0; x < FUXI_BOOT_LOGO_W; x++)
+   line[x] = LOGO_BLACK | m[x] * 0x010101U;
+ }
+}
+#endif
+
 void loader_main(uintptr_t fdt)
 {
  probe_main(fdt);
  monitor_report[MON_STAGE]=4;
  const char *error=0;
 #if defined(FUXI_SALAMI)
- /* con_clear() below paints the whole splash: refuse before it can reach the payload or FDT. */
+ /* con_clear() and boot_logo_draw() below paint the whole splash: refuse before
+  * either can reach the payload or FDT. */
  error=probe_splash_overlap();
 #endif
  /* Refuse to draw unless ABL left the measured SSPP0/CTL0 splash active. */
  if (error || !fg_abl_scanout_ok(sspp0_rd, 0))
   con_fb=0; /* USB diagnostics also work without a usable inherited scanout. */
+#if defined(FUXI_BOOT_LOGO)
+ boot_logo_draw();
+ if (!error) error=loader_boot();
+ /* Only a failed boot gets here: the console takes the splash back for the error. */
+ con_clear(BLUE);
+ con_str("FUXI", "XNU loader + USB monitor");
+#else
  con_clear(BLUE);
  con_str("FUXI", "XNU loader + USB monitor");
  if (!error) error=loader_boot();
+#endif
  con_str("ERROR", error);
  for (unsigned i=0;i<sizeof(monitor_error)-1 && error[i];i++) monitor_error[i]=error[i];
  monitor_report[MON_STAGE]=99;

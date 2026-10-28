@@ -14,12 +14,12 @@ import sys
 import time
 import zlib
 
-import usb.core
-import usb.util
-
 MON_FIELDS = 'magic delegate active usb_mpidr launch stage boot_args entry deadline image end'.split()
 WANTED = {'_fuxi_early_status', '_sweet_log_ring', '_sweet_log_total'}
 FB_FUXI = (1080, 2400, 4320)   # Fuxi panel and ABL stride: used when the ADT has no sweet-fbcon
+# Salami (gpu-handoff.h FG_FB_W/FG_FB_H/FG_FB_STRIDE under FUXI_SALAMI): used when a salami
+# ADT has no sweet-fbcon (tools/mkadt-salami.py --no-fbcon, boot-logo loader).
+FB_SALAMI = (1080, 2412, 4320)
 FB_SLOT = 0xa00000             # one ABL splash scanout slot, the most request 0x4e can serve
 
 
@@ -27,15 +27,17 @@ def fb_geometry(payload, rows=None):
     """(width, height, stride) of the inherited framebuffer to save.
 
     From the payload ADT sweet-fbcon node (1080x2400 on Fuxi, 1080x2412 on salami;
-    the loader serves exactly stride*height bytes), Fuxi's geometry when the ADT
-    has no such node; rows (--fb-rows) overrides the height."""
+    the loader serves exactly stride*height bytes). When the ADT has no such node:
+    the salami loader's 1080x2412 stride 4320 for a salami ADT (compatible
+    oneplus,salami), Fuxi's geometry otherwise. rows (--fb-rows) overrides the height."""
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import adt  # tools/adt.py, only needed for --framebuffer/--tour-shots
     adt_off, adt_size = struct.unpack_from('<2Q', payload, 0x20)
     if not adt_size or adt_off + adt_size > len(payload):
         raise ValueError('payload ADT is out of range')
     root, _ = adt.parse(payload[adt_off:adt_off + adt_size])
-    w, h, s = FB_FUXI
+    salami = b'oneplus,salami' in (root.prop('compatible') or b'').split(b'\0')
+    w, h, s = FB_SALAMI if salami else FB_FUXI
     fbcon = next((c for c in root.children if c.name == 'sweet-fbcon'), None)
     if fbcon is not None:
         w, h, s = (struct.unpack('<I', fbcon.prop(k))[0] for k in ('width', 'height', 'stride'))
@@ -174,14 +176,15 @@ def main():
     ap.add_argument('--seconds', type=float, default=65)
     ap.add_argument('--framebuffer',action='store_true',help='save the validated inherited framebuffer after collecting logs')
     ap.add_argument('--tour-shots',action='store_true',help='also save framebuffer-shotN-NAME.png at each "FUXI TOUR: shot N NAME" console line (fuxitour=S)')
-    ap.add_argument('--fb-rows',type=int,metavar='ROWS',help='framebuffer rows to save (default: the payload ADT sweet-fbcon height, 2400 on Fuxi, 2412 on salami)')
+    ap.add_argument('--fb-rows',type=int,metavar='ROWS',help='framebuffer rows to save (default: the payload ADT sweet-fbcon height; without that node 2412 on salami, 2400 on Fuxi)')
     ap.add_argument('--skip-clocks',action='store_true',help='do not take the AHB-ungating clock snapshot before handoff')
     ap.add_argument('--reset-minutes',type=int,help='move the monitor PSCI reset deadline to now + N minutes (1-60)')
     ap.add_argument('--touch-test',type=float,metavar='SECONDS',help='before handoff: touch snapshot, power-up, then poll touch events for SECONDS')
     ap.add_argument('--touch-stage',default='9',help='touch power-up: stop after this stage (1 SE GSI mode, 2 GPI init, 9 all)')
     ap.add_argument('--touch-power',action='store_true',help='loader touch power-up (rails, reset, sense on) right before the handoff')
     ap.add_argument('--no-handoff',action='store_true',help='stop after the touch test; the loader resets at its 90 s deadline')
-    ap.add_argument('--display-poll',action='store_true',help='sample CTL0 START, INTF1 autorefresh and DSI status/FIFO each poll')
+    ap.add_argument('--display-poll',action='store_true',help='sample CTL0 START, INTF1 autorefresh/line and DSI ctrl/status/FIFO each poll')
+    ap.add_argument('--i-know-s5-s6',action='store_true',help='salami: allow --display-poll before probe stages S5 (INTF1) and S6 (DSI0) prove those reads safe')
     ap.add_argument('--thermal-log',type=float,metavar='SECONDS',help='sample TSENS + EPSS every SECONDS after handoff into thermal.jsonl')
     ap.add_argument('--thermal-probe',action='store_true',help='before handoff: staged first-time 0x57 probe (each TSENS/EPSS block separately) + LUT dump')
     ap.add_argument('--thermal-mask',type=lambda x:int(x,0),default=0x17,help='0x57 TH mask for samples (1/2/4 TSENS TM, 8 SROT, 0x10 EPSS)')
@@ -190,6 +193,8 @@ def main():
     ap.add_argument('--cpu-level',metavar='SPEC',help="before handoff: EPSS perf level per domain, e.g. '0:3,1:@1200,2:@1200' (LUT index, or @MHz = highest non-turbo row <= MHz)")
     ap.add_argument('--cpu-at',action='append',default=[],metavar='SECONDS=SPEC',help='after handoff: apply SPEC (as --cpu-level, or idle:MODE) at SECONDS after handoff (repeatable)')
     args = ap.parse_args()
+    import usb.core  # lazy: --help needs no pyusb
+    import usb.util
     payload = args.payload.read_bytes()
     if payload[:8] != b'SWEETXNU':
         ap.error('invalid payload')
@@ -197,6 +202,19 @@ def main():
     if phys != 0x8c0000000 or size not in (0x40000000, 0x30000000, 0x13e000000):
         ap.error('unexpected Fuxi RAM window')
     cmdline = payload[72:680].split(b'\0')[0].decode()
+    adt_off, adt_size = struct.unpack_from('<2Q', payload, 0x20)
+    salami = False
+    if adt_size and adt_off + adt_size <= len(payload):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import adt as _adt  # tools/adt.py
+        try:
+            root, _ = _adt.parse(payload[adt_off:adt_off + adt_size])
+            salami = b'oneplus,salami' in (root.prop('compatible') or b'')
+        except Exception:
+            salami = False
+    if args.display_poll and salami and not args.i_know_s5_s6:
+        ap.error('--display-poll on salami reads INTF1 (+0x2b4/+0x2b0) and DSI0, unproven until '
+                 'probe stages S5 (INTF) and S6 (DSI) pass; pass --i-know-s5-s6 to override')
     if 'fuxiperf=1' in cmdline.split() and (args.cpu_level or args.cpu_at):
         ap.error('fuxiperf=1 owns EPSS: do not pass --cpu-level or --cpu-at')
     fb_w, fb_h, fb_s = FB_FUXI
@@ -263,8 +281,8 @@ def main():
     def display_poll():
         # Read-only 0x4f windows: 1 CTL0, 2 INTF1, 9 DSI0 (never window 0).
         word=lambda w,o: struct.unpack('<I',request(0x4f,4,w,o))[0]
-        return {'ctl_start':word(1,0x1c),'autorefresh':word(2,0x2b4),
-                'dsi_status':word(9,0x4),'dsi_fifo':word(9,0xc)}
+        return {'ctl_start':word(1,0x1c),'autorefresh':word(2,0x2b4),'intf_line':word(2,0x2b0),
+                'dsi_ctrl':word(9,0x4),'dsi_status0':word(9,0x8),'dsi_fifo':word(9,0xc)}
     if args.display_poll:
         print('display before handoff', display_poll(), flush=True)
     # ---- thermal lane: pre-handoff probe / levels / idle ----

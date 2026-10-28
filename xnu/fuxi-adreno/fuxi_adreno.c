@@ -604,9 +604,25 @@ static void fg_thread(thread_call_param_t arg, thread_call_param_t result)
   * checked at the top), so a -DFG_ABL_SSPP_FORMAT build agrees with the
   * loader. Written out, not through a reader callback, so fg_thread stays
   * self-contained (host tests lift it alone) and double mode can skip the
-  * SRC0 read: it validates SRC0 under display ownership, failing closed there. */
- if ((!fg_scanout_double_requested && g3_read(0xae05014) != G4_FB_PA) || g3_read(0xae05024) != FG_FB_STRIDE ||
-     g3_read(0xae05000) != (FUXI_PANEL_H<<16 | 1080u) || g3_read(0xae05030) != FG_ABL_SSPP_FORMAT ||
+  * SRC0 read: it validates SRC0 under display ownership, failing closed there.
+  * A flag, not an early exit, so both boards share the tail below. */
+#if defined(FUXI_SALAMI)
+ /* salami: ABL scans the splash through VIG0 and VIG1, FG_ABL_PIPE_W columns
+  * each, VIG1 at +FG_SSPP_STRIDE (0xae07000, inside the 0xae04000 window).
+  * Per pipe, VIG0 first, in the two-pipe guard's order: +0x14 (skipped in
+  * double mode), +0x24, +0x00, +0x30 (the loader's guard also checks +0x0c,
+  * +0x34 and +0x170); reads stop at the first mismatch. */
+ int abl_bad = 0;
+ for (uint32_t p = 0; p < FG_ABL_PIPES && !abl_bad; p++) {
+  uint64_t sspp = FG_SSPP0 + p*FG_SSPP_STRIDE;
+  abl_bad = (!fg_scanout_double_requested && g3_read(sspp+0x14) != G4_FB_PA) || g3_read(sspp+0x24) != FG_FB_STRIDE ||
+      g3_read(sspp) != (FUXI_PANEL_H<<16 | FG_ABL_PIPE_W) || g3_read(sspp+0x30) != FG_ABL_SSPP_FORMAT;
+ }
+#else
+ int abl_bad = (!fg_scanout_double_requested && g3_read(0xae05014) != G4_FB_PA) || g3_read(0xae05024) != FG_FB_STRIDE ||
+     g3_read(0xae05000) != (FUXI_PANEL_H<<16 | 1080u) || g3_read(0xae05030) != FG_ABL_SSPP_FORMAT;
+#endif
+ if (abl_bad ||
      !g_map_at(G3_PT, &g3_next, G4_FB_VA, G4_FB_PA, (4320*FUXI_PANEL_H+4095)&~4095u, 1u<<6) ||
      (fg_scanout_double_requested && !g_map_at(G3_PT, &g3_next, G4_FB_VA+0xa00000u, 0xb8a00000u, (4320*FUXI_PANEL_H+4095)&~4095u, 1u<<6)) ||
      (fg_scanout_triple_requested && !g_map_at(G3_PT, &g3_next, G4_FB_VA+0x1400000u, 0xb9400000u, (4320*FUXI_PANEL_H+4095)&~4095u, 1u<<6)) ||

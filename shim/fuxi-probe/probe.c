@@ -72,6 +72,63 @@ static struct {
 } probe_info;
 _Static_assert(sizeof(probe_info)==19*8, "USB report format");
 
+#if defined(FUXI_SALAMI_MDSS_STAGE) && !defined(FUXI_SALAMI)
+#error "FUXI_SALAMI_MDSS_STAGE is a salami (FUXI_SALAMI) build cap"
+#endif
+#if defined(FUXI_SALAMI)
+/* Staged MDSS probe cap (display_salami_plan.md 5.1). Every display access not
+ * proven on salami carries a risk class: the 0x4f windows below, the 0x4c
+ * DISPCC reads (class 7) and the 0x53 modes (ar_test). A request whose class
+ * exceeds this build's cap STALLs. Cumulative: a cap-N image (build.sh
+ * FUXI_SALAMI_MDSS_STAGE=N, default 0) allows classes 0..N. Proven on salami
+ * (class 0): request 0x42 (SSPP +0x00/0c/14/24/30/34/38/170, CTL +0x14/1c). */
+#ifndef FUXI_SALAMI_MDSS_STAGE
+#define FUXI_SALAMI_MDSS_STAGE 0
+#endif
+#if FUXI_SALAMI_MDSS_STAGE < 0 || FUXI_SALAMI_MDSS_STAGE > 9
+#error "FUXI_SALAMI_MDSS_STAGE must be 0..9"
+#endif
+#define SALAMI_CLASS_DISPCC 7
+#define SALAMI_CLASS_KS     9
+#define SALAMI_CLASS_NEVER  0xffu
+/* Request 0x4f windows on salami (P-7). Indices 0..9 are the Fuxi ones, 10/11
+ * DSC_1, 12..19 the staged blocks. Window 0 (MDP top: a 0x4f dump of it hung
+ * the SoC, crashdump 900E) and PP_0/PP_1 (catalog length 0 on SM8550, the
+ * MDP_PERIPH_TOP0 hole class) keep their index with length 0 and class never.
+ * Window 19 is MDP top below 0x300 only: 0xae01300..0xae013a7 (IGC LUT ports,
+ * MDP_PERIPH_TOP0) is outside every window of every build. Class 10 is above
+ * every buildable cap. */
+static const struct { uint32_t base, len, cls; } salami_mdss_win[]={
+ {0xae01000,0,SALAMI_CLASS_NEVER},  /*  0 MDP top: refused */
+ {0xae16000,0x290,2},               /*  1 CTL0 (+0x14/+0x1c alone: class 0) */
+ {0xae36000,0x300,5},               /*  2 INTF_1 */
+ {0xae36800,0xc,5},                 /*  3 INTF_1 tear INTR_EN/STATUS/CLEAR */
+ {0xae81000,0x4,4},                 /*  4 DCE_0 DSC_CMN_MAIN_CNF */
+ {0xae81100,0x9c,4},                /*  5 DSC_0 encoder */
+ {0xae81f00,0x10,4},                /*  6 DSC_0 ctl (live DT 0x24, Linux 0x10) */
+ {0xae6a000,0,SALAMI_CLASS_NEVER},  /*  7 PP_0: refused */
+ {0xae6b000,0,SALAMI_CLASS_NEVER},  /*  8 PP_1: refused */
+ {0xae94000,0x300,6},               /*  9 DSI0 controller */
+ {0xae81200,0x9c,4},                /* 10 DSC_1 encoder */
+ {0xae81f80,0x10,4},                /* 11 DSC_1 ctl */
+ {0xae05000,0x344,1},               /* 12 VIG0 */
+ {0xae07000,0x344,1},               /* 13 VIG1 */
+ {0xae45000,0x400,3},               /* 14 LM_0 */
+ {0xae46000,0x400,3},               /* 15 LM_1 */
+ {0xae82000,0x4,4},                 /* 16 DCE_1 DSC_CMN_MAIN_CNF */
+ {0xae37000,0x300,5},               /* 17 INTF_2 */
+ {0xae4f000,0x8,10},                /* 18 MERGE_3D_0 (only if CTL_MERGE_3D_ACTIVE != 0) */
+ {0xae01000,0x300,8}};              /* 19 MDP top low, never 0x300 and up */
+#define SALAMI_MDSS_WINDOWS (sizeof(salami_mdss_win)/sizeof(salami_mdss_win[0]))
+/* Class of one 0x4f request: window 1 +0x14 or +0x1c as a single word is the
+ * proven 0x42 read; any other range takes the window's class. */
+static unsigned salami_mdss_class(uint32_t w, uint32_t index, uint32_t n)
+{
+ if (w == 1 && n == 4 && (index == 0x14 || index == 0x1c)) return 0;
+ return salami_mdss_win[w].cls;
+}
+#endif
+
 /* Read-only display snapshot, requested after basic USB/FDT capture. */
 static uint32_t display_regs[10 * 9 + 6 * 3];
 static uint32_t display_snapshot(void)
@@ -118,8 +175,13 @@ static uint32_t display_paint(void)
        fb[(48 + gy * 3 + sy) * FG_FB_W + 48 + c * 24 + gx * 3 + sx] = 0xffffffff;
  }
  __asm__ volatile("dsb sy" ::: "memory");
+#if !defined(FUXI_SALAMI)
  *(volatile uint32_t *)0x0ae1601cUL = 1; /* CTL0 START: command-mode frame */
  __asm__ volatile("dsb sy" ::: "memory");
+#endif
+ /* Salami (P-4): DRAM only. A CTL0 START write is unproven there and an
+  * unchecked START on top of INTF1 autorefresh corrupts DSC (Fuxi ar-01);
+  * the one gated START is 0x53 'KS' (class 9). */
  return 1;
 }
 
@@ -128,7 +190,11 @@ static uint32_t display_paint(void)
  * [7] DSI status, [8] DSI FIFO status. Mode 'NS' paints with no START (autorefresh
  * delivers); 'AS' disables autorefresh, waits for the transfer to end, then STARTs;
  * 'RE' restores the saved autorefresh config. */
+#if defined(FUXI_SALAMI)
+static uint32_t ar_report[10];
+#else
 static uint32_t ar_report[10], ar_saved;
+#endif
 static void ar_paint(uint32_t color)
 {
  volatile uint32_t *fb = (volatile uint32_t *)0xb8000000UL;
@@ -145,6 +211,71 @@ static void ar_paint(uint32_t color)
  }
  __asm__ volatile("dsb sy" ::: "memory");
 }
+#if defined(FUXI_SALAMI)
+/* Salami 0x53 (display_salami_plan.md P-6): the Fuxi report layout with the
+ * fixes. The line word is INTF_TEAR_LINE_COUNT +0x2b0 (Fuxi reads +0x2a8, the
+ * static WR_PTR_IRQ threshold, so its idle wait never worked); [7] is DSI0
+ * +0x04 DSI_CTRL (6G map, not a status word), [8] +0x0c FIFO_STATUS and [9]
+ * +0x08 STATUS0. Modes and risk classes: 'NS' 6 (DRAM paint, INTF1 and DSI0
+ * reads, no START); 'KS' 9, compiled in only for cap 9: paint, wait (bounded)
+ * for CTL0 START idle and the INTF1 write line at 0 or >= panel height (Linux
+ * _dpu_encoder_phys_cmd_is_ongoing_pptx), then exactly one CTL0 START, and
+ * never with INTF1 autorefresh on. 'AS'/'RE' write the INTF1 autorefresh
+ * config, which the salami plan never needs: class never, so they STALL.
+ * [0]: 1 NS painted, 4 KS started, 0x100 paint guard refused, 0x200 KS saw
+ * autorefresh on (no START), 0x300 KS wait timed out (no START), 0x400 class
+ * above this image's cap (the STALL list refuses it first). */
+static unsigned salami_ar_class(uint32_t mode)
+{
+ if (mode == 0x4e53) return 6;
+#if FUXI_SALAMI_MDSS_STAGE >= SALAMI_CLASS_KS
+ if (mode == 0x4b53) return SALAMI_CLASS_KS;
+#endif
+ return SALAMI_CLASS_NEVER;
+}
+static void ar_test(uint32_t mode)
+{
+ for (unsigned i = 0; i < 10; i++) ar_report[i] = 0;
+ if (salami_ar_class(mode) > FUXI_SALAMI_MDSS_STAGE) { ar_report[0] = 0x400; return; }
+ if (!probe_paint_ok()) { ar_report[0] = 0x100; return; }
+ ar_report[1] = usb_rd(0xae36000, 0x2b4);
+ ar_report[3] = usb_rd(0xae36000, 0x2b0) & 0xffff;
+ if (mode == 0x4e53) {
+  ar_paint(0xff0040c0);               /* blue, no START */
+  ar_report[0] = 1;
+ }
+#if FUXI_SALAMI_MDSS_STAGE >= SALAMI_CLASS_KS
+ else if (mode == 0x4b53) {
+  if (ar_report[1] & 0x80000000u) {
+   ar_report[0] = 0x200;              /* autorefresh delivers: a START would corrupt DSC */
+  } else {
+   ar_paint(0xffc02000);              /* red, then at most one START */
+   unsigned i;
+   uint32_t l = 0;
+   for (i = 0; i < 200000; i++) {
+    l = usb_rd(0xae36000, 0x2b0) & 0xffff;
+    if (!(usb_rd(0xae16000, 0x1c) & 1) && (l == 0 || l >= FG_FB_H)) break;
+    delay(1);
+   }
+   ar_report[4] = l; ar_report[5] = i;
+   if (i == 200000) {
+    ar_report[0] = 0x300;
+   } else {
+    *(volatile uint32_t *)0x0ae1601cUL = 1;
+    __asm__ volatile("dsb sy" ::: "memory");
+    delay(40000);
+    ar_report[6] = usb_rd(0xae36000, 0x2b0) & 0xffff;
+    ar_report[0] = 4;
+   }
+  }
+ }
+#endif
+ ar_report[2] = usb_rd(0xae36000, 0x2b4);
+ ar_report[7] = usb_rd(0xae94000, 0x4);  /* DSI_CTRL */
+ ar_report[8] = usb_rd(0xae94000, 0xc);  /* FIFO_STATUS */
+ ar_report[9] = usb_rd(0xae94000, 0x8);  /* STATUS0 */
+}
+#else
 static void ar_test(uint32_t mode)
 {
  for (unsigned i = 0; i < 10; i++) ar_report[i] = 0;
@@ -181,6 +312,7 @@ static void ar_test(uint32_t mode)
  ar_report[7] = usb_rd(0xae94000, 0x4);
  ar_report[8] = usb_rd(0xae94000, 0xc);
 }
+#endif
 
 static uint64_t ram_report[8];
 static void ram_probe(void)
@@ -244,7 +376,19 @@ static void ufs_snapshot_awake(void)
  *(volatile uint32_t *)0x177024UL=old;
  __asm__ volatile("dsb sy" ::: "memory");
 }
+#if defined(FUXI_SALAMI)
+/* Salami layout (P-9, version 2): words 0..13 as on Fuxi, so a 56-byte request
+ * still decodes; then [14] mdp_lut_clk CBCR 0xaf08018, [15] gate (0 read,
+ * 1 DISPCC reads are class 7, above this image's cap, 2 GCC_DISP_AHB neither
+ * running nor enabled under HW control, 3 MDSS_GDSC off), [16..20] mdp RCG
+ * 0xaf080d8..0xaf080e8, [21..40] PLL0 0xaf00000..0xaf0004c. Read-only: 0x4c
+ * with a nonzero value and 0x50 (the GCC HWCG write) STALL on salami. The gate
+ * accepts the HW-gated idle state ABL leaves (0x80000003: enable, HW_CTL,
+ * CLK_OFF), reads MDSS_GDSC first and stops there if it is off. */
+static uint32_t display_clocks[41];
+#else
 static uint32_t display_clocks[14];
+#endif
 /* dispcc-kalama.c RCGs (CMD, CFG, M, N, D): mdp, pclk0, byte0, esc0, ahb;
  * then PLL0 and PLL1 register words 0x00-0x4c. Valid only if word 0 = 1. */
 static uint32_t display_rcg[1+25+40];
@@ -255,6 +399,25 @@ static void display_clock_snapshot(void)
  display_clocks[2]=usb_rd(0x100000,0x27004);
  display_clocks[3]=usb_rd(0x100000,0x2700c);
  display_clocks[4]=0;
+#if defined(FUXI_SALAMI)
+ display_clocks[1]=2;
+ for (unsigned i=5;i<sizeof(display_clocks)/sizeof(display_clocks[0]);i++) display_clocks[i]=0;
+#if FUXI_SALAMI_MDSS_STAGE < SALAMI_CLASS_DISPCC
+ (void)offsets;
+ display_clocks[15]=1;
+#else
+ const uint32_t ahb=display_clocks[2];
+ if (!(ahb&1) || ((ahb&0x80000000u) && !(ahb&2))) { display_clocks[15]=2; return; }
+ display_clocks[5]=usb_rd(0xaf00000,offsets[0]); /* MDSS_GDSC first */
+ if (!(display_clocks[5]&0x80000000u)) { display_clocks[15]=3; return; }
+ for (unsigned i=1;i<sizeof(offsets)/sizeof(offsets[0]);i++)
+  display_clocks[5+i]=usb_rd(0xaf00000,offsets[i]);
+ display_clocks[14]=usb_rd(0xaf00000,0x8018);
+ for (unsigned j=0;j<5;j++) display_clocks[16+j]=usb_rd(0xaf00000,0x80d8+4*j);
+ for (unsigned j=0;j<20;j++) display_clocks[21+j]=usb_rd(0xaf00000,4*j);
+ display_clocks[4]=1;
+#endif
+#else
  if (display_clocks[2]&0x80000000) return;
  for(unsigned i=0;i<sizeof(offsets)/sizeof(offsets[0]);i++)
   display_clocks[5+i]=usb_rd(0xaf00000,offsets[i]);
@@ -266,6 +429,7 @@ static void display_clock_snapshot(void)
  for(unsigned pll=0;pll<2;pll++)
   for(unsigned j=0;j<20;j++) display_rcg[n++]=usb_rd(0xaf00000,pll*0x1000+4*j);
  display_rcg[0]=1;
+#endif
 }
 static void display_clock_snapshot_awake(void)
 {
@@ -414,15 +578,32 @@ out:
  * 44-47 func 1, supplies ldob12 (vdd 1.8 V) and ldom6 (avdd 3.2 V) on RPMh.
  * Request 0x55: 'TS' read-only snapshot, 'TP' power + reset + chip ID +
  * sense on, 'TE' read one FIFO batch (polled; no GIC/PDC interrupt work).
+ * Salami (OnePlus 11) has a Synaptics S3908 on SE4 I2C instead: the FTS code
+ * below is compiled out there, 'TE' STALLs and 'TP' is the S3908 touch_power
+ * (salami-port/touch_s3908_design.md 2.2), which the loader also runs by
+ * itself right before the XNU handoff (FUXI_SALAMI_TOUCH_AUTO, default 1).
  */
+#if defined(FUXI_SALAMI_TOUCH_AUTO) && !defined(FUXI_SALAMI)
+#error "FUXI_SALAMI_TOUCH_AUTO is a salami (FUXI_SALAMI) build switch"
+#endif
+#if defined(FUXI_SALAMI)
+#ifndef FUXI_SALAMI_TOUCH_AUTO
+#define FUXI_SALAMI_TOUCH_AUTO 1
+#endif
+#if FUXI_SALAMI_TOUCH_AUTO != 0 && FUXI_SALAMI_TOUCH_AUTO != 1
+#error "FUXI_SALAMI_TOUCH_AUTO must be 0 or 1"
+#endif
+#endif
 #define TS_SE   0x00a90000UL
 #define TS_GCC  0x00100000UL
 #define TS_TLMM 0x0f100000UL /* DT node 0x0f000000 + downstream tile 0x100000 = upstream tlmm@f100000 (ts-03) */
 static uint32_t touch_report[64];
+#if !defined(FUXI_SALAMI)
 static uint8_t touch_events[8*32];
 static unsigned ts_depth;
 static uint32_t ts_level;
 static unsigned ts_stage;
+#endif
 static void ts_wr(uintptr_t base, uint32_t off, uint32_t v)
 {
  __asm__ volatile("dmb oshst" ::: "memory");
@@ -449,14 +630,23 @@ static void ts_gpio(unsigned n, unsigned func, unsigned pull, unsigned ma, int o
  * clocks are gated: touch them only with m_ahb running (s_ahb is under
  * hardware clock gating, its CLK_OFF bit is not meaningful at idle). */
 static bool ts_ahb_on(void) { return !(usb_rd(TS_GCC,0x2327c)&0x80000000u); }
+#if !defined(FUXI_SALAMI)
 static bool ts_s4_on(void) { return !(usb_rd(TS_GCC,0x184e4)&0x80000000u); }
+#endif
 /* Groups (ts-02 bisect; any abort resets the SoC): 0 GCC, 1 TLMM, 2 SE4 + QUP
  * version (only with the wrapper clocks on), 3 a single GCC word (index). */
 static void touch_snapshot(unsigned group)
 {
  static const uint16_t se[]={0x040,0x048,0x064,0x068,0x07c,0x258,0x25c,0x268,
   0x260,0x264,0x610,0x614,0x800,0x804,0xe24,0xe28};
+#if defined(FUXI_SALAMI)
+ /* Salami group 1 appends GPIO10 (S3908 AVDD enable): words 13/14. */
+ static const uint8_t g[]={24,25,44,45,46,47,10};
+#define TS_SNAP_PINS 7u
+#else
  static const uint8_t g[]={24,25,44,45,46,47};
+#define TS_SNAP_PINS 6u
+#endif
  unsigned n=1;
  for (unsigned i=0;i<64;i++) touch_report[i]=0;
  touch_report[0]=0x100|group;
@@ -470,7 +660,7 @@ static void touch_snapshot(unsigned group)
   touch_report[n++]=usb_rd(TS_GCC,0x18504);
   for (unsigned l=0;l<8;l++) touch_report[n++]=usb_rd(TS_GCC,0x1850c+4*l);
  } else if (group==1) {
-  for (unsigned i=0;i<6;i++) {
+  for (unsigned i=0;i<TS_SNAP_PINS;i++) {
    touch_report[n++]=usb_rd(TS_TLMM+0x1000u*g[i],0);
    touch_report[n++]=usb_rd(TS_TLMM+0x1000u*g[i],4);
   }
@@ -510,6 +700,8 @@ static void touch_snapshot(unsigned group)
   }
  }
 }
+#if !defined(FUXI_SALAMI)
+/* ST FTS over SPI (Fuxi only, through touch_read_events). */
 static void ts_clock_regs(unsigned at)
 {
  static const uint32_t r[]={0x52008,0x184e4,0x2327c,0x23280,0x23284,0x23294,0x184f0};
@@ -746,14 +938,6 @@ static void touch_power(unsigned stage)
  for (unsigned i=0;i<64;i++) touch_report[i]=0;
  ts_stage=stage;
  touch_report[0]=1;
-#if defined(FUXI_SALAMI)
- /* The VRM addresses below are Fuxi cmd-db literals. On salami 0x40900 is
-  * ldob10 and 0x41b00 is ldon7 (pm8010n_l7, max 2960 mV): never send them.
-  * Request 0x55 'TP' is refused there until the S3908 touch_power lands, and
-  * that one resolves ldob4 by name (like wl_cmddb_addr) and asserts it is
-  * 0x40800 before any vote. */
- touch_report[0]=0x300; return;
-#endif
  uint32_t id=usb_rd(RH_DRV_PA,0), cfg=usb_rd(RH_DRV_PA,0xc);
  if (((id>>16)&0xff)!=3 || ((cfg>>12)&0x3f)<3) { touch_report[0]=0x100; return; }
  /* Hold the IC in reset (and IRQ low, as the vendor driver does) while the rails come up. */
@@ -809,6 +993,128 @@ static unsigned touch_read_events(void)
  }
  return n*8;
 }
+#else
+/*
+ * Salami touch power: Synaptics S3908, TouchComm v1 over I2C at 0x4b on QUP1
+ * SE4 (salami-port/touch_s3908_design.md 2.1-2.2). XNU never votes RPMh, so
+ * the loader owns VDD = ldob4 (pm_humu_l4, 1.8 V): its VRM address is looked
+ * up by NAME in cmd-db and must equal 0x40800 (measure/cmd_db.txt) before any
+ * vote. No other VRM address exists in this branch; the Fuxi table above
+ * (0x40900/0x41b00 = ldob10/ldon7 on salami) is compiled out. AVDD 3.0 V is an
+ * external switch on TLMM GPIO10 (raw high = on), reset is GPIO24 (raw low =
+ * in reset), ATTN is GPIO25 (the IC's output with a pull-up): read, never
+ * driven. No VRM mode write (design 2.2 open item).
+ * 'TP' wIndex = stage: 0 checks only, nothing written; 1 reset low, AVDD on,
+ * ldob4 1800 mV then enable, 10 ms, reset release; 2..255 the same plus
+ * GPIO44/45 muxed to qup1_se4 I2C (TLMM CTL 0x2007) while the IC is still in
+ * reset. AVDD and the ldob4 vote stay on across the XNU handoff.
+ * Report (64 words): [0] 0x10 checked, 0x11 powered, 0x12 powered + I2C pins,
+ * 0x100 RSC DRV check, 0x101 cmd-db magic, 0x102 ldob4 is not 0x40800 (all
+ * three before any write), 0x200/0x201 voltage/enable vote failed (GPIO10 and
+ * GPIO24 then go back to their entry CTL/IO); [1] stage; [2]/[3] RSC DRV
+ * +0/+0xc; [4] cmd-db magic; [5] ldob4 address; [6]/[7] rh_send status of the
+ * voltage/enable vote; [8] ms from reset release to the first ATTN low sample
+ * (0xffffffff: none in 300 ms); [9] GPIO25 IO just before the release;
+ * [10..19] CTL/IO of GPIO10, 24, 25, 44, 45 at entry; [20..29] the same at
+ * exit; [62] layout 1; [63] 0x544c4153 'SALT'.
+ */
+#define ST_AVDD     10u
+#define ST_RESET    24u
+#define ST_ATTN     25u
+#define ST_SDA      44u
+#define ST_SCL      45u
+#define ST_LDO_ADDR 0x40800u    /* cmd-db "ldob4" (pm_humu_l4) on salami */
+#define ST_LDO_MV   1800u
+#define ST_I2C_CTL  0x2007u     /* pull up, func 1 (qup1_se4), 2 mA, i2c_pull bit 13 */
+static const uint8_t st_pins[5]={ST_AVDD,ST_RESET,ST_ATTN,ST_SDA,ST_SCL};
+static void st_pin_state(unsigned at)
+{
+ for (unsigned i=0;i<5;i++) {
+  touch_report[at+2*i]=usb_rd(TS_TLMM+0x1000u*st_pins[i],0);
+  touch_report[at+2*i+1]=usb_rd(TS_TLMM+0x1000u*st_pins[i],4);
+ }
+}
+/* Raw TLMM CTL write: ts_gpio clears only bits 9:0 and cannot set i2c_pull. */
+static void st_gpio_ctl(unsigned n, uint32_t ctl)
+{
+ uintptr_t c=TS_TLMM+0x1000u*n;
+ ts_wr(c,0,(usb_rd(c,0)&~0x23ffu)|(ctl&0x23ffu));
+}
+/* Pin st_pins[slot] back to its entry state: output level first, then CTL. */
+static void st_gpio_restore(unsigned slot)
+{
+ uintptr_t c=TS_TLMM+0x1000u*st_pins[slot];
+ ts_wr(c,4,touch_report[11+2*slot]&2u);
+ ts_wr(c,0,touch_report[10+2*slot]);
+}
+static void touch_power(unsigned stage)
+{
+ for (unsigned i=0;i<64;i++) touch_report[i]=0;
+ touch_report[0]=1; touch_report[1]=stage;
+ touch_report[62]=1; touch_report[63]=0x544c4153u;
+ st_pin_state(10);
+ uint32_t id=usb_rd(RH_DRV_PA,0), cfg=usb_rd(RH_DRV_PA,0xc);
+ touch_report[2]=id; touch_report[3]=cfg;
+ if (((id>>16)&0xff)!=3 || ((cfg>>12)&0x3f)<3) { touch_report[0]=0x100; return; }
+ touch_report[4]=usb_rd(WL_CMDDB,4);
+ if (touch_report[4]!=0x0c0330dbu) { touch_report[0]=0x101; return; }
+ uint32_t ldo=wl_cmddb_addr("ldob4");
+ touch_report[5]=ldo;
+ if (ldo!=ST_LDO_ADDR) { touch_report[0]=0x102; return; }
+ if (!stage) { touch_report[0]=0x10; return; }
+ ts_gpio(ST_RESET,0,0,8,0);   /* hold the IC in reset: out low, 8 mA, no pull */
+ ts_gpio(ST_AVDD,0,1,2,1);    /* AVDD on (Android order: AVDD, then VDD): out high, 2 mA, pull down */
+ touch_report[6]=rh_send(0,ldo,ST_LDO_MV);
+ if (!touch_report[6]) touch_report[7]=rh_send(0,ldo+4,1);
+ if (touch_report[6] || touch_report[7]) {
+  st_gpio_restore(0); st_gpio_restore(1);
+  touch_report[0]=touch_report[6] ? 0x200u : 0x201u;
+  st_pin_state(20);
+  return;
+ }
+ if (stage>=2) { st_gpio_ctl(ST_SDA,ST_I2C_CTL); st_gpio_ctl(ST_SCL,ST_I2C_CTL); }
+ delay(10000);                /* rail settle, IC still in reset */
+ touch_report[9]=usb_rd(TS_TLMM+0x1000u*ST_ATTN,4);
+ ts_gpio(ST_RESET,0,0,8,1);
+ touch_report[8]=~0u;
+ for (unsigned ms=0;ms<300;ms++) {
+  if (!(usb_rd(TS_TLMM+0x1000u*ST_ATTN,4)&1u)) { touch_report[8]=ms; break; }
+  delay(1000);
+ }
+ st_pin_state(20);
+ touch_report[0]=stage>=2 ? 0x12u : 0x11u;
+}
+#if defined(FUXI_XNU_LOADER)
+/* Loader auto power (FUXI_SALAMI_TOUCH_AUTO=1): the S3908 design expects VDD
+ * on at the handoff, so probe_main runs touch_power(2) once after the launch
+ * request, on the boot CPU, while the second CPU keeps serving USB. Monitor
+ * stage 2 = running, 3 = done (loader_main then sets 4). The record is the
+ * 'TP' layout above; request 0x46 returns it after the 88-byte report (see
+ * touch_auto_tail), so 88-byte readers see no change. */
+static uint32_t touch_auto_report[64];
+static void touch_auto_power(void)
+{
+#if FUXI_SALAMI_TOUCH_AUTO
+ monitor_report[MON_STAGE]=2;
+ __asm__ volatile("dsb sy" ::: "memory");
+ touch_power(2);
+ memcpy(touch_auto_report,touch_report,sizeof(touch_auto_report));
+ __asm__ volatile("dsb sy" ::: "memory");
+ monitor_report[MON_STAGE]=3;
+ __asm__ volatile("dsb sy" ::: "memory");
+#endif
+}
+/* 0x46 tail: 0x54410000 | FUXI_SALAMI_TOUCH_AUTO ('TA'), then the 64-word
+ * record (all zero until the auto power ran). 260 bytes. */
+static uint32_t touch_auto_tail(uint8_t *out)
+{
+ const uint32_t sw=0x54410000u|FUXI_SALAMI_TOUCH_AUTO;
+ memcpy(out,&sw,sizeof(sw));
+ memcpy(out+sizeof(sw),touch_auto_report,sizeof(touch_auto_report));
+ return sizeof(sw)+sizeof(touch_auto_report);
+}
+#endif
+#endif
 /* SM8550 cpu@100 from the live FDT. CPU_ON is only requested by the host. */
 static volatile uint64_t core_report[10] __attribute__((aligned(64)));
 void probe_secondary_main(void)
@@ -1173,12 +1479,17 @@ ud_setup(void)
 	ud.audio_out = false;
 #if defined(FUXI_SALAMI)
 	/* Lanes not ported to the OnePlus 11 (salami) STALL before any of their code
-	 * runs: 0x52 MDP/PLL0 boost, 0x55 'TP' touch rails (its Fuxi VRM literals
-	 * are ldob10 0x40900 and ldon7 0x41b00, pm8010n_l7 max 2960 mV, here),
-	 * 0x5a/0x5b audio (QUP2 SE0 CS35L41 and the Fuxi adspslpi size), 0x5c WLAN
-	 * (Fuxi BDF and rail expectations). */
-	if ((type & 0x60) == 0x40 && (req == 0x52 || (req == 0x55 && value == 0x5450) ||
-	    req == 0x5a || req == 0x5b || req == 0x5c)) {
+	 * runs: 0x52 MDP/PLL0 boost, 0x55 'TE' (the FTS SPI event FIFO; 'TP' is
+	 * the S3908 touch_power, ldob4 by name, and the Fuxi rail table is not in
+	 * salami images), 0x5a/0x5b audio (QUP2 SE0 CS35L41 and the Fuxi
+	 * adspslpi size), 0x5c WLAN (Fuxi BDF and rail expectations). Display
+	 * (P-5): 0x50 and 0x4c with a nonzero value write GCC_DISP_AHB (HWCG off);
+	 * 0x53 runs only a mode whose risk class this image's
+	 * FUXI_SALAMI_MDSS_STAGE cap allows (ar_test). */
+	if ((type & 0x60) == 0x40 && (req == 0x52 || (req == 0x55 && value == 0x5445) ||
+	    req == 0x5a || req == 0x5b || req == 0x5c ||
+	    req == 0x50 || (req == 0x4c && value != 0) ||
+	    (req == 0x53 && salami_ar_class(value) > FUXI_SALAMI_MDSS_STAGE))) {
 		ok = false;
 	} else
 #endif
@@ -1209,6 +1520,10 @@ ud_setup(void)
             monitor_report[MON_DELEGATE]=1;
         monitor_report[MON_USB_MPIDR]=rsr("mpidr_el1");
         memcpy(data, (const void *)monitor_report, sizeof(monitor_report)); n=sizeof(monitor_report);
+#if defined(FUXI_SALAMI) && defined(FUXI_XNU_LOADER)
+        /* Salami loader: the touch auto-power record follows (348 bytes in all). */
+        n+=touch_auto_tail(data+n);
+#endif
     } else if (type == 0xc0 && (req == 0x47 || req == 0x58)) {
         uint32_t index=(uint32_t)st[4] | ((uint32_t)st[5]<<8);
         uint64_t off=(uint64_t)value | ((uint64_t)index<<16);
@@ -1231,7 +1546,14 @@ ud_setup(void)
         n=length > 512 ? 512 : length;
         uint32_t base=usb_rd(0xae05000,0x14);
         if (off>size || n>size-off || (base!=0xb8000000 && base!=0xb8a00000 && base!=0xb9400000) ||
-            usb_rd(0xae05000,0x24)!=fb_pitch || usb_rd(0xae05000,0x30)!=fb_format)
+            usb_rd(0xae05000,0x24)!=fb_pitch || usb_rd(0xae05000,0x30)!=fb_format
+#if defined(FUXI_SALAMI)
+            /* P-8: VIG1 scans columns 540..1079; a frame is one buffer only
+             * while both pipes fetch it (proven SSPP offsets only). */
+            || usb_rd(0xae07000,0x14)!=base || usb_rd(0xae07000,0x24)!=fb_pitch ||
+            usb_rd(0xae07000,0x30)!=fb_format
+#endif
+            )
             ok=false;
         else memcpy(data,(const void *)(uintptr_t)((uint64_t)base+off),n);
     } else if (type == 0xc0 && req == 0x4f) {
@@ -1239,14 +1561,34 @@ ud_setup(void)
          * INTF1 (+tear irq), DSC0 enc/ctl, PP0/PP1, DSI0 controller; salami
          * adds DSC1 enc/ctl as windows 10/11 (2 LM / 2 DSC / 1 INTF). MDSS top
          * (0xae00000) is excluded: reading it with non-GDSC AHB off reset the SoC. */
+#if defined(FUXI_SALAMI)
+        /* Salami: salami_mdss_win (P-7), each window with a risk class above
+         * which this image STALLs. Value 0x4353 'CS' (index 0) returns the cap
+         * and the table with no MMIO: magic 'FXMW', cap, count, then base,
+         * length, class per window. */
+        uint32_t index=(uint32_t)st[4] | ((uint32_t)st[5]<<8);
+        n=length > 512 ? 512 : length;
+        if (value == 0x4353 && index == 0) {
+            /* 252 bytes, inside the 512-byte ep0 data stage. */
+            const uint32_t head[3]={0x574d5846,FUXI_SALAMI_MDSS_STAGE,(uint32_t)SALAMI_MDSS_WINDOWS};
+            memcpy(data,head,sizeof(head));
+            for (uint32_t w=0;w<SALAMI_MDSS_WINDOWS;w++) {
+                const uint32_t e[3]={salami_mdss_win[w].base,salami_mdss_win[w].len,salami_mdss_win[w].cls};
+                memcpy(data+sizeof(head)+sizeof(e)*w,e,sizeof(e));
+            }
+            if (n>4*(3+3*SALAMI_MDSS_WINDOWS)) n=4*(3+3*SALAMI_MDSS_WINDOWS);
+        } else if (value >= SALAMI_MDSS_WINDOWS || (index|n)&3 ||
+            index > salami_mdss_win[value].len || n > salami_mdss_win[value].len-index ||
+            salami_mdss_class(value,index,n) > FUXI_SALAMI_MDSS_STAGE) ok=false;
+        else for (uint32_t i=0;i<n;i+=4) {
+            uint32_t v=usb_rd(salami_mdss_win[value].base,index+i);
+            memcpy(data+i,&v,4);
+        }
+#else
         static const uint32_t win[][2]={{0xae01000,0x400},
             {0xae16000,0x290},{0xae36000,0x300},{0xae36800,0x10},{0xae81000,0x4},
             {0xae81100,0x9c},{0xae81f00,0x24},{0xae6a000,0x4},{0xae6b000,0x4},
-            {0xae94000,0x300}
-#if defined(FUXI_SALAMI)
-            ,{0xae81200,0x9c},{0xae81f80,0x24}
-#endif
-            };
+            {0xae94000,0x300}};
         uint32_t index=(uint32_t)st[4] | ((uint32_t)st[5]<<8);
         n=length > 512 ? 512 : length;
         if (value >= sizeof(win)/sizeof(win[0]) || (index|n)&3 ||
@@ -1255,6 +1597,7 @@ ud_setup(void)
             uint32_t v=usb_rd(win[value][0],index+i);
             memcpy(data+i,&v,4);
         }
+#endif
     } else if (type == 0xc0 && req == 0x4b) {
         ufs_snapshot();
         memcpy(data, ufs_report, sizeof(ufs_report)); n=sizeof(ufs_report);
@@ -1273,6 +1616,11 @@ ud_setup(void)
         memcpy(data, ar_report, sizeof(ar_report)); n=sizeof(ar_report);
     } else if (type == 0xc0 && req == 0x55 && !monitor_report[MON_LAUNCH] &&
                (value == 0x5453 || value == 0x5450 || value == 0x5445)) {
+#if defined(FUXI_SALAMI)
+        /* 'TE' STALLed above; 'TP' wIndex = S3908 stage (0 checks, 1 power, 2+ power + I2C pins). */
+        if (value == 0x5450) touch_power(st[4]); else touch_snapshot(st[4]);
+        memcpy(data, touch_report, sizeof(touch_report)); n=sizeof(touch_report);
+#else
         if (value == 0x5445) {
             n=touch_read_events();
             memcpy(data, touch_events, n);
@@ -1280,6 +1628,7 @@ ud_setup(void)
             if (value == 0x5450) touch_power(st[4]); else touch_snapshot(st[4]);
             memcpy(data, touch_report, sizeof(touch_report)); n=sizeof(touch_report);
         }
+#endif
     } else if (type == 0xc0 && req == 0x56 && value == 0x4753 && !monitor_report[MON_LAUNCH]) {
         /* 'GS': stages1..16 / 0x8a snapshot; 0x100..10f read frozen pages. */
         unsigned index = st[4] | (unsigned)st[5] << 8;
@@ -1561,7 +1910,10 @@ void probe_main(uintptr_t fdt)
     monitor_report[MON_DELEGATE]=2;
    }
   }
-#if defined(FUXI_XNU_LOADER)
+#if defined(FUXI_XNU_LOADER) && defined(FUXI_SALAMI)
+  /* S3908 VDD/AVDD/reset right before the handoff (touch_auto_power). */
+  if (monitor_report[MON_ACTIVE] && monitor_report[MON_LAUNCH]) { touch_auto_power(); return; }
+#elif defined(FUXI_XNU_LOADER)
   if (monitor_report[MON_ACTIVE] && monitor_report[MON_LAUNCH]) return;
 #endif
  }

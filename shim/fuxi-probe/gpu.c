@@ -1466,11 +1466,13 @@ static int g4_clear(uint32_t *d)
  return d[56] ? 0xe0b : 1;
 }
 /* g4_copy took SSPP0 +0x14/+0x24/+0x00/+0x30 into d[50..53] with fault-contained
- * reads; hand those words to the shared ABL-scanout guard. */
+ * reads; hand those words to the shared ABL-scanout guard. Any other offset
+ * (salami's VIG1 and +0x0c/+0x34/+0x170) was never read: 0xffffffff fails it. */
 static uint32_t g4_sspp_word(const void *ctx, uint32_t off)
 {
  const uint32_t *d = ctx;
- return off == 0x14 ? d[50] : off == 0x24 ? d[51] : off == 0x00 ? d[52] : d[53];
+ return off == 0x14 ? d[50] : off == 0x24 ? d[51] : off == 0x00 ? d[52] :
+        off == 0x30 ? d[53] : 0xffffffffu;
 }
 static int g4_copy(unsigned panel, uint32_t *d)
 {
@@ -1596,6 +1598,12 @@ static void gpu_m4(unsigned limit)
 {
  for (unsigned stage = 14; stage <= 15 && stage <= limit; stage++) {
   uint32_t *d = gpu_extra[stage-3];
+#if defined(FUXI_SALAMI)
+  /* GS 15 blits into the live ABL splash, which salami scans through VIG0
+   * and VIG1 behind an unproven kick: refused. Its page records 0xe0c, and
+   * stage 15 reads no SSPP, maps nothing and submits nothing. */
+  if (stage == 15 && !d[1]) { d[0] = 0xa7400009; d[1] = stage; d[2] = 0xe0cu; }
+#endif
   if (!d[1]) {
    g_enter(stage); d[0] = 0xa7400009; d[1] = stage;
    d[2] = g4_copy(stage == 15, d); g4_snapshot(d);

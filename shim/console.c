@@ -11,12 +11,21 @@
 #define MARGIN		24
 #define LABEL_COLS	8
 
+#if defined(FUXI_SALAMI) && defined(FUXI_SALAMI_KICK) && \
+    (!defined(FUXI_SALAMI_MDSS_STAGE) || FUXI_SALAMI_MDSS_STAGE < 9)
+#error "FUXI_SALAMI_KICK reads INTF1 and writes CTL0 START: build it only with FUXI_SALAMI_MDSS_STAGE=9"
+#endif
+
 volatile uint32_t *con_fb = (volatile uint32_t *)FB_BASE;
 static uint32_t con_bg;
 static int row;
+/* Salami (OnePlus 11): no kick. INTF1 +0x2b4 and a CTL0 START write are
+ * unproven there (display_salami_plan.md P-1, stages S5/S9), and the loader
+ * console runs inside loader_main with no USB report to attribute a hang.
+ * -DFUXI_SALAMI_KICK restores the Fuxi kick once S5 and S9 have passed. */
 static void kick(void)
 {
-#if defined(FUXI)
+#if defined(FUXI) && (!defined(FUXI_SALAMI) || defined(FUXI_SALAMI_KICK))
  if (!con_fb) return;
  /* ABL's INTF1 autorefresh already sends every frame; a START on top of it
   * corrupts the DSC stream (ar-01). Kick only when autorefresh is off. */

@@ -10,6 +10,36 @@ cd "$(dirname "$0")"
 # FUXI_BOARD=fuxi (default, Xiaomi 13) or salami (OnePlus 11: -DFUXI_SALAMI=1, own out dir).
 board=${FUXI_BOARD:-fuxi}
 [[ $board == fuxi || $board == salami ]] || { echo 'FUXI_BOARD must be fuxi or salami' >&2; exit 1; }
+# FUXI_SALAMI_MDSS_STAGE=N (salami only, one digit, probe.c default 0): the staged
+# MDSS probe cap of the embedded probe; display requests of a higher risk class
+# STALL. A set cap gets its own out dir and image name (-sN).
+stage=
+if [[ -n ${FUXI_SALAMI_MDSS_STAGE:-} ]]; then
+ [[ $board == salami ]] || { echo 'FUXI_SALAMI_MDSS_STAGE is for FUXI_BOARD=salami only' >&2; exit 1; }
+ [[ $FUXI_SALAMI_MDSS_STAGE =~ ^[0-9]$ ]] || { echo 'FUXI_SALAMI_MDSS_STAGE must be one digit 0..9' >&2; exit 1; }
+ stage=-s$FUXI_SALAMI_MDSS_STAGE
+fi
+# FUXI_BOOT_LOGO=/abs/mask FUXI_BOOT_LOGO_W=W FUXI_BOOT_LOGO_H=H (salami only): the
+# loader fills the ABL splash black and draws this W*H-byte 8-bit coverage mask
+# (255 = logo) centred as grey, with no loader text (loader.c boot_logo_draw); pair
+# it with an ADT from tools/mkadt-salami.py --no-fbcon. The mask is Apple artwork and
+# never enters git: only the ignored out dir receives its bytes (incbin). A mask that
+# is not exactly W*H bytes is refused. Own out dir and image name (-logo).
+logo=
+if [[ -n ${FUXI_BOOT_LOGO:-}${FUXI_BOOT_LOGO_W:-}${FUXI_BOOT_LOGO_H:-} ]]; then
+ [[ $board == salami ]] || { echo 'FUXI_BOOT_LOGO is for FUXI_BOARD=salami only' >&2; exit 1; }
+ [[ ${FUXI_BOOT_LOGO:-} =~ ^/[A-Za-z0-9._/+-]+$ && -f ${FUXI_BOOT_LOGO:-} ]] ||
+  { echo 'FUXI_BOOT_LOGO must be an existing absolute file path (letters, digits and ._/+- only)' >&2; exit 1; }
+ [[ ${FUXI_BOOT_LOGO_W:-} =~ ^[1-9][0-9]{0,3}$ && ${FUXI_BOOT_LOGO_H:-} =~ ^[1-9][0-9]{0,3}$ ]] ||
+  { echo 'FUXI_BOOT_LOGO needs FUXI_BOOT_LOGO_W and FUXI_BOOT_LOGO_H (decimal pixel counts)' >&2; exit 1; }
+ (( FUXI_BOOT_LOGO_W <= 1080 && FUXI_BOOT_LOGO_H <= 2412 )) ||
+  { echo 'FUXI_BOOT_LOGO is larger than the 1080x2412 salami splash' >&2; exit 1; }
+ logo_bytes=$(wc -c < "$FUXI_BOOT_LOGO")
+ logo_bytes=${logo_bytes//[[:space:]]/}
+ (( logo_bytes == FUXI_BOOT_LOGO_W * FUXI_BOOT_LOGO_H )) ||
+  { echo "FUXI_BOOT_LOGO is $logo_bytes bytes, not ${FUXI_BOOT_LOGO_W}x${FUXI_BOOT_LOGO_H} = $((FUXI_BOOT_LOGO_W * FUXI_BOOT_LOGO_H))" >&2; exit 1; }
+ logo=-logo
+fi
 # FUXI_NO_GPU_FW=1 is the only way to build without GPU firmware: empty slots, no pins, and
 # stage_gpu_firmware() then never publishes the handoff magic, so the GPU lane stays off.
 no_gpu_fw=${FUXI_NO_GPU_FW:-0}
@@ -32,7 +62,7 @@ fi
 for input in "${inputs[@]}"; do
  [[ $input == /* && -f $input ]] || { echo 'Packing inputs must be existing absolute file paths' >&2; exit 1; }
 done
-out=../out/$board-loader
+out=../out/$board-loader$stage$logo
 mkdir -p "$out"
 # Reject a payload made from a different board, truncated segments, or unsafe RAM.
 python3 - "$payload" "$board" <<'PY'
@@ -87,6 +117,10 @@ printf '.section .payload,"a"\n.incbin "%s"\n' "$payload" > "$out/payload.S"
 flags=(--target=aarch64-none-elf -O2 -ffreestanding -fno-builtin -nostdlib
        -fno-pic -fno-stack-protector -mgeneral-regs-only -mstrict-align -Wall -Wextra -Werror -DFUXI=1 -DFUXI_XNU_LOADER=1 -I..)
 if [[ $board == salami ]]; then flags+=(-DFUXI_SALAMI=1); fi
+if [[ -n $stage ]]; then flags+=("-DFUXI_SALAMI_MDSS_STAGE=$FUXI_SALAMI_MDSS_STAGE"); fi
+if [[ -n $logo ]]; then
+ flags+=(-DFUXI_BOOT_LOGO=1 "-DFUXI_BOOT_LOGO_W=$FUXI_BOOT_LOGO_W" "-DFUXI_BOOT_LOGO_H=$FUXI_BOOT_LOGO_H")
+fi
 # Expected ABL SSPP0 format (gpu-handoff.h FG_ABL_SSPP_FORMAT), once a probe boot has measured it.
 if [[ -n ${FUXI_ABL_SSPP_FORMAT:-} ]]; then
  [[ $FUXI_ABL_SSPP_FORMAT =~ ^0x[0-9a-fA-F]{1,8}$ ]] || { echo 'FUXI_ABL_SSPP_FORMAT must look like 0x237ff' >&2; exit 1; }
@@ -101,7 +135,15 @@ for source in start.S loader.c ../console.c ../fuxi-probe/probe.c; do
 done
 "$CLANG" "${flags[@]}" -c "$out/payload.S" -o "$out/payload.o"
 "$CLANG" "${flags[@]}" -c "$out/gpu-fw.S" -o "$out/gpu-fw.o"
-"$LLD" -T loader.ld --build-id=none "$out/start.o" "$out/loader.o" "$out/console.o" "$out/probe.o" "$out/gpu-fw.o" "$out/payload.o" -o "$out/loader.elf"
+# The boot logo mask, incbin like the payload; .rodata.* lands in loader.ld's .rodata.
+logo_obj=()
+if [[ -n $logo ]]; then
+ printf '.section .rodata.boot_logo,"a"\n.global _boot_logo_start\n_boot_logo_start:\n.incbin "%s"\n.global _boot_logo_end\n_boot_logo_end:\n' \
+  "$FUXI_BOOT_LOGO" > "$out/logo.S"
+ "$CLANG" "${flags[@]}" -c "$out/logo.S" -o "$out/logo.o"
+ logo_obj=("$out/logo.o")
+fi
+"$LLD" -T loader.ld --build-id=none "$out/start.o" "$out/loader.o" "$out/console.o" "$out/probe.o" "${logo_obj[@]}" "$out/gpu-fw.o" "$out/payload.o" -o "$out/loader.elf"
 python3 - "$out/loader.elf" "$READELF" "$no_gpu_fw" <<'GPUCHECK'
 import re, subprocess, sys
 sections = subprocess.check_output([sys.argv[2], '-SW', sys.argv[1]], text=True)
@@ -122,8 +164,21 @@ b=Path(sys.argv[1]).read_bytes()
 assert struct.unpack_from('<Q',b,16)[0]==len(b), 'Image size must cover embedded payload'
 assert b[56:60]==b'ARM\x64'
 PY
+# A logo Image carries the mask once and the marker tools/run-ios-salami.py checks; others neither.
+python3 - "$out/Image" "${FUXI_BOOT_LOGO:-}" <<'LOGOPY'
+import sys
+from pathlib import Path
+image = Path(sys.argv[1]).read_bytes()
+marker = b'FUXI BOOT LOGO:'
+if sys.argv[2]:
+    assert image.count(Path(sys.argv[2]).read_bytes()) == 1, 'Image must carry the boot logo mask exactly once'
+    assert image.count(marker) == 1, 'Image lacks the boot logo marker'
+    print('Boot logo: mask and marker embedded, no loader text')
+else:
+    assert marker not in image, 'Image carries a boot logo marker without FUXI_BOOT_LOGO'
+LOGOPY
 # A GPU-less image never takes the name of the firmware-bearing one runners expect.
 if [[ $no_gpu_fw == 1 ]]; then suffix=-nogpufw; else suffix=; fi
 python3 "$MKBOOTIMG" --header_version 4 --kernel "$out/Image" \
- --os_version 16.0.0 --os_patch_level 2026-08 -o "$out/$board-xnu-boot$suffix.img"
-ls -lh "$out/Image" "$out/$board-xnu-boot$suffix.img"
+ --os_version 16.0.0 --os_patch_level 2026-08 -o "$out/$board-xnu-boot$stage$logo$suffix.img"
+ls -lh "$out/Image" "$out/$board-xnu-boot$stage$logo$suffix.img"

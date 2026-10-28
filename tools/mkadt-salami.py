@@ -16,6 +16,12 @@ refuses salami. Differences:
     the fhd_sa_60 timing ABL is believed to scan out; stride 4*W unless
     --fb-stride). It must equal the loader's FB_W/FB_H/FB_STRIDE and is only
     confirmed by the first loader probe boot (SSPP0 +0x00/+0x24/+0x30);
+  * --no-fbcon omits sweet-fbcon altogether: patch 0003 fbcon_probe then registers
+    no framebuffer text console, so XNU draws no kernel text before the GUI (the
+    log still reaches the USB monitor through sweet_log_ring). Pair it with a
+    loader built with FUXI_BOOT_LOGO (shim/fuxi-loader/build.sh), which leaves the
+    Apple logo on the splash; tools/run-ios-salami.py accepts a missing
+    sweet-fbcon only with such a loader;
   * /product comes from --d22ap-adt (mkadt.build otherwise reads only its
     hardcoded research/ipsw-x path); a missing tree is refused, because without
     /product MobileGestalt loses the D22AP identity;
@@ -55,6 +61,29 @@ FX_MAX_EXTENTS = 512                     # xnu/fuxi-unixnu/sweet_ufs.c:135
 USERDATA_BLOCKS = 61332474 - 4234843 + 1 # sda14, 4 KiB blocks (= 57097632)
 SCANOUT_SLOT = 0xa00000                  # one GPU scanout slot (0xb8000000/0xb8a00000/0xb9400000)
 COMPATIBLE = b'D22AP\0iPhone10,3\0oneplus,salami\0xiaomi,fuxi\0qcom,sm8550\0AppleARM\0'
+
+
+# Touch baseline for the ADT /defaults node (touch_s3908_design.md 5.2-5.3): TCM backend
+# and the salami SweetHID surface size in mm. Integer knobs are 4-byte LE u32.
+TOUCH_DEFAULTS = (('fuxitic', 2), ('sweethid_mmw', 70), ('sweethid_mmh', 156))
+# The proven salami payload cmdline (also in tools/run-ios-salami.py): ufsrw=1 rootrw=1
+# (booted iOS to the lock screen 2026-10-28), fuxikick=0. The cmdline itself is written
+# by tools/mkpayload.py.
+SALAMI_FIRST_BOOT_CMDLINE = (
+    'debug=0xc serial=3 cpus=7 keepsyms=1 -enable_kprintf_spam -noprogress '
+    'rd=ufsroot0 fuxi_ufs_probe=1 ufsroot=userdata ufsrw=1 rootrw=1 '
+    'unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin '
+    'launchd_unsecure_cache=1 wdt=-1 sweetlog=0 sweetnoexec=bluetoothd,fairplayd.H2 '
+    'sweetfb_noconsole=1 fuxikick=0')
+
+
+class PrintCmdline(argparse.Action):
+    def __init__(self, option_strings, dest, **kw):
+        super().__init__(option_strings, dest, nargs=0, **kw)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print(SALAMI_FIRST_BOOT_CMDLINE)
+        parser.exit()
 
 
 def validate_salami(path, ufs_readonly=False):
@@ -162,12 +191,20 @@ def main():
     ap.add_argument('--product-camera', action='store_true', help='add an empty /product/camera node (no flash)')
     ap.add_argument('--display-gamut', choices=('P3', 'sRGB'), help='set /product artwork-display-gamut')
     ap.add_argument('--d22ap-adt', type=Path, default=Path(mkadt.D22AP_ADT), help='real D22AP device tree (not in git)')
-    ap.add_argument('--fb', default='1080x2412', help='ABL splash WxH; must match the loader FB_W/FB_H')
+    ap.add_argument('--fb', help='ABL splash WxH (default 1080x2412); must match the loader FB_W/FB_H')
     ap.add_argument('--fb-stride', help='bytes per line (default 4*W); must match the loader FB_STRIDE')
+    ap.add_argument('--no-fbcon', action='store_true',
+                    help='omit the sweet-fbcon node: no XNU framebuffer text console (boot-logo loader)')
+    ap.add_argument('--touch-defaults', action='store_true',
+                    help='write the S3908 touch baseline into /defaults (fuxitic=2, sweethid_mmw/h)')
+    ap.add_argument('--print-cmdline', action=PrintCmdline,
+                    help='print the recommended salami first-boot payload cmdline and exit')
     args = ap.parse_args()
     mem_size = fx.MEM_SIZE if args.ram_layout == 'full' else fx.LEGACY_SIZE
     try:
-        w, h, stride = parse_fb(args.fb, args.fb_stride)
+        if args.no_fbcon and (args.fb or args.fb_stride):
+            raise ValueError('--no-fbcon writes no sweet-fbcon node: --fb/--fb-stride have nothing to set')
+        w, h, stride = parse_fb(args.fb or '1080x2412', args.fb_stride)
         mkadt.FB_W, mkadt.FB_H, mkadt.FB_STRIDE = w, h, stride
         product_path = str(args.d22ap_adt)
         if not args.d22ap_adt.is_file():
@@ -183,6 +220,12 @@ def main():
         elif args.root_bytes:
             raise ValueError('--root-bytes without --root-extents')
         root = fx.build(args.ufs_readonly or bool(args.root_extents), root_props, args.smp, args.gpu_reserve, mem_size)
+        if args.no_fbcon:
+            # fbcon_probe (patch 0003) returns before register_serial_functions when
+            # SecureDTFindEntry("name", "sweet-fbcon") fails: no kernel text on the panel.
+            if sum(n.name == 'sweet-fbcon' for n in root.children) != 1:
+                raise ValueError('expected exactly one sweet-fbcon node to omit')
+            root.children = [n for n in root.children if n.name != 'sweet-fbcon']
         fx.setprop(root, 'compatible', COMPATIBLE)
         chosen = next(n for n in root.children if n.name == 'chosen')
         fx.setprop(chosen, 'firmware-version', b'salami-shim\0')
@@ -193,6 +236,13 @@ def main():
         root = fx.add_product_children(root, args.product_haptics, args.product_camera, product_path)
         if args.display_gamut:
             root = fx.set_display_gamut(root, args.display_gamut)
+        if args.touch_defaults:
+            defaults = next((n for n in root.children if n.name == 'defaults'), None)
+            if defaults is None:
+                raise ValueError('no /defaults node to carry the touch baseline')
+            for name, value in TOUCH_DEFAULTS:
+                defaults.props = [(k, fl, v) for k, fl, v in defaults.props if k != name]
+                defaults.props.append((name, 0, struct.pack('<I', value)))
         has_ufs = any(n.name == 'fuxi-ufs' for n in root.children)
         validate_salami(args.live_fdt, has_ufs)
         blob = adt.serialize(root)
@@ -208,8 +258,10 @@ def main():
     extra = sorted(c.name for c in product.children)
     print(f'{args.out}: {len(blob)} bytes (cap {ADT_MAX}, {ADT_MAX - len(blob)} free); '
           f'RAM {fx.PHYS_BASE:#x}+{mem_size:#x}; CPUs {cpus}; UFS={"present" if has_ufs else "absent"}; '
-          f'root extents {n_extents}; fb {w}x{h} stride {stride}'
-          + (f'; /product children {",".join(extra)}' if extra else ''))
+          f'root extents {n_extents}; '
+          + ('no sweet-fbcon (no XNU text console)' if args.no_fbcon else f'fb {w}x{h} stride {stride}')
+          + (f'; /product children {",".join(extra)}' if extra else '')
+          + ('; touch defaults' if args.touch_defaults else ''))
 
 
 if __name__ == '__main__':

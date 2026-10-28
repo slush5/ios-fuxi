@@ -35,7 +35,11 @@ Checks (all fail closed, before the phone leaves Android):
     the pinned file for an older extents.json); rd=ufsroot0 on userdata (the
     kernel's default ufsroot) without fuxi-root-extents is refused;
   * the ADT sweet-fbcon geometry is the loader's 1080x2412 stride 4320, unless
-    --fb-geometry WxH:S names another one measured by a probe boot;
+    --fb-geometry WxH:S names another one measured by a probe boot. An ADT
+    without sweet-fbcon (tools/mkadt-salami.py --no-fbcon: no XNU text console)
+    is accepted only when the loader carries the boot-logo marker
+    (shim/fuxi-loader/build.sh FUXI_BOOT_LOGO), which then stands in for the
+    geometry check; --logo requires that marker in any case;
   * the payload cmdline has no fuxipanel120=1 (Xiaomi M3 panel DCS sequence), and
     ufsrw / rootrw with any nonzero, bare or unparsable value (PE_parse_boot_argn
     semantics) need --allow-rw (only after a read-only boot logged
@@ -72,11 +76,34 @@ BLK = 4096
 BOOT_PAGE = 4096                  # Android boot image header v3/v4: fixed 4 KiB pages
 SALAMI_COMPATIBLE = b'oneplus,salami'
 LOADER_MARKER = b'overlaps ABL splash'            # probe.c probe_splash_overlap(), FUXI_SALAMI only
+LOGO_MARKER = b'FUXI BOOT LOGO:'                  # loader.c boot_logo_marker, FUXI_BOOT_LOGO builds only
 KERNEL_MARKER = b'FUXI KEYS: salami volume map'   # xnu/fuxi-h1/fuxi_keys.c, FUXI_SALAMI only
 LOADER_FB = (1080, 2412, 4320)    # gpu-handoff.h FG_FB_W/FG_FB_H/FG_FB_STRIDE under FUXI_SALAMI
 DEFAULT_EXTENTS = TOOLS.parent / 'research/salami/pinfile-01/extents.json'
 MONITOR = TOOLS / 'fuxi-xnu-monitor.py'
 FULL_BOOT_ARGS = ['--seconds', '14400', '--framebuffer', '--reset-minutes', '60']
+# GPU scanout family refused on salami unless fuxiscansalami=1 (VIG0-only flips, INTF1
+# ownership unproven). fuxiscan* (except fuxiscansalami) is caught by prefix below.
+SCANOUT_ARGS = {'fuxigpuscanout', 'fuxivsyncte', 'fuxigpuncimport'}
+# Proven salami boot (iOS 16.7.16 to the lock screen, 2026-10-28): ufsrw=1 rootrw=1 as
+# Sweet/Fuxi boot (XNU initialises the NeedInit HFS journal; launchd needs a writable
+# /private/var), fuxikick=0 (no MDSS access). Under the 608-byte payload limit
+# (tools/mkpayload.py). Pass --allow-rw for it.
+SALAMI_FIRST_BOOT_CMDLINE = (
+    'debug=0xc serial=3 cpus=7 keepsyms=1 -enable_kprintf_spam -noprogress '
+    'rd=ufsroot0 fuxi_ufs_probe=1 ufsroot=userdata ufsrw=1 rootrw=1 '
+    'unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin '
+    'launchd_unsecure_cache=1 wdt=-1 sweetlog=0 sweetnoexec=bluetoothd,fairplayd.H2 '
+    'sweetfb_noconsole=1 fuxikick=0')
+
+
+class PrintCmdline(argparse.Action):
+    def __init__(self, option_strings, dest, **kw):
+        super().__init__(option_strings, dest, nargs=0, **kw)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print(SALAMI_FIRST_BOOT_CMDLINE)
+        parser.exit()
 
 
 def fail(message):
@@ -124,7 +151,13 @@ class Phone:
         return code, out.strip(), err.strip()
 
 
+def is_display_poll(name):
+    return name.startswith('--display') and '--display-poll'.startswith(name)
+
+
 def split_monitor_args(extra):
+    i_know = any(a.split('=', 1)[0] == '--i-know-s5-s6' for a in extra)
+    poll = False
     for a in extra:
         name = a.split('=', 1)[0]
         if name.startswith('--touc'):
@@ -132,6 +165,11 @@ def split_monitor_args(extra):
                  f'VRM addresses are ldob10 and ldon7 (camera PMIC) here)')
         if name == '--no-handoff':
             fail('--no-handoff: use --loader-only')
+        if is_display_poll(name):
+            poll = True
+    if poll and not i_know:
+        fail('--display-poll samples INTF1 (+0x2b4/+0x2b0) and DSI0, unproven on salami until '
+             'probe stages S5 (INTF) and S6 (DSI) pass; pass --i-know-s5-s6 to override')
     return extra
 
 
@@ -168,12 +206,49 @@ def boot_arg_on(value):
     return not re.fullmatch(r'-?(0+|0[xX]0+|0[bB]0+)', value)
 
 
+def boot_arg_int(value):
+    """PE_parse_boot_argn into an integer, or None when XNU would copy it as a string.
+
+    A bare name is 1; a leading 0 is octal, 0x hex, 0b binary; a minus is allowed."""
+    if value is None or value == '':
+        return 1
+    m = re.fullmatch(r'(-?)(0[xX][0-9a-fA-F]+|0[bB][01]+|0[0-7]*|[1-9][0-9]*)', value)
+    if not m:
+        return None
+    sign, body = m.groups()
+    if body[:2] in ('0x', '0X'):
+        n = int(body, 16)
+    elif body[:2] in ('0b', '0B'):
+        n = int(body, 2)
+    elif len(body) > 1 and body[0] == '0':
+        n = int(body, 8)
+    else:
+        n = int(body)
+    return -n if sign else n
+
+
 def check_cmdline(cmdline, allow_rw):
-    """Returns the cmdline as [(name, value or None)], after the rw/panel guards."""
+    """Returns the cmdline as [(name, value or None)], after the display/rw guards."""
     args = [(n, v if sep else None) for n, sep, v in (w.partition('=') for w in cmdline.split())]
     if any(n == 'fuxipanel120' and boot_arg_on(v) for n, v in args):
         fail('payload cmdline has fuxipanel120 (Xiaomi panel DCS); never on salami')
-    rw = [n if v is None else f'{n}={v}' for n, v in args if n in ('ufsrw', 'rootrw') and boot_arg_on(v)]
+    salami_scan = any(n == 'fuxiscansalami' and boot_arg_on(v) for n, v in args)
+    scan = sorted({n for n, v in args if boot_arg_on(v)
+                   and (n in SCANOUT_ARGS or (n.startswith('fuxiscan') and n != 'fuxiscansalami'))})
+    if scan and not salami_scan:
+        fail(f'payload cmdline has {" ".join(scan)} (GPU scanout); on salami these flip VIG0 '
+             f'only and take unproven INTF1 ownership, so add fuxiscansalami=1 to accept them')
+    kicks = [v for n, v in args if n == 'fuxikick']
+    if any(boot_arg_int(v) == 2 for v in kicks):
+        fail('payload cmdline has fuxikick=2 (INTF1 read every kick); never on salami '
+             '(use 0 for no MDSS access, or 1/3 after probe stage S5)')
+    if not kicks:
+        print('warning: payload cmdline has no fuxikick; the salami kernel default 0 (no MDSS '
+              'access) applies. Add fuxikick=0 to document it.', flush=True)
+    if any(n == 'rootrw' and boot_arg_on(v) for n, v in args) and not allow_rw:
+        fail('payload cmdline has rootrw (root mounted read-write); pass --allow-rw (the proven '
+             'salami boot uses ufsrw=1 rootrw=1, writes bounded to the pinned extents)')
+    rw = [n if v is None else f'{n}={v}' for n, v in args if n == 'ufsrw' and boot_arg_on(v)]
     if rw and not allow_rw:
         fail(f'payload cmdline has {" ".join(rw)} (read-write); pass --allow-rw only after a '
              f'read-only boot logged the expected extent count')
@@ -187,7 +262,9 @@ def userdata_ufsroot(args):
     return rd and (not roots or any(v in (None, '', 'userdata') for v in roots))
 
 
-def check_payload(path, b, table, loader_only, allow_rw, want_fb):
+def check_payload(path, b, table, loader_only, allow_rw, want_fb, logo_loader=False, fb_explicit=False):
+    """logo_loader: the boot image's loader carries LOGO_MARKER (check_boot_img).
+    fb_explicit: want_fb came from --fb-geometry, not the LOADER_FB default."""
     if b[:8] != b'SWEETXNU' or len(b) < 0x48 + 608:
         fail(f'{path}: not a SWEETXNU payload')
     if KERNEL_MARKER not in b:
@@ -202,20 +279,33 @@ def check_payload(path, b, table, loader_only, allow_rw, want_fb):
     if SALAMI_COMPATIBLE not in (root.prop('compatible') or b'').split(b'\0'):
         fail(f'{path}: ADT is not a salami ADT (build it with tools/mkadt-salami.py)')
     chosen = next(c for c in root.children if c.name == 'chosen')
-    fbcon = next((c for c in root.children if c.name == 'sweet-fbcon'), None)
-    if fbcon is None:
-        fail(f'{path}: ADT has no sweet-fbcon node')
-    try:
-        fb = tuple(struct.unpack('<I', fbcon.prop(k))[0] for k in ('width', 'height', 'stride'))
-    except (TypeError, struct.error):
-        fail(f'{path}: ADT sweet-fbcon width/height/stride are not u32 properties')
-    if fb != want_fb:
-        fail(f'payload ADT sweet-fbcon {fb[0]}x{fb[1]} stride {fb[2]} differs from the loader '
-             f'{want_fb[0]}x{want_fb[1]} stride {want_fb[2]} (mkadt-salami.py --fb/--fb-stride; '
-             f'--fb-geometry only for a geometry a probe boot measured)')
+    fbcons = [c for c in root.children if c.name == 'sweet-fbcon']
+    if len(fbcons) > 1:
+        fail(f'{path}: ADT has {len(fbcons)} sweet-fbcon nodes')
+    if not fbcons:
+        # No XNU text console (mkadt-salami.py --no-fbcon). There is no ADT geometry to
+        # compare: the loader's boot-logo marker is the check instead.
+        if not logo_loader:
+            fail(f'{path}: ADT has no sweet-fbcon node; that is only accepted with a boot-logo '
+                 f'loader (shim/fuxi-loader/build.sh FUXI_BOOT_LOGO), which the boot image is not')
+        if fb_explicit:
+            fail('--fb-geometry checks the ADT sweet-fbcon node, and this payload ADT has none')
+        fb_text = 'no sweet-fbcon (no XNU text console; the loader draws the boot logo)'
+    else:
+        try:
+            fb = tuple(struct.unpack('<I', fbcons[0].prop(k))[0] for k in ('width', 'height', 'stride'))
+        except (TypeError, struct.error):
+            fail(f'{path}: ADT sweet-fbcon width/height/stride are not u32 properties')
+        if fb != want_fb:
+            fail(f'payload ADT sweet-fbcon {fb[0]}x{fb[1]} stride {fb[2]} differs from the loader '
+                 f'{want_fb[0]}x{want_fb[1]} stride {want_fb[2]} (mkadt-salami.py --fb/--fb-stride; '
+                 f'--fb-geometry only for a geometry a probe boot measured)')
+        fb_text = f'fb {fb[0]}x{fb[1]} stride {fb[2]}'
+        if logo_loader:
+            print('warning: the ADT has sweet-fbcon, so the XNU text console draws over the loader '
+                  'boot logo (build the ADT with mkadt-salami.py --no-fbcon for a clean boot)', flush=True)
     ext, blocks = chosen.prop('fuxi-root-extents'), chosen.prop('fuxi-root-blocks')
-    print(f'payload: {path.name}, salami kernel, ADT {adt_size} bytes, fb {fb[0]}x{fb[1]} stride {fb[2]}',
-          flush=True)
+    print(f'payload: {path.name}, salami kernel, ADT {adt_size} bytes, {fb_text}', flush=True)
     print(f'cmdline: {cmdline}', flush=True)
     if loader_only:
         print('loader-only: no handoff, ADT root extents not checked', flush=True)
@@ -243,8 +333,11 @@ def check_payload(path, b, table, loader_only, allow_rw, want_fb):
     return root_blocks
 
 
-def check_boot_img(path, payload):
-    """The image fastboot boots must be a salami loader carrying exactly this payload."""
+def check_boot_img(path, payload, want_logo=False):
+    """The image fastboot boots must be a salami loader carrying exactly this payload.
+
+    Returns True when the loader is a boot-logo build (LOGO_MARKER); want_logo
+    (--logo) refuses any other loader."""
     b = path.read_bytes()
     if len(b) < BOOT_PAGE or b[:8] != b'ANDROID!':
         fail(f'{path}: not an Android boot image')
@@ -266,8 +359,14 @@ def check_boot_img(path, payload):
     if LOADER_MARKER not in loader:
         fail(f'{path}: not a salami loader (no FUXI_SALAMI splash-overlap guard; build it with '
              f'FUXI_BOARD=salami)')
-    print(f'boot image: {path.name}, salami loader, kernel {kernel_size} bytes'
+    logo = LOGO_MARKER in loader
+    if want_logo and not logo:
+        fail(f'{path}: --logo, but the loader has no boot logo (build it with FUXI_BOOT_LOGO, '
+             f'shim/fuxi-loader/build.sh)')
+    print(f'boot image: {path.name}, salami loader{" with boot logo" if logo else ""}, '
+          f'kernel {kernel_size} bytes'
           + (f', ends with the {len(payload)}-byte payload' if payload is not None else ''), flush=True)
+    return logo
 
 
 def check_phone(phone, table, helper_local):
@@ -370,9 +469,14 @@ def main():
     ap.add_argument('--loader-only', action='store_true', help='no root checks; the monitor gets --no-handoff')
     ap.add_argument('--no-monitor', action='store_true', help='stop after fastboot boot')
     ap.add_argument('--check-only', action='store_true', help='run the checks, do not reboot')
-    ap.add_argument('--allow-rw', action='store_true', help='accept ufsrw/rootrw (read-write) in the payload cmdline')
+    ap.add_argument('--allow-rw', action='store_true', help='accept ufsrw (read-write) in the payload cmdline; needed for the first boot')
+    ap.add_argument('--print-cmdline', action=PrintCmdline,
+                    help='print the recommended salami first-boot payload cmdline and exit')
     ap.add_argument('--fb-geometry', type=fb_geometry, metavar='WxH:S',
                     help='expected ADT sweet-fbcon geometry (default 1080x2412:4320, the salami loader)')
+    ap.add_argument('--logo', action='store_true',
+                    help='require a boot-logo loader (FUXI_BOOT_LOGO); an ADT without sweet-fbcon '
+                         '(mkadt-salami.py --no-fbcon) is accepted only with one')
     ap.add_argument('--push-helper', type=Path, help='push this local salami-pin to the phone first')
     ap.add_argument('--monitor-python', default=sys.executable)
     args, extra = ap.parse_known_args()
@@ -402,10 +506,11 @@ def main():
             ap.error(f'{args.extents}: no extents.json (run tools/salami-install-root.sh)')
         table = load_extents(args.extents)
     payload = args.payload.read_bytes() if args.payload else None
+    # The loader first: whether it draws the boot logo decides if the ADT may lack sweet-fbcon.
+    logo = check_boot_img(args.boot_img, payload, args.logo)
     if payload is not None:
         check_payload(args.payload, payload, table, args.loader_only, args.allow_rw,
-                      args.fb_geometry or LOADER_FB)
-    check_boot_img(args.boot_img, payload)
+                      args.fb_geometry or LOADER_FB, logo, args.fb_geometry is not None)
     payload = None
     phone = Phone(args.serial, args.adb)
     check_phone(phone, table, args.push_helper)
