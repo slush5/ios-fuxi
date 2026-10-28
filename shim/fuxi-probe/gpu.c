@@ -29,6 +29,7 @@
 #define G_RING_INDEX(w) (w)
 #endif
 #include "gpu-clock.h"
+#include "gpu-handoff.h" /* board splash geometry and fg_abl_scanout_ok() */
 /* XNU sets this once before cold start. Loader probes retain zero. */
 static unsigned g_gpu_selected;
 static uint64_t g_gpu_ddr_requested;
@@ -1218,7 +1219,7 @@ static int g3_fence(void)
 #define G4_FB_VA  0x41000000u
 #define G4_FB_PA  0xb8000000ULL
 #define G4_BYTES  0x40000u
-#define G4_FB_BYTES (1080u * 2400u * 4u)
+#define G4_FB_BYTES ((uint32_t)FG_FB_W * FG_FB_H * 4u)
 #define G4_FB_MAP ((G4_FB_BYTES + 4095u) & ~4095u)
 #define G4_WIDTH 256u
 #define G4_FB_HEIGHT 64u
@@ -1464,6 +1465,13 @@ static int g4_clear(uint32_t *d)
  if (d[62]) return 0xe06;
  return d[56] ? 0xe0b : 1;
 }
+/* g4_copy took SSPP0 +0x14/+0x24/+0x00/+0x30 into d[50..53] with fault-contained
+ * reads; hand those words to the shared ABL-scanout guard. */
+static uint32_t g4_sspp_word(const void *ctx, uint32_t off)
+{
+ const uint32_t *d = ctx;
+ return off == 0x14 ? d[50] : off == 0x24 ? d[51] : off == 0x00 ? d[52] : d[53];
+}
 static int g4_copy(unsigned panel, uint32_t *d)
 {
  unsigned height = panel ? G4_FB_HEIGHT : 256u;
@@ -1494,7 +1502,7 @@ static int g4_copy(unsigned panel, uint32_t *d)
   d[50] = g3_read(0x0ae05014); d[51] = g3_read(0x0ae05024);
   d[52] = g3_read(0x0ae05000); d[53] = g3_read(0x0ae05030);
   if (gpu_extra[5][116]) return 0xe01;
-  if (d[50] != G4_FB_PA || d[51] != 4320 || d[52] != (2400u<<16 | 1080u) || d[53] != 0x237ff) return 0xe08;
+  if (!fg_abl_scanout_ok(g4_sspp_word, d)) return 0xe08;
  }
  d[3] = 2;
  if (panel) {

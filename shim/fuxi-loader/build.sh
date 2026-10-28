@@ -7,23 +7,45 @@ cd "$(dirname "$0")"
 : "${OBJCOPY:?Set OBJCOPY to llvm-objcopy}"
 : "${READELF:?Set READELF to llvm-readelf}"
 : "${MKBOOTIMG:?Set MKBOOTIMG to AOSP mkbootimg.py}"
-# GPU-bearing payloads must never silently produce a GPU-disabled image.
-: "${FUXI_GMU_FIRMWARE:?Set the pinned GMU firmware absolute path}"
-: "${FUXI_SQE_FIRMWARE:?Set the pinned sheng-firmware/a740_sqe.fw absolute path}"
-: "${FUXI_GPU_ZAP_MBN:?Set the pinned ZAP MBN absolute path}"
-for input in "$MKBOOTIMG" "$FUXI_GMU_FIRMWARE" "$FUXI_SQE_FIRMWARE" "$FUXI_GPU_ZAP_MBN"; do
+# FUXI_BOARD=fuxi (default, Xiaomi 13) or salami (OnePlus 11: -DFUXI_SALAMI=1, own out dir).
+board=${FUXI_BOARD:-fuxi}
+[[ $board == fuxi || $board == salami ]] || { echo 'FUXI_BOARD must be fuxi or salami' >&2; exit 1; }
+# FUXI_NO_GPU_FW=1 is the only way to build without GPU firmware: empty slots, no pins, and
+# stage_gpu_firmware() then never publishes the handoff magic, so the GPU lane stays off.
+no_gpu_fw=${FUXI_NO_GPU_FW:-0}
+[[ $no_gpu_fw == 0 || $no_gpu_fw == 1 ]] || { echo 'FUXI_NO_GPU_FW must be 0 or 1' >&2; exit 1; }
+if [[ $no_gpu_fw == 1 ]]; then
+ if [[ -n ${FUXI_GMU_FIRMWARE:-}${FUXI_SQE_FIRMWARE:-}${FUXI_GPU_ZAP_MBN:-} ]]; then
+  echo 'FUXI_NO_GPU_FW=1 conflicts with FUXI_GMU_FIRMWARE/FUXI_SQE_FIRMWARE/FUXI_GPU_ZAP_MBN; unset them' >&2; exit 1
+ fi
+ FUXI_GMU_FIRMWARE='' FUXI_SQE_FIRMWARE='' FUXI_GPU_ZAP_MBN=''
+ inputs=("$MKBOOTIMG")
+else
+ # The pins below are the Xiaomi set; salami needs its own (OnePlus-signed zap) first.
+ [[ $board == fuxi ]] || { echo 'FUXI_BOARD=salami has no pinned GPU firmware yet: set FUXI_NO_GPU_FW=1' >&2; exit 1; }
+ # GPU-bearing payloads must never silently produce a GPU-disabled image.
+ : "${FUXI_GMU_FIRMWARE:?Set the pinned GMU firmware absolute path}"
+ : "${FUXI_SQE_FIRMWARE:?Set the pinned sheng-firmware/a740_sqe.fw absolute path}"
+ : "${FUXI_GPU_ZAP_MBN:?Set the pinned ZAP MBN absolute path}"
+ inputs=("$MKBOOTIMG" "$FUXI_GMU_FIRMWARE" "$FUXI_SQE_FIRMWARE" "$FUXI_GPU_ZAP_MBN")
+fi
+for input in "${inputs[@]}"; do
  [[ $input == /* && -f $input ]] || { echo 'Packing inputs must be existing absolute file paths' >&2; exit 1; }
 done
-out=../out/fuxi-loader
+out=../out/$board-loader
 mkdir -p "$out"
 # Reject a payload made from a different board, truncated segments, or unsafe RAM.
-python3 - "$payload" <<'PY'
+python3 - "$payload" "$board" <<'PY'
 import struct,sys
 b=open(sys.argv[1],'rb').read()
 assert len(b)>=680 and b[:8]==b'SWEETXNU'
 # Native Mac builds embed their DEVELOPMENT_ARM64_FUXI object path; hosted CI
 # (darwin-xnu-build) builds do not, so accept an xnu-8796 kernel with Fuxi drivers.
 assert b'DEVELOPMENT_ARM64_FUXI' in b or (b'xnu-8796' in b and b'FUXI KEYS:' in b), 'Payload is not a FUXI kernel'
+# Only a FUXI_SALAMI kernel (fuxi_keys.c, 0114) carries this string: the kernel's
+# board (volume map, panel height) must be the board this loader is built for.
+salami=b'FUXI KEYS: salami volume map' in b
+assert salami==(sys.argv[2]=='salami'), 'payload kernel board does not match FUXI_BOARD'
 version,n=struct.unpack_from('<II',b,8)
 assert version==1 and 0<n<=32 and len(b)>=680+32*n
 assert struct.unpack_from('<Q',b,56)[0]==0x8c0000000
@@ -33,6 +55,7 @@ for i in range(n):
  assert off<=len(b) and sz<=len(b)-off and sz<=vs
 PY
 # Required pinned firmware input; only the ignored build directory receives bytes.
+# With FUXI_NO_GPU_FW=1 all three paths are empty: empty slots, no pin is consulted.
 python3 - "$payload" "${FUXI_GMU_FIRMWARE:-}" "${FUXI_SQE_FIRMWARE:-}" "${FUXI_GPU_ZAP_MBN:-}" "$out/gpu-fw.S" <<'FWPY'
 import hashlib, json, pathlib, struct, sys
 payload, gmu, sqe, zap, dst = sys.argv[1:]
@@ -63,6 +86,12 @@ FWPY
 printf '.section .payload,"a"\n.incbin "%s"\n' "$payload" > "$out/payload.S"
 flags=(--target=aarch64-none-elf -O2 -ffreestanding -fno-builtin -nostdlib
        -fno-pic -fno-stack-protector -mgeneral-regs-only -mstrict-align -Wall -Wextra -Werror -DFUXI=1 -DFUXI_XNU_LOADER=1 -I..)
+if [[ $board == salami ]]; then flags+=(-DFUXI_SALAMI=1); fi
+# Expected ABL SSPP0 format (gpu-handoff.h FG_ABL_SSPP_FORMAT), once a probe boot has measured it.
+if [[ -n ${FUXI_ABL_SSPP_FORMAT:-} ]]; then
+ [[ $FUXI_ABL_SSPP_FORMAT =~ ^0x[0-9a-fA-F]{1,8}$ ]] || { echo 'FUXI_ABL_SSPP_FORMAT must look like 0x237ff' >&2; exit 1; }
+ flags+=("-DFG_ABL_SSPP_FORMAT=${FUXI_ABL_SSPP_FORMAT}u")
+fi
 for source in start.S loader.c ../console.c ../fuxi-probe/probe.c; do
  name=$(basename "${source%.*}")
  "$CLANG" "${flags[@]}" -c "$source" -o "$out/$name.o"
@@ -73,12 +102,17 @@ done
 "$CLANG" "${flags[@]}" -c "$out/payload.S" -o "$out/payload.o"
 "$CLANG" "${flags[@]}" -c "$out/gpu-fw.S" -o "$out/gpu-fw.o"
 "$LLD" -T loader.ld --build-id=none "$out/start.o" "$out/loader.o" "$out/console.o" "$out/probe.o" "$out/gpu-fw.o" "$out/payload.o" -o "$out/loader.elf"
-python3 - "$out/loader.elf" "$READELF" <<'GPUCHECK'
+python3 - "$out/loader.elf" "$READELF" "$no_gpu_fw" <<'GPUCHECK'
 import re, subprocess, sys
 sections = subprocess.check_output([sys.argv[2], '-SW', sys.argv[1]], text=True)
 match = re.search(r'\.gpu_fw\s+PROGBITS\s+[0-9a-fA-F]+\s+[0-9a-fA-F]+\s+([0-9a-fA-F]+)', sections)
-assert match and int(match[1], 16) == 0x25ac8, 'loader .gpu_fw must be exactly 0x25ac8 bytes'
-print('Verified loader .gpu_fw size 0x25ac8')
+if sys.argv[3] == '1':
+    # No-firmware mode: the section must be absent or empty, never a partial set.
+    assert not match or int(match[1], 16) == 0, 'FUXI_NO_GPU_FW=1 image must carry no GPU firmware'
+    print('NO GPU FIRMWARE: empty .gpu_fw, GPU handoff magic is never published')
+else:
+    assert match and int(match[1], 16) == 0x25ac8, 'loader .gpu_fw must be exactly 0x25ac8 bytes'
+    print('Verified loader .gpu_fw size 0x25ac8')
 GPUCHECK
 "$OBJCOPY" -O binary "$out/loader.elf" "$out/Image"
 python3 - "$out/Image" <<'PY'
@@ -88,6 +122,8 @@ b=Path(sys.argv[1]).read_bytes()
 assert struct.unpack_from('<Q',b,16)[0]==len(b), 'Image size must cover embedded payload'
 assert b[56:60]==b'ARM\x64'
 PY
+# A GPU-less image never takes the name of the firmware-bearing one runners expect.
+if [[ $no_gpu_fw == 1 ]]; then suffix=-nogpufw; else suffix=; fi
 python3 "$MKBOOTIMG" --header_version 4 --kernel "$out/Image" \
- --os_version 16.0.0 --os_patch_level 2026-08 -o "$out/fuxi-xnu-boot.img"
-ls -lh "$out/Image" "$out/fuxi-xnu-boot.img"
+ --os_version 16.0.0 --os_patch_level 2026-08 -o "$out/$board-xnu-boot$suffix.img"
+ls -lh "$out/Image" "$out/$board-xnu-boot$suffix.img"

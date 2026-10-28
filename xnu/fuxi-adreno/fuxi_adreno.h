@@ -1,6 +1,22 @@
 #ifndef FUXI_ADRENO_H
 #define FUXI_ADRENO_H
 #define FG_CACHE_SLOTS 4u
+/* Panel rows the ABL splash pipe scans out of 0xb8000000 (and the double/
+ * triple buffers 0xb8a00000/0xb9400000), 1080 wide, ARGB8888, stride 4320.
+ * fuxi (Xiaomi 13): 2400. salami (OnePlus 11, FUXI_SALAMI, timing
+ * fhd_sa_60): 2412. Either frame fits one 0xa00000 slot (4320 x 2412 =
+ * 0x9efe80). FUXI_PANEL_MAP is one frame rounded up to 16 KiB pages.
+ * The single source is FG_FB_H in gpu-handoff.h, which the C++ users of this
+ * header (SweetSurface, SweetFramebuffer) never include; fuxi_adreno.c sees
+ * both and refuses to compile if they differ. */
+#ifndef FUXI_PANEL_H
+#if defined(FUXI_SALAMI)
+#define FUXI_PANEL_H 2412u
+#else
+#define FUXI_PANEL_H 2400u
+#endif
+#endif
+#define FUXI_PANEL_MAP ((4320u*FUXI_PANEL_H+16383u)&~16383u)
 /* Timings in mach absolute ticks, CPU uses scheduler runtime (excludes sleep).
  * Surface leases use a short lock separate from the copy/cache transaction.
  * The ABI shared mutex serializes ring and SMMU control. */

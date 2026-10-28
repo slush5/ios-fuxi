@@ -1,0 +1,13 @@
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -63,7 +63,9 @@
+ MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
+ MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
+ # Reuse the generic ARM/SWEET providers with explicitly gated Fuxi hardware.
+-MACHINE_FLAGS_ARM64_FUXI = -DARM64_BOARD_CONFIG_SWEET -DFUXI=1       -march=armv8.2-a+crypto
++# salami branch: OnePlus 11 (same SM8550) keeps the FUXI config name; its
++# board deltas (panel 1080x2412, swapped volume keys) key off FUXI_SALAMI.
++MACHINE_FLAGS_ARM64_FUXI = -DARM64_BOARD_CONFIG_SWEET -DFUXI=1 -DFUXI_SALAMI=1 -march=armv8.2-a+crypto
+ 
+ 
+ #

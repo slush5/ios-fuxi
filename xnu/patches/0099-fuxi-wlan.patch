@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,5315 @@
+@@ -0,0 +1,5330 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -5326,12 +5326,27 @@
 +{
 +	static bool started;
 +	int arg = 0;
++	bool requested;
 +	thread_t thread;
 +	if (started) {
 +		return;
 +	}
 +	started = true;
-+	if (!PE_parse_boot_argn("fuxiwlan", &arg, sizeof(arg)) || arg <= 0) {
++	requested = PE_parse_boot_argn("fuxiwlan", &arg, sizeof(arg)) && arg > 0;
++#if defined(FUXI_SALAMI)
++	/*
++	 * Refused on salami (OnePlus 11) whatever fuxiwlan says: the rail
++	 * table votes Fuxi cmd-db addresses (0x40a00 is salami ldob12, the
++	 * display vddio) and the BDF defaults to Xiaomi bd_m3gl.elf. Cleared
++	 * rather than returned, so nothing below becomes unreachable code
++	 * under -Weverything -Werror.
++	 */
++	if (requested) {
++		printf("FUXI WLAN: refused on salami (Fuxi BDF/rail table)\n");
++	}
++	requested = false;
++#endif
++	if (!requested) {
 +		return;
 +	}
 +	unsigned limit = (arg == 1 || arg > (int)WL5_STEPS) ? WL5_STEPS : (unsigned)arg;
@@ -5347,7 +5362,7 @@
 +#endif /* FUXI */
 --- a/bsd/dev/wlan.c
 +++ b/bsd/dev/wlan.c
-@@ -0,0 +1,551 @@
+@@ -0,0 +1,549 @@
 +/* Lane-wlan (milestone 1): read-only WCN7850 / PCIe0 / BT-UART snapshot on
 + * request 0x5c, value 0x574c ('WL'), index 1. Included from probe.c after
 + * gpu.c (uses probe_safe_rd32). No register writes of any kind.
@@ -5559,9 +5574,7 @@
 + /* XNU copy (bsd/dev/wlan.c via xnu/patches/0099): log, no scanout paint. */
 + printf("FUXI WLAN: step %u\n", step);
 +#else
-+ if (usb_rd(0xae05000, 0x14) != 0xb8000000 || usb_rd(0xae05000, 0x24) != 4320 ||
-+     usb_rd(0xae05000, 0x00) != ((2400u << 16) | 1080u) ||
-+     usb_rd(0xae05000, 0x30) != 0x237ff) return;
++ if (!probe_paint_ok()) return;
 + volatile uint32_t *fb = (volatile uint32_t *)0xb8000000UL;
 + char text[] = "WLAN M3 STEP 00";
 + text[13] = (char)('0' + step / 10); text[14] = (char)('0' + step % 10);

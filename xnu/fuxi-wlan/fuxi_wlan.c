@@ -5294,12 +5294,27 @@ fuxi_wlan_init(void)
 {
 	static bool started;
 	int arg = 0;
+	bool requested;
 	thread_t thread;
 	if (started) {
 		return;
 	}
 	started = true;
-	if (!PE_parse_boot_argn("fuxiwlan", &arg, sizeof(arg)) || arg <= 0) {
+	requested = PE_parse_boot_argn("fuxiwlan", &arg, sizeof(arg)) && arg > 0;
+#if defined(FUXI_SALAMI)
+	/*
+	 * Refused on salami (OnePlus 11) whatever fuxiwlan says: the rail
+	 * table votes Fuxi cmd-db addresses (0x40a00 is salami ldob12, the
+	 * display vddio) and the BDF defaults to Xiaomi bd_m3gl.elf. Cleared
+	 * rather than returned, so nothing below becomes unreachable code
+	 * under -Weverything -Werror.
+	 */
+	if (requested) {
+		printf("FUXI WLAN: refused on salami (Fuxi BDF/rail table)\n");
+	}
+	requested = false;
+#endif
+	if (!requested) {
 		return;
 	}
 	unsigned limit = (arg == 1 || arg > (int)WL5_STEPS) ? WL5_STEPS : (unsigned)arg;

@@ -15,7 +15,7 @@ spec = importlib.util.spec_from_file_location('submit', ROOT / 'tools/test-fuxi-
 submit = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(submit)
 
-PREFIX = r'''
+PREFIX = submit.PANEL_DEFAULTS + r'''
 static unsigned fg_scanout_requested, fg_scanout_panel120_requested, fg_scanout_double_requested, fg_scanout_triple_requested;
 #include <assert.h>
 #define FG_GUARD
@@ -314,12 +314,17 @@ def main():
     code = re.sub(r'/\*.*?\*/', '', adapter, flags=re.S)
     assert not re.search(r'\b(ml_io_map\w*|io_map|pmap_map\w*|kernel_thread_start\w*|thread_call_allocate\w*|thread_call_func_delayed|KMA_NOFAIL)\b', code)
     declarations = re.search(r'struct fg_window.*?static uint64_t fg_mapped_bytes;', adapter, re.S)[0]
-    windows = [(int(a, 16), int(b, 16)) for a, b in re.findall(r'\{(0x[0-9a-f]+),(0x[0-9a-f]+),0\}', adapter)]
-    windows.append((0x8f0000000, 0x2000000))
-    for i, (a, n) in enumerate(windows):
-        assert not ((a | n) & 16383)
-        for b, m in windows[i+1:]:
-            assert a+n <= b or b+m <= a, 'overlapping platform mappings'
+    for height, size in submit.PANEL_MAPS.items():
+        windows = submit.windows(adapter, height)
+        # Buffers B and C (FUXI_PANEL_MAP) stay inside the ABL splash on every board.
+        panels = [(a, n) for a, n in windows if a in (0xb8a00000, 0xb9400000)]
+        assert panels == [(0xb8a00000, size), (0xb9400000, size)], (height, panels)
+        assert 0xb9400000 + size <= 0xbab00000
+        windows.append((0x8f0000000, 0x2000000))
+        for i, (a, n) in enumerate(windows):
+            assert not ((a | n) & 16383)
+            for b, m in windows[i+1:]:
+                assert a+n <= b or b+m <= a, 'overlapping platform mappings'
     functions = ''.join(submit.function(adapter, n) for n in
                         ('fg_map_window', 'fg_map_windows', 'fuxi_gpu_nc_pointer', 'fg_pointer', 'fg_pointer_range', 'fg_fail'))
     functions += 'static thread_call_data_t fg_init_call;\n#define G_PTR(pa) fg_pointer(pa)\n#define G_PTR_RANGE(pa, bytes) fg_pointer_range(pa, bytes)\n'

@@ -16,7 +16,7 @@
  osfmk/vm/vm_fourk_pager.c	 standard
 --- a/bsd/dev/gpu.c
 +++ b/bsd/dev/gpu.c
-@@ -22,10 +22,16 @@
+@@ -22,10 +22,17 @@
  #ifndef G_PTR
  #define G_PTR(pa) ((uintptr_t)(pa))
  #endif
@@ -28,13 +28,14 @@
  #endif
 -
 +#include "gpu-clock.h"
++#include "gpu-handoff.h" /* board splash geometry and fg_abl_scanout_ok() */
 +/* XNU sets this once before cold start. Loader probes retain zero. */
 +static unsigned g_gpu_selected;
 +static uint64_t g_gpu_ddr_requested;
  /* ---- Fuxi-verified physical bases (research/device/probe-09/live.dtb) ---- */
  #define GPU_GCC_BASE      0x00100000ULL   /* gcc kalama-v2 @100000 (clock-controller) */
  #define GPU_GCC_GPU_PAGE  (GPU_GCC_BASE + 0x71000) /* gcc-kalama: gpu branch page */
-@@ -117,7 +123,7 @@
+@@ -117,7 +124,7 @@
   #ifdef FUXI_GPU_XNU
   uint32_t f, v = probe_safe_rd32(base + off, &f);
  #else
@@ -43,7 +44,7 @@
  #endif
   __asm__ volatile("dmb oshld" ::: "memory");
   return v;
-@@ -128,7 +134,7 @@
+@@ -128,7 +135,7 @@
   #ifdef FUXI_GPU_XNU
   (void)probe_safe_wr32(base + off, v);
  #else
@@ -52,7 +53,7 @@
  #endif
   __asm__ volatile("dsb osh" ::: "memory");
  }
-@@ -214,13 +220,13 @@
+@@ -214,13 +221,13 @@
   #ifdef FUXI_GPU_XNU
   fg_store64(at, val);
  #else
@@ -68,7 +69,7 @@
   for (unsigned i = 0; i < bytes / 8; i++) p[i] = 0;
   __asm__ volatile("dsb sy" ::: "memory");
  }
-@@ -306,13 +312,13 @@
+@@ -306,13 +313,13 @@
  {
   for (unsigned off = 0; off < size; off += 4096) {
    unsigned v = va + off;
@@ -85,7 +86,7 @@
    unsigned c = (v >> 12) & 511;
    if (l3[c]) return 0;
    l3[c] = (pa + off) | 3 | (3u << 8) | (1u << 10) | attr;
-@@ -525,6 +531,38 @@
+@@ -525,6 +532,38 @@
   }
   *vote = (uint32_t)cdb16(p+pi*2)<<16 | si<<8 | pi;
   return 1;
@@ -124,7 +125,7 @@
  }
  /* e[40..59]: five command/ACK records {sent, response, returned, error}.
   * Poll shared queue indices as well as interrupt status; reject malformed or
-@@ -591,8 +629,6 @@
+@@ -591,8 +630,6 @@
   for (unsigned i = 0; i < 59; i++) ((volatile uint32_t *)perf)[i] = 0;
   for (unsigned i = 0; i < 160; i++) ((volatile uint32_t *)bw)[i] = 0;
   /* Ascending Linux frequency indices, including OFF at index 0. kHz. */
@@ -133,7 +134,7 @@
   static const uint32_t cfreq[3] = {0,200000,500000};
   static const unsigned clevel[3] = {0,0x40,0x80};
   static const char gfx[8] = "gfx.lvl", mx[8] = "mx.lvl", cx[8] = "cx.lvl", gmxc[8] = "gmxc.lvl";
-@@ -600,8 +636,8 @@
+@@ -600,8 +637,8 @@
   const char *secondary = g_aux(gmxc, &unused) ? gmxc : mx;
   perf[1] = 10; perf[2] = 3;
   for (unsigned i = 0; i < 10; i++) {
@@ -144,7 +145,7 @@
   }
   for (unsigned i = 0; i < 3; i++) {
    if (!g_arc_vote(cx, mx, clevel[i], &perf[51+i*2])) { e[3] = 0x908; return 0; }
-@@ -615,6 +651,8 @@
+@@ -615,6 +652,8 @@
    if (!bw[24+i]) { e[3] = 0x908; return 0; }
   }
   if (!bw[6]) { e[3] = 0x908; return 0; }
@@ -153,7 +154,7 @@
   if (gm_rd(0x5000) != 1 || g_rd(GPU_RSCC_BASE, 0x101*4) || (gm_rd(0x5180)&1)) { e[3] = 0x909; return 0; }
   g_hfi_init(); g_rpmh_init();
   gm_wr(0x9304, 0xffffffff); gm_wr(0x9306, 0xffffffff);
-@@ -648,7 +686,7 @@
+@@ -648,7 +687,7 @@
  {
   uint32_t *e = gpu_extra[0];
   if (g_rd(GPU_SMMU_BASE, g_cb(g_bank) + 0x58) & 0xc00001feu) { e[60] = 0xa04; return; }
@@ -162,7 +163,7 @@
   int err = g_hfi_send(30, vote, 4, 4);
   if (err) { e[60] = err; return; }
   gm_wr(0x5191, 1u<<31); gm_wr(0x5194, 1u<<30);
-@@ -672,10 +710,16 @@
+@@ -672,10 +711,16 @@
  #define G3_RING_PA  (G_MEM + 0x1320000)
  #define G3_PTR_PA   (G_MEM + 0x1328000)
  #define G3_FENCE_PA (G_MEM + 0x1329000)
@@ -182,7 +183,7 @@
  #define G3_MAGIC    0xa740f00du
  #define G3_GUARD    0x5ac3e17bu
  #define G3_FSR_MASK 0xc00001feu /* SMMUv2 defined faults; keep reserved bit10 in report */
-@@ -848,7 +892,7 @@
+@@ -848,7 +893,7 @@
  #ifdef FUXI_GPU_XNU
   /* Uncached scratch, serialized once at the doorbell. Avoid an MMIO
    * recovery call and three barriers for every command dword. */
@@ -191,7 +192,39 @@
  #else
   g_wr(G3_RING_PA, G_RING_INDEX(g3_wptr++) * 4, word);
  #endif
-@@ -1527,8 +1571,8 @@
+@@ -1174,7 +1219,7 @@
+ #define G4_FB_VA  0x41000000u
+ #define G4_FB_PA  0xb8000000ULL
+ #define G4_BYTES  0x40000u
+-#define G4_FB_BYTES (1080u * 2400u * 4u)
++#define G4_FB_BYTES ((uint32_t)FG_FB_W * FG_FB_H * 4u)
+ #define G4_FB_MAP ((G4_FB_BYTES + 4095u) & ~4095u)
+ #define G4_WIDTH 256u
+ #define G4_FB_HEIGHT 64u
+@@ -1420,6 +1465,13 @@
+  if (d[62]) return 0xe06;
+  return d[56] ? 0xe0b : 1;
+ }
++/* g4_copy took SSPP0 +0x14/+0x24/+0x00/+0x30 into d[50..53] with fault-contained
++ * reads; hand those words to the shared ABL-scanout guard. */
++static uint32_t g4_sspp_word(const void *ctx, uint32_t off)
++{
++ const uint32_t *d = ctx;
++ return off == 0x14 ? d[50] : off == 0x24 ? d[51] : off == 0x00 ? d[52] : d[53];
++}
+ static int g4_copy(unsigned panel, uint32_t *d)
+ {
+  unsigned height = panel ? G4_FB_HEIGHT : 256u;
+@@ -1450,7 +1502,7 @@
+   d[50] = g3_read(0x0ae05014); d[51] = g3_read(0x0ae05024);
+   d[52] = g3_read(0x0ae05000); d[53] = g3_read(0x0ae05030);
+   if (gpu_extra[5][116]) return 0xe01;
+-  if (d[50] != G4_FB_PA || d[51] != 4320 || d[52] != (2400u<<16 | 1080u) || d[53] != 0x237ff) return 0xe08;
++  if (!fg_abl_scanout_ok(g4_sspp_word, d)) return 0xe08;
+  }
+  d[3] = 2;
+  if (panel) {
+@@ -1527,8 +1579,8 @@
     * Baseline is probe.c's volatile byte memcpy, MMU/caches off. */
    d[3] = 7; start = g4_counter();
    for (unsigned y = 0; y < height; y++)
@@ -202,21 +235,66 @@
    __asm__ volatile("dsb sy" ::: "memory");
    elapsed = g4_counter()-start; d[40] = elapsed; d[41] = elapsed>>32;
    d[43] |= G4_CPU_VALID;
+--- a/bsd/dev/gpu-handoff.h
++++ b/bsd/dev/gpu-handoff.h
+@@ -1,4 +1,5 @@
+-/* M6 cold handoff, shared by the loader and XNU. No firmware bytes here. */
++/* M6 cold handoff, shared by the loader and XNU. No firmware bytes here.
++ * Also the one source of the board's ABL splash geometry and its scanout guard. */
+ #ifndef FUXI_GPU_HANDOFF_H
+ #define FUXI_GPU_HANDOFF_H
+ #define FG_BANK_SIZE 0x140000000ULL
+@@ -21,4 +22,32 @@
+  for (unsigned i = 0; i < n; i++) h = (h ^ p[i]) * 16777619u;
+  return h;
+ }
++/* ABL splash (live FDT /reserved-memory/splash_region, same on both boards).
++ * Fuxi panel 1080x2400. OnePlus 11 "salami" (FUXI_SALAMI) timing@fhd_sa_60 is
++ * 1080x2412 (panel-height 0x96c). Stride 4320 and format 0x237ff are what Fuxi
++ * ABL programs; salami's are unknown until a probe boot reads SSPP0, so the
++ * format can be overridden at build time (-DFG_ABL_SSPP_FORMAT=...). */
++#define FG_SPLASH_PA   0xb8000000ULL
++#define FG_SPLASH_SIZE 0x2b00000ULL
++#define FG_SSPP0       0x0ae05000UL
++#define FG_FB_W 1080
++#if defined(FUXI_SALAMI)
++#define FG_FB_H 2412
++#else
++#define FG_FB_H 2400
+ #endif
++#define FG_FB_STRIDE (FG_FB_W * 4)
++#ifndef FG_ABL_SSPP_FORMAT
++#define FG_ABL_SSPP_FORMAT 0x237ffu
++#endif
++/* The ABL-scanout guard: nonzero only while SSPP0 still scans the splash with
++ * exactly this geometry. rd(ctx, off) returns SSPP0 register off; reads stop at
++ * the first mismatch: +0x14 address, +0x24 stride, +0x00 source size, +0x30 format. */
++static inline __attribute__((unused)) int
++fg_abl_scanout_ok(uint32_t (*rd)(const void *ctx, uint32_t off), const void *ctx)
++{
++ return rd(ctx, 0x14) == (uint32_t)FG_SPLASH_PA && rd(ctx, 0x24) == (uint32_t)FG_FB_STRIDE &&
++        rd(ctx, 0x00) == ((uint32_t)FG_FB_H << 16 | (uint32_t)FG_FB_W) &&
++        rd(ctx, 0x30) == (uint32_t)FG_ABL_SSPP_FORMAT;
++}
++#endif
 --- a/bsd/dev/fuxi_adreno.c
 +++ b/bsd/dev/fuxi_adreno.c
-@@ -20,7 +20,11 @@
+@@ -20,7 +20,14 @@
  #undef MACH_KERNEL_PRIVATE
  #include <kern/kern_types.h>
  #include "fuxi_adreno.h"
 +#include "fuxi_gpu_dcvs.h"
  #include "gpu-handoff.h"
++#if FUXI_PANEL_H != FG_FB_H
++#error "fuxi_adreno.h FUXI_PANEL_H differs from gpu-handoff.h FG_FB_H"
++#endif
 +#include <IOKit/IOLocks.h>
 +#include "fuxi_gpu_abi.h"
 +#include "fuxi_abi_wire.h"
  extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
  /* The BSD header export omits sched_prim's private dependencies. These match
   * osfmk/kern/{processor,sched_prim}.h; processor_t remains opaque here. */
-@@ -37,8 +41,9 @@
+@@ -37,8 +44,9 @@
  #define rsr(r) ({ uint64_t v; __asm__ volatile("mrs %0, " r : "=r"(v)); v; })
  #define delay fg_delay
  static void fg_delay(unsigned us) { delay_for_interval(us, NSEC_PER_USEC); }
@@ -227,18 +305,18 @@
   * Stage14 uses scratch, never stage15's panel readback/CPU comparator. */
  static struct fg_window fg_windows[] = {
   {0x100000,0x80000,0}, {0x3d00000,0x40000,0},
-@@ -47,6 +52,10 @@
+@@ -47,6 +55,10 @@
   {0xb280000,0x8000,0}, {0x81c60000,0x20000,0},
   {FG_SCRATCH,FG_SCRATCH_SIZE,0}, {0x9b098000,0x4000,0},
   {0xae04000,0x4000,0},
 + {0xae14000,0x4000,0}, {0xae34000,0x4000,0},
-+ {0xb8a00000,0x9e4000,0}, /* reserved splash buffer B, fuxiscandouble=1 only */
-+ {0xb9400000,0x9e4000,0}, /* reserved splash buffer C, fuxiscantriple=1 only */
++ {0xb8a00000,FUXI_PANEL_MAP,0}, /* reserved splash buffer B, fuxiscandouble=1 only */
++ {0xb9400000,FUXI_PANEL_MAP,0}, /* reserved splash buffer C, fuxiscantriple=1 only */
 + {0xae94000,0x4000,0}, /* DSI0 command FIFO, fuxipanel120=1 only */
  };
  static uint64_t fg_mapped_bytes;
  /* io_map's 8 MiB submap and ALL ml_io_map variants use KMA_NOFAIL.
-@@ -82,6 +91,10 @@
+@@ -82,6 +94,10 @@
  {
   for (unsigned i = 0; i < sizeof(fg_windows)/sizeof(fg_windows[0]); i++) {
    struct fg_window *w = &fg_windows[i];
@@ -249,7 +327,7 @@
    kern_return_t kr = fg_map_window(w);
    if (kr != KERN_SUCCESS) {
     printf("FUXI GPU: map PA %#llx bytes %#llx failed %d, mapped %llu bytes, IO submap 0 bytes\n",
-@@ -95,17 +108,31 @@
+@@ -95,17 +111,31 @@
  static unsigned fg_access_failed;
  uint32_t probe_fault_esr;
  uint64_t probe_fault_far;
@@ -285,7 +363,7 @@
   if (!va || (pa & (wide ? 7 : 3))) return fg_access_failed = 1;
   unsigned bad = fuxi_gpu_access(va, v, wr, wide);
   if (bad) {
-@@ -135,17 +162,109 @@
+@@ -135,17 +165,109 @@
  }
  static const uint8_t *fg_firmware(unsigned which, unsigned *size)
  {
@@ -399,7 +477,7 @@
  /* Retain BOTH physical attempts, independently of the shared logical-call
   * report slot. Static storage only; no allocation or firmware in diagnostics. */
  static volatile struct {
-@@ -188,7 +307,7 @@
+@@ -188,7 +310,7 @@
  
  #define FG_SOURCE_VA 0x50000000u
  #define FG_SOURCE_BYTES 0x01000000u
@@ -408,7 +486,7 @@
  #define FG_SOURCE_L3 8u
  _Static_assert(FG_SOURCE_TABLE + FG_CACHE_SLOTS*FG_SOURCE_L3*4096 <= G3_PT+0x100000,
      "source tables exceed reserved GPU table pool");
-@@ -200,10 +319,14 @@
+@@ -200,10 +322,14 @@
  static ppnum_t fg_ppns[FG_SOURCE_BYTES/PAGE_SIZE+1];
  static volatile uint64_t *fg_l2(void)
  {
@@ -425,7 +503,7 @@
  static unsigned fg_started, fg_limit, fg_force, fg_seq;
  int fuxi_gpu_ready(void) { return __atomic_load_n(&fg_state, __ATOMIC_ACQUIRE) == 1; }
  static uint64_t fg_deadline, fg_submit_time;
-@@ -211,6 +334,7 @@
+@@ -211,6 +337,7 @@
  static int fg_expired(void) { return rsr("cntpct_el0") >= fg_deadline; }
  static void fg_fail(const char *reason, unsigned code)
  {
@@ -433,7 +511,7 @@
   __atomic_store_n(&fg_state, 2, __ATOMIC_RELEASE);
   printf("FUXI GPU: disabled permanently: %s (%#x), CPU present\n", reason, code);
  }
-@@ -237,7 +361,11 @@
+@@ -237,7 +364,11 @@
     if (fg_access(GPU_REG_BASE + 0x3c45*4, &v, 1, 0)) good = 0;
    }
   }
@@ -446,7 +524,7 @@
   delay(100);
   for (unsigned i = 0; i < 2; i++) {
    v = 2u << 16; (void)fg_access(GPU_SMMU_BASE + SMMU_S2CR(g3_slot[i]), &v, 1, 0);
-@@ -250,7 +378,7 @@
+@@ -250,7 +381,7 @@
  static int fg_source_tables(void)
  {
   volatile uint64_t *l2 = fg_l2();
@@ -455,7 +533,7 @@
   for (unsigned i = 0; i < FG_CACHE_SLOTS*FG_SOURCE_L3; i++) {
    unsigned slot = ((FG_SOURCE_VA >> 21) & 511) + i;
    if (l2[slot]) return 0;
-@@ -265,6 +393,7 @@
+@@ -265,6 +396,7 @@
   * new generation. No PFN scan or TLB invalidation on a cache hit. */
  int fuxi_gpu_unmap(unsigned slot, struct fg_times *t)
  {
@@ -463,7 +541,7 @@
   if (slot >= FG_CACHE_SLOTS || fg_busy) return 0;
   uint64_t start = mach_absolute_time();
   volatile uint64_t *l2 = fg_l2();
-@@ -285,10 +414,11 @@
+@@ -285,10 +417,11 @@
  int fuxi_gpu_map(unsigned slot, uint64_t generation, uintptr_t source,
      uint64_t length, struct fg_times *t)
  {
@@ -476,7 +554,7 @@
   volatile uint64_t *l2 = fg_l2();
   unsigned first = ((FG_SOURCE_VA >> 21) & 511) + slot*FG_SOURCE_L3;
   unsigned pages = (length+(source&4095)+4095)/4096;
-@@ -341,12 +471,91 @@
+@@ -341,12 +474,91 @@
   t->misses++;
   return 1;
  }
@@ -569,7 +647,7 @@
   if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
       SecureDTGetProperty(chosen, "fuxi-gpu-memory", &prop, &bytes) != kSuccess ||
       bytes != 16 || ((uint64_t *)prop)[0] != FG_SCRATCH || ((uint64_t *)prop)[1] != FG_SCRATCH_SIZE) {
-@@ -359,7 +568,7 @@
+@@ -359,7 +571,7 @@
   }
   kern_return_t kr = fg_map_windows();
   if (kr != KERN_SUCCESS) { fg_fail("uncached mapping failed", kr); goto out; }
@@ -578,7 +656,7 @@
   if (h->magic != FG_MAGIC || h->version != 1 || h->bytes != sizeof(*h) || h->reserved ||
       h->base != FG_SCRATCH || h->size != FG_SCRATCH_SIZE) {
    fg_fail("missing/invalid cold firmware handoff", 3); goto out;
-@@ -367,7 +576,7 @@
+@@ -367,7 +579,7 @@
   for (unsigned i = 0; i < 3; i++) {
    unsigned n = h->fw_size[i];
    if (!n || n > FG_FW_SLOT || (n & 3) ||
@@ -587,19 +665,26 @@
     fg_fail("firmware size/checksum", i); goto out;
    }
   }
-@@ -385,15 +594,26 @@
+@@ -385,15 +597,31 @@
       "fence=%#x TRUST=%#x zap=%#x pixels=%#x\n", fg_limit == 13 ? 13 : 16,
       g_bank, g3_bank, g3_asid, g3_read(G3_FENCE_PA), g3_gr(0xf400),
       gpu_extra[13][2], gpu_extra[11][2]);
 + fg_clock_log();
   if (fg_limit < 17 || fg_force == 1) { fg_fail("diagnostic stop after self-test", fg_limit); goto out; }
 - if (g3_read(0xae05014) != G4_FB_PA || g3_read(0xae05024) != 4320 ||
-+ /* Double mode validates SRC0 under display ownership, failing closed there. */
-+ if ((!fg_scanout_double_requested && g3_read(0xae05014) != G4_FB_PA) || g3_read(0xae05024) != 4320 ||
-      g3_read(0xae05000) != (2400u<<16 | 1080u) || g3_read(0xae05030) != 0x237ff ||
-      !g_map_at(G3_PT, &g3_next, G4_FB_VA, G4_FB_PA, (4320*2400+4095)&~4095u, 1u<<6) ||
-+     (fg_scanout_double_requested && !g_map_at(G3_PT, &g3_next, G4_FB_VA+0xa00000u, 0xb8a00000u, (4320*2400+4095)&~4095u, 1u<<6)) ||
-+     (fg_scanout_triple_requested && !g_map_at(G3_PT, &g3_next, G4_FB_VA+0x1400000u, 0xb9400000u, (4320*2400+4095)&~4095u, 1u<<6)) ||
+-     g3_read(0xae05000) != (2400u<<16 | 1080u) || g3_read(0xae05030) != 0x237ff ||
+-     !g_map_at(G3_PT, &g3_next, G4_FB_VA, G4_FB_PA, (4320*2400+4095)&~4095u, 1u<<6) ||
++ /* The ABL-scanout guard of gpu-handoff.h (fg_abl_scanout_ok): same SSPP0
++  * reads in the same order, values from the handoff (FUXI_PANEL_H == FG_FB_H,
++  * checked at the top), so a -DFG_ABL_SSPP_FORMAT build agrees with the
++  * loader. Written out, not through a reader callback, so fg_thread stays
++  * self-contained (host tests lift it alone) and double mode can skip the
++  * SRC0 read: it validates SRC0 under display ownership, failing closed there. */
++ if ((!fg_scanout_double_requested && g3_read(0xae05014) != G4_FB_PA) || g3_read(0xae05024) != FG_FB_STRIDE ||
++     g3_read(0xae05000) != (FUXI_PANEL_H<<16 | 1080u) || g3_read(0xae05030) != FG_ABL_SSPP_FORMAT ||
++     !g_map_at(G3_PT, &g3_next, G4_FB_VA, G4_FB_PA, (4320*FUXI_PANEL_H+4095)&~4095u, 1u<<6) ||
++     (fg_scanout_double_requested && !g_map_at(G3_PT, &g3_next, G4_FB_VA+0xa00000u, 0xb8a00000u, (4320*FUXI_PANEL_H+4095)&~4095u, 1u<<6)) ||
++     (fg_scanout_triple_requested && !g_map_at(G3_PT, &g3_next, G4_FB_VA+0x1400000u, 0xb9400000u, (4320*FUXI_PANEL_H+4095)&~4095u, 1u<<6)) ||
       !fg_source_tables()) { fg_fail("scanout geometry/mapping", 4); goto out; }
   uint32_t tlb[128] = {0};
   if (g4_tlb(tlb) || fg_access_failed) { fg_fail("initial TLB sync", 5); goto out; }
@@ -616,7 +701,7 @@
   out: return;
  }
  void fuxi_gpu_start(uint64_t fb, unsigned width, unsigned height, unsigned pitch)
-@@ -402,6 +622,28 @@
+@@ -402,10 +630,32 @@
   (void)PE_parse_boot_argn("fuxigpu", &enable, sizeof(enable));
   if (enable != 1 || fg_started) return;
   fg_started = 1; fg_limit = 17;
@@ -645,7 +730,12 @@
   (void)PE_parse_boot_argn("fuxigpu_stage", &fg_limit, sizeof(fg_limit));
   (void)PE_parse_boot_argn("fuxigpu_fail", &fg_force, sizeof(fg_force));
   if ((fg_limit != 13 && fg_limit != 16 && fg_limit != 17) ||
-@@ -451,16 +693,50 @@
+-     fb != G4_FB_PA || width != 1080 || height != 2400 || pitch != 4320) {
++     fb != G4_FB_PA || width != 1080 || height != FUXI_PANEL_H || pitch != 4320) {
+   fg_fail("unsupported boot framebuffer/stage", fg_limit); return;
+  }
+  /* Static storage avoids kernel_thread_start's NOFAIL thread/stack allocation
+@@ -451,16 +701,50 @@
   }
   if (end) CleanPoC_DcacheRegion_Force(begin, end-begin);
  }
@@ -697,7 +787,7 @@
    return 1;
   }
   if (!err && !fg_expired()) return 0;
-@@ -468,6 +744,7 @@
+@@ -468,6 +752,7 @@
   /* Only fault containment has bounded register polling; no scheduler wait. */
   int drained = fg_isolate();
   fg_busy = 0;
@@ -705,23 +795,24 @@
   t->wait += mach_absolute_time()-fg_submit_time;
   return drained ? -1 : -2;
  }
-@@ -475,41 +752,72 @@
+@@ -475,41 +760,72 @@
      unsigned pitch, unsigned sx, unsigned sy, unsigned dx, unsigned dy,
      unsigned width, unsigned height, struct fg_times *t)
  {
 - if (!fuxi_gpu_ready() || fg_busy || slot >= FG_CACHE_SLOTS || fg_generation[slot] != generation) return 0;
+- if (!width || !height || width > 1080 || height > 2400 || dx > 1080-width || dy > 2400-height ||
 + FG_GUARD;
 + if (fg_scanout_owned && !fg_scanout_writable) return 0;
 + if (fg_client_busy) fg_abi_present_wait = 1;
 + if (!fuxi_gpu_ready() || fg_busy || fg_client_busy || slot >= FG_CACHE_SLOTS || fg_generation[slot] != generation) return 0;
-  if (!width || !height || width > 1080 || height > 2400 || dx > 1080-width || dy > 2400-height ||
++ if (!width || !height || width > 1080 || height > FUXI_PANEL_H || dx > 1080-width || dy > FUXI_PANEL_H-height ||
       (source & 3) || (pitch & 3) || pitch > 131008 || ((uint64_t)sx+width)*4 > pitch ||
       length+(source&4095) > FG_SOURCE_BYTES ||
       ((uint64_t)sy+height-1)*pitch+((uint64_t)sx+width)*4 > length) return 0;
 + if (fg_scanout_double_active) {
 +  /* CA supplies a complete surface; expand damage to the complete panel. */
 +  if (sx < dx || sy < dy) return 0;
-+  sx -= dx; sy -= dy; dx = dy = 0; width = 1080; height = 2400;
++  sx -= dx; sy -= dy; dx = dy = 0; width = 1080; height = FUXI_PANEL_H;
 +  if (((uint64_t)sx+width)*4 > pitch ||
 +      ((uint64_t)sy+height-1)*pitch+((uint64_t)sx+width)*4 > length) return 0;
 + }
@@ -786,9 +877,26 @@
  #endif
 --- a/bsd/dev/fuxi_adreno.h
 +++ b/bsd/dev/fuxi_adreno.h
-@@ -2,19 +2,57 @@
+@@ -1,20 +1,74 @@
+ #ifndef FUXI_ADRENO_H
  #define FUXI_ADRENO_H
  #define FG_CACHE_SLOTS 4u
++/* Panel rows the ABL splash pipe scans out of 0xb8000000 (and the double/
++ * triple buffers 0xb8a00000/0xb9400000), 1080 wide, ARGB8888, stride 4320.
++ * fuxi (Xiaomi 13): 2400. salami (OnePlus 11, FUXI_SALAMI, timing
++ * fhd_sa_60): 2412. Either frame fits one 0xa00000 slot (4320 x 2412 =
++ * 0x9efe80). FUXI_PANEL_MAP is one frame rounded up to 16 KiB pages.
++ * The single source is FG_FB_H in gpu-handoff.h, which the C++ users of this
++ * header (SweetSurface, SweetFramebuffer) never include; fuxi_adreno.c sees
++ * both and refuses to compile if they differ. */
++#ifndef FUXI_PANEL_H
++#if defined(FUXI_SALAMI)
++#define FUXI_PANEL_H 2412u
++#else
++#define FUXI_PANEL_H 2400u
++#endif
++#endif
++#define FUXI_PANEL_MAP ((4320u*FUXI_PANEL_H+16383u)&~16383u)
  /* Timings in mach absolute ticks, CPU uses scheduler runtime (excludes sleep).
 - * Protected by SweetSurface's cache lock. No userspace submit interface. */
 + * Surface leases use a short lock separate from the copy/cache transaction.
@@ -1361,7 +1469,7 @@
 +#endif
 --- a/bsd/dev/fuxi_gpu_scanout.inc
 +++ b/bsd/dev/fuxi_gpu_scanout.inc
-@@ -0,0 +1,1598 @@
+@@ -0,0 +1,1604 @@
 +/* SPDX-License-Identifier: MIT
 + * Copyright (c) 2026 NativeMetal contributors
 + * Ported from UniXNU drivers/NativeMetal/GpuScanoutClient.h (MIT).
@@ -1433,7 +1541,7 @@
 +{
 + unsigned line, start;
 + if (!fg_scanout_xfer_open || !fg_scanout_read(FG_SCAN_INTF+0x2b0, &line) || !fg_scanout_read(FG_SCAN_CTL+0x1c, &start)) return;
-+ if ((start & 1) || ((line & 65535) != 0 && (line & 65535) < 2400)) return;
++ if ((start & 1) || ((line & 65535) != 0 && (line & 65535) < FUXI_PANEL_H)) return;
 + uint64_t hz = rsr("cntfrq_el0"), us = (rsr("cntpct_el0") - fg_scanout_started)*1000000/hz;
 + unsigned bin = 0;
 + while (bin < 7 && us >= fg_scanout_xfer_edges[bin]) bin++;
@@ -1475,6 +1583,12 @@
 +  unsigned triple = PE_parse_boot_argn("fuxiscantriple", &triple_buffer, sizeof(triple_buffer)) && triple_buffer == 1;
 +  fg_scanout_triple_requested = fg_scanout_double_requested && triple;
 +  fg_scanout_panel120_requested = PE_parse_boot_argn("fuxipanel120", &panel120, sizeof(panel120)) && panel120 == 1;
++#if defined(FUXI_SALAMI)
++  /* The 120 Hz switch below is the Xiaomi M3 panel's DCS sequence; salami's
++   * Samsung AMB670YF07 has its own (timing@fhd_sa_120). Never send it there. */
++  if (fg_scanout_panel120_requested) printf("FUXI SCANOUT: fuxipanel120 refused on salami (fuxi panel DCS)\n");
++  fg_scanout_panel120_requested = 0;
++#endif
 +  fg_scanout_te_mode = PE_parse_boot_argn("fuxiscante", &te, sizeof(te)) && te == 1;
 +  /* The TE gate needs no floor unless one is given explicitly. */
 +  if (fg_scanout_te_mode) fg_scanout_drain_us = 0;
@@ -1583,7 +1697,7 @@
 +      !fg_scanout_read(FG_SCAN_CTL+0x1c, &start)) break;
 +  if (!res[0] && (count >> 16) != fg_scanout_probe_te0) res[0] = now - t0 + 1;
 +  if (!res[1] && !(start & 1)) res[1] = now - t0 + 1;
-+  if ((line & 65535) != 0 && (line & 65535) < 2400) active = 1;
++  if ((line & 65535) != 0 && (line & 65535) < FUXI_PANEL_H) active = 1;
 +  else if (active && !res[2]) res[2] = now - t0 + 1;
 +  /* START clears ~17 us after the write, before the MDP starts writing at the next TE: finishing on "clear and never active" ended
 +   * nearly every probe early. Wait for the TE edge, then 0.5 ms for the line to go active (otherwise the START was a no-op). */
@@ -1703,16 +1817,16 @@
 +   if (hard && !masked) { irq = ml_set_interrupts_enabled(FALSE); masked = 1; slice = now + fg_scanout_us_to_ticks(FG_SCAN_HARD_SLICE_US); }
 +   if (!fg_scanout_te_count(&cnt) || !fg_scanout_read(FG_SCAN_INTF+0x2b0, &line) || !fg_scanout_read(FG_SCAN_CTL+0x1c, &start)) break;
 +   nedge = (cnt - c0) & 0xffffu; c = cnt; line &= 65535;
-+   if (nedge && line != 0 && line < 2400) active = 1;
++   if (nedge && line != 0 && line < FUXI_PANEL_H) active = 1;
 +   /* An idle line with the START bit clear between 1 ms and the minimum transfer time after the predicted edge means the transfer never
 +    * started there (the START missed that TE, W177: expired/catch_fail/raced ~25% of wakes): it starts one period later. */
-+   if (nedge && !active && !(start & 1) && (line == 0 || line >= 2400) && now >= e + fg_scanout_us_to_ticks(FG_SCAN_SPIN_SEEN_US) &&
++   if (nedge && !active && !(start & 1) && (line == 0 || line >= FUXI_PANEL_H) && now >= e + fg_scanout_us_to_ticks(FG_SCAN_SPIN_SEEN_US) &&
 +       now < e + fg_scanout_us_to_ticks(FG_SCAN_SPIN_MINXFER_US)) { result = FG_SPIN_MISSED; break; }
 +   /* Done = an edge since the START, the write line idle and either seen active or (START margin to the edge at least 500 us, so the
 +    * edge was caught) the minimum transfer time elapsed since the edge: the thread call is often late enough to miss the active
 +    * period (W176). */
 +   if (nedge && (active || (fg_scanout_spin_m >= fg_scanout_us_to_ticks(FG_SCAN_SPIN_SAFE_US) && now >= e + fg_scanout_us_to_ticks(FG_SCAN_SPIN_MINXFER_US))) &&
-+       !(start & 1) && (line == 0 || line >= 2400)) {
++       !(start & 1) && (line == 0 || line >= FUXI_PANEL_H)) {
 +    idle_t = now;
 +    if (masked) { (void)ml_set_interrupts_enabled(irq); masked = 0; }
 +    FG_GUARD;
@@ -1941,7 +2055,7 @@
 + unsigned line, immediate = 0;
 + while (fg_scanout_read(FG_SCAN_INTF+0x2b0, &line)) {
 +  line &= 0xffffu;
-+  if (line != 0 && line < 2400) { immediate = 1; break; }
++  if (line != 0 && line < FUXI_PANEL_H) { immediate = 1; break; }
 +  if (rsr("cntpct_el0") >= limit) break;
 +  delay(5);
 + }
@@ -2174,7 +2288,7 @@
 +  unsigned bucket;
 +  (void)fg_scanout_read(FG_SCAN_INTF+0x2b0, &line);
 +  line &= 0xffffu;
-+  bucket = line == 0 || line >= 2400 ? 0 : line < 200 ? 1 : line < 600 ? 2 : line < 1200 ? 3 : 4;
++  bucket = line == 0 || line >= FUXI_PANEL_H ? 0 : line < 200 ? 1 : line < 600 ? 2 : line < 1200 ? 3 : 4;
 +  fg_scanout_ar_ll[bucket]++;
 +  if (bucket >= 3) fg_scanout_ar_st[FG_AR_LATCH_MID]++;
 +  if (b == fg_scanout_front) {
@@ -2273,7 +2387,7 @@
 + uint64_t now = rsr("cntpct_el0"), hz = rsr("cntfrq_el0"), elapsed = (now - fg_scanout_ar_t0)*1000000/hz;
 + if (fg_scanout_ar_state == 1) {
 +  fg_scanout_ar_samples++;
-+  if (line != 0 && line < 2400) fg_scanout_ar_active++;
++  if (line != 0 && line < FUXI_PANEL_H) fg_scanout_ar_active++;
 +  /* Duty = share of samples with the write line active. One transfer per TE is 7.92/8.28 = 95.6%, one per N+1 TEs a 1/(N+1) of that. */
 +  unsigned cnt = fg_scanout_ar_counts[fg_scanout_ar_idx], expect = 956/(cnt + 1), duty = fg_scanout_ar_samples ? fg_scanout_ar_active*1000/fg_scanout_ar_samples : 0;
 +  if (elapsed >= FG_SCAN_AR_MIN_US && fg_scanout_ar_samples >= 20 && duty*10 >= expect*8) {
@@ -2594,7 +2708,7 @@
 + }
 + if (!fg_scanout_read(FG_SCAN_INTF+0x2b0, &line) ||
 +     !fg_scanout_read(FG_SCAN_CTL+0x1c, &start)) return fg_scanout_stop("read transfer status");
-+ if ((start & 1) || ((line & 65535) != 0 && (line & 65535) < 2400)) {
++ if ((start & 1) || ((line & 65535) != 0 && (line & 65535) < FUXI_PANEL_H)) {
 +  if (rsr("cntpct_el0") >= fg_scanout_timeout) {
 +   unsigned rd = 0;
 +   (void)fg_scanout_read(FG_SCAN_INTF+0x298, &rd);
@@ -2619,14 +2733,14 @@
 +  }
 + }
 + if (fg_scanout_double_requested && !fg_scanout_double_initialized) {
-+  fg_scanout_pixels_b = fuxi_gpu_nc_pointer(0xb8a00000u, 4320u*2400);
++  fg_scanout_pixels_b = fuxi_gpu_nc_pointer(0xb8a00000u, 4320u*FUXI_PANEL_H);
 +  if (!fg_scanout_pixels || !fg_scanout_pixels_b) return fg_scanout_stop("double buffer mapping");
-+  for (unsigned i = 0; i < 1080u*2400; i++)
++  for (unsigned i = 0; i < 1080u*FUXI_PANEL_H; i++)
 +   ((volatile uint32_t *)fg_scanout_pixels_b)[i] = ((const volatile uint32_t *)fg_scanout_pixels)[i];
 +  if (fg_scanout_triple_requested) {
-+   fg_scanout_pixels_c = fuxi_gpu_nc_pointer(0xb9400000u, 4320u*2400);
++   fg_scanout_pixels_c = fuxi_gpu_nc_pointer(0xb9400000u, 4320u*FUXI_PANEL_H);
 +   if (!fg_scanout_pixels_c) return fg_scanout_stop("triple buffer mapping");
-+   for (unsigned i = 0; i < 1080u*2400; i++)
++   for (unsigned i = 0; i < 1080u*FUXI_PANEL_H; i++)
 +    ((volatile uint32_t *)fg_scanout_pixels_c)[i] = ((const volatile uint32_t *)fg_scanout_pixels)[i];
 +  }
 +  fg_scanout_double_initialized = fg_scanout_double_active = 1;
@@ -2672,7 +2786,7 @@
 + if (writable != 1 || !fg_scanout_double_active) return writable;
 + unsigned newest = fg_scanout_back_ready ? (fg_scanout_triple_requested ? fg_scanout_ready : fg_scanout_front ^ 1u) : fg_scanout_front;
 + if (newest) {
-+  for (unsigned i = 0; i < 1080u*2400; i++)
++  for (unsigned i = 0; i < 1080u*FUXI_PANEL_H; i++)
 +   ((volatile uint32_t *)fg_scanout_pixels)[i] = ((const volatile uint32_t *)fg_scanout_pixels_at(newest))[i];
 + }
 + if (!fg_scanout_address(0xb8000000u)) return fg_scanout_stop("CPU restore A");
@@ -2886,7 +3000,7 @@
 + if (r == 1 && fg_abi_spin) fg_scanout_spin_stat[FG_SPIN_DIRECT]++;
 + if (r == 2) {
 +  fg_scanout_kick_why = 0;
-+  if (fg_abi_hard) { unsigned line, start; fg_scanout_offer_xfer = fg_scanout_read(FG_SCAN_CTL+0x1c, &start) && fg_scanout_read(FG_SCAN_INTF+0x2b0, &line) && ((start & 1) || ((line & 65535) != 0 && (line & 65535) < 2400)); }
++  if (fg_abi_hard) { unsigned line, start; fg_scanout_offer_xfer = fg_scanout_read(FG_SCAN_CTL+0x1c, &start) && fg_scanout_read(FG_SCAN_INTF+0x2b0, &line) && ((start & 1) || ((line & 65535) != 0 && (line & 65535) < FUXI_PANEL_H)); }
 +  fg_scanout_spin_kick(0);
 + }
 + return r;

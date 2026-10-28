@@ -24,7 +24,7 @@ def main():
     zero = submit.function((ROOT/'shim/fuxi-probe/gpu.c').read_text(), 'g_zero')
     zero = re.sub(r'__asm__ volatile\([^;]*\);', '(void)0;', zero)
     lookup += '#define G_PTR_RANGE(pa, bytes) fg_pointer_range(pa, bytes)\n' + zero
-    prefix = r'''
+    prefix = submit.PANEL_DEFAULTS + r'''
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>

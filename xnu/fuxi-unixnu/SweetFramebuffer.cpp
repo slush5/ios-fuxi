@@ -1,6 +1,7 @@
 /*
  * Built-in IOMobileFramebuffer for SWEET: the ABL's continuous-splash
- * framebuffer (1080x2400 a8r8g8b8 in RAM, the panel scans it out by
+ * framebuffer (a8r8g8b8 in RAM, 1080x2400 on fuxi, 1080x2412 on salami;
+ * the size comes from boot_args Video; the panel scans it out by
  * itself) as the main display, driven by CoreAnimation's CPU renderer.
  *
  * IOMobileFramebuffer.framework (iOS 16.7) counts /arm-io children with
@@ -106,7 +107,8 @@ enum {
  * screens (UIKit: "No status bar visual provider for screen", the red
  * rdar://45025538 bar for 360x800 points). The display is therefore
  * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
- * centered 1080x2400 part of it is shown on the 1080x2400 panel.
+ * centered panel-sized part of it is shown on the panel (boot framebuffer
+ * size: 1080x2400 on fuxi, 1080x2412 on salami).
  * Boot-arg sweetfb_native=1 presents the real panel size instead.
  */
 #define SWEET_FB_LOGICAL_W              1125
@@ -295,6 +297,9 @@ static void sweet_fb_refresh_publish(AppleCLCD *fb)
 {
  uint32_t panel120 = 0, hz = 0;
  PE_parse_boot_argn("fuxipanel120", &panel120, sizeof(panel120));
+#if defined(FUXI_SALAMI)
+ panel120 = 0;	/* refused on salami: the GPU scanout never switches its panel to 120 Hz */
+#endif
  bool hzPresent = PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
  if (!sweet_fb_refresh_wanted(panel120, hzPresent, hz)) return;
  OSDictionary *refresh = OSDictionary::withCapacity(1);
@@ -1152,7 +1157,7 @@ AppleCLCD::present(const SwapRecord &record)
              fStageGpu = true; fStage[3] = times.submitted;
              if (read.held) { sweet_surface_present_end(); read.held = false; }
              if (fEarlyRetire) retireEarly(record);
-             fScanoutBytes = fuxi_gpu_scanout_double() ? (uint64_t)1080 * 2400 * 4 : (uint64_t)w * h * 4;
+             fScanoutBytes = fuxi_gpu_scanout_double() ? (uint64_t)fWidth * fHeight * 4 : (uint64_t)w * h * 4;
 				fShadowValid = false;
 				gpuFrame = true;
 				fGpuPending = true;

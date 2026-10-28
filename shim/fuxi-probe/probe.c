@@ -8,6 +8,7 @@
 #include <stdbool.h>
 #include "../font.h"
 #include "monitor.h"
+#include "gpu-handoff.h"
 #define printf(...) ((void)0)
 #define rsr(r) ({ uint64_t v; __asm__ volatile("mrs %0, " r : "=r"(v)); v; })
 static void *memset(void *dst, int c, size_t n)
@@ -38,6 +39,32 @@ static uintptr_t probe_fdt;
 static uint32_t probe_fdt_size;
 uint64_t probe_fdt_address(void) { return probe_fdt; }
 uint32_t probe_fdt_bytes(void) { return probe_fdt_size; }
+#if defined(FUXI_SALAMI)
+/* Every splash write (loader con_clear, requests 0x43/0x53) covers the whole
+ * ABL splash, and ABL alone chose where this Image (embedded payload included)
+ * and the FDT sit. NULL when both are clear of it; an FDT of unknown size
+ * counts from its first byte. */
+const char *probe_splash_overlap(void)
+{
+ extern char _head[], _end[];
+ const uint64_t lo=FG_SPLASH_PA, hi=FG_SPLASH_PA+FG_SPLASH_SIZE;
+ if ((uintptr_t)_head < hi && lo < (uintptr_t)_end) return "loader/payload overlaps ABL splash";
+ if (probe_fdt && probe_fdt < hi && lo < probe_fdt+(probe_fdt_size ? probe_fdt_size : 1))
+  return "FDT overlaps ABL splash";
+ return 0;
+}
+#endif
+/* SSPP0 register for the shared ABL-scanout guard (gpu-handoff.h). */
+static uint32_t sspp0_rd(const void *ctx, uint32_t off) { (void)ctx; return usb_rd(FG_SSPP0, off); }
+/* Paint only on the measured ABL scanout; on salami also only while this
+ * Image and the FDT are clear of the splash. */
+static bool probe_paint_ok(void)
+{
+#if defined(FUXI_SALAMI)
+ if (probe_splash_overlap()) return false;
+#endif
+ return fg_abl_scanout_ok(sspp0_rd, 0);
+}
 static struct {
  uint64_t magic, version, midr, mpidr, mmfr0, mmfr1, current_el, cntfrq, sctlr;
  uint64_t fdt_address, fdt_size, gsnpsid, gctl_before, dctl_before, dsts_before;
@@ -76,13 +103,10 @@ static uint32_t display_snapshot(void)
 static uint32_t display_paint(void)
 {
  /* Only touch the exact linear scanout geometry observed in probe-03. */
- if (usb_rd(0xae05000, 0x14) != 0xb8000000 ||
-     usb_rd(0xae05000, 0x24) != 4320 ||
-     usb_rd(0xae05000, 0x00) != ((2400u << 16) | 1080u) ||
-     usb_rd(0xae05000, 0x30) != 0x237ff) return 0;
+ if (!probe_paint_ok()) return 0;
  volatile uint32_t *fb = (volatile uint32_t *)0xb8000000UL;
  for (unsigned y = 0; y < 160; y++)
-  for (unsigned x = 0; x < 1080; x++) fb[y * 1080 + x] = 0xff102040;
+  for (unsigned x = 0; x < FG_FB_W; x++) fb[y * FG_FB_W + x] = 0xff102040;
  const char *text = "FUXI NATIVE PROBE";
  for (unsigned c = 0; text[c]; c++) {
   const unsigned char *glyph = font8x16[(unsigned char)text[c] - 32];
@@ -91,7 +115,7 @@ static uint32_t display_paint(void)
     if (glyph[gy] & (0x80u >> gx))
      for (unsigned sy = 0; sy < 3; sy++)
       for (unsigned sx = 0; sx < 3; sx++)
-       fb[(48 + gy * 3 + sy) * 1080 + 48 + c * 24 + gx * 3 + sx] = 0xffffffff;
+       fb[(48 + gy * 3 + sy) * FG_FB_W + 48 + c * 24 + gx * 3 + sx] = 0xffffffff;
  }
  __asm__ volatile("dsb sy" ::: "memory");
  *(volatile uint32_t *)0x0ae1601cUL = 1; /* CTL0 START: command-mode frame */
@@ -108,7 +132,7 @@ static uint32_t ar_report[10], ar_saved;
 static void ar_paint(uint32_t color)
 {
  volatile uint32_t *fb = (volatile uint32_t *)0xb8000000UL;
- for (unsigned i = 0; i < 1080 * 2400; i++) fb[i] = color;
+ for (unsigned i = 0; i < FG_FB_W * FG_FB_H; i++) fb[i] = color;
  const char *text = "FUXI AUTOREFRESH TEST";
  for (unsigned c = 0; text[c]; c++) {
   const unsigned char *glyph = font8x16[(unsigned char)text[c] - 32];
@@ -117,16 +141,14 @@ static void ar_paint(uint32_t color)
     if (glyph[gy] & (0x80u >> gx))
      for (unsigned sy = 0; sy < 4; sy++)
       for (unsigned sx = 0; sx < 4; sx++)
-       fb[(1100 + gy * 4 + sy) * 1080 + 48 + c * 32 + gx * 4 + sx] = 0xffffffff;
+       fb[(1100 + gy * 4 + sy) * FG_FB_W + 48 + c * 32 + gx * 4 + sx] = 0xffffffff;
  }
  __asm__ volatile("dsb sy" ::: "memory");
 }
 static void ar_test(uint32_t mode)
 {
  for (unsigned i = 0; i < 10; i++) ar_report[i] = 0;
- if (usb_rd(0xae05000, 0x14) != 0xb8000000 || usb_rd(0xae05000, 0x24) != 4320 ||
-     usb_rd(0xae05000, 0x00) != ((2400u << 16) | 1080u) ||
-     usb_rd(0xae05000, 0x30) != 0x237ff) { ar_report[0] = 0x100; return; }
+ if (!probe_paint_ok()) { ar_report[0] = 0x100; return; }
  ar_report[1] = usb_rd(0xae36000, 0x2b4);
  ar_report[3] = usb_rd(0xae36000, 0x2a8) & 0xffff;
  if (mode == 0x4e53) {
@@ -140,7 +162,7 @@ static void ar_test(uint32_t mode)
   unsigned i;
   for (i = 0; i < 200000; i++) {
    uint32_t l = usb_rd(0xae36000, 0x2a8) & 0xffff;
-   if (i > 20000 && (l == 0 || l >= 2400)) break;  /* >= 20 ms: one frame past */
+   if (i > 20000 && (l == 0 || l >= FG_FB_H)) break;  /* >= 20 ms: one frame past */
    delay(1);
   }
   ar_report[4] = usb_rd(0xae36000, 0x2a8) & 0xffff; ar_report[5] = i;
@@ -347,6 +369,10 @@ static void display_boost(void)
   {0x50068,(3u<<29)|(8u<<14)|8u},             /* ACV HLOS enable mask */
   {0x50000,(3u<<29)|(0x3fffu<<14)|0x3fff}};    /* MC0 */
  for (unsigned i=0;i<12;i++) boost_report[i]=0;
+#if defined(FUXI_SALAMI)
+ /* Not ported to salami (request 0x52 is refused there): no votes, no PLL retune. */
+ boost_report[0]=0x500; return;
+#endif
  uint32_t id=usb_rd(RH_DRV_PA,0), cfg=usb_rd(RH_DRV_PA,0xc);
  if (((id>>16)&0xff)!=3 || ((cfg>>12)&0x3f)<3) { boost_report[0]=0x100|((id>>16)&0xff); return; }
  boost_report[0]=1;
@@ -720,11 +746,20 @@ static void touch_power(unsigned stage)
  for (unsigned i=0;i<64;i++) touch_report[i]=0;
  ts_stage=stage;
  touch_report[0]=1;
+#if defined(FUXI_SALAMI)
+ /* The VRM addresses below are Fuxi cmd-db literals. On salami 0x40900 is
+  * ldob10 and 0x41b00 is ldon7 (pm8010n_l7, max 2960 mV): never send them.
+  * Request 0x55 'TP' is refused there until the S3908 touch_power lands, and
+  * that one resolves ldob4 by name (like wl_cmddb_addr) and asserts it is
+  * 0x40800 before any vote. */
+ touch_report[0]=0x300; return;
+#endif
  uint32_t id=usb_rd(RH_DRV_PA,0), cfg=usb_rd(RH_DRV_PA,0xc);
  if (((id>>16)&0xff)!=3 || ((cfg>>12)&0x3f)<3) { touch_report[0]=0x100; return; }
  /* Hold the IC in reset (and IRQ low, as the vendor driver does) while the rails come up. */
  ts_gpio(24,0,3,8,0); ts_gpio(25,0,3,8,0);
- /* VRM: +0 voltage mV, +4 enable. vdd first, then avdd. */
+ /* VRM: +0 voltage mV, +4 enable. vdd first, then avdd. Fuxi cmd-db
+  * addresses (Xiaomi 13 only: on salami they are ldob10 and ldon7). */
  static const uint32_t cmds[][2]={{0x40900,1800},{0x40904,1},{0x41b00,3200},{0x41b04,1}};
  for (unsigned i=0;i<4;i++) {
   touch_report[1+i]=rh_send(0,cmds[i][0],cmds[i][1]);
@@ -1136,6 +1171,17 @@ ud_setup(void)
 		printf("SWEET USB: setup %02x %02x %04x len %u\n", type, req, value, length);
 	ud.data_in = (type & 0x80) != 0;
 	ud.audio_out = false;
+#if defined(FUXI_SALAMI)
+	/* Lanes not ported to the OnePlus 11 (salami) STALL before any of their code
+	 * runs: 0x52 MDP/PLL0 boost, 0x55 'TP' touch rails (its Fuxi VRM literals
+	 * are ldob10 0x40900 and ldon7 0x41b00, pm8010n_l7 max 2960 mV, here),
+	 * 0x5a/0x5b audio (QUP2 SE0 CS35L41 and the Fuxi adspslpi size), 0x5c WLAN
+	 * (Fuxi BDF and rail expectations). */
+	if ((type & 0x60) == 0x40 && (req == 0x52 || (req == 0x55 && value == 0x5450) ||
+	    req == 0x5a || req == 0x5b || req == 0x5c)) {
+		ok = false;
+	} else
+#endif
 	if (type == 0xc0 && (req == 0x40 || req == 0x41)) {
         uint32_t offset = (uint32_t)value | ((uint32_t)st[4] << 16) | ((uint32_t)st[5] << 24);
         const uint8_t *src = req == 0x40 ? (const uint8_t *)&probe_info : (const uint8_t *)probe_fdt;
@@ -1173,21 +1219,34 @@ ud_setup(void)
     } else if (type == 0xc0 && req == 0x4e) {
         uint32_t index=(uint32_t)st[4] | ((uint32_t)st[5]<<8);
         uint64_t off=(uint64_t)value | ((uint64_t)index<<16);
+#if defined(FUXI_SALAMI)
+        /* One frame of the shared ABL scanout geometry (gpu-handoff.h). */
+        const uint64_t size=(uint64_t)FG_FB_STRIDE*FG_FB_H;
+        const uint32_t fb_pitch=FG_FB_STRIDE, fb_format=FG_ABL_SSPP_FORMAT;
+#else
+        /* Fuxi literals: tools/test-fuxi-gpu-scanout.py compiles this body standalone. */
         const uint64_t size=1080ULL*2400*4;
+        const uint32_t fb_pitch=4320, fb_format=0x237ff;
+#endif
         n=length > 512 ? 512 : length;
         uint32_t base=usb_rd(0xae05000,0x14);
         if (off>size || n>size-off || (base!=0xb8000000 && base!=0xb8a00000 && base!=0xb9400000) ||
-            usb_rd(0xae05000,0x24)!=4320 || usb_rd(0xae05000,0x30)!=0x237ff)
+            usb_rd(0xae05000,0x24)!=fb_pitch || usb_rd(0xae05000,0x30)!=fb_format)
             ok=false;
         else memcpy(data,(const void *)(uintptr_t)((uint64_t)base+off),n);
     } else if (type == 0xc0 && req == 0x4f) {
         /* Read-only display pipeline windows from live FDT: MDP top, CTL0,
-         * INTF1 (+tear irq), DSC0 enc/ctl, PP0/PP1, DSI0 controller. MDSS top
+         * INTF1 (+tear irq), DSC0 enc/ctl, PP0/PP1, DSI0 controller; salami
+         * adds DSC1 enc/ctl as windows 10/11 (2 LM / 2 DSC / 1 INTF). MDSS top
          * (0xae00000) is excluded: reading it with non-GDSC AHB off reset the SoC. */
         static const uint32_t win[][2]={{0xae01000,0x400},
             {0xae16000,0x290},{0xae36000,0x300},{0xae36800,0x10},{0xae81000,0x4},
             {0xae81100,0x9c},{0xae81f00,0x24},{0xae6a000,0x4},{0xae6b000,0x4},
-            {0xae94000,0x300}};
+            {0xae94000,0x300}
+#if defined(FUXI_SALAMI)
+            ,{0xae81200,0x9c},{0xae81f80,0x24}
+#endif
+            };
         uint32_t index=(uint32_t)st[4] | ((uint32_t)st[5]<<8);
         n=length > 512 ? 512 : length;
         if (value >= sizeof(win)/sizeof(win[0]) || (index|n)&3 ||

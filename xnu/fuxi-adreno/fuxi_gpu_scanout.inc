@@ -69,7 +69,7 @@ static void fg_scanout_xfer_sample(void)
 {
  unsigned line, start;
  if (!fg_scanout_xfer_open || !fg_scanout_read(FG_SCAN_INTF+0x2b0, &line) || !fg_scanout_read(FG_SCAN_CTL+0x1c, &start)) return;
- if ((start & 1) || ((line & 65535) != 0 && (line & 65535) < 2400)) return;
+ if ((start & 1) || ((line & 65535) != 0 && (line & 65535) < FUXI_PANEL_H)) return;
  uint64_t hz = rsr("cntfrq_el0"), us = (rsr("cntpct_el0") - fg_scanout_started)*1000000/hz;
  unsigned bin = 0;
  while (bin < 7 && us >= fg_scanout_xfer_edges[bin]) bin++;
@@ -111,6 +111,12 @@ void fuxi_gpu_scanout_configure(uintptr_t pixels, unsigned enabled, unsigned che
   unsigned triple = PE_parse_boot_argn("fuxiscantriple", &triple_buffer, sizeof(triple_buffer)) && triple_buffer == 1;
   fg_scanout_triple_requested = fg_scanout_double_requested && triple;
   fg_scanout_panel120_requested = PE_parse_boot_argn("fuxipanel120", &panel120, sizeof(panel120)) && panel120 == 1;
+#if defined(FUXI_SALAMI)
+  /* The 120 Hz switch below is the Xiaomi M3 panel's DCS sequence; salami's
+   * Samsung AMB670YF07 has its own (timing@fhd_sa_120). Never send it there. */
+  if (fg_scanout_panel120_requested) printf("FUXI SCANOUT: fuxipanel120 refused on salami (fuxi panel DCS)\n");
+  fg_scanout_panel120_requested = 0;
+#endif
   fg_scanout_te_mode = PE_parse_boot_argn("fuxiscante", &te, sizeof(te)) && te == 1;
   /* The TE gate needs no floor unless one is given explicitly. */
   if (fg_scanout_te_mode) fg_scanout_drain_us = 0;
@@ -219,7 +225,7 @@ static void fg_scanout_probe_run(thread_call_param_t a, thread_call_param_t b)
       !fg_scanout_read(FG_SCAN_CTL+0x1c, &start)) break;
   if (!res[0] && (count >> 16) != fg_scanout_probe_te0) res[0] = now - t0 + 1;
   if (!res[1] && !(start & 1)) res[1] = now - t0 + 1;
-  if ((line & 65535) != 0 && (line & 65535) < 2400) active = 1;
+  if ((line & 65535) != 0 && (line & 65535) < FUXI_PANEL_H) active = 1;
   else if (active && !res[2]) res[2] = now - t0 + 1;
   /* START clears ~17 us after the write, before the MDP starts writing at the next TE: finishing on "clear and never active" ended
    * nearly every probe early. Wait for the TE edge, then 0.5 ms for the line to go active (otherwise the START was a no-op). */
@@ -339,16 +345,16 @@ static void fg_scanout_spin_run(thread_call_param_t a, thread_call_param_t b)
    if (hard && !masked) { irq = ml_set_interrupts_enabled(FALSE); masked = 1; slice = now + fg_scanout_us_to_ticks(FG_SCAN_HARD_SLICE_US); }
    if (!fg_scanout_te_count(&cnt) || !fg_scanout_read(FG_SCAN_INTF+0x2b0, &line) || !fg_scanout_read(FG_SCAN_CTL+0x1c, &start)) break;
    nedge = (cnt - c0) & 0xffffu; c = cnt; line &= 65535;
-   if (nedge && line != 0 && line < 2400) active = 1;
+   if (nedge && line != 0 && line < FUXI_PANEL_H) active = 1;
    /* An idle line with the START bit clear between 1 ms and the minimum transfer time after the predicted edge means the transfer never
     * started there (the START missed that TE, W177: expired/catch_fail/raced ~25% of wakes): it starts one period later. */
-   if (nedge && !active && !(start & 1) && (line == 0 || line >= 2400) && now >= e + fg_scanout_us_to_ticks(FG_SCAN_SPIN_SEEN_US) &&
+   if (nedge && !active && !(start & 1) && (line == 0 || line >= FUXI_PANEL_H) && now >= e + fg_scanout_us_to_ticks(FG_SCAN_SPIN_SEEN_US) &&
        now < e + fg_scanout_us_to_ticks(FG_SCAN_SPIN_MINXFER_US)) { result = FG_SPIN_MISSED; break; }
    /* Done = an edge since the START, the write line idle and either seen active or (START margin to the edge at least 500 us, so the
     * edge was caught) the minimum transfer time elapsed since the edge: the thread call is often late enough to miss the active
     * period (W176). */
    if (nedge && (active || (fg_scanout_spin_m >= fg_scanout_us_to_ticks(FG_SCAN_SPIN_SAFE_US) && now >= e + fg_scanout_us_to_ticks(FG_SCAN_SPIN_MINXFER_US))) &&
-       !(start & 1) && (line == 0 || line >= 2400)) {
+       !(start & 1) && (line == 0 || line >= FUXI_PANEL_H)) {
     idle_t = now;
     if (masked) { (void)ml_set_interrupts_enabled(irq); masked = 0; }
     FG_GUARD;
@@ -577,7 +583,7 @@ static void fg_scanout_mid_account(unsigned count, unsigned gap1)
  unsigned line, immediate = 0;
  while (fg_scanout_read(FG_SCAN_INTF+0x2b0, &line)) {
   line &= 0xffffu;
-  if (line != 0 && line < 2400) { immediate = 1; break; }
+  if (line != 0 && line < FUXI_PANEL_H) { immediate = 1; break; }
   if (rsr("cntpct_el0") >= limit) break;
   delay(5);
  }
@@ -810,7 +816,7 @@ static int fg_scanout_ar_sync(void)
   unsigned bucket;
   (void)fg_scanout_read(FG_SCAN_INTF+0x2b0, &line);
   line &= 0xffffu;
-  bucket = line == 0 || line >= 2400 ? 0 : line < 200 ? 1 : line < 600 ? 2 : line < 1200 ? 3 : 4;
+  bucket = line == 0 || line >= FUXI_PANEL_H ? 0 : line < 200 ? 1 : line < 600 ? 2 : line < 1200 ? 3 : 4;
   fg_scanout_ar_ll[bucket]++;
   if (bucket >= 3) fg_scanout_ar_st[FG_AR_LATCH_MID]++;
   if (b == fg_scanout_front) {
@@ -909,7 +915,7 @@ static void fg_scanout_ar_run(thread_call_param_t a, thread_call_param_t b)
  uint64_t now = rsr("cntpct_el0"), hz = rsr("cntfrq_el0"), elapsed = (now - fg_scanout_ar_t0)*1000000/hz;
  if (fg_scanout_ar_state == 1) {
   fg_scanout_ar_samples++;
-  if (line != 0 && line < 2400) fg_scanout_ar_active++;
+  if (line != 0 && line < FUXI_PANEL_H) fg_scanout_ar_active++;
   /* Duty = share of samples with the write line active. One transfer per TE is 7.92/8.28 = 95.6%, one per N+1 TEs a 1/(N+1) of that. */
   unsigned cnt = fg_scanout_ar_counts[fg_scanout_ar_idx], expect = 956/(cnt + 1), duty = fg_scanout_ar_samples ? fg_scanout_ar_active*1000/fg_scanout_ar_samples : 0;
   if (elapsed >= FG_SCAN_AR_MIN_US && fg_scanout_ar_samples >= 20 && duty*10 >= expect*8) {
@@ -1230,7 +1236,7 @@ static int fg_scanout_acquire(unsigned publication)
  }
  if (!fg_scanout_read(FG_SCAN_INTF+0x2b0, &line) ||
      !fg_scanout_read(FG_SCAN_CTL+0x1c, &start)) return fg_scanout_stop("read transfer status");
- if ((start & 1) || ((line & 65535) != 0 && (line & 65535) < 2400)) {
+ if ((start & 1) || ((line & 65535) != 0 && (line & 65535) < FUXI_PANEL_H)) {
   if (rsr("cntpct_el0") >= fg_scanout_timeout) {
    unsigned rd = 0;
    (void)fg_scanout_read(FG_SCAN_INTF+0x298, &rd);
@@ -1255,14 +1261,14 @@ static int fg_scanout_acquire(unsigned publication)
   }
  }
  if (fg_scanout_double_requested && !fg_scanout_double_initialized) {
-  fg_scanout_pixels_b = fuxi_gpu_nc_pointer(0xb8a00000u, 4320u*2400);
+  fg_scanout_pixels_b = fuxi_gpu_nc_pointer(0xb8a00000u, 4320u*FUXI_PANEL_H);
   if (!fg_scanout_pixels || !fg_scanout_pixels_b) return fg_scanout_stop("double buffer mapping");
-  for (unsigned i = 0; i < 1080u*2400; i++)
+  for (unsigned i = 0; i < 1080u*FUXI_PANEL_H; i++)
    ((volatile uint32_t *)fg_scanout_pixels_b)[i] = ((const volatile uint32_t *)fg_scanout_pixels)[i];
   if (fg_scanout_triple_requested) {
-   fg_scanout_pixels_c = fuxi_gpu_nc_pointer(0xb9400000u, 4320u*2400);
+   fg_scanout_pixels_c = fuxi_gpu_nc_pointer(0xb9400000u, 4320u*FUXI_PANEL_H);
    if (!fg_scanout_pixels_c) return fg_scanout_stop("triple buffer mapping");
-   for (unsigned i = 0; i < 1080u*2400; i++)
+   for (unsigned i = 0; i < 1080u*FUXI_PANEL_H; i++)
     ((volatile uint32_t *)fg_scanout_pixels_c)[i] = ((const volatile uint32_t *)fg_scanout_pixels)[i];
   }
   fg_scanout_double_initialized = fg_scanout_double_active = 1;
@@ -1308,7 +1314,7 @@ int fuxi_gpu_scanout_cpu_acquire(void)
  if (writable != 1 || !fg_scanout_double_active) return writable;
  unsigned newest = fg_scanout_back_ready ? (fg_scanout_triple_requested ? fg_scanout_ready : fg_scanout_front ^ 1u) : fg_scanout_front;
  if (newest) {
-  for (unsigned i = 0; i < 1080u*2400; i++)
+  for (unsigned i = 0; i < 1080u*FUXI_PANEL_H; i++)
    ((volatile uint32_t *)fg_scanout_pixels)[i] = ((const volatile uint32_t *)fg_scanout_pixels_at(newest))[i];
  }
  if (!fg_scanout_address(0xb8000000u)) return fg_scanout_stop("CPU restore A");
@@ -1522,7 +1528,7 @@ int fuxi_gpu_scanout_publish(void)
  if (r == 1 && fg_abi_spin) fg_scanout_spin_stat[FG_SPIN_DIRECT]++;
  if (r == 2) {
   fg_scanout_kick_why = 0;
-  if (fg_abi_hard) { unsigned line, start; fg_scanout_offer_xfer = fg_scanout_read(FG_SCAN_CTL+0x1c, &start) && fg_scanout_read(FG_SCAN_INTF+0x2b0, &line) && ((start & 1) || ((line & 65535) != 0 && (line & 65535) < 2400)); }
+  if (fg_abi_hard) { unsigned line, start; fg_scanout_offer_xfer = fg_scanout_read(FG_SCAN_CTL+0x1c, &start) && fg_scanout_read(FG_SCAN_INTF+0x2b0, &line) && ((start & 1) || ((line & 65535) != 0 && (line & 65535) < FUXI_PANEL_H)); }
   fg_scanout_spin_kick(0);
  }
  return r;

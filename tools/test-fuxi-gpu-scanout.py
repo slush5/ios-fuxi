@@ -23,6 +23,14 @@ def module(name, path):
 
 
 PREFIX = r'''
+/* fuxi_adreno.h panel geometry, not pasted here. Fuxi defaults (the model
+ * asserts 1080x2400), guarded so a definition already in scope wins. */
+#ifndef FUXI_PANEL_H
+#define FUXI_PANEL_H 2400u
+#endif
+#ifndef FUXI_PANEL_MAP
+#define FUXI_PANEL_MAP ((4320u*FUXI_PANEL_H+16383u)&~16383u)
+#endif
 #include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -180,6 +188,14 @@ static void phase_run(uint64_t e,unsigned c,unsigned hold,unsigned wakeOff) {
  fg_scanout_spin_c0=c;fg_scanout_ph_wake=ticks;fg_scanout_spin_busy=1;probeScript=phase_script;phase_script();
  fg_scanout_spin_run(0,0);probeScript=0;}
 static void panel120_tests(uint8_t *panel) {
+#if defined(FUXI_SALAMI)
+ // salami refuses fuxipanel120 (the Xiaomi M3 panel DCS): the exact opt-in
+ // behaves like no opt-in, so no DSI read, write or command ever happens.
+ reset();panel120_setup();panel120_drain(panel);
+ assert(fuxi_gpu_scanout_acquire()==1 && !fg_scanout_panel120_requested && !dsiReads && !dmaStarts);
+ assert(!fg_scanout_panel120_active && fg_scanout_period_us==16667);
+ return;
+#endif
  // Exact boot-arg admission; no ownership means no DSI read, write, or command.
  reset();panel120_setup();modelPanel120=0;panel120_drain(panel);
  assert(fuxi_gpu_scanout_acquire()==1 && !fg_scanout_panel120_requested && !dsiReads && !dmaStarts);
@@ -1114,11 +1130,13 @@ def main():
         probe = (ROOT / 'shim/fuxi-probe/probe.c').read_text()
         body = probe.split('} else if (type == 0xc0 && req == 0x4e) {', 1)[1].split(
             '} else if (type == 0xc0 && req == 0x4f)', 1)[0]
+        # The salami branch of the body reads the shared geometry (gpu-handoff.h).
         compile_run(tmp, 'screenshot', r"""
 #include <assert.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include "gpu-handoff.h"
 static uint32_t base,pitch=4320,format=0x237ff;
 static uint64_t copiedFrom;static unsigned copiedBytes;
 static uint32_t usb_rd(unsigned block,unsigned offset) {
@@ -1136,7 +1154,11 @@ static bool screenshot(uint64_t requestedOffset,unsigned length) {
  return ok;
 }
 int main(void) {
+#if defined(FUXI_SALAMI)
+ const unsigned size=4320u*2412; /* salami frame, 1080x2412 */
+#else
  const unsigned size=4320u*2400;
+#endif
  for(unsigned b=0;b<3;b++) {
   base=0xb8000000u+b*0xa00000u;
   assert(screenshot(123,1024) && copiedFrom==(uint64_t)base+123 && copiedBytes==512);
@@ -1152,7 +1174,7 @@ int main(void) {
  puts("PASS: actual USB screenshot request, current A/B/C base, one-frame bounds, pitch/format refusals and length cap");
  return 0;
 }
-""")
+""", includes=(ROOT / 'shim/fuxi-probe',))
         # Compile final production SweetSurface, including the reservation changes.
         source = (ROOT / 'xnu/fuxi-scanout/SweetSurface.cpp').read_text()
         declarations = source[source.index('struct sweet_gpu_backing'):source.index('static bool sweet_gpu_init')]

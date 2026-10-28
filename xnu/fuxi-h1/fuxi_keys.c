@@ -2,10 +2,17 @@
  * FUXI keys: polled Power / Volume up / Volume down for SweetHIDButtons.
  * Hardware (live DT research/device/probe-09/live.dtb, docs-lanes/buttons.md):
  *   Power    PMK8550 SID 0, pon_hlos@1300 RT_STS 0x1310 bit 7 (KPDPWR_N_SET)
- *   Vol down PMK8550 SID 0, same register, bit 6 (RESIN_N_SET)
- *   Vol up   PM8550 SID 1, GPIO6 @0x8d00, RT_STS 0x8d10 bit 0, active low
+ *   RESIN    PMK8550 SID 0, same register, bit 6 (RESIN_N_SET)
+ *   GPIO6    PM8550 SID 1, GPIO6 @0x8d00, RT_STS 0x8d10 bit 0, active low
  *            (gpio_keys/vol_up: gpios <pm8550_gpios 6 GPIO_ACTIVE_LOW>,
  *            key_vol_up_default: input, pull-up, power-source 1)
+ * Which volume key each source is depends on the board:
+ *   fuxi (Xiaomi 13):          GPIO6 = volume up,   RESIN = volume down
+ *   salami (OnePlus 11, FUXI_SALAMI, salami-live.dts pon_hlos@1300 and
+ *   /soc/gpio_keys):           RESIN = volume up (resin linux,code 0x73
+ *                              KEY_VOLUMEUP), GPIO6 = volume down (the node
+ *                              is still named vol_up, but its linux,code is
+ *                              0x72 KEY_VOLUMEDOWN). Same pin and config.
  * SPMI PMIC arbiter v7 (qcom,spmi@c42d000, EE 0): core 0x0c400000 (APID map
  * 0x2000 + 4n), cnfg 0x0c42d000 (owner 4n), obsrvr 0x0c440000 (0x20 per
  * APID), chnls 0x0c500000 (0x1000 per APID). Offsets as Linux
@@ -62,6 +69,20 @@ bool fuxi_keys_touch_wake(void);
 #define FK_PON_PWR     0x80u
 #define FK_PON_RESIN   0x40u
 #define FK_NO_APID     0xffffu
+/* HID volume key fed by PM8550 GPIO6 (fk_names order); RESIN feeds the other. */
+#if defined(FUXI_SALAMI)
+#define FK_GPIO6_KEY   "volume-down"
+#else
+#define FK_GPIO6_KEY   "volume-up"
+#endif
+/* Panel rows in touch coordinates: fuxi 1080x2400, salami 1080x2412. */
+#ifndef FUXI_PANEL_H
+#if defined(FUXI_SALAMI)
+#define FUXI_PANEL_H   2412u
+#else
+#define FUXI_PANEL_H   2400u
+#endif
+#endif
 
 static vm_offset_t fk_core, fk_cnfg, fk_obs;
 static uint16_t fk_pon_apid = FK_NO_APID, fk_gpio_apid = FK_NO_APID;
@@ -288,16 +309,22 @@ fk_setup(void)
 		}
 	}
 	if (!gok || !fk_gpio_input(subtype, mode, en)) {
-		printf("FUXI KEYS: gpio6 not an enabled input; volume-up withheld\n");
+		printf("FUXI KEYS: gpio6 not an enabled input; " FK_GPIO6_KEY " withheld\n");
 		fk_gpio_apid = FK_NO_APID;
 	}
 	if (fk_pon_apid == FK_NO_APID && fk_gpio_apid == FK_NO_APID) {
 		printf("FUXI KEYS: no readable keys\n");
 		return false;
 	}
+	int pon_ok = fk_pon_apid != FK_NO_APID, gpio_ok = fk_gpio_apid != FK_NO_APID;
+#if defined(FUXI_SALAMI)
+	printf("FUXI KEYS: salami volume map: RESIN=volume-up GPIO6=volume-down\n");
 	printf("FUXI KEYS: polling every 20 ms (power=%d volume-up=%d volume-down=%d)\n",
-	    fk_pon_apid != FK_NO_APID, fk_gpio_apid != FK_NO_APID,
-	    fk_pon_apid != FK_NO_APID);
+	    pon_ok, pon_ok, gpio_ok);
+#else
+	printf("FUXI KEYS: polling every 20 ms (power=%d volume-up=%d volume-down=%d)\n",
+	    pon_ok, gpio_ok, pon_ok);
+#endif
 	return true;
 }
 
@@ -316,8 +343,15 @@ fk_thread(void *arg, wait_result_t result)
 		uint64_t t = mach_absolute_time();
 		bool pok = fk_read(fk_pon_apid, FK_PON_RT, &pon);
 		bool gok = fk_read(fk_gpio_apid, 0x10, &gpio);
+#if defined(FUXI_SALAMI)
+		/* salami: RESIN is volume up, PM8550 GPIO6 (active low) volume down. */
+		bool ok[3] = {pok, pok, gok};
+		int now[3] = {!!(pon & FK_PON_PWR), !!(pon & FK_PON_RESIN), !(gpio & 1u)};
+#else
+		/* fuxi: PM8550 GPIO6 (active low) is volume up, RESIN volume down. */
 		bool ok[3] = {pok, gok, pok};
 		int now[3] = {!!(pon & FK_PON_PWR), !(gpio & 1u), !!(pon & FK_PON_RESIN)};
+#endif
 		bool failed = (fk_pon_apid != FK_NO_APID && !pok) ||
 		    (fk_gpio_apid != FK_NO_APID && !gok);
 		if (fuxi_keys_failed(&errors, failed)) {
@@ -472,7 +506,8 @@ fk_touch_script(void *arg, wait_result_t wr)
  * prints "FUXI TOUR: shot N name" and holds for fuxitourhold=H seconds
  * (default 45) so the USB monitor can read the framebuffer. Tap targets match
  * the stock iOS 16 home layout at 1080x2400; fuxitourg=Y and fuxitoura=Y move
- * the General and About rows in Settings. Device tests only (synthetic touch).
+ * the General and About rows in Settings (Y below the panel height,
+ * FUXI_PANEL_H). Device tests only (synthetic touch).
  */
 static unsigned fk_tour_hold = 45, fk_tour_general = 2100, fk_tour_about = 400;
 
@@ -675,10 +710,10 @@ fuxi_keys_init(void)
 		if (PE_parse_boot_argn("fuxitourhold", &v, sizeof(v)) && v >= 5 && v <= 300) {
 			fk_tour_hold = v;
 		}
-		if (PE_parse_boot_argn("fuxitourg", &v, sizeof(v)) && v < 2400) {
+		if (PE_parse_boot_argn("fuxitourg", &v, sizeof(v)) && v < FUXI_PANEL_H) {
 			fk_tour_general = v;
 		}
-		if (PE_parse_boot_argn("fuxitoura", &v, sizeof(v)) && v < 2400) {
+		if (PE_parse_boot_argn("fuxitoura", &v, sizeof(v)) && v < FUXI_PANEL_H) {
 			fk_tour_about = v;
 		}
 		if (kernel_thread_start(fk_tour, (void *)(uintptr_t)tour, &thread) == KERN_SUCCESS) {

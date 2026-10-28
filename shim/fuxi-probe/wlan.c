@@ -209,9 +209,7 @@ static void wl_mark(unsigned step)
  /* XNU copy (bsd/dev/wlan.c via xnu/patches/0099): log, no scanout paint. */
  printf("FUXI WLAN: step %u\n", step);
 #else
- if (usb_rd(0xae05000, 0x14) != 0xb8000000 || usb_rd(0xae05000, 0x24) != 4320 ||
-     usb_rd(0xae05000, 0x00) != ((2400u << 16) | 1080u) ||
-     usb_rd(0xae05000, 0x30) != 0x237ff) return;
+ if (!probe_paint_ok()) return;
  volatile uint32_t *fb = (volatile uint32_t *)0xb8000000UL;
  char text[] = "WLAN M3 STEP 00";
  text[13] = (char)('0' + step / 10); text[14] = (char)('0' + step % 10);

@@ -26,7 +26,30 @@ def function(source, name):
     return source[match.start():end] + '\n'
 
 
-PREFIX = r'''
+# The pasted driver fragments use fuxi_adreno.h's panel geometry, which these
+# harnesses do not paste. Fuxi defaults, guarded so a definition already in
+# scope (a pasted fuxi_adreno.h, or -DFUXI_PANEL_H=...) wins. The models
+# assert Fuxi values (1080x2400, 0x9e4000), so these stay the Fuxi ones.
+PANEL_DEFAULTS = r'''
+#ifndef FUXI_PANEL_H
+#define FUXI_PANEL_H 2400u
+#endif
+#ifndef FUXI_PANEL_MAP
+#define FUXI_PANEL_MAP ((4320u*FUXI_PANEL_H+16383u)&~16383u)
+#endif
+'''
+# FUXI_PANEL_MAP per board: one 1080-wide ARGB8888 frame rounded up to 16 KiB.
+PANEL_MAPS = {h: (4320*h + 16383) & ~16383 for h in (2400, 2412)}  # fuxi, salami
+assert PANEL_MAPS[2400] == 0x9e4000 and PANEL_MAPS[2412] == 0x9f0000
+
+
+def windows(adapter, height):
+    """fg_windows (pa, size) pairs; FUXI_PANEL_MAP sizes resolved for one panel height."""
+    return [(int(a, 16), PANEL_MAPS[height] if n == 'FUXI_PANEL_MAP' else int(n, 16))
+            for a, n in re.findall(r'\{(0x[0-9a-f]+),(0x[0-9a-f]+|FUXI_PANEL_MAP),0\}', adapter)]
+
+
+PREFIX = PANEL_DEFAULTS + r'''
 #include <assert.h>
 #define FG_GUARD
 #include <stdint.h>
@@ -422,15 +445,17 @@ def main():
     adapter = sync.added_file('fuxi_adreno.c')
     for n in ('fuxi_gpu_copy', 'fuxi_gpu_poll'):
         assert not any(x in function(adapter, n) for x in ('thread_block', 'assert_wait', 'fg_sleep', 'delay('))
-    windows = [(int(a, 16), int(b, 16)) for a, b in re.findall(r'\{(0x[0-9a-f]+),(0x[0-9a-f]+),0\}', adapter)]
-    for pa, size in ((0x100000, 0x80000), (0x3d00000, 0x40000), (0x3d50000, 0x40000),
-                     (0x3d90000, 0x10000), (0x3da0000, 0x40000), (0xb280000, 0x8000),
-                     (0x81c60000, 0x20000), (0x9b098000, 0x4000), (0xae04000, 0x4000)):
-        assert any(a <= pa and pa + size <= a + n for a, n in windows), hex(pa)
-    for i, (a, n) in enumerate(windows):
-        assert not (a & 16383) and not (n & 16383)
-        for b, m in windows[i+1:]:
-            assert a + n <= b or b + m <= a, 'overlapping platform mappings'
+    for height in PANEL_MAPS:
+        board = windows(adapter, height)
+        for pa, size in ((0x100000, 0x80000), (0x3d00000, 0x40000), (0x3d50000, 0x40000),
+                         (0x3d90000, 0x10000), (0x3da0000, 0x40000), (0xb280000, 0x8000),
+                         (0x81c60000, 0x20000), (0x9b098000, 0x4000), (0xae04000, 0x4000),
+                         (0xb8a00000, 4320*height), (0xb9400000, 4320*height)):
+            assert any(a <= pa and pa + size <= a + n for a, n in board), hex(pa)
+        for i, (a, n) in enumerate(board):
+            assert not (a & 16383) and not (n & 16383)
+            for b, m in board[i+1:]:
+                assert a + n <= b or b + m <= a, 'overlapping platform mappings'
     functions = ''.join(function(probe, n) for n in ('g3_parity', 'g3_pkt7', 'g4_pkt4', 'g4_reg', 'g4_event', 'g4_wfi', 'g4_setup', 'g4_end'))
     functions += function((ROOT / 'xnu/fuxi-adreno/fuxi_gpu_scanout.inc').read_text(), 'fg_scanout_target')
     functions += ''.join(function(adapter, n) for n in ('fg_fail', 'fg_isolate', 'fuxi_gpu_unmap', 'fuxi_gpu_map', 'fg_rect', 'fg_clean', 'fg_ring_doorbell', 'fuxi_gpu_poll', 'fuxi_gpu_copy'))

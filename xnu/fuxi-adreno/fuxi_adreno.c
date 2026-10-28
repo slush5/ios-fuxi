@@ -22,6 +22,9 @@
 #include "fuxi_adreno.h"
 #include "fuxi_gpu_dcvs.h"
 #include "gpu-handoff.h"
+#if FUXI_PANEL_H != FG_FB_H
+#error "fuxi_adreno.h FUXI_PANEL_H differs from gpu-handoff.h FG_FB_H"
+#endif
 #include <IOKit/IOLocks.h>
 #include "fuxi_gpu_abi.h"
 #include "fuxi_abi_wire.h"
@@ -53,8 +56,8 @@ static struct fg_window fg_windows[] = {
  {FG_SCRATCH,FG_SCRATCH_SIZE,0}, {0x9b098000,0x4000,0},
  {0xae04000,0x4000,0},
  {0xae14000,0x4000,0}, {0xae34000,0x4000,0},
- {0xb8a00000,0x9e4000,0}, /* reserved splash buffer B, fuxiscandouble=1 only */
- {0xb9400000,0x9e4000,0}, /* reserved splash buffer C, fuxiscantriple=1 only */
+ {0xb8a00000,FUXI_PANEL_MAP,0}, /* reserved splash buffer B, fuxiscandouble=1 only */
+ {0xb9400000,FUXI_PANEL_MAP,0}, /* reserved splash buffer C, fuxiscantriple=1 only */
  {0xae94000,0x4000,0}, /* DSI0 command FIFO, fuxipanel120=1 only */
 };
 static uint64_t fg_mapped_bytes;
@@ -596,12 +599,17 @@ static void fg_thread(thread_call_param_t arg, thread_call_param_t result)
      gpu_extra[13][2], gpu_extra[11][2]);
  fg_clock_log();
  if (fg_limit < 17 || fg_force == 1) { fg_fail("diagnostic stop after self-test", fg_limit); goto out; }
- /* Double mode validates SRC0 under display ownership, failing closed there. */
- if ((!fg_scanout_double_requested && g3_read(0xae05014) != G4_FB_PA) || g3_read(0xae05024) != 4320 ||
-     g3_read(0xae05000) != (2400u<<16 | 1080u) || g3_read(0xae05030) != 0x237ff ||
-     !g_map_at(G3_PT, &g3_next, G4_FB_VA, G4_FB_PA, (4320*2400+4095)&~4095u, 1u<<6) ||
-     (fg_scanout_double_requested && !g_map_at(G3_PT, &g3_next, G4_FB_VA+0xa00000u, 0xb8a00000u, (4320*2400+4095)&~4095u, 1u<<6)) ||
-     (fg_scanout_triple_requested && !g_map_at(G3_PT, &g3_next, G4_FB_VA+0x1400000u, 0xb9400000u, (4320*2400+4095)&~4095u, 1u<<6)) ||
+ /* The ABL-scanout guard of gpu-handoff.h (fg_abl_scanout_ok): same SSPP0
+  * reads in the same order, values from the handoff (FUXI_PANEL_H == FG_FB_H,
+  * checked at the top), so a -DFG_ABL_SSPP_FORMAT build agrees with the
+  * loader. Written out, not through a reader callback, so fg_thread stays
+  * self-contained (host tests lift it alone) and double mode can skip the
+  * SRC0 read: it validates SRC0 under display ownership, failing closed there. */
+ if ((!fg_scanout_double_requested && g3_read(0xae05014) != G4_FB_PA) || g3_read(0xae05024) != FG_FB_STRIDE ||
+     g3_read(0xae05000) != (FUXI_PANEL_H<<16 | 1080u) || g3_read(0xae05030) != FG_ABL_SSPP_FORMAT ||
+     !g_map_at(G3_PT, &g3_next, G4_FB_VA, G4_FB_PA, (4320*FUXI_PANEL_H+4095)&~4095u, 1u<<6) ||
+     (fg_scanout_double_requested && !g_map_at(G3_PT, &g3_next, G4_FB_VA+0xa00000u, 0xb8a00000u, (4320*FUXI_PANEL_H+4095)&~4095u, 1u<<6)) ||
+     (fg_scanout_triple_requested && !g_map_at(G3_PT, &g3_next, G4_FB_VA+0x1400000u, 0xb9400000u, (4320*FUXI_PANEL_H+4095)&~4095u, 1u<<6)) ||
      !fg_source_tables()) { fg_fail("scanout geometry/mapping", 4); goto out; }
  uint32_t tlb[128] = {0};
  if (g4_tlb(tlb) || fg_access_failed) { fg_fail("initial TLB sync", 5); goto out; }
@@ -647,7 +655,7 @@ void fuxi_gpu_start(uint64_t fb, unsigned width, unsigned height, unsigned pitch
  (void)PE_parse_boot_argn("fuxigpu_stage", &fg_limit, sizeof(fg_limit));
  (void)PE_parse_boot_argn("fuxigpu_fail", &fg_force, sizeof(fg_force));
  if ((fg_limit != 13 && fg_limit != 16 && fg_limit != 17) ||
-     fb != G4_FB_PA || width != 1080 || height != 2400 || pitch != 4320) {
+     fb != G4_FB_PA || width != 1080 || height != FUXI_PANEL_H || pitch != 4320) {
   fg_fail("unsupported boot framebuffer/stage", fg_limit); return;
  }
  /* Static storage avoids kernel_thread_start's NOFAIL thread/stack allocation
@@ -756,14 +764,14 @@ int fuxi_gpu_copy(unsigned slot, uint64_t generation, uintptr_t source, uint64_t
  if (fg_scanout_owned && !fg_scanout_writable) return 0;
  if (fg_client_busy) fg_abi_present_wait = 1;
  if (!fuxi_gpu_ready() || fg_busy || fg_client_busy || slot >= FG_CACHE_SLOTS || fg_generation[slot] != generation) return 0;
- if (!width || !height || width > 1080 || height > 2400 || dx > 1080-width || dy > 2400-height ||
+ if (!width || !height || width > 1080 || height > FUXI_PANEL_H || dx > 1080-width || dy > FUXI_PANEL_H-height ||
      (source & 3) || (pitch & 3) || pitch > 131008 || ((uint64_t)sx+width)*4 > pitch ||
      length+(source&4095) > FG_SOURCE_BYTES ||
      ((uint64_t)sy+height-1)*pitch+((uint64_t)sx+width)*4 > length) return 0;
  if (fg_scanout_double_active) {
   /* CA supplies a complete surface; expand damage to the complete panel. */
   if (sx < dx || sy < dy) return 0;
-  sx -= dx; sy -= dy; dx = dy = 0; width = 1080; height = 2400;
+  sx -= dx; sy -= dy; dx = dy = 0; width = 1080; height = FUXI_PANEL_H;
   if (((uint64_t)sx+width)*4 > pitch ||
       ((uint64_t)sy+height-1)*pitch+((uint64_t)sx+width)*4 > length) return 0;
  }

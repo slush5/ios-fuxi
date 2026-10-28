@@ -780,6 +780,18 @@ fuxi_touch_init(void)
 	}
 	ft.started = true;
 	(void)PE_parse_boot_argn("fuxitouch", &enabled, sizeof(enabled));
+#if defined(FUXI_SALAMI)
+	/*
+	 * salami (OnePlus 11) has a Synaptics S3908 on I2C, not this ST FTS on
+	 * SPI: ft_thread's ft_clock() would reprogram GCC 0x52008 and the SE4
+	 * clock before ft_se_init() refused protocol 3. Refused here, before
+	 * any register write, until the S3908 TouchComm driver lands. Cleared
+	 * rather than returned, so nothing below becomes unreachable code
+	 * under -Weverything -Werror.
+	 */
+	printf("FUXI TOUCH: FTS/SPI driver refused on salami (S3908 TouchComm pending)\n");
+	enabled = 0;
+#endif
 	if (!enabled) {
 		return;
 	}

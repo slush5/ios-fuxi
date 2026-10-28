@@ -374,6 +374,31 @@ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
  * app-switcher gesture.
  */
 #define SWEET_TOUCH_EDGE_PX 48
+/*
+ * Touch coordinates arrive in panel pixels, 1080 wide. The panel height is
+ * taken from the boot framebuffer (PE_Video), the same source AppleCLCD
+ * centres its presented display on, so touch and display always agree.
+ * Without a usable boot framebuffer the board's panel is assumed:
+ * fuxi (Xiaomi 13) 1080x2400, 68x151 mm; salami (OnePlus 11, FUXI_SALAMI,
+ * timing fhd_sa_60) 1080x2412, 70x156 mm.
+ */
+#define SWEET_TOUCH_PANEL_W 1080
+#define SWEET_TOUCH_LOGICAL_W 1125	/* iPhone X, as SweetFramebuffer.cpp */
+#define SWEET_TOUCH_LOGICAL_H 2436
+#ifndef FUXI_PANEL_H
+#if defined(FUXI_SALAMI)
+#define FUXI_PANEL_H 2412u
+#else
+#define FUXI_PANEL_H 2400u
+#endif
+#endif
+#if defined(FUXI_SALAMI)
+#define SWEET_TOUCH_SURFACE_W_MM 70
+#define SWEET_TOUCH_SURFACE_H_MM 156
+#else
+#define SWEET_TOUCH_SURFACE_W_MM 68
+#define SWEET_TOUCH_SURFACE_H_MM 151
+#endif
 class SweetHIDTouch : public IOHIDEventService {
 	OSDeclareDefaultStructors(SweetHIDTouch);
 public:
@@ -456,20 +481,37 @@ SweetHIDTouch::start(IOService *provider)
 	if (!fLock || !IOHIDEventService::start(provider)) {
 		return false;
 	}
+	PE_Video video = {};
+	PE_current_console(&video);
+	int panelH = (int)FUXI_PANEL_H;
+	bool fromVideo = video.v_baseAddr != 0 && video.v_width == SWEET_TOUCH_PANEL_W &&
+	    video.v_height > 2 * SWEET_TOUCH_EDGE_PX && video.v_height <= SWEET_TOUCH_LOGICAL_H &&
+	    ((SWEET_TOUCH_LOGICAL_H - video.v_height) & 1) == 0;
+	if (fromVideo) {
+		panelH = (int)video.v_height;
+	}
+	/*
+	 * Same centring as AppleCLCD::start. touch()/report() take the panel
+	 * height back as fLogicalH - 2 * fOffY, exact only for an even margin:
+	 * both panels have one (2436 - 2400 = 36, 2436 - 2412 = 24), and
+	 * fromVideo refuses an odd one (it would clamp one row past the panel).
+	 */
 	int native = 0;
 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
-	fLogicalW = native ? 1080 : 1125;
-	fLogicalH = native ? 2400 : 2436;
-	fOffX = (fLogicalW - 1080) / 2;
-	fOffY = (fLogicalH - 2400) / 2;
+	fLogicalW = native ? SWEET_TOUCH_PANEL_W : SWEET_TOUCH_LOGICAL_W;
+	fLogicalH = native ? panelH : SWEET_TOUCH_LOGICAL_H;
+	fOffX = (fLogicalW - SWEET_TOUCH_PANEL_W) / 2;
+	fOffY = (fLogicalH - panelH) / 2;
 	/* The digitizer covers the main display (backboardd maps it 1:1). */
 	setProperty("DisplayIntegrated", kOSBooleanTrue);
-	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
-	setProperty("SurfaceHeight", (unsigned long long)(151 << 16), 32);
+	setProperty("SurfaceWidth", (unsigned long long)(SWEET_TOUCH_SURFACE_W_MM << 16), 32);	/* mm, 16.16 */
+	setProperty("SurfaceHeight", (unsigned long long)(SWEET_TOUCH_SURFACE_H_MM << 16), 32);
 	fSeenKeys = OSSet::withCapacity(SWEET_TOUCH_SEEN_KEYS);
 	gSweetTouch = this;
 	registerService();
-	IOLog("SWEET HID: touch registered\n");
+	IOLog("SWEET HID: touch registered (panel %dx%d from %s, logical %dx%d)\n",
+	    SWEET_TOUCH_PANEL_W, panelH, fromVideo ? "boot framebuffer" : "board default",
+	    fLogicalW, fLogicalH);
 	return true;
 }
 
@@ -521,8 +563,9 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
 	if (finger < 0 || finger >= SWEET_TOUCH_FINGERS) {
 		return;
 	}
+	int maxY = fLogicalH - 2 * fOffY - 1;	/* last panel row, see start() */
 	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
+	y = y < 0 ? 0 : (y > maxY ? maxY : y);
 
 	IOLockLock(fLock);
 	bool was = fDown[finger];
@@ -536,7 +579,7 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
 	}
 	if (!was && down) {
 		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
-		    y < SWEET_TOUCH_EDGE_PX || y > 2399 - SWEET_TOUCH_EDGE_PX;
+		    y < SWEET_TOUCH_EDGE_PX || y > maxY - SWEET_TOUCH_EDGE_PX;
 	}
 
 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
@@ -620,20 +663,21 @@ SweetHIDTouch::report(UInt32 mask, const int *x, const int *y)
 	bool edge[SWEET_TOUCH_FINGERS];
 	UInt32 old = 0, changed = 0;
 	uint64_t now = mach_absolute_time();
+	int maxY = fLogicalH - 2 * fOffY - 1;	/* last panel row, see start() */
 
 	IOLockLock(fLock);
 	for (int i = 0; i < SWEET_TOUCH_FINGERS; i++) {
 		UInt32 bit = 1u << i;
 		bool down = (mask & bit) != 0;
 		int px = x[i] < 0 ? 0 : (x[i] > 1079 ? 1079 : x[i]);
-		int py = y[i] < 0 ? 0 : (y[i] > 2399 ? 2399 : y[i]);
+		int py = y[i] < 0 ? 0 : (y[i] > maxY ? maxY : y[i]);
 		old |= fDown[i] ? bit : 0;
 		/* A lift keeps the last reported position, not the leave payload. */
 		nx[i] = down ? (IOFixed)(((int64_t)(px + fOffX) << 16) / fLogicalW) : fX[i];
 		ny[i] = down ? (IOFixed)(((int64_t)(py + fOffY) << 16) / fLogicalH) : fY[i];
 		edge[i] = !fDown[i] && down ?
 		    px < SWEET_TOUCH_EDGE_PX || px > 1079 - SWEET_TOUCH_EDGE_PX ||
-		    py < SWEET_TOUCH_EDGE_PX || py > 2399 - SWEET_TOUCH_EDGE_PX : fEdge[i];
+		    py < SWEET_TOUCH_EDGE_PX || py > maxY - SWEET_TOUCH_EDGE_PX : fEdge[i];
 		if (fDown[i] != down || (down && (nx[i] != fX[i] || ny[i] != fY[i]))) {
 			changed |= bit;
 		}

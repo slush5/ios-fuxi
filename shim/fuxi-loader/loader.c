@@ -8,6 +8,9 @@
 void probe_main(uintptr_t fdt);
 uint64_t probe_fdt_address(void);
 uint32_t probe_fdt_bytes(void);
+#if defined(FUXI_SALAMI)
+const char *probe_splash_overlap(void);
+#endif
 
 #define BOOT_LINE_LENGTH	608
 #define PAGE_16K		0x4000UL
@@ -208,18 +211,28 @@ static const char *loader_boot(void)
 	return "xnu returned";
 }
 
+/* SSPP0 register for the shared ABL-scanout guard; MMU off, so a plain Device read. */
+static uint32_t sspp0_rd(const void *ctx, uint32_t off)
+{
+ (void)ctx;
+ return *(volatile uint32_t *)(FG_SSPP0 + off);
+}
+
 void loader_main(uintptr_t fdt)
 {
  probe_main(fdt);
  monitor_report[MON_STAGE]=4;
+ const char *error=0;
+#if defined(FUXI_SALAMI)
+ /* con_clear() below paints the whole splash: refuse before it can reach the payload or FDT. */
+ error=probe_splash_overlap();
+#endif
  /* Refuse to draw unless ABL left the measured SSPP0/CTL0 splash active. */
- volatile uint32_t *sspp=(volatile uint32_t *)0xae05000;
- if (sspp[0x14/4] != 0xb8000000 || sspp[0x24/4] != 4320 ||
-     sspp[0] != ((2400u<<16)|1080u) || sspp[0x30/4] != 0x237ff)
+ if (error || !fg_abl_scanout_ok(sspp0_rd, 0))
   con_fb=0; /* USB diagnostics also work without a usable inherited scanout. */
  con_clear(BLUE);
  con_str("FUXI", "XNU loader + USB monitor");
- const char *error=loader_boot();
+ if (!error) error=loader_boot();
  con_str("ERROR", error);
  for (unsigned i=0;i<sizeof(monitor_error)-1 && error[i];i++) monitor_error[i]=error[i];
  monitor_report[MON_STAGE]=99;

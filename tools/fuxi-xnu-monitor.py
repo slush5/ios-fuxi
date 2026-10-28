@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 import re
 import struct
+import sys
 import time
 import zlib
 
@@ -18,6 +19,31 @@ import usb.util
 
 MON_FIELDS = 'magic delegate active usb_mpidr launch stage boot_args entry deadline image end'.split()
 WANTED = {'_fuxi_early_status', '_sweet_log_ring', '_sweet_log_total'}
+FB_FUXI = (1080, 2400, 4320)   # Fuxi panel and ABL stride: used when the ADT has no sweet-fbcon
+FB_SLOT = 0xa00000             # one ABL splash scanout slot, the most request 0x4e can serve
+
+
+def fb_geometry(payload, rows=None):
+    """(width, height, stride) of the inherited framebuffer to save.
+
+    From the payload ADT sweet-fbcon node (1080x2400 on Fuxi, 1080x2412 on salami;
+    the loader serves exactly stride*height bytes), Fuxi's geometry when the ADT
+    has no such node; rows (--fb-rows) overrides the height."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import adt  # tools/adt.py, only needed for --framebuffer/--tour-shots
+    adt_off, adt_size = struct.unpack_from('<2Q', payload, 0x20)
+    if not adt_size or adt_off + adt_size > len(payload):
+        raise ValueError('payload ADT is out of range')
+    root, _ = adt.parse(payload[adt_off:adt_off + adt_size])
+    w, h, s = FB_FUXI
+    fbcon = next((c for c in root.children if c.name == 'sweet-fbcon'), None)
+    if fbcon is not None:
+        w, h, s = (struct.unpack('<I', fbcon.prop(k))[0] for k in ('width', 'height', 'stride'))
+    if rows is not None:
+        h = rows
+    if not (w > 0 and h > 0 and s >= 4 * w and s % 4 == 0 and s * h <= FB_SLOT):
+        raise ValueError(f'framebuffer {w}x{h} stride {s} is not one scanout slot')
+    return w, h, s
 
 
 def symbols(path):
@@ -148,6 +174,7 @@ def main():
     ap.add_argument('--seconds', type=float, default=65)
     ap.add_argument('--framebuffer',action='store_true',help='save the validated inherited framebuffer after collecting logs')
     ap.add_argument('--tour-shots',action='store_true',help='also save framebuffer-shotN-NAME.png at each "FUXI TOUR: shot N NAME" console line (fuxitour=S)')
+    ap.add_argument('--fb-rows',type=int,metavar='ROWS',help='framebuffer rows to save (default: the payload ADT sweet-fbcon height, 2400 on Fuxi, 2412 on salami)')
     ap.add_argument('--skip-clocks',action='store_true',help='do not take the AHB-ungating clock snapshot before handoff')
     ap.add_argument('--reset-minutes',type=int,help='move the monitor PSCI reset deadline to now + N minutes (1-60)')
     ap.add_argument('--touch-test',type=float,metavar='SECONDS',help='before handoff: touch snapshot, power-up, then poll touch events for SECONDS')
@@ -172,6 +199,12 @@ def main():
     cmdline = payload[72:680].split(b'\0')[0].decode()
     if 'fuxiperf=1' in cmdline.split() and (args.cpu_level or args.cpu_at):
         ap.error('fuxiperf=1 owns EPSS: do not pass --cpu-level or --cpu-at')
+    fb_w, fb_h, fb_s = FB_FUXI
+    if args.framebuffer or args.tour_shots:
+        try:
+            fb_w, fb_h, fb_s = fb_geometry(payload, args.fb_rows)
+        except (ImportError, ValueError, TypeError, IndexError, struct.error) as error:
+            ap.error(f'framebuffer geometry: {error}')
     offsets = {name: value - virt for name, value in symbols(args.kernel).items()}
     if any(not 0 <= off < size - 0x400000 for off in offsets.values()):
         ap.error('symbol outside XNU window')
@@ -349,19 +382,20 @@ def main():
     renew = time.monotonic() + 600
     def save_framebuffer(name):
         raw=bytearray()
-        for off in range(0,1080*2400*4,512):
-            raw.extend(request(0x4e,min(512,1080*2400*4-off),off&0xffff,off>>16))
+        fb_bytes=fb_s*fb_h
+        for off in range(0,fb_bytes,512):
+            raw.extend(request(0x4e,min(512,fb_bytes-off),off&0xffff,off>>16))
         if name=='framebuffer':
             (args.out/'framebuffer.bgra').write_bytes(raw)
         rows=[]
-        for y in range(2400):
-            line=raw[y*4320:(y+1)*4320]
-            rgb=bytearray(1080*3)
+        for y in range(fb_h):
+            line=raw[y*fb_s:y*fb_s+fb_w*4]
+            rgb=bytearray(fb_w*3)
             rgb[0::3],rgb[1::3],rgb[2::3]=line[2::4],line[1::4],line[0::4]
             rows.append(b'\0'+rgb)
         def chunk(kind,data):
             return struct.pack('>I',len(data))+kind+data+struct.pack('>I',zlib.crc32(kind+data))
-        png=b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',1080,2400,8,2,0,0,0))
+        png=b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',fb_w,fb_h,8,2,0,0,0))
         png+=chunk(b'IDAT',zlib.compress(b''.join(rows),6))+chunk(b'IEND',b'')
         (args.out/(name+'.png')).write_bytes(png)
     tour_tail, tour_done = b'', set()
