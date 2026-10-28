@@ -23,6 +23,7 @@ const char *probe_splash_overlap(void);
 /* Logo boot: the progress lines below are never drawn, so the panel shows only
  * the logo until XNU's GUI. A failed boot still gets the console back. */
 #define con_info(call) ((void)0)
+#include "boot_logo_args.h"
 #else
 #define con_info(call) call
 #endif
@@ -117,6 +118,50 @@ static int magic_ok(const char *m)
 
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
+#if defined(FUXI_BOOT_LOGO)
+static int boot_logo_shown; /* boot_logo_draw painted the mask */
+
+/* Monitor note (request 0x48 reads monitor_error), always NUL-terminated. */
+static void boot_logo_note(const char *s)
+{
+ unsigned i = 0;
+ for (; i < sizeof(monitor_error) - 1 && s[i]; i++) monitor_error[i] = s[i];
+ monitor_error[i] = 0;
+}
+
+/* XNU takes the logo over: " sweetlogo_pa=0x<pa> sweetlogo_w=W sweetlogo_h=H"
+ * is appended to its command line (boot_logo_args.h). pa is the mask's physical
+ * address: the MMU is off, this Image runs where ABL loaded it (monitor
+ * MON_IMAGE = _head) and every C reference is PC-relative (build.sh rejects
+ * absolute relocations), so the address of _boot_logo_start is the load PA plus
+ * its link offset (build.sh prints that offset). The bytes stay put during XNU:
+ * the cpu@100 USB monitor keeps running from this Image. Nothing is appended
+ * when the loader did not draw the mask, the mask overlaps XNU RAM or the GPU
+ * scratch, the payload already sets sweetlogo_, or the line would pass
+ * BOOT_LINE_LENGTH - 1 characters; the boot goes on and request 0x48 says why. */
+static void boot_logo_args(volatile char *cl, uint64_t ram_base, uint64_t ram_size)
+{
+ extern const uint8_t _boot_logo_start[], _boot_logo_end[];
+ const uint64_t pa = (uintptr_t)_boot_logo_start, end = (uintptr_t)_boot_logo_end;
+ if (!boot_logo_shown) {
+  boot_logo_note("sweetlogo: not appended, the loader did not draw the logo");
+  return;
+ }
+ if ((pa < ram_base + ram_size && ram_base < end) ||
+     (pa < FG_SCRATCH + FG_SCRATCH_SIZE && FG_SCRATCH < end)) {
+  boot_logo_note("sweetlogo: not appended, mask inside XNU RAM or GPU scratch");
+  return;
+ }
+ const int r = boot_logo_args_append(cl, BOOT_LINE_LENGTH, pa, FUXI_BOOT_LOGO_W, FUXI_BOOT_LOGO_H);
+ if (r == BOOT_LOGO_ARGS_FULL)
+  boot_logo_note("sweetlogo: not appended, boot_args CommandLine would overflow");
+ else if (r == BOOT_LOGO_ARGS_PRESENT)
+  boot_logo_note("sweetlogo: not appended, payload cmdline already sets sweetlogo_");
+ else if (r != BOOT_LOGO_ARGS_OK)
+  boot_logo_note("sweetlogo: not appended, CommandLine has no terminator");
+}
+#endif
+
 static const char *loader_boot(void)
 {
 
@@ -208,6 +253,9 @@ static const char *loader_boot(void)
 	ba->deviceTreeLength = (uint32_t)p->adt_size;
 	for (int i = 0; i < BOOT_LINE_LENGTH; i++)
 		ba->CommandLine[i] = p->cmdline[i];
+#if defined(FUXI_BOOT_LOGO)
+	boot_logo_args(ba->CommandLine, p->phys_base, p->mem_size);
+#endif
 	ba->memSizeActual = p->mem_size;
 	con_info(con_hex2("BOOTARG", "pa=", ba_pa, "top=", top));
 
@@ -242,7 +290,8 @@ static uint32_t sspp0_rd(const void *ctx, uint32_t off)
  * 0xff000000 | m * 0x010101, the byte order of the console's WHITE (B, G, R, A
  * in memory). MMU off: every store is a 32-bit Device write. con_fb is 0 unless
  * the splash-overlap check and the two-pipe ABL scanout guard passed. Nothing
- * is drawn when the linked mask is not exactly W x H bytes. */
+ * is drawn when the linked mask is not exactly W x H bytes. A drawn mask is
+ * handed to XNU at the handoff (boot_logo_args: sweetlogo_pa/_w/_h). */
 #define LOGO_X0		((FB_W - FUXI_BOOT_LOGO_W) / 2)
 #define LOGO_Y0		((FB_H - FUXI_BOOT_LOGO_H) / 2)
 #define LOGO_BLACK	0xff000000U
@@ -263,6 +312,7 @@ static void boot_logo_draw(void)
   for (unsigned x = 0; x < FUXI_BOOT_LOGO_W; x++)
    line[x] = LOGO_BLACK | m[x] * 0x010101U;
  }
+ boot_logo_shown = 1;
 }
 #endif
 
@@ -282,6 +332,7 @@ void loader_main(uintptr_t fdt)
 #if defined(FUXI_BOOT_LOGO)
  boot_logo_draw();
  if (!error) error=loader_boot();
+ boot_logo_note(error); /* the error replaces a sweetlogo note, terminated */
  /* Only a failed boot gets here: the console takes the splash back for the error. */
  con_clear(BLUE);
  con_str("FUXI", "XNU loader + USB monitor");

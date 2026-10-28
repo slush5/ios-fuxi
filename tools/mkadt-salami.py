@@ -20,8 +20,11 @@ refuses salami. Differences:
     no framebuffer text console, so XNU draws no kernel text before the GUI (the
     log still reaches the USB monitor through sweet_log_ring). Pair it with a
     loader built with FUXI_BOOT_LOGO (shim/fuxi-loader/build.sh), which leaves the
-    Apple logo on the splash; tools/run-ios-salami.py accepts a missing
-    sweet-fbcon only with such a loader;
+    Apple logo on the splash (logo only); tools/run-ios-salami.py accepts a
+    missing sweet-fbcon only with such a loader. The default ADT (WITH
+    sweet-fbcon), such a loader and a kernel with xnu/patches/0115 make the
+    verbose then logo boot instead: kernel text for sweetfb_verbose_secs, then
+    the loader's Apple logo until iOS draws (logo-boot/s30_build.sh);
   * /product comes from --d22ap-adt (mkadt.build otherwise reads only its
     hardcoded research/ipsw-x path); a missing tree is refused, because without
     /product MobileGestalt loses the D22AP identity;
@@ -194,7 +197,8 @@ def main():
     ap.add_argument('--fb', help='ABL splash WxH (default 1080x2412); must match the loader FB_W/FB_H')
     ap.add_argument('--fb-stride', help='bytes per line (default 4*W); must match the loader FB_STRIDE')
     ap.add_argument('--no-fbcon', action='store_true',
-                    help='omit the sweet-fbcon node: no XNU framebuffer text console (boot-logo loader)')
+                    help='omit the sweet-fbcon node: no XNU framebuffer text console (logo-only boot with a '
+                         'boot-logo loader; keep the node for verbose then logo)')
     ap.add_argument('--touch-defaults', action='store_true',
                     help='write the S3908 touch baseline into /defaults (fuxitic=2, sweethid_mmw/h)')
     ap.add_argument('--print-cmdline', action=PrintCmdline,

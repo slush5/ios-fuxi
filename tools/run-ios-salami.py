@@ -35,15 +35,36 @@ Checks (all fail closed, before the phone leaves Android):
     the pinned file for an older extents.json); rd=ufsroot0 on userdata (the
     kernel's default ufsroot) without fuxi-root-extents is refused;
   * the ADT sweet-fbcon geometry is the loader's 1080x2412 stride 4320, unless
-    --fb-geometry WxH:S names another one measured by a probe boot. An ADT
-    without sweet-fbcon (tools/mkadt-salami.py --no-fbcon: no XNU text console)
-    is accepted only when the loader carries the boot-logo marker
-    (shim/fuxi-loader/build.sh FUXI_BOOT_LOGO), which then stands in for the
-    geometry check; --logo requires that marker in any case;
+    --fb-geometry WxH:S names another one measured by a probe boot. A boot-logo
+    loader (shim/fuxi-loader/build.sh FUXI_BOOT_LOGO; --logo requires one) is
+    accepted with either ADT:
+      - without sweet-fbcon (tools/mkadt-salami.py --no-fbcon, no XNU text
+        console): logo only. Such an ADT is accepted ONLY with a boot-logo
+        loader, whose marker then stands in for the geometry check;
+      - with sweet-fbcon: verbose then logo. A kernel with xnu/patches/0115
+        (string sweetlogo_pa) draws kernel text for sweetfb_verbose_secs, then
+        the loader's Apple logo until iOS draws. A kernel without 0115 only
+        gets a warning: its text covers the loader logo for the whole boot;
   * the payload cmdline has no fuxipanel120=1 (Xiaomi M3 panel DCS sequence), and
     ufsrw / rootrw with any nonzero, bare or unparsable value (PE_parse_boot_argn
     semantics) need --allow-rw (only after a read-only boot logged
     'FUXI UFS: root file in userdata: N extents' with the expected N).
+Verbose then logo boot-args (never refused; logo-boot/s30_build.sh builds this boot):
+  sweetfb_verbose_secs=N  0115 kernels: seconds of sweet-fbcon kernel text before
+      the kernel stops the text and draws the boot-logo loader's Apple logo, which
+      then stays until iOS (backboardd) draws its own at the first swaps. s30 uses
+      30; without it the kernel's own default applies. It times the text console,
+      so it only matters with a sweet-fbcon ADT and a boot-logo loader; otherwise,
+      or when PE_parse_boot_argn would not read it as an integer, a warning says so.
+  sweetlogo_pa=0x<PA> sweetlogo_w=W sweetlogo_h=H  where the loader's logo mask
+      lives (the loader image stays in DRAM, outside XNU RAM, because the cpu@100
+      USB monitor runs from it). The boot-logo loader appends them at the handoff
+      (shim/fuxi-loader/loader.c boot_logo_args, at most 66 characters), so the
+      payload normally has none. It appends nothing when the payload cmdline
+      already contains sweetlogo_ or the line would pass 607 characters (a
+      warning when the payload cmdline leaves less than 66); monitor request 0x48
+      then says why. Payload sweetlogo_* are accepted with a note: XNU uses those
+      payload values (PE_parse_boot_argn takes the first occurrence).
 Touch: unlike run-ios-thermal.py this never passes --touch-power, and any --touch*
 monitor argument (--touch-power, --touch-test, --touch-stage, abbreviations) is
 refused. The Fuxi loader touch_power sends Fuxi's literal VRM addresses; on salami
@@ -77,6 +98,13 @@ BOOT_PAGE = 4096                  # Android boot image header v3/v4: fixed 4 KiB
 SALAMI_COMPATIBLE = b'oneplus,salami'
 LOADER_MARKER = b'overlaps ABL splash'            # probe.c probe_splash_overlap(), FUXI_SALAMI only
 LOGO_MARKER = b'FUXI BOOT LOGO:'                  # loader.c boot_logo_marker, FUXI_BOOT_LOGO builds only
+LOGO_HANDOVER = b'sweetlogo_'                     # a boot-logo loader that appends sweetlogo_* to the cmdline
+# Longest loader append (boot_logo_args.h): ' sweetlogo_pa=0x' + 16 hex digits + ' sweetlogo_w='
+# + 4 digits (W <= 1080) + ' sweetlogo_h=' + 4 digits (H <= 2412). It must fit in 607 characters.
+LOGO_APPEND_MAX = 16 + 16 + 13 + 4 + 13 + 4
+BOOT_LINE_CHARS = 607                             # BOOT_LINE_LENGTH 608 minus the NUL
+VERBOSE_LOGO_KERNEL = b'sweetlogo_pa'             # xnu/patches/0115 (verbose then logo) boot-arg name
+VERBOSE_SECS = 'sweetfb_verbose_secs'             # 0115: seconds of kernel text before the logo
 KERNEL_MARKER = b'FUXI KEYS: salami volume map'   # xnu/fuxi-h1/fuxi_keys.c, FUXI_SALAMI only
 LOADER_FB = (1080, 2412, 4320)    # gpu-handoff.h FG_FB_W/FG_FB_H/FG_FB_STRIDE under FUXI_SALAMI
 DEFAULT_EXTENTS = TOOLS.parent / 'research/salami/pinfile-01/extents.json'
@@ -252,6 +280,19 @@ def check_cmdline(cmdline, allow_rw):
     if rw and not allow_rw:
         fail(f'payload cmdline has {" ".join(rw)} (read-write); pass --allow-rw only after a '
              f'read-only boot logged the expected extent count')
+    # Verbose then logo (0115): accepted, only checked for readability.
+    secs = [v for n, v in args if n == VERBOSE_SECS]
+    if secs and (boot_arg_int(secs[0]) is None or boot_arg_int(secs[0]) < 0):
+        print(f'warning: {VERBOSE_SECS}={secs[0]} is not a non-negative integer as PE_parse_boot_argn '
+              f'reads it, so the kernel gets no usable text time', flush=True)
+    if len(secs) > 1:
+        print(f'note: the payload cmdline has {VERBOSE_SECS} {len(secs)} times; XNU takes the first', flush=True)
+    if 'sweetlogo_' in cmdline:
+        named = sorted({n for n, _ in args if n.startswith('sweetlogo_')})
+        print(f'note: the payload cmdline already contains sweetlogo_ ({" ".join(named) or "inside a value"}), '
+              f'so the boot-logo loader appends nothing and '
+              + ('XNU uses the payload values (PE_parse_boot_argn takes the first occurrence)' if named else
+                 'XNU gets no sweetlogo_* at all'), flush=True)
     return args
 
 
@@ -260,6 +301,30 @@ def userdata_ufsroot(args):
     rd = any(n in ('rd', 'rootdev') and 'ufsroot' in (v or '') for n, v in args)
     roots = [v for n, v in args if n == 'ufsroot']
     return rd and (not roots or any(v in (None, '', 'userdata') for v in roots))
+
+
+def payload_kernel_has(b, needle):
+    """needle in a SWEETXNU payload outside its cmdline and ADT, so in the kernel itself
+    (a cmdline that names a boot-arg must not pass for a kernel that parses it)."""
+    masked = bytearray(b)
+    masked[0x48:0x48 + 608] = bytes(len(masked[0x48:0x48 + 608]))
+    if len(b) >= 0x30:
+        adt_off, adt_size = struct.unpack_from('<2Q', b, 0x20)
+        if adt_off + adt_size <= len(b):
+            masked[adt_off:adt_off + adt_size] = bytes(adt_size)
+    return needle in masked
+
+
+def adt_has_fbcon(b):
+    """True when the payload ADT has a sweet-fbcon node (False when it cannot be parsed)."""
+    try:
+        adt_off, adt_size = struct.unpack_from('<2Q', b, 0x20)
+        if not 0 < adt_size <= 0x4000 or adt_off + adt_size > len(b):
+            return False
+        root, _ = adt.parse(b[adt_off:adt_off + adt_size])
+        return any(c.name == 'sweet-fbcon' for c in root.children)
+    except (struct.error, AssertionError, IndexError, ValueError, RecursionError):
+        return False
 
 
 def check_payload(path, b, table, loader_only, allow_rw, want_fb, logo_loader=False, fb_explicit=False):
@@ -273,6 +338,7 @@ def check_payload(path, b, table, loader_only, allow_rw, want_fb, logo_loader=Fa
     adt_off, adt_size = struct.unpack_from('<2Q', b, 0x20)
     cmdline = b[0x48:0x48 + 608].split(b'\0')[0].decode(errors='replace')
     args = check_cmdline(cmdline, allow_rw)
+    secs = [v for n, v in args if n == VERBOSE_SECS]
     if not 0 < adt_size <= 0x4000 or adt_off + adt_size > len(b):
         fail(f'{path}: ADT {adt_size} bytes at {adt_off:#x} is not a loader-acceptable ADT')
     root, _ = adt.parse(b[adt_off:adt_off + adt_size])
@@ -291,6 +357,9 @@ def check_payload(path, b, table, loader_only, allow_rw, want_fb, logo_loader=Fa
         if fb_explicit:
             fail('--fb-geometry checks the ADT sweet-fbcon node, and this payload ADT has none')
         fb_text = 'no sweet-fbcon (no XNU text console; the loader draws the boot logo)'
+        if secs:
+            print(f'warning: {VERBOSE_SECS} times the XNU text console, and this ADT has no sweet-fbcon '
+                  f'(mkadt-salami.py --no-fbcon), so it has nothing to time', flush=True)
     else:
         try:
             fb = tuple(struct.unpack('<I', fbcons[0].prop(k))[0] for k in ('width', 'height', 'stride'))
@@ -301,9 +370,20 @@ def check_payload(path, b, table, loader_only, allow_rw, want_fb, logo_loader=Fa
                  f'{want_fb[0]}x{want_fb[1]} stride {want_fb[2]} (mkadt-salami.py --fb/--fb-stride; '
                  f'--fb-geometry only for a geometry a probe boot measured)')
         fb_text = f'fb {fb[0]}x{fb[1]} stride {fb[2]}'
-        if logo_loader:
-            print('warning: the ADT has sweet-fbcon, so the XNU text console draws over the loader '
-                  'boot logo (build the ADT with mkadt-salami.py --no-fbcon for a clean boot)', flush=True)
+        if logo_loader and payload_kernel_has(b, VERBOSE_LOGO_KERNEL):
+            n = boot_arg_int(secs[0]) if secs else None
+            when = (f'the kernel default time (no {VERBOSE_SECS})' if not secs else
+                    f'{n} s ({VERBOSE_SECS})' if n is not None and n >= 0 else
+                    f'{VERBOSE_SECS}={secs[0]} (unreadable, see the warning)')
+            fb_text += f'; verbose then logo (0115): kernel text for {when}, then the loader Apple logo'
+        elif logo_loader:
+            print(f'warning: the ADT has sweet-fbcon but the payload kernel has no xnu/patches/0115 '
+                  f'({VERBOSE_LOGO_KERNEL.decode()}): its text console covers the loader boot logo until '
+                  f'the GUI. Use a 0115 kernel for verbose then logo, or mkadt-salami.py --no-fbcon for '
+                  f'logo only', flush=True)
+        elif secs:
+            print(f'warning: {VERBOSE_SECS} is set but the loader is not a boot-logo loader '
+                  f'(FUXI_BOOT_LOGO): there is no loader logo for the kernel to draw after the text', flush=True)
     ext, blocks = chosen.prop('fuxi-root-extents'), chosen.prop('fuxi-root-blocks')
     print(f'payload: {path.name}, salami kernel, ADT {adt_size} bytes, {fb_text}', flush=True)
     print(f'cmdline: {cmdline}', flush=True)
@@ -363,9 +443,24 @@ def check_boot_img(path, payload, want_logo=False):
     if want_logo and not logo:
         fail(f'{path}: --logo, but the loader has no boot logo (build it with FUXI_BOOT_LOGO, '
              f'shim/fuxi-loader/build.sh)')
-    print(f'boot image: {path.name}, salami loader{" with boot logo" if logo else ""}, '
-          f'kernel {kernel_size} bytes'
+    handover = logo and LOGO_HANDOVER in loader
+    print(f'boot image: {path.name}, salami loader'
+          + (' with boot logo' + (' (appends sweetlogo_* for the kernel)' if handover else '') if logo else '')
+          + f', kernel {kernel_size} bytes'
           + (f', ends with the {len(payload)}-byte payload' if payload is not None else ''), flush=True)
+    # Verbose then logo needs both halves: a 0115 kernel with nothing handed over has no
+    # logo to draw after the text (only matters when the ADT gives it a text console).
+    if (logo and not handover and payload is not None and adt_has_fbcon(payload)
+            and payload_kernel_has(payload, VERBOSE_LOGO_KERNEL)):
+        print('warning: the payload kernel has xnu/patches/0115 and the ADT has sweet-fbcon, but this '
+              'boot-logo loader appends no sweetlogo_* (built before the loader handover): after the '
+              'text there is no logo for the kernel to draw', flush=True)
+    if handover and payload is not None and len(payload) >= 0x48 + 608:
+        used = len(payload[0x48:0x48 + 608].split(b'\0')[0])
+        if used + LOGO_APPEND_MAX > BOOT_LINE_CHARS:
+            print(f'warning: the payload cmdline is {used} characters; the loader appends up to '
+                  f'{LOGO_APPEND_MAX} (sweetlogo_pa/_w/_h) and appends nothing past {BOOT_LINE_CHARS}, '
+                  f'so the logo may not reach the kernel (monitor request 0x48 would say so)', flush=True)
     return logo
 
 
@@ -476,7 +571,8 @@ def main():
                     help='expected ADT sweet-fbcon geometry (default 1080x2412:4320, the salami loader)')
     ap.add_argument('--logo', action='store_true',
                     help='require a boot-logo loader (FUXI_BOOT_LOGO); an ADT without sweet-fbcon '
-                         '(mkadt-salami.py --no-fbcon) is accepted only with one')
+                         '(mkadt-salami.py --no-fbcon, logo only) is accepted only with one, and with '
+                         'sweet-fbcon plus a 0115 kernel the boot is verbose then logo')
     ap.add_argument('--push-helper', type=Path, help='push this local salami-pin to the phone first')
     ap.add_argument('--monitor-python', default=sys.executable)
     args, extra = ap.parse_known_args()

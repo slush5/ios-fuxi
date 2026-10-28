@@ -1,0 +1,238 @@
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index fb6bbdb..47cce04 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -851,11 +851,195 @@ fbcon_receive_data(void)
+ 	return 0;
+ }
+ 
++#if defined(FUXI_SALAMI)
++/*
++ * salami verbose then logo (0115). Console text is drawn as above for the
++ * first sweetfb_verbose_secs seconds after fbcon_probe (default 30, 0 = never
++ * switch). The first character at or after that deadline fills the whole
++ * framebuffer black and draws the boot-logo loader's Apple logo in the centre;
++ * from then on console text is not drawn here (it still reaches sweet_log and
++ * every other output, and a newline still kicks the display as before) until
++ * iOS draws over it. A panic draws text again, like sweet_console_muted. When
++ * the GUI already owns the screen at the deadline (AppleCLCD set
++ * sweet_console_muted, or the GPU scanout owns the display) the switch only
++ * stops the text: no fill and no logo over the GUI.
++ *   sweetlogo_pa   physical address of the loader's 8-bit coverage mask
++ *                  (row-major, 255 = logo), in loader DRAM below XNU RAM
++ *   sweetlogo_w    mask width, sweetlogo_h mask height
++ * The boot-logo loader (shim/fuxi-loader FUXI_BOOT_LOGO) appends the three.
++ * The mask is mapped once at fbcon_probe and read with aligned 32-bit loads.
++ * fbcon_probe runs before STARTUP_SUB_KMEM, where ml_io_map reserves
++ * round_page(size) of VA but maps round_page(size + page offset), so the mask
++ * is mapped from its page start for whole pages: reserve == mapping. The logo
++ * also stays off unless the sweet-fbcon reg size covers what fbcon draws,
++ * (height - 1) * stride + width * 4 bytes.
++ * A pixel is 0xff000000 | m * 0x010101 (FBCON_BG plus grey, the byte order of
++ * FBCON_FG), at ((W - w) / 2, (H - h) / 2), as the loader draws it. The setup
++ * result is printed once at EARLY_BOOT. printf and kprintf reach this driver
++ * under different locks, so fbcon_logo_drawing counts text draws in flight and
++ * the switch waits (bounded) for them before its fill.
++ */
++#define FBCON_LOGO_SECS         30u             /* sweetfb_verbose_secs default */
++#define FBCON_LOGO_MAX_PIXELS   (1080ULL * 2412ULL)
++#define FBCON_LOGO_RAM_BASE     0x8c0000000ULL  /* salami XNU RAM starts here */
++#define FBCON_LOGO_SPINS        (1u << 20)      /* bound of the in-flight wait */
++#define FBCON_LOGO_OFF          0u              /* plain verbose (no or bad logo) */
++#define FBCON_LOGO_ARMED        1u              /* text until the deadline */
++#define FBCON_LOGO_SHOWN        2u              /* logo (or the GUI) on screen, text hidden */
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern int sweet_console_muted;                 /* osfmk/console/serial_console.c */
++#endif
++
++static uint32_t fbcon_logo_state, fbcon_logo_drawing;
++static volatile uint32_t *fbcon_logo_mask;
++static uint64_t fbcon_logo_pa, fbcon_logo_start, fbcon_logo_after;
++static uint32_t fbcon_logo_w, fbcon_logo_h, fbcon_logo_secs;
++static const char *fbcon_logo_why = "not probed";
++
++static void
++fbcon_logo_probe(uint64_t fb_pa, uint64_t fb_len)
++{
++	uint64_t pa = 0, after = 0, bytes, need, span, map_off;
++	uint32_t w = 0, h = 0, secs = FBCON_LOGO_SECS;
++	vm_offset_t map_va;
++
++	PE_parse_boot_argn("sweetlogo_pa", &pa, sizeof(pa));
++	PE_parse_boot_argn("sweetlogo_w", &w, sizeof(w));
++	PE_parse_boot_argn("sweetlogo_h", &h, sizeof(h));
++	PE_parse_boot_argn("sweetfb_verbose_secs", &secs, sizeof(secs));
++	fbcon_logo_pa = pa;
++	fbcon_logo_w = w;
++	fbcon_logo_h = h;
++	fbcon_logo_secs = secs;
++	bytes = (uint64_t)w * h;
++	/* fbcon_probe: height >= 1, stride >= width * 4 */
++	need = (uint64_t)(fbcon_height - 1) * fbcon_stride + (uint64_t)fbcon_width * 4;
++	span = (uint64_t)fbcon_stride * fbcon_height;
++	if (fb_len > span) {
++		span = fb_len;
++	}
++	if (secs == 0) {
++		fbcon_logo_why = "sweetfb_verbose_secs=0";
++	} else if (pa == 0) {
++		fbcon_logo_why = "no sweetlogo_pa";
++	} else if (fb_len < need) {
++		fbcon_logo_why = "sweet-fbcon reg size below (height - 1) * stride + width * 4";
++	} else if (pa & 3) {
++		fbcon_logo_why = "sweetlogo_pa not 4-byte aligned";
++	} else if (w == 0 || h == 0 || w > fbcon_width || h > fbcon_height || bytes > FBCON_LOGO_MAX_PIXELS) {
++		fbcon_logo_why = "sweetlogo_w x sweetlogo_h does not fit the framebuffer";
++	} else if (pa >= FBCON_LOGO_RAM_BASE || bytes > FBCON_LOGO_RAM_BASE - pa) {
++		fbcon_logo_why = "mask not below XNU RAM";
++	} else if (pa < fb_pa + span && fb_pa < pa + bytes) {
++		fbcon_logo_why = "mask overlaps the framebuffer";
++	} else {
++		nanoseconds_to_absolutetime((uint64_t)secs * NSEC_PER_SEC, &after);
++		if (after == 0) {
++			fbcon_logo_why = "no timebase";
++		} else {
++			/* page-aligned: the early io_map reserve then covers every mapped page */
++			map_off = pa & PAGE_MASK;
++			map_va = ml_io_map(pa - map_off, round_page(map_off + bytes));
++			fbcon_logo_mask = map_va == 0 ? NULL : (volatile uint32_t *)(map_va + map_off);
++			fbcon_logo_why = fbcon_logo_mask == NULL ? "mask mapping failed" : NULL;
++		}
++	}
++	if (fbcon_logo_why == NULL) {
++		fbcon_logo_after = after;
++		fbcon_logo_start = mach_absolute_time();
++		fbcon_logo_state = FBCON_LOGO_ARMED;
++	}
++}
++
++/* The one switch: write-only black fill of the whole buffer, then the mask. */
++static void
++fbcon_logo_show(void)
++{
++	uint32_t pitch = fbcon_stride / 4;
++	uint32_t x0 = (fbcon_width - fbcon_logo_w) / 2, y0 = (fbcon_height - fbcon_logo_h) / 2;
++	uint32_t word = 0, i = 0;
++
++	for (uint32_t y = 0; y < fbcon_height; y++) {
++		volatile uint32_t *line = fbcon_base + y * pitch;
++		for (uint32_t x = 0; x < fbcon_width; x++) {
++			line[x] = FBCON_BG;
++		}
++	}
++	for (uint32_t y = 0; y < fbcon_logo_h; y++) {
++		volatile uint32_t *line = fbcon_base + (y0 + y) * pitch + x0;
++		for (uint32_t x = 0; x < fbcon_logo_w; x++) {
++			if ((i & 3u) == 0) {
++				word = fbcon_logo_mask[i / 4];
++			}
++			line[x] = FBCON_BG | ((word >> ((i & 3u) * 8)) & 0xffu) * 0x010101u;
++			i++;
++		}
++	}
++}
++
++/* The GUI already presents: AppleCLCD muted the console, or the GPU scans out. */
++static bool
++fbcon_logo_gui_owns(void)
++{
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (__atomic_load_n(&sweet_console_muted, __ATOMIC_RELAXED) != 0) {
++		return true;
++	}
++#endif
++	return fuxi_gpu_scanout_owned() != 0;
++}
++
++static void
++fbcon_logo_transmit_data(uint8_t c)
++{
++	uint32_t state = __atomic_load_n(&fbcon_logo_state, __ATOMIC_RELAXED);
++	uint32_t armed = FBCON_LOGO_ARMED, spins = 0;
++
++	if (state == FBCON_LOGO_OFF || panic_active()) {
++		fbcon_transmit_data(c);
++		return;
++	}
++	if (state == FBCON_LOGO_ARMED) {
++		(void)__atomic_fetch_add(&fbcon_logo_drawing, 1u, __ATOMIC_SEQ_CST);
++		if (mach_absolute_time() - fbcon_logo_start < fbcon_logo_after) {
++			if (__atomic_load_n(&fbcon_logo_state, __ATOMIC_SEQ_CST) == FBCON_LOGO_ARMED) {
++				fbcon_transmit_data(c);
++			}
++			(void)__atomic_fetch_sub(&fbcon_logo_drawing, 1u, __ATOMIC_SEQ_CST);
++			return;
++		}
++		(void)__atomic_fetch_sub(&fbcon_logo_drawing, 1u, __ATOMIC_SEQ_CST);
++		if (fbcon_logo_gui_owns()) {
++			/* Never over the GUI: the text stops, nothing is drawn. */
++			(void)__atomic_compare_exchange_n(&fbcon_logo_state, &armed, FBCON_LOGO_SHOWN, false,
++			    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
++		} else if (__atomic_compare_exchange_n(&fbcon_logo_state, &armed, FBCON_LOGO_SHOWN, false,
++		    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
++			while (__atomic_load_n(&fbcon_logo_drawing, __ATOMIC_SEQ_CST) != 0 && spins < FBCON_LOGO_SPINS) {
++				spins++;
++			}
++			fbcon_logo_show();
++			fuxi_display_kick();
++			return;
++		}
++	}
++	/* Logo (or the GUI) on screen: no text, but a newline still kicks the display. */
++	if (c == '\n') {
++		fuxi_display_kick();
++	}
++}
++#endif
++
+ SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) sweet_fbcon_serial_functions =
+ {
+ 	.init = fbcon_init,
+ 	.transmit_ready = fbcon_transmit_ready,
++#if defined(FUXI_SALAMI)
++	.transmit_data = fbcon_logo_transmit_data,
++#else
+ 	.transmit_data = fbcon_transmit_data,
++#endif
+ 	.receive_ready = fbcon_receive_ready,
+ 	.receive_data = fbcon_receive_data,
+ 	.device = SERIAL_SWEET_FBCON
+@@ -891,12 +1075,37 @@ fbcon_probe(void)
+ #if defined(FUXI)
+     fuxi_ctl0 = (volatile uint32_t *)ml_io_map(0x0ae16000, 0x1000);
+     fuxi_intf1 = (volatile uint32_t *)ml_io_map(0x0ae36000, 0x1000);
++#endif
++#if defined(FUXI_SALAMI)
++	if (fbcon_base != NULL) {
++		fbcon_logo_probe(reg[0], reg[1]);
++	}
+ #endif
+     if (fbcon_base != NULL) {
+ 		register_serial_functions(&sweet_fbcon_serial_functions);
+ 	}
+ }
+ 
++#if defined(FUXI_SALAMI)
++/* One line with the fbcon_logo_probe result, once printf is safe. */
++__startup_func
++static void
++fbcon_logo_report(void)
++{
++	if (fbcon_base == NULL) {
++		return;
++	}
++	if (fbcon_logo_why == NULL) {
++		printf("sweetlogo: %ux%u mask at 0x%llx, Apple logo after %u s of console text\n",
++		    fbcon_logo_w, fbcon_logo_h, fbcon_logo_pa, fbcon_logo_secs);
++	} else {
++		printf("sweetlogo: off, %s (pa 0x%llx w %u h %u secs %u); console text only\n",
++		    fbcon_logo_why, fbcon_logo_pa, fbcon_logo_w, fbcon_logo_h, fbcon_logo_secs);
++	}
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_MIDDLE, fbcon_logo_report);
++#endif
++
+ #if HIBERNATION
+ /**
+  * Transitions the serial driver into a mode that can be run in the hibernation

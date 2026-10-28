@@ -19,12 +19,25 @@ if [[ -n ${FUXI_SALAMI_MDSS_STAGE:-} ]]; then
  [[ $FUXI_SALAMI_MDSS_STAGE =~ ^[0-9]$ ]] || { echo 'FUXI_SALAMI_MDSS_STAGE must be one digit 0..9' >&2; exit 1; }
  stage=-s$FUXI_SALAMI_MDSS_STAGE
 fi
+# FUXI_SALAMI_TOUCH_AUTO=0 or 1 (salami only, probe.c default 1): the loader's S3908
+# touch auto power right before the XNU handoff. 1 builds the default image; 0 gets
+# its own out dir and image name (-ta0).
+touch=
+if [[ -n ${FUXI_SALAMI_TOUCH_AUTO:-} ]]; then
+ [[ $board == salami ]] || { echo 'FUXI_SALAMI_TOUCH_AUTO is for FUXI_BOARD=salami only' >&2; exit 1; }
+ [[ $FUXI_SALAMI_TOUCH_AUTO =~ ^[01]$ ]] || { echo 'FUXI_SALAMI_TOUCH_AUTO must be 0 or 1' >&2; exit 1; }
+ [[ $FUXI_SALAMI_TOUCH_AUTO == 1 ]] || touch=-ta0
+fi
 # FUXI_BOOT_LOGO=/abs/mask FUXI_BOOT_LOGO_W=W FUXI_BOOT_LOGO_H=H (salami only): the
 # loader fills the ABL splash black and draws this W*H-byte 8-bit coverage mask
 # (255 = logo) centred as grey, with no loader text (loader.c boot_logo_draw); pair
 # it with an ADT from tools/mkadt-salami.py --no-fbcon. The mask is Apple artwork and
 # never enters git: only the ignored out dir receives its bytes (incbin). A mask that
 # is not exactly W*H bytes is refused. Own out dir and image name (-logo).
+# At the handoff the loader appends " sweetlogo_pa=0x<PA> sweetlogo_w=W sweetlogo_h=H"
+# to the XNU command line (PA = Image load address + the mask offset printed below)
+# unless the line would pass 607 characters or another loader.c boot_logo_args check
+# fails; then nothing is appended, the boot goes on and monitor request 0x48 says why.
 logo=
 if [[ -n ${FUXI_BOOT_LOGO:-}${FUXI_BOOT_LOGO_W:-}${FUXI_BOOT_LOGO_H:-} ]]; then
  [[ $board == salami ]] || { echo 'FUXI_BOOT_LOGO is for FUXI_BOARD=salami only' >&2; exit 1; }
@@ -62,7 +75,7 @@ fi
 for input in "${inputs[@]}"; do
  [[ $input == /* && -f $input ]] || { echo 'Packing inputs must be existing absolute file paths' >&2; exit 1; }
 done
-out=../out/$board-loader$stage$logo
+out=../out/$board-loader$stage$logo$touch
 mkdir -p "$out"
 # Reject a payload made from a different board, truncated segments, or unsafe RAM.
 python3 - "$payload" "$board" <<'PY'
@@ -118,6 +131,7 @@ flags=(--target=aarch64-none-elf -O2 -ffreestanding -fno-builtin -nostdlib
        -fno-pic -fno-stack-protector -mgeneral-regs-only -mstrict-align -Wall -Wextra -Werror -DFUXI=1 -DFUXI_XNU_LOADER=1 -I..)
 if [[ $board == salami ]]; then flags+=(-DFUXI_SALAMI=1); fi
 if [[ -n $stage ]]; then flags+=("-DFUXI_SALAMI_MDSS_STAGE=$FUXI_SALAMI_MDSS_STAGE"); fi
+if [[ -n ${FUXI_SALAMI_TOUCH_AUTO:-} ]]; then flags+=("-DFUXI_SALAMI_TOUCH_AUTO=$FUXI_SALAMI_TOUCH_AUTO"); fi
 if [[ -n $logo ]]; then
  flags+=(-DFUXI_BOOT_LOGO=1 "-DFUXI_BOOT_LOGO_W=$FUXI_BOOT_LOGO_W" "-DFUXI_BOOT_LOGO_H=$FUXI_BOOT_LOGO_H")
 fi
@@ -136,9 +150,11 @@ done
 "$CLANG" "${flags[@]}" -c "$out/payload.S" -o "$out/payload.o"
 "$CLANG" "${flags[@]}" -c "$out/gpu-fw.S" -o "$out/gpu-fw.o"
 # The boot logo mask, incbin like the payload; .rodata.* lands in loader.ld's .rodata.
+# 16 KiB aligned (one XNU page): XNU maps it from its page start (0115
+# fbcon_logo_probe) and reads it with aligned 32-bit loads.
 logo_obj=()
 if [[ -n $logo ]]; then
- printf '.section .rodata.boot_logo,"a"\n.global _boot_logo_start\n_boot_logo_start:\n.incbin "%s"\n.global _boot_logo_end\n_boot_logo_end:\n' \
+ printf '.section .rodata.boot_logo,"a"\n.balign 16384\n.global _boot_logo_start\n_boot_logo_start:\n.incbin "%s"\n.global _boot_logo_end\n_boot_logo_end:\n' \
   "$FUXI_BOOT_LOGO" > "$out/logo.S"
  "$CLANG" "${flags[@]}" -c "$out/logo.S" -o "$out/logo.o"
  logo_obj=("$out/logo.o")
@@ -165,20 +181,33 @@ assert struct.unpack_from('<Q',b,16)[0]==len(b), 'Image size must cover embedded
 assert b[56:60]==b'ARM\x64'
 PY
 # A logo Image carries the mask once and the marker tools/run-ios-salami.py checks; others neither.
-python3 - "$out/Image" "${FUXI_BOOT_LOGO:-}" <<'LOGOPY'
-import sys
+python3 - "$out/Image" "${FUXI_BOOT_LOGO:-}" "$out/loader.elf" "$READELF" <<'LOGOPY'
+import subprocess, sys
 from pathlib import Path
 image = Path(sys.argv[1]).read_bytes()
 marker = b'FUXI BOOT LOGO:'
 if sys.argv[2]:
-    assert image.count(Path(sys.argv[2]).read_bytes()) == 1, 'Image must carry the boot logo mask exactly once'
+    mask = Path(sys.argv[2]).read_bytes()
+    assert image.count(mask) == 1, 'Image must carry the boot logo mask exactly once'
     assert image.count(marker) == 1, 'Image lacks the boot logo marker'
+    # loader.ld links at 0 and objcopy starts the Image there: a link address is an
+    # Image offset, and at run time load PA + offset (PC-relative C references).
+    syms = {}
+    for line in subprocess.check_output([sys.argv[4], '-sW', sys.argv[3]], text=True).splitlines():
+        f = line.split()
+        if len(f) == 8 and f[7] in ('_head', '_boot_logo_start', '_boot_logo_end'):
+            syms[f[7]] = int(f[1], 16)
+    assert syms.get('_head') == 0 and len(syms) == 3, 'loader.elf must link _head at 0'
+    off = syms['_boot_logo_start']
+    assert syms['_boot_logo_end'] - off == len(mask) and image[off:off + len(mask)] == mask, 'mask symbol off its bytes'
+    assert off % 16384 == 0, f'mask Image offset {off:#x} is not 16 KiB aligned (logo.S .balign 16384)'
     print('Boot logo: mask and marker embedded, no loader text')
+    print(f'Boot logo: mask at Image offset {off:#x} (16 KiB aligned), {len(mask)} bytes; XNU gets sweetlogo_pa = load PA + {off:#x}')
 else:
     assert marker not in image, 'Image carries a boot logo marker without FUXI_BOOT_LOGO'
 LOGOPY
 # A GPU-less image never takes the name of the firmware-bearing one runners expect.
 if [[ $no_gpu_fw == 1 ]]; then suffix=-nogpufw; else suffix=; fi
 python3 "$MKBOOTIMG" --header_version 4 --kernel "$out/Image" \
- --os_version 16.0.0 --os_patch_level 2026-08 -o "$out/$board-xnu-boot$stage$logo$suffix.img"
-ls -lh "$out/Image" "$out/$board-xnu-boot$stage$logo$suffix.img"
+ --os_version 16.0.0 --os_patch_level 2026-08 -o "$out/$board-xnu-boot$stage$logo$touch$suffix.img"
+ls -lh "$out/Image" "$out/$board-xnu-boot$stage$logo$touch$suffix.img"

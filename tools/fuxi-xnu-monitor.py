@@ -4,6 +4,8 @@
 The image must match --payload and --kernel. Only the selected 1 GiB XNU RAM
 window and the validated fixed splash framebuffer can be read; no storage writes or unrestricted physical-memory requests.
 Private output includes native reports, staged progress and console bytes.
+After the handoff it reads the loader note once (request 0x48, loader-note.txt):
+a boot-logo loader that did not hand its logo to XNU (sweetlogo_*) says why there.
 """
 import argparse
 import json
@@ -417,11 +419,24 @@ def main():
         png+=chunk(b'IDAT',zlib.compress(b''.join(rows),6))+chunk(b'IEND',b'')
         (args.out/(name+'.png')).write_bytes(png)
     tour_tail, tour_done = b'', set()
+    loader_note = None
     with (args.out / 'progress.jsonl').open('w') as progress, (args.out / 'boot.log').open('wb') as log:
         while time.monotonic() < until:
             status = monitor()
             if status['stage'] == 99:
                 status['error'] = request(0x48, 128).split(b'\0', 1)[0].decode(errors='replace')
+            if status['stage'] >= 8 and status['stage'] != 99 and loader_note is None:
+                # Once, after the handoff: a boot-logo loader that did not append
+                # sweetlogo_* for XNU says why in monitor_error (loader.c boot_logo_args);
+                # empty when it appended them, or for a loader without that hand-over.
+                try:
+                    loader_note = request(0x48, 128).split(b'\0', 1)[0].decode(errors='replace')
+                except (usb.core.USBError, ValueError) as e:  # never let it end the console log
+                    loader_note = f'(request 0x48 failed: {e})'
+                status['loader_note'] = loader_note
+                (args.out / 'loader-note.txt').write_text(loader_note + '\n')
+                if loader_note:
+                    print('loader note:', loader_note, flush=True)
             if status['stage'] >= 8 and status['stage'] != 99:
                 early = read_ram(offsets['_fuxi_early_status'], 128)
                 status['kernel_stage'] = struct.unpack_from('<Q', early)[0]
