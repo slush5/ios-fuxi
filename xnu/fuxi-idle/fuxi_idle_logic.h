@@ -423,4 +423,75 @@ fi_log_this(uint64_t count)
 	return count && !(count & (count - 1));
 }
 
+/*
+ * fuxiclk=N clock meter (perf_plan.md K3). Every N seconds each online CPU in
+ * turn runs a chain of dependent 64-bit adds with interrupts masked and times
+ * it with mach_absolute_time(). A510, A715, A710 and X3 retire one dependent
+ * add per cycle, so adds per microsecond is the core clock in MHz: the level
+ * the bootloader left, or lower when the hardware limiter (LMh) throttles.
+ * A run is FI_CLK_PASSES passes over FI_CLK_BLOCK unrolled adds. After a
+ * one-pass warm-up a CPU does up to FI_CLK_RUNS timed runs and starts no run
+ * once FI_CLK_BUDGET_US have passed, so it stays masked for less than the
+ * budget plus one run plus the warm-up: at most 0.51 ms at 307.2 MHz (the
+ * lowest SM8550 CPU level), 0.4 ms from 1.31 GHz up, 1.8 ms even at the
+ * 19.2 MHz crystal.
+ */
+#define FI_CLK_BLOCK            1024    /* adds per pass, 4 KB of code; a plain int for .rept */
+#define FI_CLK_PASSES           32u     /* passes per run: 32768 adds */
+#define FI_CLK_RUNS             16u     /* at most 524288 timed adds per CPU */
+#define FI_CLK_BUDGET_US        400u    /* no new run after this much masked time */
+#define FI_CLK_LINE             192u    /* one FUXI CLK line, 8 CPUs at 10 digits fit */
+
+/* Time another run: fewer than FI_CLK_RUNS done and the masked time still under budget. */
+static inline int
+fi_clk_more(unsigned runs, uint64_t elapsed, uint64_t budget)
+{
+	return runs < FI_CLK_RUNS && elapsed < budget;
+}
+
+/* Adds per microsecond, rounded: the clock in MHz at one add per cycle. 0 = nothing timed. */
+static inline unsigned
+fi_clk_mhz(uint64_t adds, uint64_t ns)
+{
+	uint64_t mhz;
+
+	if (!ns || adds > UINT64_MAX / 1000) {
+		return 0;
+	}
+	mhz = (adds * 1000 + ns / 2) / ns;
+	return mhz > 0xffffffffu ? 0xffffffffu : (unsigned)mhz;
+}
+
+/*
+ *   FUXI CLK: 60s | c0 1786 | c1 1786 | c2 2803 | c3 2803 | c4 2803 | c5 2803 | c6 3187
+ * MHz per logical CPU, the numbering of the cpuload line (salami: c0-c1 A510,
+ * c2-c3 A715, c4-c5 A710, c6 X3). 0 (offline, still registering, or the
+ * switch to it failed) prints "-". Returns the line length (always terminated).
+ */
+static inline unsigned
+fi_format_clk(char *buf, unsigned size, unsigned period, const unsigned *mhz, unsigned ncpu)
+{
+	unsigned at = 0;
+
+	if (!size) {
+		return 0;
+	}
+	buf[0] = 0;
+	fi_append(buf, size, &at, "FUXI CLK: ");
+	fi_append_u(buf, size, &at, period);
+	fi_append(buf, size, &at, "s");
+	if (ncpu > FI_MAX_CPUS) {
+		ncpu = FI_MAX_CPUS;
+	}
+	for (unsigned c = 0; c < ncpu; c++) {
+		fi_field(buf, size, &at, " | c", c);
+		if (!mhz[c]) {
+			fi_append(buf, size, &at, " -");
+			continue;
+		}
+		fi_field(buf, size, &at, " ", mhz[c]);
+	}
+	return at;
+}
+
 #endif /* FUXI_IDLE_LOGIC_H */

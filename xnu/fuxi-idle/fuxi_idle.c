@@ -18,13 +18,19 @@
  *                snoops) the clusters are hardware coherent, so the flush only
  *                costs time and cache refills. Unset: unchanged.
  *
+ * fuxiclk=N      every N seconds (1..3600) one "FUXI CLK" line with each
+ *                online CPU's clock in MHz, timed on that CPU with a chain of
+ *                dependent adds while its interrupts are masked for at most
+ *                about 0.5 ms (perf_plan.md K3, see fuxi_idle_logic.h). Own
+ *                thread; no MMIO, mach_absolute_time() is the only clock read.
+ *
  * Ported from HackiOS hackios-xnu-kernel xnu/files/bsd/dev/redwood_cpufreq.c
  * (cpuload=MS, load_thread) and xnu/redwood.patch ml_cpu_idle_time() (APSL 2.0).
  * SPDX-License-Identifier: APSL-2.0
  * Changes: seconds instead of milliseconds, a blocking wait with 100 ms timer
  * leeway so the logger does not add its own wakeups, per-CPU irq/ipi/timer
  * rates and user/system split, printf instead of the loader log; the IPI,
- * idle-flush and wake-attribution lines and fuxinoidleflush are new.
+ * idle-flush and wake-attribution lines, fuxinoidleflush and fuxiclk are new.
  */
 #include <pexpert/arm64/board_config.h>
 #if defined(FUXI)
@@ -273,6 +279,8 @@ fi_thread(void *arg __unused, wait_result_t wr __unused)
 	}
 }
 
+static void fuxi_clk_init(void);
+
 static void
 fuxi_idle_init(void)
 {
@@ -280,6 +288,9 @@ fuxi_idle_init(void)
 	thread_t thread;
 	int max;
 
+	/* fuxiclk starts here, not from a STARTUP entry of its own: one more entry
+	 * would reorder equal-rank startup functions (the sort is not stable). */
+	fuxi_clk_init();
 	if (PE_parse_boot_argn("fuxinoidleflush", &noflush, sizeof(noflush)) && noflush == 1) {
 		fi_noflush = 1;
 		printf("FUXI IDLE: idle L1 flush skipped (fuxinoidleflush=1)\n");
@@ -302,4 +313,149 @@ fuxi_idle_init(void)
 	printf("FUXI IDLE: cpuload every %us over %u CPUs (fuxicpuload=%u)\n", fi_seconds, fi_ncpu, seconds);
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, fuxi_idle_init);
+
+/*
+ * fuxiclk=N clock meter (perf_plan.md K3, fuxi_idle_logic.h). Own thread and
+ * boot-arg: fuxicpuload, its thread and its hooks are not involved. The thread
+ * moves itself to one CPU at a time with thread_bind() + thread_block(), as
+ * processor_start() does for the boot CPU. A bound thread runs on its CPU even
+ * when fuxicores left that CPU unrecommended: thread_select() and
+ * processor_idle() keep taking bound work there. No lock is held while bound,
+ * blocked or masked, and no other thread's binding is touched (the compile
+ * lease binds and unbinds only its leaseholder).
+ */
+static unsigned fi_clk_seconds;
+static unsigned fi_clk_ncpu;
+static uint64_t fi_clk_budget;          /* FI_CLK_BUDGET_US in mach_absolute_time() units */
+static uint64_t fi_clk_sink;            /* keeps every chain result live */
+static unsigned fi_clk_cpu_mhz[FI_MAX_CPUS];
+
+#define FI_CLK_STR2(x)  #x
+#define FI_CLK_STR(x)   FI_CLK_STR2(x)
+
+/*
+ * passes (at least 1) x FI_CLK_BLOCK adds, each needing the previous result:
+ * one cycle per add. The loop counter runs beside the chain. noinline keeps a
+ * single copy, so the warm-up pass warms the code that is timed.
+ */
+__attribute__((noinline))
+static uint64_t
+fi_clk_chain(uint64_t passes, uint64_t x)
+{
+	if (!passes) {
+		return x;
+	}
+	__asm__ volatile (
+		"1:\n"
+		".rept " FI_CLK_STR(FI_CLK_BLOCK) "\n"
+		"add %[x], %[x], #1\n"
+		".endr\n"
+		"subs %[n], %[n], #1\n"
+		"b.ne 1b\n"
+		: [x] "+r" (x), [n] "+r" (passes)
+		:
+		: "cc");
+	return x;
+}
+
+/* fuxi_compile_online() (fuxi_compile_sched.h) on a logical CPU: registered
+ * (its pset, once set, never changes) and idle, dispatching or running. */
+static int
+fi_clk_online(processor_t p)
+{
+	processor_set_t pset;
+	spl_t s;
+	int online;
+
+	if (p == PROCESSOR_NULL) {
+		return 0;
+	}
+	pset = p->processor_set;
+	if (pset == PROCESSOR_SET_NULL) {
+		return 0;
+	}
+	s = splsched();
+	pset_lock(pset);
+	online = p->state >= PROCESSOR_IDLE;
+	pset_unlock(pset);
+	splx(s);
+	return online;
+}
+
+/* MHz of logical CPU c, timed on c; 0 when c is not online or the switch to it failed. */
+static unsigned
+fi_clk_measure(unsigned c)
+{
+	processor_t p = processor_array[c];
+	processor_t prev;
+	boolean_t istate;
+	uint64_t start = 0, end = 0, ns = 0;
+	unsigned runs = 0;
+
+	if (!fi_clk_online(p)) {
+		return 0;
+	}
+	prev = thread_bind(p);
+	thread_block(THREAD_CONTINUE_NULL);     /* continues on p */
+	istate = ml_set_interrupts_enabled(FALSE);
+	if ((unsigned)cpu_number() == c) {
+		fi_clk_sink += fi_clk_chain(1, fi_clk_sink);    /* warm-up, untimed */
+		start = end = mach_absolute_time();
+		while (fi_clk_more(runs, end - start, fi_clk_budget)) {
+			fi_clk_sink += fi_clk_chain(FI_CLK_PASSES, runs);
+			end = mach_absolute_time();
+			runs++;
+		}
+	}
+	(void)ml_set_interrupts_enabled(istate);
+	(void)thread_bind(prev);
+	absolutetime_to_nanoseconds(end - start, &ns);
+	return fi_clk_mhz((uint64_t)runs * FI_CLK_PASSES * FI_CLK_BLOCK, ns);
+}
+
+__dead2
+static void
+fi_clk_thread(void *arg __unused, wait_result_t wr __unused)
+{
+	static char line[FI_CLK_LINE];
+
+	for (;;) {
+		assert_wait_timeout_with_leeway((event_t)&fi_clk_seconds, THREAD_UNINT,
+		    TIMEOUT_URGENCY_SYS_NORMAL | TIMEOUT_URGENCY_LEEWAY, fi_clk_seconds * 1000, 100, NSEC_PER_MSEC);
+		thread_block(THREAD_CONTINUE_NULL);
+		for (unsigned c = 0; c < fi_clk_ncpu; c++) {
+			fi_clk_cpu_mhz[c] = fi_clk_measure(c);
+		}
+		(void)fi_format_clk(line, sizeof(line), fi_clk_seconds, fi_clk_cpu_mhz, fi_clk_ncpu);
+		printf("%s\n", line);
+	}
+}
+
+static void
+fuxi_clk_init(void)
+{
+	unsigned seconds = 0;
+	thread_t thread;
+	int max;
+
+	if (!PE_parse_boot_argn("fuxiclk", &seconds, sizeof(seconds)) || !fi_period(seconds)) {
+		return;
+	}
+	max = ml_get_max_cpu_number();
+	fi_clk_ncpu = max < 0 ? 1 : (unsigned)max + 1;
+	if (fi_clk_ncpu > FI_MAX_CPUS) {
+		fi_clk_ncpu = FI_MAX_CPUS;
+	}
+	nanoseconds_to_absolutetime((uint64_t)FI_CLK_BUDGET_US * NSEC_PER_USEC, &fi_clk_budget);
+	fi_clk_seconds = fi_period(seconds);
+	if (kernel_thread_start(fi_clk_thread, NULL, &thread) != KERN_SUCCESS) {
+		printf("FUXI CLK: thread NOT started\n");
+		return;
+	}
+	thread_set_thread_name(thread, "fuxi_clk");
+	thread_deallocate(thread);
+	printf("FUXI CLK: every %us over %u CPUs, chain of %u dependent adds per run, "
+	    "up to %u runs or %u us masked per CPU (fuxiclk=%u)\n", fi_clk_seconds, fi_clk_ncpu,
+	    FI_CLK_PASSES * FI_CLK_BLOCK, FI_CLK_RUNS, FI_CLK_BUDGET_US, seconds);
+}
 #endif /* FUXI */
