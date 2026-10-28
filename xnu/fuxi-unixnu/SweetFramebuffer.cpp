@@ -45,6 +45,14 @@
  * single black fill (write-only: the panel memory is write-combined, the
  * read-modify-write fade read it back uncached). sweet_fb_display_off tells
  * the touch driver (bsd/dev/fuxi_touch.c) that the display is off.
+ *
+ * The plain CPU copy moves BGRA words only: a layer whose surface has another
+ * format (w30r, b3a8 with wide colour) is not copied, logged once per format
+ * and counted (fmt_refused in the stats line); sweetfb_fmtcheck=0 copies it
+ * as before. FUXI opt-ins, both off by default: sweetfb_tegate=1 starts each
+ * CPU copy into the panel buffer inside a window of INTF1 tear-check lines
+ * (sweet_fb_tegate_configure); sweetfb_wakepresent=1 presents a CPU-path swap
+ * from SwapEnd through the writer-wake call instead of at the next tick.
  */
 // Ported from UniXNU drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp (BSD-2-Clause-Patent)
 // Optional demand-driven timer policy; see LICENSE.NativeMobileDisplay.
@@ -202,6 +210,12 @@ public:
  bool presentStep(bool flush);
  void stageStats(uint64_t now);
 	uint32_t      fGpuBusyTicks, fGpuFailed;
+ bool          fFormatAny;     /* sweetfb_fmtcheck=0: copy non-BGRA layers as BGRA */
+ uint32_t      fFormatRefused, fFormatSeenCount, fFormatSeen[4];
+#if defined(FUXI)
+ struct fuxi_unixnu_te fTeGate; /* sweetfb_tegate; read_line unset: off */
+ bool          fWakePresent;   /* sweetfb_wakepresent: CPU-path present from SwapEnd */
+#endif
 
 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
 	IOReturn requestPowerChange(uint64_t state);
@@ -453,6 +467,113 @@ static bool sweet_fb_bootoff_ignored(AppleCLCD *fb)
  return n != 0;
 }
 
+#if defined(FUXI)
+/*
+ * sweetfb_tegate=1 (default off; refused with GPU scanout): before the CPU
+ * copy of a frame into the panel buffer, wait until the INTF1 tear-check line
+ * count is inside a window at its wrap (fuxi_unixnu_te_gate), so the
+ * top-to-bottom copy starts as the panel starts a new fetch and stays ahead of
+ * it. Register: INTF1 0x0ae36000 + sweetfb_tereg, 0x2b0 (TEAR_LINE_COUNT,
+ * default) or 0x298 (INT_COUNT_VAL): the low 16 bits of 32-bit reads, mapped
+ * once here and never written; autorefresh (+0x2b4) is read once for the log.
+ * The window is sweetfb_tewin lines (default 64) and opens sweetfb_telead
+ * lines (default 32, so the window straddles the wrap and also holds a counter
+ * parked at its last line between transfers; 0 opens at the first lines of the
+ * frame) before the wrap. The wait
+ * sleeps without timer coalescing until sweetfb_teguard us (default 300, at
+ * most 2000) before the predicted opening, then polls; it never exceeds one
+ * wrap period (17 ms cap), after which the copy goes ahead as a miss, and 120
+ * misses in a row turn the gate off. While the gate is on, the software vsync
+ * tick follows the counter (sweet_fb_rearm): each tick lands guard + 0.7 ms
+ * before a window opening, so a tick-driven present waits about that long
+ * instead of up to a frame. Calibration samples the counter every 10 us for up
+ * to 70 ms (4 wraps) and logs one line.
+ */
+#define SWEET_FB_INTF1_PA               0x0ae36000ULL
+extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+static volatile uint32_t *sweet_fb_te_line;
+static int sweet_fb_te_event;
+
+static uint32_t
+sweet_fb_te_read(void)
+{
+ return *sweet_fb_te_line;
+}
+
+static void
+sweet_fb_te_sleep(uint64_t deadline)
+{
+ /* Critical urgency: a normal-urgency kernel wait may be coalesced up to 1 ms late. */
+ if (assert_wait_deadline_with_leeway((event_t)&sweet_fb_te_event, THREAD_UNINT,
+     TIMEOUT_URGENCY_SYS_CRITICAL, deadline, 0) == THREAD_WAITING)
+  (void)thread_block(THREAD_CONTINUE_NULL);
+}
+
+static void
+sweet_fb_tegate_configure(AppleCLCD *fb)
+{
+ uint32_t enabled = 0, reg = 0x2b0, window = 64, lead = 32, guard = 300;
+ PE_parse_boot_argn("sweetfb_tegate", &enabled, sizeof(enabled));
+ if (enabled != 1) return;
+ PE_parse_boot_argn("sweetfb_tereg", &reg, sizeof(reg));
+ PE_parse_boot_argn("sweetfb_tewin", &window, sizeof(window));
+ PE_parse_boot_argn("sweetfb_telead", &lead, sizeof(lead));
+ PE_parse_boot_argn("sweetfb_teguard", &guard, sizeof(guard));
+ if (guard > 2000) guard = 2000;
+ if (fb->fScanout || (reg != 0x2b0 && reg != 0x298)) {
+  IOLog("SWEET FB: tegate refused: %s\n", fb->fScanout ? "GPU scanout owns the panel" :
+      "sweetfb_tereg must be 0x2b0 or 0x298");
+  return;
+ }
+ vm_offset_t intf1 = ml_io_map(SWEET_FB_INTF1_PA, 0x1000);
+ if (intf1 == 0) {
+  IOLog("SWEET FB: tegate refused: INTF1 not mapped\n");
+  return;
+ }
+ sweet_fb_te_line = (volatile uint32_t *)(intf1 + reg);
+ uint32_t autorefresh = *(volatile uint32_t *)(intf1 + 0x2b4);
+ struct fuxi_unixnu_te_cal cal;
+ bzero(&cal, sizeof(cal));
+ uint64_t stop, minPeriod, maxPeriod, cap, ns = 0, periodNs = 0;
+ nanoseconds_to_absolutetime(70000000ULL, &stop);
+ nanoseconds_to_absolutetime(4000000ULL, &minPeriod);
+ nanoseconds_to_absolutetime(40000000ULL, &maxPeriod);
+ nanoseconds_to_absolutetime(17000000ULL, &cap);
+ uint64_t now = mach_absolute_time();
+ stop += now;
+ while (cal.wraps < 4 && now < stop) {
+  uint32_t line = sweet_fb_te_read() & 0xffffu;
+  now = mach_absolute_time();
+  fuxi_unixnu_te_sample(&cal, now, line);
+  IODelay(10);
+ }
+ struct fuxi_unixnu_te *te = &fb->fTeGate;
+ bool on = fuxi_unixnu_te_finish(&cal, te, minPeriod, maxPeriod) != 0;
+ absolutetime_to_nanoseconds(cal.count_ticks, &ns);
+ uint64_t perMs = ns ? cal.count_lines * 1000000000ULL / ns : 0;     /* lines per ms x 1000 */
+ if (cal.wraps >= 2) absolutetime_to_nanoseconds((cal.wrap_last - cal.wrap_first) / (cal.wraps - 1), &periodNs);
+ if (on) {
+  fuxi_unixnu_te_window(te, window, lead);
+  nanoseconds_to_absolutetime((uint64_t)guard * 1000, &te->guard);
+  nanoseconds_to_absolutetime((uint64_t)guard * 1000 + 700000, &te->early);
+  if (te->early > te->period / 4) te->early = te->period / 4;
+  te->interval = fb->fTickAbs;
+  te->budget = te->period < cap ? te->period : cap;
+  te->now = mach_absolute_time;
+  te->sleep_until = sweet_fb_te_sleep;
+  te->read_line = sweet_fb_te_read;
+ }
+ uint64_t earlyNs = 0;
+ absolutetime_to_nanoseconds(te->early, &earlyNs);
+ IOLog("SWEET FB: tegate calibration INTF1+0x%x autorefresh 0x%x: lines %u..%u wraps %u period_us %llu "
+     "lines_per_ms %llu.%03llu advanced %llu lines, stalled %u of %u samples; tewin %u telead %u -> "
+     "start %u window %u of %u, guard_us %u tick_early_us %llu -> %s\n",
+     reg, autorefresh, cal.lo, cal.hi, cal.wraps, periodNs / 1000, perMs / 1000, perMs % 1000,
+     cal.count_lines, cal.stalls, cal.samples, window, lead, te->start, te->window, te->span, guard,
+     earlyNs / 1000, on ? "on" : "off (no periodic counter)");
+}
+#endif
+
 bool
 AppleCLCD::start(IOService *provider)
 {
@@ -544,6 +665,10 @@ AppleCLCD::start(IOService *provider)
 	setProperty("external", false);
 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
 	sweet_fb_bootoff_configure();
+	uint32_t fmtcheck = 1;
+	PE_parse_boot_argn("sweetfb_fmtcheck", &fmtcheck, sizeof(fmtcheck));
+	fFormatAny = fmtcheck == 0;
+	if (fFormatAny) IOLog("SWEET FB: format check off, non-BGRA layers copied as BGRA (sweetfb_fmtcheck=0)\n");
 #if defined(FUXI)
 	int backlight = 0;
 	PE_parse_boot_argn("fuxibacklight", &backlight, sizeof(backlight));
@@ -575,6 +700,19 @@ AppleCLCD::start(IOService *provider)
   fWriterWakeCall = thread_call_allocate(&AppleCLCD::writerWake, this);
   if (!fWriterWakeCall) return false;
   sweet_surface_present_notify(&AppleCLCD::writerRetired, this);
+ }
+ sweet_fb_tegate_configure(this);
+ /* K2: the CPU path presents a swap from SwapEnd like fScanout's writer wake, not at the next tick. */
+ uint32_t wakepresent = 0;
+ PE_parse_boot_argn("sweetfb_wakepresent", &wakepresent, sizeof(wakepresent));
+ if (wakepresent == 1 && (fScanout || fTeGate.read_line)) {
+  /* With the gate a SwapEnd present would only sleep (up to a frame, gated) until the window the locked tick meets anyway. */
+  IOLog("SWEET FB: sweetfb_wakepresent ignored, %s\n", fScanout ? "GPU scanout already presents from SwapEnd" :
+      "sweetfb_tegate presents at ticks locked to the panel");
+ } else if (wakepresent == 1) {
+  fWriterWakeCall = thread_call_allocate(&AppleCLCD::writerWake, this);
+  fWakePresent = fWriterWakeCall != NULL;
+  IOLog("SWEET FB: CPU present from SwapEnd %s (sweetfb_wakepresent=1)\n", fWakePresent ? "on" : "unavailable");
  }
  fuxi_gpu_start(fPhys, fWidth, fHeight, fRowBytes);
 	fuxi_perf_start();
@@ -657,10 +795,13 @@ sweet_fb_rearm(AppleCLCD *fb, IOTimerEventSource *sender)
   return;
  }
 	if (!fb->fUnixnuIdle) {
-		/* Preserve the existing continuous-tick path when the option is absent. */
+		/* Preserve the existing continuous-tick path when the option is absent.
+		 * A SwapEnd present (writer wake) keeps the armed tick: never advance it early.
+		 * sweetfb_tegate: each tick lands just before a counter window (fuxi_unixnu_te_tick). */
 		uint64_t now = mach_absolute_time();
-  if (!fb->fScanout || now >= fb->fNextTick)
-   fb->fNextTick = fuxi_unixnu_next_tick(fb->fNextTick, fb->fTickAbs, now);
+  if (!(fb->fScanout || fb->fWakePresent) || now >= fb->fNextTick)
+   fb->fNextTick = fb->fTeGate.read_line && !fb->fTeGate.disabled ? fuxi_unixnu_te_tick(&fb->fTeGate) :
+       fuxi_unixnu_next_tick(fb->fNextTick, fb->fTickAbs, now);
 		sender->wakeAtTime(kIOTimeOptionsWithLeeway, fb->fNextTick, 0);
 		return;
 	}
@@ -673,8 +814,9 @@ sweet_fb_rearm(AppleCLCD *fb, IOTimerEventSource *sender)
 		return;
 	}
 	uint64_t now = mach_absolute_time();
- if (!fb->fScanout || now >= fb->fNextTick)
-  fb->fNextTick = fuxi_unixnu_next_tick(fb->fNextTick, fb->fTickAbs, now);
+ if (!(fb->fScanout || fb->fWakePresent) || now >= fb->fNextTick)
+  fb->fNextTick = fb->fTeGate.read_line && !fb->fTeGate.disabled ? fuxi_unixnu_te_tick(&fb->fTeGate) :
+      fuxi_unixnu_next_tick(fb->fNextTick, fb->fTickAbs, now);
 	sender->wakeAtTime(kIOTimeOptionsWithLeeway, fb->fNextTick, 0);
 	IOLockUnlock(fb->fLock);
 #else
@@ -690,7 +832,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
 	uint64_t now = mach_absolute_time();
  bool vsyncTick = true;
 #if defined(FUXI)
- if (fb->fScanout) vsyncTick = now >= fb->fNextTick;
+ if (fb->fScanout || fb->fWakePresent) vsyncTick = now >= fb->fNextTick;
  if (fb->fVsyncTE) {
   vsyncTick = fb->teVsyncTick(now, vsyncTick);
   if (vsyncTick) fb->teVsyncLog(now);
@@ -1051,7 +1193,7 @@ AppleCLCD::swap(const uint8_t *rec)
  fStatSwaps++; fDirty = true; wakePresentLocked();
  IOLockUnlock(fLock);
 #if defined(FUXI)
- if (fScanout && fWriterWakeCall && fFlushTicks == 1) writerRetired(this);
+ if ((fScanout || fWakePresent) && fWriterWakeCall && fFlushTicks == 1) writerRetired(this);
 #endif
  if ((++sweet_fb_swap_count % 1000) == 0) IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
  return kIOReturnSuccess;
@@ -1116,6 +1258,8 @@ AppleCLCD::present(const SwapRecord &record)
 	bool gpuFrame = false, cpuFrame = false;
 #if defined(FUXI)
  struct PresentRead { bool held; ~PresentRead() { if (held) sweet_surface_present_end(); } } read = { fScanout };
+ bool teGated = false;
+ uint64_t teWait = 0;
 #endif
  uint64_t cpuBytes = 0, cpuTicks = 0;
 
@@ -1238,6 +1382,23 @@ AppleCLCD::present(const SwapRecord &record)
               return false;
              }
             }
+#endif
+			/* The CPU copies move BGRA words: another 4-byte format would show wrong colours. */
+			bool refused = copied != 2 && s->pixelFormat != SWEET_FB_FORMAT_BGRA && !fFormatAny;
+			if (refused) {
+				fFormatRefused++;
+				if (fuxi_unixnu_format_new(fFormatSeen, &fFormatSeenCount, 4, s->pixelFormat))
+					IOLog("SWEET FB: layer %u surface %u format 0x%x is not BGRA: not copied (sweetfb_fmtcheck=0 copies it)\n",
+					    layer, id, s->pixelFormat);
+			}
+#if defined(FUXI)
+			/* sweetfb_tegate: once per frame, before the first CPU store into the panel buffer. */
+			if (copied != 2 && !refused && !teGated && fTeGate.read_line && !fTeGate.disabled) {
+				teGated = true;
+				teWait = fuxi_unixnu_te_gate(&fTeGate);
+				if (fTeGate.disabled)
+					IOLog("SWEET FB: tegate off after %u misses in a row\n", fTeGate.streak);
+			}
 			copyStart = mach_absolute_time();
 #endif
 			bool diffCopied = false;
@@ -1260,7 +1421,7 @@ AppleCLCD::present(const SwapRecord &record)
 				}
 			}
 #endif
-			if (copied != 2 && !diffCopied) {
+			if (copied != 2 && !diffCopied && !refused) {
 				fShadowValid = false;
 #if defined(FUXI)
 				if (fUnixnuDiff) {
@@ -1278,7 +1439,7 @@ AppleCLCD::present(const SwapRecord &record)
 				}
 			}
 #if defined(FUXI)
-			if (copied != 2) {
+			if (copied != 2 && !refused) {
 				cpuFrame = true;
                 uint64_t duration = mach_absolute_time() - copyStart;
 				fCpuTime += duration;
@@ -1294,7 +1455,7 @@ AppleCLCD::present(const SwapRecord &record)
  if (!gpuFrame) {
   fStage[3] = fStage[4] = mach_absolute_time();
   if (read.held) { sweet_surface_present_end(); read.held = false; }
-  completePresent(mach_absolute_time() - t0);
+  completePresent(mach_absolute_time() - t0 - teWait);   /* copy time without the tegate wait */
   if (cpuFrame) scanoutLog(false, cpuBytes, cpuTicks, 0);
  }
 #endif
@@ -1400,9 +1561,18 @@ void AppleCLCD::presentStats(uint64_t took)
   unsigned outstanding = fOutstandingMax;
 		fStatSwaps = fStatDropped = 0;
 		IOLockUnlock(fLock);
+  /* Present-path counters (serialized with present()): format refusals and the tegate window. */
+  uint32_t teCalls = fTeGate.hits + fTeGate.misses;
+  uint64_t teAvg = 0, teMax = 0;
+  absolutetime_to_nanoseconds(teCalls ? fTeGate.wait_sum / teCalls : 0, &teAvg);
+  absolutetime_to_nanoseconds(fTeGate.wait_max, &teMax);
 		IOLog("SWEET FB: stats %u frames in %llu ms, copy avg %llu us max %llu us, "
-		    "%u swaps, %u not shown queued_pending=%u fifo_overflow=%u ready_skips=%u ownership_defers=%u reuse_before_show=%llu wait_mode0=%llu wait_mode1=%llu wait_early=%llu wait_id0=%llu outstanding_max=%u early_retires=%u\n", fStatFrames, span_ns / 1000000, avg_ns / 1000,
-		    max_ns / 1000, swaps, dropped, pending, overflow, skips, fScanoutDefers, reuse, waits[0], waits[1], early, latest, outstanding, fEarlyRetires);
+		    "%u swaps, %u not shown queued_pending=%u fifo_overflow=%u ready_skips=%u ownership_defers=%u reuse_before_show=%llu wait_mode0=%llu wait_mode1=%llu wait_early=%llu wait_id0=%llu outstanding_max=%u early_retires=%u "
+		    "fmt_refused=%u tegate_hits=%u tegate_misses=%u tegate_wait_avg_us=%llu tegate_wait_max_us=%llu\n", fStatFrames, span_ns / 1000000, avg_ns / 1000,
+		    max_ns / 1000, swaps, dropped, pending, overflow, skips, fScanoutDefers, reuse, waits[0], waits[1], early, latest, outstanding, fEarlyRetires,
+		    fFormatRefused, fTeGate.hits, fTeGate.misses, teAvg / 1000, teMax / 1000);
+  fFormatRefused = fTeGate.hits = fTeGate.misses = 0;
+  fTeGate.wait_sum = fTeGate.wait_max = 0;
 		uint64_t gpu_ns, cpu_ns;
 		absolutetime_to_nanoseconds(fGpuTime, &gpu_ns);
 		absolutetime_to_nanoseconds(fCpuTime, &cpu_ns);

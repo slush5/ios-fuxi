@@ -71,6 +71,10 @@ static uint64_t fp_pressure_since, fp_pressure_dwell; /* fall hold, 10 s */
  * worker tick. [0] while boosted, [1] otherwise; gold and prime only. */
 static uint64_t fp_cur_sum[2][2], fp_cur_n[2];
 static unsigned fp_cur_max[2][2];
+/* fuxicores=MASK without fuxiperf=1 (K1): fp_call only applies the mask, then
+ * stops. fp_enabled stays 0, so no hook, sysctl, EPSS or TSENS access. */
+static unsigned fp_cores_only;
+static uint64_t fp_cores_end;
 static unsigned fp_enabled, fp_started, fp_ready;
 static thread_call_data_t fp_call;
 /* Refusals are EBUSY, never EAGAIN: userland_sysctl() retries a handler's
@@ -87,7 +91,8 @@ static struct fuxi_compile_reply fp_compile_reply;
 extern void sched_perfcontrol_update_recommended_cores(uint32_t);
 /* fuxicores=MASK (logical CPUs): the clutch scheduler is homogeneous and
  * put UI threads mostly on the A510s (logical 0-1, observed). Unrecommended
- * cores keep interrupts and bound threads only. Applied once when ready. */
+ * cores keep interrupts and bound threads only. Applied once: when ready with
+ * fuxiperf=1, otherwise by fp_worker once every CPU in the mask is online. */
 static unsigned fp_recommend;
 static void fp_apply_cores(void)
 {
@@ -661,23 +666,56 @@ static void fp_worker_locked(thread_call_param_t arg, thread_call_param_t result
 static void fp_worker(thread_call_param_t arg, thread_call_param_t result)
 {
  lck_mtx_lock(&fp_lock);
- fp_worker_locked(arg,result);
+ if (fp_cores_only) {
+  /* AppleCLCD::start runs while SweetCPU still starts cores 2-6 (salami
+   * boot.log). XNU re-adds the boot CPU when no recommended core is online,
+   * and a CPU registered later comes up recommended. So wait until every CPU
+   * in the mask is online (they start only after all CPUs registered).
+   * Logical n>0 is physical core n+1: cpu@100 runs the loader monitor. */
+  unsigned offline = 0;
+  for (unsigned n = 0; n < 7; n++)
+   if ((fp_recommend & (1u << n)) && !fuxi_compile_online(n ? (int)n+1 : 0)) offline |= 1u << n;
+  if (!offline) {
+   sched_perfcontrol_update_recommended_cores(fp_recommend);
+   printf("FUXI PERF: recommended cores 0x%x (no governor)\n",fp_recommend);
+  } else if (mach_absolute_time() >= fp_cores_end) {
+   printf("FUXI PERF: recommended cores 0x%x ignored, cpus 0x%x offline after 60 s (no governor)\n",
+       fp_recommend,offline);
+  } else {
+   uint64_t deadline;
+   clock_interval_to_deadline(20,NSEC_PER_MSEC,&deadline);
+   (void)thread_call_enter_delayed(&fp_call,deadline);
+  }
+ } else fp_worker_locked(arg,result);
  lck_mtx_unlock(&fp_lock);
 }
 void fuxi_perf_start(void)
 {
- unsigned enable = 0;
+ unsigned enable = 0, cores = 0;
+ int cores_arg;
  (void)PE_parse_boot_argn("fuxiperf",&enable,sizeof(enable));
- if (enable != 1 || fp_started) return;
+ if (fp_started) return;
+ /* Keep at least two of logical 2-6 (gold/prime); otherwise ignore. */
+ cores_arg = PE_parse_boot_argn("fuxicores",&cores,sizeof(cores));
+ fp_recommend = (!cores_arg || (cores & ~0x7fu) || __builtin_popcount(cores & 0x7cu) < 2) ? 0 : cores;
+ if (enable != 1) {
+  if (!fp_recommend) {
+   if (cores_arg) printf("FUXI PERF: recommended cores 0x%x ignored (no governor)\n",cores);
+   return;
+  }
+  fp_started = fp_cores_only = 1;
+  clock_interval_to_deadline(60,NSEC_PER_SEC,&fp_cores_end);
+  thread_call_setup_with_options(&fp_call,fp_worker,NULL,
+      THREAD_CALL_PRIORITY_KERNEL,THREAD_CALL_OPTIONS_ONCE);
+  (void)thread_call_enter(&fp_call);
+  return;
+ }
  fp_started = 1;
  (void)PE_parse_boot_argn("fuxitp",&fp_pressure_enabled,sizeof(fp_pressure_enabled));
  fp_pressure_enabled = fp_pressure_enabled == 1;
  nanoseconds_to_absolutetime(10*NSEC_PER_SEC,&fp_pressure_dwell);
  (void)PE_parse_boot_argn("fuxicompileboost",&fp_compile_enabled,sizeof(fp_compile_enabled));
  fp_compile_enabled = fp_compile_enabled == 1;
- /* Keep at least two of logical 2-6 (gold/prime); otherwise ignore. */
- if (!PE_parse_boot_argn("fuxicores",&fp_recommend,sizeof(fp_recommend)) ||
-     (fp_recommend & ~0x7fu) || __builtin_popcount(fp_recommend & 0x7cu) < 2) fp_recommend = 0;
  nanoseconds_to_absolutetime(2000ULL*NSEC_PER_MSEC,&fp_compile_cap);
  fp_configure();
  nanoseconds_to_absolutetime(1500ULL*NSEC_PER_MSEC,&fp_hold);

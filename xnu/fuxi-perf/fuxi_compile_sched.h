@@ -14,7 +14,10 @@ fuxi_compile_online(int physical)
 {
  int cpu = ml_get_cpu_number((uint32_t)physical << 8);
  processor_t p = cpu < 0 ? PROCESSOR_NULL : cpu_to_processor(cpu);
- if (p == PROCESSOR_NULL) return 0;
+ /* cpu_data is published before processor_init() sets processor_set, and
+  * fuxicores without fuxiperf polls while SweetCPU registers CPUs. A CPU
+  * still registering is offline; its pset, once set, never changes. */
+ if (p == PROCESSOR_NULL || !p->processor_set) return 0;
  spl_t s = splsched();
  pset_lock(p->processor_set);
  int online = p->state >= PROCESSOR_IDLE;
