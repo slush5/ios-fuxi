@@ -1846,10 +1846,64 @@ def detect_upstream_dns() -> str:
                         cands.append(parts[1])
         except OSError:
             pass
+    cands += _default_gateways()
+    cands += list(FALLBACK_DNS)
+    seen, order = set(), []
     for ip in cands:
-        if _usable_dns(ip) and (not ip.startswith("127.") or not IS_WIN):
+        if ip not in seen and _usable_dns(ip) and (not ip.startswith("127.") or not IS_WIN):
+            seen.add(ip)
+            order.append(ip)
+    # The OS list can name a resolver this process cannot reach (a VPN client such as
+    # Twingate answers only its own traffic): use the first that answers a real query.
+    for ip in order:
+        if dns_probe(ip):
             return ip
-    return "1.1.1.1"
+    return order[0] if order else FALLBACK_DNS[0]
+
+
+FALLBACK_DNS = ("9.9.9.9", "8.8.8.8", "1.1.1.1")
+
+
+def _default_gateways() -> list:
+    """IPv4 default gateways (home routers usually answer DNS too); [] when unknown."""
+    if IS_WIN:
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 "Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway } | "
+                 "ForEach-Object { $_.IPv4DefaultGateway.NextHop }"],
+                capture_output=True, text=True, timeout=15,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+        except (OSError, subprocess.SubprocessError):
+            return []
+        return _IPV4_RE.findall(out or "")
+    try:
+        with open("/proc/net/route", encoding="ascii", errors="replace") as fh:
+            gws = []
+            for line in fh.readlines()[1:]:
+                f = line.split()
+                if len(f) > 2 and f[1] == "00000000":
+                    gws.append(socket.inet_ntoa(struct.pack("<I", int(f[2], 16))))
+            return gws
+    except (OSError, ValueError):
+        return []
+
+
+def dns_probe(ip: str, timeout: float = 1.5, name: str = "example.com") -> bool:
+    """True when ip answers an A query for name over UDP/53 (any rcode) within timeout."""
+    qid = random.randrange(1, 0x10000)
+    q = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)
+    q += b"".join(bytes([len(p)]) + p.encode("ascii") for p in name.split(".")) + b"\x00"
+    q += struct.pack(">HH", 1, 1)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(timeout)
+            s.connect((ip, 53))
+            s.send(q)
+            r = s.recv(512)
+    except OSError:
+        return False
+    return len(r) >= 12 and struct.unpack(">H", r[:2])[0] == qid and bool(r[2] & 0x80)
 
 
 # ----------------------------------------------------------------------------
