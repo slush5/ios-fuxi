@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,5330 @@
+@@ -0,0 +1,5466 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -63,6 +63,18 @@
 + *   fuxiwlanw15=1  W15 only: omit WLAN_CFG shadow-v3 TLV (default 0)
 + *   fuxiwlanw16=N  qrtr=5 only: 1 larger IPCR, 2 doorbell redrive, 3 both,
 + *                 4 diagnostics only; all include MODE context diagnostics
++ * Salami (FUXI_SALAMI, OnePlus 11, K-W1): the driver runs only when
++ * fuxiwlansalami=1 is present as well; its absence or any other value refuses
++ * before the thread starts, as do fuxiwlanrails (any value), fuxiwlanseq with
++ * cyclerails and any invalid selector. Step 1 expects the salami cmd-db
++ * (ldob15 0x40b00), step 2 votes S4E 950 mV (salami live DT), and
++ * rh_send_request checks every RPMh command before the first TCS write: only
++ * a salami WLAN rail ON at its live-DT mV or a BCM address; never an OFF,
++ * mode or headroom vote, never 0x40a00 (salami ldob12, panel vddio). The
++ * firmware names are boot-args (basenames under /usr/local/share/fuxi/wlan),
++ * defaults = the files salami Android loads:
++ *   fuxiwlanbdf=bdwlan.b0e  fuxiwlanregdb=regdb.bin  fuxiwlanm3=phy_ucode20.elf
++ *   fuxiwlanamss=NAME  replaces the amss20.bin/amss.bin choice; not with fuxiwlanfw=stock
 + * Steps 17..28 probe DMA safety and load rootfs firmware through BHI/BHIe.
 + * Completion is polled; M6o can enable MSI to a RAM sink. W11 channels/QMI are opt-in;
 + * see docs-lanes/wlan-bt.md M6.
@@ -311,11 +323,21 @@
 +}
 +struct wl_rh_cmd { uint32_t addr, data, wait; };
 +static bool rh_poisoned;
++#if defined(FUXI_SALAMI)
++/* K-W1 salami RPMh policy, defined after bsd/dev/wlan.c (wl_salami_rail). */
++static bool wl_salami_vote_ok(const struct wl_rh_cmd *cmd, bool regulator);
++#endif
 +static uint32_t
 +rh_send_request(unsigned t, const struct wl_rh_cmd *cmd, unsigned n, bool regulator)
 +{
 +	/* DRV2 has three ACTIVE TCSs; preserve all sleep/wake/other slots. */
 +	if (t >= 3 || !n || n > 16 || rh_poisoned || fw_faults) { return 1; }
++#if defined(FUXI_SALAMI)
++	/* Before the first TCS register access: a refused command is never sent. */
++	for (unsigned i = 0; i < n; i++) {
++		if (!wl_salami_vote_ok(&cmd[i], regulator)) { return 1; }
++	}
++#endif
 +	uint32_t b = t * RH_STRIDE, bit = 1u << t;
 +	uint32_t cfg = usb_rd(RH_DRV_PA, 0xc);
 +	if (((usb_rd(RH_DRV_PA, 0) >> 16) & 255) != 3 ||
@@ -400,6 +422,43 @@
 +static int wl_m6o_host(unsigned);
 +#define FUXI_WLAN_XNU 1
 +#include "wlan.c"
++
++#if defined(FUXI_SALAMI)
++/* ---- K-W1 salami RPMh policy ----
++ * Every command rh_send_request would put in a TCS is checked first. A
++ * regulator request may only set one of the eight salami WLAN rails
++ * (wlan.c wl_salami_rail, cmd-db by name) to its salami live-DT voltage
++ * (+0) or enable it (+4 = 1). Refused: any OFF (+4 = 0), mode (+8) or
++ * headroom (+0xc) write, any other address, and 0x40a00 (salami ldob12, the
++ * panel vddio) whatever the register. ldob15 also feeds the eUSB2 repeater
++ * of the USB monitor, the WCD938x codec, the TFA amps and NFC, so it is only
++ * ever voted ON. A batch (M6i ICC) may only address BCMs (cmd-db slave 5,
++ * 0x5xxxx). This table is independent of the step 2/4 literals in wlan.c:
++ * a mismatch fails the step closed instead of sending another voltage.
++ * mV, wl_salami_rail order: salami live DT chip_cfg@1 vdd-wlan-io, -dig,
++ * -aon, -rfa2, vdd-wlan, -rfa1, then pcie0 vreg-0p9 and vreg-1p2. */
++static const uint16_t wl_salami_mv[8] = {1800, 950, 980, 1350, 1000, 1900, 880, 1200};
++static bool
++wl_salami_vote_ok(const struct wl_rh_cmd *cmd, bool regulator)
++{
++	uint32_t base = cmd->addr & ~0xffu, reg = cmd->addr & 0xffu;
++	if (!regulator) {
++		if ((cmd->addr >> 16) == 5) { return true; }
++	} else if (base != WL_SALAMI_LDOB12) {
++		for (unsigned i = 0; i < 8; i++) {
++			if (base != wl_salami_rail[i]) { continue; }
++			if ((reg == 0 && cmd->data == (uint32_t)wl_salami_mv[i]) || (reg == 4 && cmd->data == 1)) {
++				return true;
++			}
++			break;
++		}
++	}
++	printf("FUXI WLAN: salami refused RPMh %s addr %#x data %#x (only a salami WLAN rail ON at its DT mV, or a BCM)\n",
++	    regulator ? "regulator" : "batch", cmd->addr, cmd->data);
++	return false;
++}
++/* ---- end K-W1 salami RPMh policy ---- */
++#endif
 +
 +/* ---- milestone 6i: fixed SM8550 PCIe0 ICC clients, ACTIVE session votes ----
 + * Graph, aggregation and packet format: Linux v6.18 sm8550.c, bcm-voter.c,
@@ -901,6 +960,16 @@
 +/* W14 inputs are retained through keep/containment, including partial reads. */
 +static struct wl_dma wl14_regdb, wl14_bdf, wl14_m3;
 +static char wl14_bdf_name[65]; /* one extra byte detects XNU string truncation */
++#if defined(FUXI_SALAMI)
++/* K-W1: salami firmware names are boot-args (same 65-byte rule as the BDF). */
++static char wl14_regdb_name[65], wl14_m3_name[65];
++static char wl_amss_path[96]; /* empty = the SoC-major choice at step 18 */
++#define WL14_REGDB_NAME wl14_regdb_name
++#define WL14_M3_NAME wl14_m3_name
++#else
++#define WL14_REGDB_NAME "regdb_xiaomi.bin"
++#define WL14_M3_NAME "m3.bin"
++#endif
 +#define WL14_FILE_MAX (1024u * 1024u)
 +#define WL14_M3_MAX (2u * 1024u * 1024u)
 +#define WL14_SEG 6144u
@@ -917,6 +986,24 @@
 +	}
 +	return false;
 +}
++#if defined(FUXI_SALAMI)
++/* K-W1: a 65-byte firmware basename from boot-arg ARG, else FALLBACK (a
++ * literal, SIZE = sizeof it). false = truncated or not a plain basename. */
++static bool
++wl_salami_name(const char *arg, char *name, const char *fallback, size_t size)
++{
++	bool given;
++	bzero(name, 65);
++	given = PE_parse_boot_arg_str(arg, name, 65);
++	if (!given && size <= 65) { memcpy(name, fallback, size); }
++	if (name[63] || !wl14_basename(name)) {
++		printf("FUXI WLAN: salami invalid %s basename; refused\n", arg);
++		return false;
++	}
++	printf("FUXI WLAN: salami %s %s (%s)\n", arg, name, given ? "boot-arg" : "salami default");
++	return true;
++}
++#endif
 +static bool wl_stop22, wl_keep, wl_bhie_fired, wl_amss_reached;
 +static bool wl_sbl_ready, wl_contexts_published, wl_sbl_m0;
 +static uint32_t wl_bhie_seq;
@@ -1078,13 +1165,41 @@
 +	if (wl_w14) {
 +		bzero(wl14_bdf_name, sizeof(wl14_bdf_name));
 +		if (!PE_parse_boot_arg_str("fuxiwlanbdf", wl14_bdf_name, sizeof(wl14_bdf_name))) {
++#if defined(FUXI_SALAMI)
++			/* salami Android: /odm/etc/wifi/kiwi/bdwlan.b0e (board id 0xff, region 22) */
++			memcpy(wl14_bdf_name, "bdwlan.b0e", sizeof("bdwlan.b0e"));
++#else
 +			memcpy(wl14_bdf_name, "bd_m3gl.elf", sizeof("bd_m3gl.elf"));
++#endif
 +		}
 +		if (wl14_bdf_name[sizeof(wl14_bdf_name)-2] || !wl14_basename(wl14_bdf_name)) {
 +			wl_variant_invalid = true;
 +			printf("FUXI WLAN: W14 invalid fuxiwlanbdf basename; refused\n");
 +		} else { printf("FUXI WLAN: W14 selected BDF %s (override fuxiwlanbdf; default unverified)\n", wl14_bdf_name); }
++#if defined(FUXI_SALAMI)
++		/* salami Android: /odm/etc/wifi/kiwi/regdb.bin and the M3 image
++		 * /vendor/firmware_mnt/image/kiwi/phy_ucode20.elf */
++		if (!wl_salami_name("fuxiwlanregdb", wl14_regdb_name, "regdb.bin", sizeof("regdb.bin")) ||
++		    !wl_salami_name("fuxiwlanm3", wl14_m3_name, "phy_ucode20.elf", sizeof("phy_ucode20.elf"))) {
++			wl_variant_invalid = true;
++		}
++#endif
 +	}
++#if defined(FUXI_SALAMI)
++	bzero(wl_amss_path, sizeof(wl_amss_path));
++	{
++		char amss[65] = {0};
++		if (PE_parse_boot_arg_str("fuxiwlanamss", amss, sizeof(amss))) {
++			if (amss[sizeof(amss)-2] || !wl14_basename(amss) || wl_fw) {
++				wl_variant_invalid = true;
++				printf("FUXI WLAN: salami invalid fuxiwlanamss basename (or with fuxiwlanfw=stock); refused\n");
++			} else {
++				snprintf(wl_amss_path, sizeof(wl_amss_path), "/usr/local/share/fuxi/wlan/%s", amss);
++				printf("FUXI WLAN: salami fuxiwlanamss %s (replaces the SoC-major choice)\n", wl_amss_path);
++			}
++		}
++	}
++#endif
 +	wl_bhie_fired = wl_amss_reached = false;
 +	wl_sbl_ready = wl_contexts_published = wl_sbl_m0 = false;
 +	wl_bhie_seq = 0;
@@ -4570,10 +4685,10 @@
 +	// Unprogrammed OTP omits board_info; ath12k then uses board id 0xff. The
 +	// BDF here comes from fuxiwlanbdf (or its default), not from the id.
 +	if (!wl14_board_valid) { printf("FUXI WLAN: W14 CAP has no board id (OTP unset); ath12k default 0xff, BDF by name\n"); }
-+	if (wl14_download("regdb_xiaomi.bin", &wl14_regdb, WL14_REGDB) ||
++	if (wl14_download(WL14_REGDB_NAME, &wl14_regdb, WL14_REGDB) ||
 +	    wl14_download(wl14_bdf_name, &wl14_bdf, WL14_BDF)) { return 1; }
 +	unsigned size = 0;
-+	if (wl14_read("m3.bin", &wl14_m3, WL14_M3_MAX, &size)) { return 1; }
++	if (wl14_read(WL14_M3_NAME, &wl14_m3, WL14_M3_MAX, &size)) { return 1; }
 +	/* Clean after reading, before NC conversion and mapping/publication.
 +	 * Mapping checks live SMMU and every leaf.
 +	 * Firmware receives the IOVA and exact file size, never VA/backing PA. */
@@ -4729,6 +4844,9 @@
 +		if (!hw || hw == ~0u || fw_faults) { return 2; }
 +		wl_fw_path = ((hw >> 8) & 15) == 2 ?
 +		    "/usr/local/share/fuxi/wlan/amss20.bin" : "/usr/local/share/fuxi/wlan/amss.bin";
++#if defined(FUXI_SALAMI)
++		if (wl_amss_path[0]) { wl_fw_path = wl_amss_path; } /* fuxiwlanamss; never with wl_fw */
++#endif
 +		if (wl_fw) {
 +			if (wl_prd(WL_EPCFG) != 0x110717cb || ((hw >> 8) & 15) != 2) { return 0x6c; }
 +			wl_fw_path = "/usr/local/share/fuxi/wlan/stock-amss20.bin";
@@ -5335,22 +5453,40 @@
 +	requested = PE_parse_boot_argn("fuxiwlan", &arg, sizeof(arg)) && arg > 0;
 +#if defined(FUXI_SALAMI)
 +	/*
-+	 * Refused on salami (OnePlus 11) whatever fuxiwlan says: the rail
-+	 * table votes Fuxi cmd-db addresses (0x40a00 is salami ldob12, the
-+	 * display vddio) and the BDF defaults to Xiaomi bd_m3gl.elf. Cleared
-+	 * rather than returned, so nothing below becomes unreachable code
-+	 * under -Weverything -Werror.
++	 * K-W1, salami (OnePlus 11): compiled in, refused unless fuxiwlansalami=1
++	 * is present as well (read at run time, so the driver stays in the
++	 * binary). With it, step 1 expects the salami cmd-db (ldob15 0x40b00,
++	 * never 0x40a00 = salami ldob12, the panel vddio), the firmware names
++	 * default to the salami Android files, and rh_send_request refuses any
++	 * OFF/mode vote or other address (wl_salami_vote_ok).
 +	 */
 +	if (requested) {
-+		printf("FUXI WLAN: refused on salami (Fuxi BDF/rail table)\n");
++		int salami = 0;
++		if (!PE_parse_boot_argn("fuxiwlansalami", &salami, sizeof(salami)) || salami != 1) {
++			printf("FUXI WLAN: refused on salami (fuxiwlan=%d needs fuxiwlansalami=1)\n", arg);
++			requested = false;
++		}
 +	}
-+	requested = false;
 +#endif
 +	if (!requested) {
 +		return;
 +	}
 +	unsigned limit = (arg == 1 || arg > (int)WL5_STEPS) ? WL5_STEPS : (unsigned)arg;
 +	wl_iova_configure();
++#if defined(FUXI_SALAMI)
++	/* Before the thread, any mapping or register access: fuxiwlanrails (any
++	 * value) votes the Fuxi table and HPM modes, cyclerails votes the shared
++	 * rails OFF, and a selector that did not parse is refused outright. */
++	{
++		bool invalid = wl_variant_invalid || wl_probe == WL_PROBE_INVALID;
++		if (invalid || wl_rails_requested || (wl_seq_flags & WL_O_CYCLERAILS)) {
++			printf("FUXI WLAN: refused on salami before any access (invalid selector %u, fuxiwlanrails %u, cyclerails %u)\n",
++			    invalid, wl_rails_requested, !!(wl_seq_flags & WL_O_CYCLERAILS));
++			return;
++		}
++	}
++	printf("FUXI WLAN: salami K-W1 gate open (fuxiwlansalami=1)\n");
++#endif
 +	printf("FUXI WLAN: enabled (fuxiwlan=%d), WCN7850 power-up + PCIe0 + MHI firmware, limit %u\n",
 +	    arg, limit);
 +	if (kernel_thread_start(fw_thread, (void *)(uintptr_t)limit, &thread) == KERN_SUCCESS) {
@@ -5362,7 +5498,7 @@
 +#endif /* FUXI */
 --- a/bsd/dev/wlan.c
 +++ b/bsd/dev/wlan.c
-@@ -0,0 +1,549 @@
+@@ -0,0 +1,571 @@
 +/* Lane-wlan (milestone 1): read-only WCN7850 / PCIe0 / BT-UART snapshot on
 + * request 0x5c, value 0x574c ('WL'), index 1. Included from probe.c after
 + * gpu.c (uses probe_safe_rd32). No register writes of any kind.
@@ -5555,6 +5691,17 @@
 + */
 +#define WL3_MAGIC 0x574c0003u
 +#define WL3_STEPS 13u
++#if defined(FUXI_SALAMI)
++/* K-W1, OnePlus 11 (salami): step 1 expects these cmd-db addresses, looked
++ * up by name in wlan_snapshot names[] order (ldob15 smpe4 smpg2 smpg4 smpg5
++ * smpg6 ldoe1 ldoe3) and measured on salami (salami-port measure/cmd_db.txt).
++ * ldob15 is 0x40b00 here; the Fuxi ldob15 value 0x40a00 is salami ldob12, the
++ * panel vddio, and is refused outright. Step 2 order and mV are salami live
++ * DT chip_cfg@1 (S4E 950 mV). The salami loader STALLs request 0x5c, so
++ * only the XNU copy (bsd/dev/wlan.c, patch 0099) runs these steps on salami. */
++#define WL_SALAMI_LDOB12 0x40a00u
++static const uint32_t wl_salami_rail[8] = {0x40b00, 0x40200, 0x40400, 0x40500, 0x44000, 0x40600, 0x43900, 0x43a00};
++#endif
 +static uint32_t wl3_report[128];
 +static unsigned wl3_done, wl3_failed;
 +static unsigned wl3_faults;
@@ -5710,11 +5857,18 @@
 + uint32_t polls = 0;
 + switch (step) {
 + case 1: { /* precheck, read-only */
++#if defined(FUXI_SALAMI)
++  const uint32_t *expect = wl_salami_rail;
++#else
 +  static const uint32_t expect[8] = {0x40a00, 0x40200, 0x40400, 0x40500, 0x44000, 0x40600, 0x43900, 0x43a00};
++#endif
 +  wlan_snapshot();
 +  if (wlan_report[90] != 0x0c0330db) return 1;
 +  for (unsigned i = 0; i < 8; i++) {
 +   r[20 + i] = wlan_report[91 + i];
++#if defined(FUXI_SALAMI)
++   if (wlan_report[91 + i] == WL_SALAMI_LDOB12) return 5;   /* salami ldob12, panel vddio */
++#endif
 +   if (wlan_report[91 + i] != expect[i]) return 2;
 +  }
 +  uint32_t id = usb_rd(RH_DRV_PA, 0), cfg = usb_rd(RH_DRV_PA, 0xc);
@@ -5723,7 +5877,11 @@
 +  return (r[28] & 0x80000000u) ? 0 : 4;
 + }
 + case 2: { /* WCN rails in pwrseq order: s5g l15b s2g s4e s4g s6g */
++#if defined(FUXI_SALAMI)
++  static const uint16_t mv[6] = {1000, 1800, 980, 950, 1350, 1900};   /* salami DT: S4E 950 mV */
++#else
 +  static const uint16_t mv[6] = {1000, 1800, 980, 952, 1350, 1900};
++#endif
 +  static const uint8_t idx[6] = {4, 0, 2, 1, 3, 5};
 +  for (unsigned i = 0; i < 6; i++) {
 +   r[29 + i] = wl_vrm(r[20 + idx[i]], mv[i]);

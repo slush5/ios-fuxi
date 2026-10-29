@@ -24,6 +24,15 @@ on:
         description: Signed Vulkan probe/smoke and GPU ABI test
         type: boolean
         default: false
+      xcode16:
+        description: Also rebuild the selected kernel(s) with a newer Xcode, replaying this run's Xcode 15 IIG output
+        type: boolean
+        default: false
+      xcode16_runner:
+        description: Runner for the xcode16 rebuild (macos-15 uses Xcode 16.4, macos-26 uses Xcode 26.6)
+        type: choice
+        options: [macos-15, macos-26]
+        default: macos-15
 
 permissions:
   contents: read
@@ -33,6 +42,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.targets.outputs.matrix }}
+      kernels: ${{ steps.targets.outputs.kernels }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -44,9 +54,16 @@ jobs:
           NATIVEMETAL: ${{ inputs.nativemetal }}
           MESA: ${{ inputs.mesa }}
           TOOLS: ${{ inputs.tools }}
+          XCODE16: ${{ inputs.xcode16 }}
         run: |
           matrix=$(bash tools/ci/build.sh --plan "$KERNEL" "$METAL" "$MESA" "$TOOLS" "$NATIVEMETAL")
+          kernels=$(jq -c '{target: [.target[] | select(startswith("kernel-"))]}' <<< "$matrix")
+          if [[ $XCODE16 == true && $kernels == '{"target":[]}' ]]; then
+            echo '::error::xcode16 rebuilds kernels only; select kernel=metal4, wlan6g or all'
+            exit 1
+          fi
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "kernels=$kernels" >> "$GITHUB_OUTPUT"
 
   build:
     needs: plan
@@ -84,6 +101,76 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fuxi-${{ matrix.target }}
+          path: tools/out/ci/${{ matrix.target }}/
+          if-no-files-found: error
+          retention-days: 7
+      # Generated DriverKit sources from this Xcode 15 iig run (no kernel, SDK
+      # or KDK), verified by build.sh. Feeds the xcode16 job; kept longer so a
+      # cache made before macos-14 retirement can outlive the runner.
+      - name: Upload Xcode 15 IIG cache
+        if: success() && startsWith(matrix.target, 'kernel-')
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: iig-cache-xcode15-${{ matrix.target }}
+          path: tools/out/ci-iig/${{ matrix.target }}/
+          if-no-files-found: warn
+          retention-days: 90
+
+  # Optional proof of a kernel route without macos-14: a newer Xcode compiles
+  # XNU, but iig is never run; tools/xnu-iig-cache.py replays the Xcode 15
+  # output saved by the build job of this same run, and build.sh refuses to
+  # package a kernel unless every generated file matches that cache.
+  xcode16:
+    needs: [plan, build]
+    if: ${{ !cancelled() && inputs.xcode16 && needs.plan.result == 'success' }}
+    name: ${{ matrix.target }} (${{ inputs.xcode16_runner == 'macos-26' && 'Xcode 26.6' || 'Xcode 16.4' }}, Xcode 15 IIG)
+    runs-on: ${{ inputs.xcode16_runner == 'macos-26' && 'macos-26' || 'macos-15' }}
+    # A trial: its failure must not fail the run (the Xcode 15 kernel is the product).
+    continue-on-error: true
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.kernels) }}
+    env:
+      TARGET: ${{ matrix.target }}
+      # Paths from the actions/runner-images macos-15-arm64 and macos-26-arm64 inventories.
+      DEVELOPER_DIR: ${{ inputs.xcode16_runner == 'macos-26' && '/Applications/Xcode_26.6.app/Contents/Developer' || '/Applications/Xcode_16.4.app/Contents/Developer' }}
+      ARTIFACT: fuxi-${{ matrix.target }}-${{ inputs.xcode16_runner == 'macos-26' && 'xcode26' || 'xcode16' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/cache@v4
+        with:
+          path: deps/ci-downloads
+          key: fuxi-source-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('tools/ci/pins.env', 'tools/ci/build.sh') }}
+      - name: Download this run's Xcode 15 IIG cache
+        uses: actions/download-artifact@v4
+        with:
+          name: iig-cache-xcode15-${{ matrix.target }}
+          path: deps/iig-cache-xcode15-${{ matrix.target }}
+      - name: Build kernel with newer Xcode and replayed IIG (no boot-image packing)
+        env:
+          IIG: ${{ github.workspace }}/tools/xnu-iig-cache.py
+          XNU_IIG_CACHE: ${{ github.workspace }}/deps/iig-cache-xcode15-${{ matrix.target }}
+        run: bash tools/ci/build.sh "$TARGET"
+      - name: Record toolchain and kernel hashes
+        run: |
+          {
+            echo "### $ARTIFACT"
+            echo '```'
+            xcodebuild -version
+            xcrun clang --version | head -1
+            shasum -a 256 "tools/out/ci/$TARGET/kernel.development.fuxi" "tools/out/ci/$TARGET/kernel.development.fuxi.unstripped"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      # A separate name: never replaces the Xcode 15 fuxi-<target> artifact.
+      - name: Upload target outputs and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT }}
           path: tools/out/ci/${{ matrix.target }}/
           if-no-files-found: error
           retention-days: 7

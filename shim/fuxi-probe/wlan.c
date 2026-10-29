@@ -190,6 +190,17 @@ static void wlan_snapshot(void)
  */
 #define WL3_MAGIC 0x574c0003u
 #define WL3_STEPS 13u
+#if defined(FUXI_SALAMI)
+/* K-W1, OnePlus 11 (salami): step 1 expects these cmd-db addresses, looked
+ * up by name in wlan_snapshot names[] order (ldob15 smpe4 smpg2 smpg4 smpg5
+ * smpg6 ldoe1 ldoe3) and measured on salami (salami-port measure/cmd_db.txt).
+ * ldob15 is 0x40b00 here; the Fuxi ldob15 value 0x40a00 is salami ldob12, the
+ * panel vddio, and is refused outright. Step 2 order and mV are salami live
+ * DT chip_cfg@1 (S4E 950 mV). The salami loader STALLs request 0x5c, so
+ * only the XNU copy (bsd/dev/wlan.c, patch 0099) runs these steps on salami. */
+#define WL_SALAMI_LDOB12 0x40a00u
+static const uint32_t wl_salami_rail[8] = {0x40b00, 0x40200, 0x40400, 0x40500, 0x44000, 0x40600, 0x43900, 0x43a00};
+#endif
 static uint32_t wl3_report[128];
 static unsigned wl3_done, wl3_failed;
 static unsigned wl3_faults;
@@ -345,11 +356,18 @@ static int wl3_step(unsigned step)
  uint32_t polls = 0;
  switch (step) {
  case 1: { /* precheck, read-only */
+#if defined(FUXI_SALAMI)
+  const uint32_t *expect = wl_salami_rail;
+#else
   static const uint32_t expect[8] = {0x40a00, 0x40200, 0x40400, 0x40500, 0x44000, 0x40600, 0x43900, 0x43a00};
+#endif
   wlan_snapshot();
   if (wlan_report[90] != 0x0c0330db) return 1;
   for (unsigned i = 0; i < 8; i++) {
    r[20 + i] = wlan_report[91 + i];
+#if defined(FUXI_SALAMI)
+   if (wlan_report[91 + i] == WL_SALAMI_LDOB12) return 5;   /* salami ldob12, panel vddio */
+#endif
    if (wlan_report[91 + i] != expect[i]) return 2;
   }
   uint32_t id = usb_rd(RH_DRV_PA, 0), cfg = usb_rd(RH_DRV_PA, 0xc);
@@ -358,7 +376,11 @@ static int wl3_step(unsigned step)
   return (r[28] & 0x80000000u) ? 0 : 4;
  }
  case 2: { /* WCN rails in pwrseq order: s5g l15b s2g s4e s4g s6g */
+#if defined(FUXI_SALAMI)
+  static const uint16_t mv[6] = {1000, 1800, 980, 950, 1350, 1900};   /* salami DT: S4E 950 mV */
+#else
   static const uint16_t mv[6] = {1000, 1800, 980, 952, 1350, 1900};
+#endif
   static const uint8_t idx[6] = {4, 0, 2, 1, 3, 5};
   for (unsigned i = 0; i < 6; i++) {
    r[29 + i] = wl_vrm(r[20 + idx[i]], mv[i]);
