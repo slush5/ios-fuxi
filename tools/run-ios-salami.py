@@ -197,6 +197,9 @@ def split_monitor_args(extra):
             fail('--no-handoff: use --loader-only')
         if is_display_poll(name):
             poll = True
+    # INTF1 +0x2b4/+0x2b0/+0x298 were read safely on salami by probe stage S5 (2026-10-28)
+    # and by the XNU tegate calibration (1169 samples, 431 s session, 2026-10-29). The gate
+    # and its message stay as they are: --display-poll also reads DSI0 (probe stage S6).
     if poll and not i_know:
         fail('--display-poll samples INTF1 (+0x2b4/+0x2b0) and DSI0, unproven on salami until '
              'probe stages S5 (INTF) and S6 (DSI) pass; pass --i-know-s5-s6 to override')

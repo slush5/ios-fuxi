@@ -19,10 +19,12 @@
 volatile uint32_t *con_fb = (volatile uint32_t *)FB_BASE;
 static uint32_t con_bg;
 static int row;
-/* Salami (OnePlus 11): no kick. INTF1 +0x2b4 and a CTL0 START write are
- * unproven there (display_salami_plan.md P-1, stages S5/S9), and the loader
- * console runs inside loader_main with no USB report to attribute a hang.
- * -DFUXI_SALAMI_KICK restores the Fuxi kick once S5 and S9 have passed. */
+/* Salami (OnePlus 11): no kick. A CTL0 START write is unproven there
+ * (display_salami_plan.md P-1, stage S9), and the loader console runs inside
+ * loader_main with no USB report to attribute a hang. INTF1 +0x2b4 (and
+ * +0x2b0/+0x298) was read safely by probe stage S5 on 2026-10-28 and by the
+ * XNU tegate calibration (1169 samples, 431 s session) on 2026-10-29.
+ * -DFUXI_SALAMI_KICK restores the Fuxi kick once S9 has passed. */
 static void kick(void)
 {
 #if defined(FUXI) && (!defined(FUXI_SALAMI) || defined(FUXI_SALAMI_KICK))

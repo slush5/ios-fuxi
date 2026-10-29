@@ -10,8 +10,13 @@ When a USB transfer fails in the console loop (the host re-enumerates the device
 after selective suspend, or after a 0x4e read on salami), the monitor is found
 again, checked with status request 0x46 to be the same boot, and the console
 resumes at the last byte read; a reconnect never sends 0x49 (handoff) or 0x46
-value 1. --reconnect-seconds bounds each outage, then the run exits as before.
-On salami --framebuffer and --tour-shots are skipped unless --force-fb.
+value 1. An outage lasts until a console poll completes again: every retry in it
+sleeps (0.5 s, doubled up to 4 s after each failure of a monitor that answered)
+and --reconnect-seconds bounds the whole outage, then the run exits as before.
+pyusb's NotImplementedError (LIBUSB_ERROR_NOT_SUPPORTED) and ValueError (no
+langid) during re-enumeration count as failed transfers, never as success.
+On salami, or when the payload ADT does not tell the board, --framebuffer and
+--tour-shots are skipped unless --force-fb.
 """
 import argparse
 import json
@@ -30,6 +35,9 @@ FB_FUXI = (1080, 2400, 4320)   # Fuxi panel and ABL stride: used when the ADT ha
 FB_SALAMI = (1080, 2412, 4320)
 FB_SLOT = 0xa00000             # one ABL splash scanout slot, the most request 0x4e can serve
 RECONNECT_SECONDS = 180        # default --reconnect-seconds: longest USB outage in the console loop
+# Sleep before each retry in an outage: RETRY_SLEEP at first, doubled up to RETRY_SLEEP_MAX
+# after each failure of a monitor that answered (its 0x46 failed, or the poll after it did).
+RETRY_SLEEP, RETRY_SLEEP_MAX = 0.5, 4.0
 # After a reconnect the console resumes at the last byte read while the kernel's 4 MiB
 # ring (SWEET_LOG_SIZE) still holds it, up to this many bytes back (the rest is slack
 # for what the kernel writes while the host reads); otherwise the last 64 KiB as usual.
@@ -190,7 +198,7 @@ def main():
     ap.add_argument('--framebuffer',action='store_true',help='save the validated inherited framebuffer after collecting logs')
     ap.add_argument('--tour-shots',action='store_true',help='also save framebuffer-shotN-NAME.png at each "FUXI TOUR: shot N NAME" console line (fuxitour=S)')
     ap.add_argument('--fb-rows',type=int,metavar='ROWS',help='framebuffer rows to save (default: the payload ADT sweet-fbcon height; without that node 2412 on salami, 2400 on Fuxi)')
-    ap.add_argument('--force-fb',action='store_true',help='salami: do --framebuffer/--tour-shots anyway (the 0x4e read drops USB under XNU there, so they are skipped without this)')
+    ap.add_argument('--force-fb',action='store_true',help='salami, or a board the payload ADT does not tell: do --framebuffer/--tour-shots anyway (the 0x4e read drops USB under XNU on salami, so they are skipped without this)')
     ap.add_argument('--reconnect-seconds',type=float,default=RECONNECT_SECONDS,metavar='SECONDS',help='after a USB error in the console loop, look for the same monitor again for up to SECONDS per outage (default %(default)s; 0 exits on the first error)')
     ap.add_argument('--skip-clocks',action='store_true',help='do not take the AHB-ungating clock snapshot before handoff')
     ap.add_argument('--reset-minutes',type=int,help='move the monitor PSCI reset deadline to now + N minutes (1-60)')
@@ -218,21 +226,28 @@ def main():
         ap.error('unexpected Fuxi RAM window')
     cmdline = payload[72:680].split(b'\0')[0].decode()
     adt_off, adt_size = struct.unpack_from('<2Q', payload, 0x20)
-    salami = False
-    if adt_size and adt_off + adt_size <= len(payload):
+    salami, unknown = False, None  # unknown: why the payload ADT does not tell the board
+    try:
+        if not adt_size or adt_off + adt_size > len(payload):
+            raise ValueError('no ADT in the payload range')
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         import adt as _adt  # tools/adt.py
-        try:
-            root, _ = _adt.parse(payload[adt_off:adt_off + adt_size])
-            salami = b'oneplus,salami' in (root.prop('compatible') or b'')
-        except Exception:
-            salami = False
-    if args.display_poll and salami and not args.i_know_s5_s6:
+        root, _ = _adt.parse(payload[adt_off:adt_off + adt_size])
+        compatible = root.prop('compatible')
+        if not compatible:
+            raise ValueError('the ADT root has no compatible')
+        salami = b'oneplus,salami' in compatible
+    except Exception as error:  # fail closed: the 0x4e skip below treats it as salami
+        unknown = str(error) or type(error).__name__
+    if args.display_poll and (salami or unknown) and not args.i_know_s5_s6:
         ap.error('--display-poll on salami reads INTF1 (+0x2b4/+0x2b0) and DSI0, unproven until '
                  'probe stages S5 (INTF) and S6 (DSI) pass; pass --i-know-s5-s6 to override')
     if 'fuxiperf=1' in cmdline.split() and (args.cpu_level or args.cpu_at):
         ap.error('fuxiperf=1 owns EPSS: do not pass --cpu-level or --cpu-at')
-    if salami and (args.framebuffer or args.tour_shots):
+    if (salami or unknown) and (args.framebuffer or args.tour_shots):
+        if unknown:
+            print(f'warning: the payload ADT does not tell the board ({unknown}); treating it as salami',
+                  flush=True)
         print('warning: --framebuffer/--tour-shots read the scanout buffer with request 0x4e, and the '
               '0x4e read drops USB under XNU on salami (the host re-enumerates the device)', flush=True)
         if not args.force_fb:
@@ -255,7 +270,12 @@ def main():
     args.out.mkdir(parents=True, exist_ok=False)
 
     def request(number, length, value=0, index=0, timeout=3000):
-        data = bytes(dev.ctrl_transfer(0xc0, number, value, index, length, timeout=timeout))
+        try:
+            data = bytes(dev.ctrl_transfer(0xc0, number, value, index, length, timeout=timeout))
+        except (NotImplementedError, ValueError) as error:
+            # pyusb on Windows/libusb1 while the device re-enumerates: LIBUSB_ERROR_NOT_SUPPORTED
+            # is a NotImplementedError, a half-gone device can give a ValueError. A failed transfer.
+            raise usb.core.USBError(f'{type(error).__name__}: {error}') from error
         if len(data) != length:
             raise ValueError(f'short USB response: {number:#x}')
         return data
@@ -439,7 +459,10 @@ def main():
         (args.out/(name+'.png')).write_bytes(png)
     tour_tail, tour_done = b'', set()
     loader_note = None
-    last_status, outage, catch_up = before, None, False
+    last_status, outage, catch_up, backoff = before, None, False, RETRY_SLEEP
+    # pyusb errors of a device that is (re-)enumerating: USBError, NotImplementedError
+    # (LIBUSB_ERROR_NOT_SUPPORTED on Windows) and ValueError ("device has no langid").
+    usb_errors = (usb.core.USBError, NotImplementedError, ValueError)
     def release(d):
         try:  # drop the stale handle (and any claimed interface) of a device that went away
             usb.util.dispose_resources(d)
@@ -449,13 +472,13 @@ def main():
         found = []
         try:
             devices = list(usb.core.find(find_all=True, idVendor=0x1209, idProduct=0x0001))
-        except usb.core.USBError:
+        except usb_errors:
             return found
         for d in devices:
             try:
                 if usb.util.get_string(d, d.iProduct) == 'Fuxi hardware probe':
                     found.append(d)
-            except (usb.core.USBError, ValueError):
+            except usb_errors:
                 pass  # still enumerating
         return found
     def other_boot(old, new):
@@ -469,27 +492,46 @@ def main():
         if old['stage'] >= 8 and (new['boot_args'], new['entry']) != (old['boot_args'], old['entry']):
             return 'another XNU handoff'
         return None
-    def reconnect(error, give_up):
+    def reconnect(error, give_up, again):
         """Find this boot's monitor again after a USB error in the console loop. Only 0x46
-        status reads (value 0): never 0x49 (handoff) or 0x46 value 1. The new status, or None."""
+        status reads (value 0): never 0x49 (handoff) or 0x46 value 1. The new status, or None.
+        Each retry first sleeps the backoff, cut at GIVE_UP (the end of this outage's
+        budget) for one last try there; a failure at or after GIVE_UP gives up. AGAIN: the
+        poll after an earlier reconnect in this outage failed too, so the first try waits."""
         nonlocal dev
         print(f'USB transfer failed ({error}); looking for the monitor again for up to '
               f'{max(0, give_up - time.monotonic()):.0f} s', flush=True)
         t0, attempts, why = time.monotonic(), 0, 'no monitor enumerated'
+        def pause(why, grow):
+            """Sleep before the next attempt, then double the backoff when GROW (a monitor
+            answered and failed). False, without sleeping, once the budget is spent."""
+            nonlocal backoff
+            left = give_up - time.monotonic()
+            if left <= 0:
+                print(f'USB: outage budget spent after {time.monotonic() - t0:.0f} s here ({why}); '
+                      f'giving up', flush=True)
+                return False
+            time.sleep(min(backoff, left))
+            if grow:
+                backoff = min(2 * backoff, RETRY_SLEEP_MAX)
+            return True
+        if again and not pause('the poll after the last reconnect failed', True):
+            return None
         while True:
             release(dev)
             attempts += 1
             found = find_monitor()
+            grow = False
             if len(found) == 1:
                 dev = found[0]
                 try:
                     usb.util.claim_interface(dev, 0)  # the vendor interface (no endpoints)
-                except usb.core.USBError as e:
+                except usb_errors as e:
                     why = f'claim: {e}'  # control transfers may still work: 0x46 decides
                 try:
                     now = monitor()
-                except (usb.core.USBError, ValueError) as e:
-                    why = f'request 0x46: {e}'
+                except usb_errors as e:
+                    why, grow = f'request 0x46: {e}', True
                 else:
                     other = other_boot(last_status, now)
                     if other:
@@ -500,10 +542,8 @@ def main():
                     return now
             else:
                 why = f'{len(found)} Fuxi native monitors' if found else 'no monitor enumerated'
-            if time.monotonic() >= give_up:
-                print(f'USB: no monitor after {time.monotonic() - t0:.0f} s ({why}); giving up', flush=True)
+            if not pause(why, grow):
                 return None
-            time.sleep(.5)
     with (args.out / 'progress.jsonl').open('w') as progress, (args.out / 'boot.log').open('wb') as log:
         while time.monotonic() < until:
             status = None
@@ -556,7 +596,6 @@ def main():
                     status['display'] = display_poll()
                 progress.write(json.dumps(status)+'\n')
                 progress.flush()
-                outage = None
                 brief = {k: status[k] for k in ('stage','kernel_stage','kernel_label','console_total','error') if k in status}
                 if brief != previous:
                     print(brief, flush=True)
@@ -583,17 +622,19 @@ def main():
                 if args.reset_minutes and time.monotonic() > renew:
                     request(0x54, 8, args.reset_minutes)
                     renew = time.monotonic() + 600
+                outage = None  # the whole poll (and any renewal) went through: the outage is over
                 time.sleep(.25)
-            except usb.core.USBError as error:
+            except (usb.core.USBError, NotImplementedError) as error:
                 # Windows re-enumerates the device after selective suspend (or a 0x4e read
                 # on salami); the loader monitor and XNU keep running.
                 log.flush()
-                if outage is None:  # one outage lasts until a poll completes again
-                    outage = time.monotonic()
+                again = outage is not None  # the poll after this outage's reconnect failed too
+                if not again:  # one outage, one budget and one backoff until a poll completes
+                    outage, backoff = time.monotonic(), RETRY_SLEEP
                 progress.write(json.dumps({'usb_error': str(error), 'console_read': last_total,
                                            'partial_status': status, 'time': time.time()}) + '\n')
                 progress.flush()
-                back = (reconnect(error, outage + args.reconnect_seconds)
+                back = (reconnect(error, outage + args.reconnect_seconds, again)
                         if args.reconnect_seconds > 0 else None)
                 if back is None:
                     raise

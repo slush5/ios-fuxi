@@ -81,7 +81,10 @@ _Static_assert(sizeof(probe_info)==19*8, "USB report format");
  * DISPCC reads (class 7) and the 0x53 modes (ar_test). A request whose class
  * exceeds this build's cap STALLs. Cumulative: a cap-N image (build.sh
  * FUXI_SALAMI_MDSS_STAGE=N, default 0) allows classes 0..N. Proven on salami
- * (class 0): request 0x42 (SSPP +0x00/0c/14/24/30/34/38/170, CTL +0x14/1c). */
+ * (class 0): request 0x42 (SSPP +0x00/0c/14/24/30/34/38/170, CTL +0x14/1c).
+ * INTF_1 +0x2b4/+0x2b0/+0x298 (window 2) were read safely on salami by probe
+ * stage S5 on 2026-10-28 and by the XNU tegate calibration (1169 samples in a
+ * 431 s session) on 2026-10-29; window 2 still keeps class 5 below. */
 #ifndef FUXI_SALAMI_MDSS_STAGE
 #define FUXI_SALAMI_MDSS_STAGE 0
 #endif
@@ -101,7 +104,7 @@ _Static_assert(sizeof(probe_info)==19*8, "USB report format");
 static const struct { uint32_t base, len, cls; } salami_mdss_win[]={
  {0xae01000,0,SALAMI_CLASS_NEVER},  /*  0 MDP top: refused */
  {0xae16000,0x290,2},               /*  1 CTL0 (+0x14/+0x1c alone: class 0) */
- {0xae36000,0x300,5},               /*  2 INTF_1 */
+ {0xae36000,0x300,5},               /*  2 INTF_1 (+0x298/2b0/2b4 read safely, above) */
  {0xae36800,0xc,5},                 /*  3 INTF_1 tear INTR_EN/STATUS/CLEAR */
  {0xae81000,0x4,4},                 /*  4 DCE_0 DSC_CMN_MAIN_CNF */
  {0xae81100,0x9c,4},                /*  5 DSC_0 encoder */

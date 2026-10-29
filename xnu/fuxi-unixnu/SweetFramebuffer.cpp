@@ -45,6 +45,9 @@
  * single black fill (write-only: the panel memory is write-combined, the
  * read-modify-write fade read it back uncached). sweet_fb_display_off tells
  * the touch driver (bsd/dev/fuxi_touch.c) that the display is off.
+ * sweetfb_statsframes=N (30..6000) replaces the 600. IOLog cuts lines near
+ * 256 bytes, so the stats line is followed by a short "SWEET FB: tegate hits"
+ * line that repeats the gate and format counters from its tail.
  *
  * The plain CPU copy moves BGRA words only: a layer whose surface has another
  * format (w30r, b3a8 with wide colour) is not copied, logged once per format
@@ -241,6 +244,7 @@ public:
  static void writerRetired(void *context);
 #if defined(FUXI)
  thread_call_t fWriterWakeCall;
+ uint32_t      fStatEvery;     /* sweetfb_statsframes (30..6000); 0: 600. Last member: none moves */
  static void writerWake(thread_call_param_t context, thread_call_param_t unused);
  static IOReturn writerWakeAction(OSObject *owner, void *, void *, void *, void *);
 #endif
@@ -487,7 +491,8 @@ static bool sweet_fb_bootoff_ignored(AppleCLCD *fb)
  * tick follows the counter (sweet_fb_rearm): each tick lands guard + 0.7 ms
  * before a window opening, so a tick-driven present waits about that long
  * instead of up to a frame. Calibration samples the counter every 10 us for up
- * to 70 ms (4 wraps) and logs one line.
+ * to 70 ms (4 wraps) and logs one line, then its verdict again on a short line
+ * ("SWEET FB: tegate on" / "off (reason)"): IOLog cuts lines near 256 bytes.
  */
 #define SWEET_FB_INTF1_PA               0x0ae36000ULL
 extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -566,12 +571,29 @@ sweet_fb_tegate_configure(AppleCLCD *fb)
  }
  uint64_t earlyNs = 0;
  absolutetime_to_nanoseconds(te->early, &earlyNs);
+ const char *verdict = on ? "on" : "off (no periodic counter)";
  IOLog("SWEET FB: tegate calibration INTF1+0x%x autorefresh 0x%x: lines %u..%u wraps %u period_us %llu "
      "lines_per_ms %llu.%03llu advanced %llu lines, stalled %u of %u samples; tewin %u telead %u -> "
      "start %u window %u of %u, guard_us %u tick_early_us %llu -> %s\n",
      reg, autorefresh, cal.lo, cal.hi, cal.wraps, periodNs / 1000, perMs / 1000, perMs % 1000,
      cal.count_lines, cal.stalls, cal.samples, window, lead, te->start, te->window, te->span, guard,
-     earlyNs / 1000, on ? "on" : "off (no periodic counter)");
+     earlyNs / 1000, verdict);
+ IOLog("SWEET FB: tegate %s\n", verdict);    /* the line above loses its tail */
+}
+
+/*
+ * sweetfb_statsframes=N: presented frames per "SWEET FB: stats" line, clamped
+ * to 30..6000 (a lightly used phone may not present 600 in a session).
+ * Absent: 0, which presentStats() reads as the default 600, and no log.
+ */
+static uint32_t
+sweet_fb_stats_frames(void)
+{
+ uint32_t frames = 0;
+ if (!PE_parse_boot_argn("sweetfb_statsframes", &frames, sizeof(frames))) return 0;
+ uint32_t every = frames < 30 ? 30 : frames > 6000 ? 6000 : frames;
+ IOLog("SWEET FB: sweetfb_statsframes=%u: stats every %u presented frames\n", frames, every);
+ return every;
 }
 #endif
 
@@ -656,6 +678,7 @@ AppleCLCD::start(IOService *provider)
 	fNextTick = mach_absolute_time() + fTickAbs;
 	fTickArmed = true;
 	fStatStart = mach_absolute_time();
+	fStatEvery = sweet_fb_stats_frames();
 	fVsync->wakeAtTime(kIOTimeOptionsWithLeeway, fNextTick, 0);
 	IOLog("SWEET FB: present up to %u Hz (every %u ticks)\n", 60 / fFlushTicks, fFlushTicks);
 #else
@@ -1549,7 +1572,7 @@ void AppleCLCD::presentStats(uint64_t took)
  if (deferred) memcpy(fStage, activeStage, sizeof(fStage));
 	fStatCopy += took;
 	fStatCopyMax = took > fStatCopyMax ? took : fStatCopyMax;
-	if (++fStatFrames >= 600) {
+	if (++fStatFrames >= (fStatEvery ? fStatEvery : 600)) {
 		uint64_t avg_ns, max_ns, span_ns;
 		absolutetime_to_nanoseconds(fStatCopy / fStatFrames, &avg_ns);
 		absolutetime_to_nanoseconds(fStatCopyMax, &max_ns);
@@ -1572,6 +1595,9 @@ void AppleCLCD::presentStats(uint64_t took)
 		    "fmt_refused=%u tegate_hits=%u tegate_misses=%u tegate_wait_avg_us=%llu tegate_wait_max_us=%llu\n", fStatFrames, span_ns / 1000000, avg_ns / 1000,
 		    max_ns / 1000, swaps, dropped, pending, overflow, skips, fScanoutDefers, reuse, waits[0], waits[1], early, latest, outstanding, fEarlyRetires,
 		    fFormatRefused, fTeGate.hits, fTeGate.misses, teAvg / 1000, teMax / 1000);
+  /* IOLog cuts lines near 256 bytes: the tail of the line above again, short (zeros with the gate off). */
+  IOLog("SWEET FB: tegate hits %u misses %u wait avg %llu us max %llu us, fmt_refused %u\n",
+      fTeGate.hits, fTeGate.misses, teAvg / 1000, teMax / 1000, fFormatRefused);
   fFormatRefused = fTeGate.hits = fTeGate.misses = 0;
   fTeGate.wait_sum = fTeGate.wait_max = 0;
 		uint64_t gpu_ns, cpu_ns;
