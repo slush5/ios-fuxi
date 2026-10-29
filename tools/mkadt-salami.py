@@ -193,6 +193,7 @@ def main():
     ap.add_argument('--product-haptics', action='store_true', help='add /product/haptics copied from the D22AP tree')
     ap.add_argument('--product-camera', action='store_true', help='add an empty /product/camera node (no flash)')
     ap.add_argument('--display-gamut', choices=('P3', 'sRGB'), help='set /product artwork-display-gamut')
+    ap.add_argument('--wlan-node', action='store_true', help='add an empty /arm-io/wlan node so launchd starts wifid (its job is limited to the wlan / marconi-wifi device-tree nodes); pairs with fuxiwifiios=1')
     ap.add_argument('--d22ap-adt', type=Path, default=Path(mkadt.D22AP_ADT), help='real D22AP device tree (not in git)')
     ap.add_argument('--fb', help='ABL splash WxH (default 1080x2412); must match the loader FB_W/FB_H')
     ap.add_argument('--fb-stride', help='bytes per line (default 4*W); must match the loader FB_STRIDE')
@@ -240,6 +241,13 @@ def main():
         root = fx.add_product_children(root, args.product_haptics, args.product_camera, product_path)
         if args.display_gamut:
             root = fx.set_display_gamut(root, args.display_gamut)
+        if args.wlan_node:
+            arm_io = next(n for n in root.children if n.name == 'arm-io')
+            if any(n.name == 'wlan' for n in arm_io.children):
+                raise ValueError('/arm-io/wlan already exists')
+            arm_io.children.append(mkadt.node('wlan', [
+                ('AAPL,phandle', struct.pack('<I', fx.max_phandle(root) + 1)),
+                ('device_type', mkadt.cstr('wlan'))]))
         if args.touch_defaults:
             defaults = next((n for n in root.children if n.name == 'defaults'), None)
             if defaults is None:
