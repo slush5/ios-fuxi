@@ -8,7 +8,8 @@ Host tests and local arm64 syntax checks pass; no device result is claimed.
 
 ## Enablement and backend boundary
 
-`fuxiwifiios=1` enables the shim. Missing, zero or other values do nothing:
+`fuxiwifiios=1` enables the shim; `fuxiwifiios=2` enables it with route U
+(below). Missing, zero or other values do nothing:
 no interface, station thread or discovery services are created. Preserve all
 other caller boot arguments. No `fuxiwlan` argument is required for the fake
 backend. The existing USB Ethernet interface is `ue0`; it is not renamed.
@@ -18,7 +19,7 @@ The entry runs after `net_init_run()` in BSD initialization, before launchd.
 
 - `station`: power, scan request, cached results, connect (`join`), disconnect
   (`leave`), state snapshot, allowed channels and a locally administered MAC.
-- `tx_frame`: borrowed Ethernet bytes, 14–1514 bytes without FCS; copy before
+- `tx_frame`: borrowed Ethernet bytes, 14-1514 bytes without FCS; copy before
   returning. TX is serialized, but may overlap station/state calls.
 - `start`: receives the `rx_frame` and `link_state` input callbacks. RX is
   copied before return; invoke both in thread context, never an interrupt.
@@ -196,6 +197,134 @@ No root image was mounted or edited in this task.
 6. Restore the root job keys, omit `fuxiwifiios`, and repeat the baseline.
    Hardware driver validation remains a separate WLAN lane test.
 
+## Route U: internet over the USB cable (fuxiwifiios=2, salami)
+
+Route U keeps the synthetic station (scan and join of **Fuxi Loopback** are
+exactly as above) and carries `en0`'s Ethernet frames over the USB cable that
+already links the phone to the host: the loader's DWC3 ep0 monitor on cpu@100.
+A bridge on the host (DHCP, ARP, DNS, UDP NAT, TCP termination with ordinary
+sockets) answers them. Only the backend's `tx_frame` and `start` differ.
+
+    iOS en0 -> fuxi_wifi_ios.c usbnet_tx -> TX ring --0x5e--> host bridge
+    host bridge --0x5d--> RX ring -> RX thread -> fuxi_wifi_net_input -> iOS en0
+
+Enable it with all three: a loader built with `FUXI_USBNET` (the default for
+`FUXI_BOARD=salami`; `FUXI_USBNET=0` builds the old image, byte for byte, named
+`-un0`), an ADT from `tools/mkadt-salami.py --wlan-node --usbnet` (adds the
+16-byte /chosen `fuxi-usbnet` placeholder) and `fuxiwifiios=2` instead of `=1`
+(same length; no other boot-arg). The host side is `tools/fuxi_usbnet_ring.py`:
+`UsbnetTransport(ctrl, lock)` over pyusb `ctrl_transfer` (share `lock` with
+the console loop), and `LoaderRingSim`/`KernelSim`/`sim_pair()` to run a
+bridge end to end in WSL with no phone.
+
+**Region.** One 0x24000-byte block inside the loader Image (`build.sh`
+`usbnet.S`: zero bytes in the file, 16 KiB aligned, between `.data` and
+`.bss`, before the payload; `build.sh` checks it against the Image). At the
+handoff, after the ADT copy, the loader checks it is outside `FG_RAM_BASE` +
+`FG_RAM_SIZE` and the GPU scratch (else it writes and publishes nothing,
+`adt_status` 4: 0x5e keeps answering zeros, 0x5d frames are dropped), zeroes
+it, writes line 0, writes `{u64 pa, u64 0x24000}` over
+the ADT copy's placeholder when there is exactly one, and publishes it. XNU
+never manages it; the kernel maps it with `ml_io_map_wcomb` (Normal
+non-cacheable), the loader runs with the MMU off (Device), so no cache upkeep,
+only a `dsb sy` before every index store and after every index load.
+
+| Offset | Writer | Fields (u32 unless noted) |
+| --- | --- | --- |
+| 0x00 | loader, once | u64 "FXNETL01", version 1, size 0x24000, u64 self_pa, slot_size 2048, slots 32, rx_off 0x4000, tx_off 0x14000, adt_status (1 patched, 2 no placeholder, 3 several) |
+| 0x40 | kernel | u64 "FXNETK01" (its opt-in), kstate (bit0 up, bit1 en0 link), rx_tail, tx_head, rx_frames, rx_bad, tx_frames, tx_full_drops, tx_size_drops (0x64) |
+| 0x80 | loader | rx_head, host_tx_tail, out_ok, out_stall_full and out_stall_other (frames dropped: ring full, anything else), in_count, tail_bad (0x98) |
+| 0x4000 | loader | RX ring (host to phone): 32 slots of 2048 |
+| 0x14000 | kernel | TX ring (phone to host): 32 slots of 2048 |
+
+Slot k of a ring is at its offset + (k % 32) * 2048: {u16 len, u16 flags 0,
+u32 seq = k, u32 fnv1a32(frame), u32 0}, then the frame (14..1514 bytes, no
+FCS) zero padded to 4. Counters run free (u32, wraparound). RX is full at
+rx_head - rx_tail == 32, TX at tx_head - host_tx_tail == 32.
+
+**Requests** (`shim/fuxi-probe/usbnet.h`, under `FUXI_USBNET`, outside the
+salami pre-filter, no per-request log). A STALL makes the device vanish from a
+WinUSB host until the cable is replugged (measured at home, SPEC amendment
+A1), taking the console monitor with it, so only a malformed request that a
+correct host never sends is STALLed:
+
+- `0x5d` OUT (0x40), wValue `0x4e52`, wIndex = the low 16 bits of the host's
+  TX consumed count, wLength 14..1514 = one frame. STALL only for another
+  wValue or wLength (counted `out_stall_other` once published). Every
+  well-formed request gets its data stage (the audio OUT residue rule), then
+  the frame is kept only after the launch, with the region published, kmagic
+  and kstate bit0 set and a free RX slot: slot, `dsb`, rx_head + 1,
+  host_tx_tail, out_ok + 1. Otherwise it is dropped and counted
+  (`out_stall_full` when the full ring was the only reason, else
+  `out_stall_other`; nothing is counted before the region is published) and
+  host_tx_tail is left alone.
+- `0x5e` IN (0xc0), wValue `0x4e53`, same wIndex, wLength 192..4096. STALL
+  only for another wValue or wLength. Before the launch or the handoff the
+  reply is wLength zero bytes (magic 0: not ready) and nothing is touched.
+  Otherwise it is always exactly wLength bytes (no zero-length packet): header
+  lines 0..2, then whole TX slots from host_tx_tail below tx_head, each header
+  + frame padded to 4, as many as fit; zero padding (a len of 0) or a slot with
+  a bad len or seq ends the list.
+- host_tx_tail is rebuilt from wIndex and tx_head (the host's count lies in
+  [tx_head - 32, tx_head]); anything else keeps the old value (`tail_bad`).
+- The host avoids drops: `UsbnetTransport` keeps (rx_head + frames sent since
+  the last header) - rx_tail below 32, refreshes the header with one 192-byte
+  0x5e when that looks full, and sends nothing until a header shows the loader
+  magic and the kernel up. `send_frame` then returns False (busy, nothing
+  sent); `stats['phone_drops']` counts what the phone dropped anyway.
+- The loader copies frames in 64-bit Device accesses wherever the ep0 buffer
+  and the slot are both 8-byte aligned, 32-bit ones (pad bytes masked) for the
+  last word or two.
+
+**Kernel.** `fuxiwifiios=2` reads /chosen `fuxi-usbnet` (16 bytes, not the
+placeholder, size 0x24000, 16 KiB aligned, outside XNU RAM and the GPU
+scratch), maps it, checks line 0 (magic, version, size, self_pa, ring layout),
+writes kmagic and logs one line with pa and size; any handoff or header failure
+logs one `FUXI WIFI IOS: usbnet: ...` line and keeps the synthetic loopback
+(`ml_io_map_wcomb` has no soft failure: io_map uses `KMA_NOFAIL` and panics if
+`pmap_map` fails; the 144 KiB fit its 8 MiB submap). TX writes a
+slot under the backend's lock (full: `tx_full_drops`). One thread drains RX
+every 1 ms while frames moved either way in the last second, else every 20 ms,
+checks len, seq and fnv, copies the frame out and hands it to `en0`, then
+consumes the slot (`rx_bad` for a bad one). kstate bit0 is set when that thread
+runs, bit1 follows `en0`'s link (join, leave, power).
+
+**Safety.** No request names an address: the region is the loader's own
+linker symbol, checked at build time (inside the loaded Image, zero) and at
+boot (aligned, outside XNU RAM and the GPU scratch); every slot index is
+reduced mod 32 and every length bounded to 14..1514, so 0x5d writes only one RX
+slot and line 2 of that region, and 0x5e only reads the region into the ep0
+buffer (4096 bytes, inside the 16 KiB `dma_area`). No well-formed request
+STALLs, so a busy or booting phone never knocks the monitor off the host.
+Nothing is kept until the kernel opts in with kmagic and kstate bit0, a dropped
+frame changes only line 2's counters, and a host count outside the window
+only makes the kernel see fewer free slots, never overwrite unread ones. No
+MMIO, rails, clocks, RPMh or GPIO: plain DRAM plus the ep0 path every monitor
+request already uses. The kernel treats the RX ring as untrusted (len, seq,
+fnv) and frames enter iOS through the normal `en0` input path, as from any
+Ethernet; what they can reach is the host bridge's decision, as with USB
+tethering. Requests 0x4f, 0x55 and 0x57 are unchanged.
+
+**Throughput (estimate, not measured).** ep0 runs 64-byte packets; a 1514-byte
+frame is 24 of them, about 50 us on a high-speed wire. The host's synchronous
+control transfers (WinUSB through pyusb) cost roughly 0.25 to 1 ms each, so
+about 1000 to 4000 requests per second shared by both directions and the
+console loop: one frame per 0x5d, and per 4096-byte 0x5e two full-size frames
+or up to 32 small ones. Expect a few Mbit/s each way, up to roughly 10 to 20
+Mbit/s in the best case, and 1 to 3 ms more round-trip time (host poll plus the
+kernel's 1 ms poll): enough for DNS, HTTPS, messaging and App Store metadata,
+not for video. A full-speed (12 Mbit/s) link caps it lower.
+
+Host validation: `CC=cc python3 -B tools/test-fuxi-usbnet.py` (layout and
+switches; usbnet.h and fuxi_usbnet_ring.h compiled unchanged and checked byte
+for byte against the Python models over one scenario with every STALL and drop
+rule, bound and wraparound, and no STALL or drop for a host that keeps fewer
+than 32 frames in flight; probe.c's own ep0 glue; the ADT patch; the kernel
+backend on the wifi-ios model; the transport, including zeros before the
+launch and a phone reboot under a running bridge; 57 mutants of the rules and
+bounds), and
+`python3 tools/fuxi_usbnet_ring.py --selftest`.
+
 ## Provenance and exclusions
 
 HackiOS kernel checkout `8e61187098f2c26c5daee8f9f72b6416aa64b9ab`,
@@ -236,6 +365,7 @@ does not supply retransmissions or a working radio supplicant.
 ```sh
 python3 tools/sync-fuxi-wifi-ios.py --check
 python3 tools/test-fuxi-wifi-ios.py
+CC=cc python3 -B tools/test-fuxi-usbnet.py
 python3 tools/check-fuxi-wifi-ios.py "$XNU_BUILDTREE"
 ```
 

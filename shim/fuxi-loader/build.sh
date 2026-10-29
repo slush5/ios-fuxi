@@ -38,6 +38,20 @@ if [[ -n ${FUXI_USB_REATTACH:-} ]]; then
  [[ $FUXI_USB_REATTACH =~ ^[01]$ ]] || { echo 'FUXI_USB_REATTACH must be 0 or 1' >&2; exit 1; }
  [[ $FUXI_USB_REATTACH == 1 ]] || reattach=-ra0
 fi
+# FUXI_USBNET=0 or 1 (salami only, default 1 on salami): route U (docs-lanes/wifi-ios.md),
+# the loader's own 0x24000-byte usbnet ring region (usbnet.S below: zero bytes in the Image,
+# 16 KiB aligned, before the payload) and monitor requests 0x5d/0x5e (fuxi-probe/usbnet.h).
+# 1 builds the default image; 0 (no region, 0x5d/0x5e STALL as before) gets its own out dir
+# and image name (-un0).
+usbnet_on=0
+usbnet=
+if [[ $board == salami ]]; then usbnet_on=1; fi
+if [[ -n ${FUXI_USBNET:-} ]]; then
+ [[ $board == salami ]] || { echo 'FUXI_USBNET is for FUXI_BOARD=salami only' >&2; exit 1; }
+ [[ $FUXI_USBNET =~ ^[01]$ ]] || { echo 'FUXI_USBNET must be 0 or 1' >&2; exit 1; }
+ usbnet_on=$FUXI_USBNET
+ [[ $FUXI_USBNET == 1 ]] || usbnet=-un0
+fi
 # FUXI_BOOT_LOGO=/abs/mask FUXI_BOOT_LOGO_W=W FUXI_BOOT_LOGO_H=H (salami only): the
 # loader fills the ABL splash black and draws this W*H-byte 8-bit coverage mask
 # (255 = logo) centred as grey, with no loader text (loader.c boot_logo_draw); pair
@@ -85,7 +99,7 @@ fi
 for input in "${inputs[@]}"; do
  [[ $input == /* && -f $input ]] || { echo 'Packing inputs must be existing absolute file paths' >&2; exit 1; }
 done
-out=../out/$board-loader$stage$logo$touch$reattach
+out=../out/$board-loader$stage$logo$touch$reattach$usbnet
 mkdir -p "$out"
 # Reject a payload made from a different board, truncated segments, or unsafe RAM.
 python3 - "$payload" "$board" <<'PY'
@@ -143,6 +157,7 @@ if [[ $board == salami ]]; then flags+=(-DFUXI_SALAMI=1); fi
 if [[ -n $stage ]]; then flags+=("-DFUXI_SALAMI_MDSS_STAGE=$FUXI_SALAMI_MDSS_STAGE"); fi
 if [[ -n ${FUXI_SALAMI_TOUCH_AUTO:-} ]]; then flags+=("-DFUXI_SALAMI_TOUCH_AUTO=$FUXI_SALAMI_TOUCH_AUTO"); fi
 if [[ -n ${FUXI_USB_REATTACH:-} ]]; then flags+=("-DFUXI_USB_REATTACH=$FUXI_USB_REATTACH"); fi
+if [[ -n ${FUXI_USBNET:-} ]]; then flags+=("-DFUXI_USBNET=$FUXI_USBNET"); fi
 if [[ -n $logo ]]; then
  flags+=(-DFUXI_BOOT_LOGO=1 "-DFUXI_BOOT_LOGO_W=$FUXI_BOOT_LOGO_W" "-DFUXI_BOOT_LOGO_H=$FUXI_BOOT_LOGO_H")
 fi
@@ -170,7 +185,17 @@ if [[ -n $logo ]]; then
  "$CLANG" "${flags[@]}" -c "$out/logo.S" -o "$out/logo.o"
  logo_obj=("$out/logo.o")
 fi
-"$LLD" -T loader.ld --build-id=none "$out/start.o" "$out/loader.o" "$out/console.o" "$out/probe.o" "${logo_obj[@]}" "$out/gpu-fw.o" "$out/payload.o" -o "$out/loader.elf"
+# Route U region (FUXI_USBNET=1): zero bytes in the file like the payload's incbin, so ABL
+# loads them with the Image and they stay resident under the cpu@100 monitor; loader.ld puts
+# .usbnet after .data, outside .bss and the stacks. Checked against the Image below.
+usbnet_obj=()
+if [[ $usbnet_on == 1 ]]; then
+ printf '.section .usbnet,"aw",%%progbits\n.balign 16384\n.global _usbnet_start\n_usbnet_start:\n.zero 0x24000\n.global _usbnet_end\n_usbnet_end:\n' \
+  > "$out/usbnet.S"
+ "$CLANG" "${flags[@]}" -c "$out/usbnet.S" -o "$out/usbnet.o"
+ usbnet_obj=("$out/usbnet.o")
+fi
+"$LLD" -T loader.ld --build-id=none "$out/start.o" "$out/loader.o" "$out/console.o" "$out/probe.o" "${logo_obj[@]}" "${usbnet_obj[@]}" "$out/gpu-fw.o" "$out/payload.o" -o "$out/loader.elf"
 python3 - "$out/loader.elf" "$READELF" "$no_gpu_fw" <<'GPUCHECK'
 import re, subprocess, sys
 sections = subprocess.check_output([sys.argv[2], '-SW', sys.argv[1]], text=True)
@@ -217,8 +242,32 @@ if sys.argv[2]:
 else:
     assert marker not in image, 'Image carries a boot logo marker without FUXI_BOOT_LOGO'
 LOGOPY
+# Route U: the region is 0x24000 zero bytes at a 16 KiB aligned Image offset, before .bss,
+# the stacks and the payload, so the header's image_size (= the file) covers it; usbnet.h
+# checks at boot that the load PA keeps it clear of XNU RAM and the GPU scratch.
+python3 - "$out/Image" "$out/loader.elf" "$READELF" "$usbnet_on" <<'USBNETPY'
+import struct, subprocess, sys
+from pathlib import Path
+image = Path(sys.argv[1]).read_bytes()
+names = ('_head', '_usbnet_start', '_usbnet_end', '_bss_start', '_secondary_stack_top', '_payload_start')
+syms = {}
+for line in subprocess.check_output([sys.argv[3], '-sW', sys.argv[2]], text=True).splitlines():
+    f = line.split()
+    if len(f) == 8 and f[7] in names:
+        syms[f[7]] = int(f[1], 16)
+if sys.argv[4] == '1':
+    assert syms.get('_head') == 0 and len(syms) == len(names), 'loader.elf lacks the usbnet region symbols'
+    start, end = syms['_usbnet_start'], syms['_usbnet_end']
+    assert start % 16384 == 0 and end - start == 0x24000, f'usbnet region {start:#x}..{end:#x}: want 0x24000 bytes, 16 KiB aligned'
+    assert end <= syms['_bss_start'] or start >= syms['_secondary_stack_top'], 'usbnet region overlaps .bss or the stacks'
+    assert end <= syms['_payload_start'] and struct.unpack_from('<Q', image, 16)[0] == len(image) >= end, 'usbnet region outside the loaded Image'
+    assert image[start:end] == bytes(end - start), 'usbnet region is not zero in the Image'
+    print(f'usbnet: region at Image offset {start:#x}, 0x24000 zero bytes, 16 KiB aligned, inside image_size; PA = load PA + {start:#x}')
+else:
+    assert '_usbnet_start' not in syms, 'FUXI_USBNET=0 image carries a usbnet region'
+USBNETPY
 # A GPU-less image never takes the name of the firmware-bearing one runners expect.
 if [[ $no_gpu_fw == 1 ]]; then suffix=-nogpufw; else suffix=; fi
 python3 "$MKBOOTIMG" --header_version 4 --kernel "$out/Image" \
- --os_version 16.0.0 --os_patch_level 2026-08 -o "$out/$board-xnu-boot$stage$logo$touch$reattach$suffix.img"
-ls -lh "$out/Image" "$out/$board-xnu-boot$stage$logo$touch$reattach$suffix.img"
+ --os_version 16.0.0 --os_patch_level 2026-08 -o "$out/$board-xnu-boot$stage$logo$touch$reattach$usbnet$suffix.img"
+ls -lh "$out/Image" "$out/$board-xnu-boot$stage$logo$touch$reattach$usbnet$suffix.img"

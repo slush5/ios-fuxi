@@ -9,6 +9,7 @@
 #include "../font.h"
 #include "monitor.h"
 #include "gpu-handoff.h"
+#include "usbnet.h"
 #define printf(...) ((void)0)
 #define rsr(r) ({ uint64_t v; __asm__ volatile("mrs %0, " r : "=r"(v)); v; })
 /* FUXI_USB_REATTACH (0 or 1; default 1 on salami, 0 on Fuxi): when the monitor link
@@ -1242,7 +1243,7 @@ static void core_probe(void)
 #define UD_TRB_OUT      0x1000          /* ep0 OUT TRB */
 #define UD_TRB_IN       0x1010          /* ep0 IN TRB */
 #define UD_SETUP        0x1040          /* 8-byte setup packet */
-#define UD_DATA         0x1100          /* ep0 data stage, 512 bytes */
+#define UD_DATA         0x1100          /* ep0 data stage, 512 bytes (route U: 0x5d 1536, 0x5e 4096) */
 #define UD_SIZE         0x4000
 
 static struct {
@@ -1253,9 +1254,39 @@ static struct {
 	enum { EP0_SETUP, EP0_DATA, EP0_WAIT_STATUS2, EP0_WAIT_STATUS3, EP0_STATUS } state;
 	bool        data_in;        /* data stage direction */
 	bool        audio_out;      /* OUT data stage carries an audio staging chunk */
+#if FUXI_USBNET
+	bool        usbnet_out;     /* OUT data stage carries a route U frame (0x5d) */
+#endif
 	uint16_t    out_index, out_length;
 	uint32_t    events;
 } ud;
+
+#if FUXI_USBNET
+/* Route U (usbnet.h). The 0x5d OUT stage is (1514 + 63) & ~63 bytes, the 0x5e reply up
+ * to 4096 plus its zero fill to 4; nothing but the ep0 data stage lives past UD_DATA
+ * (the usb-reattach.h record is its own static, not in dma_area). */
+_Static_assert(UD_DATA + ((UN_FRAME_MAX + 63u) & ~63u) <= UD_SIZE && UD_DATA + UN_IN_MAX + 4 <= UD_SIZE,
+               "route U ep0 data stage outside dma_area");
+/* The region is build.sh's usbnet.S block inside this Image; loader_boot publishes it
+ * through probe_usbnet_handoff right after the ADT copy. */
+static struct un un;
+uint32_t probe_usbnet_handoff(uintptr_t adt, uint64_t adt_size)
+{
+ extern uint8_t _usbnet_start[];
+ return un_handoff(&un, (uintptr_t)_usbnet_start, adt, adt_size);
+}
+/* One request per frame: the setup line is logged for the first 0x5d and 0x5e only. */
+static bool un_log_setup(uint8_t req)
+{
+ static bool said[2];
+ if (req != UN_REQ_OUT && req != UN_REQ_IN) return true;
+ if (said[req - UN_REQ_OUT]) return false;
+ said[req - UN_REQ_OUT] = true;
+ return true;
+}
+#else
+#define un_log_setup(req) true
+#endif
 
 static inline void
 dwc_wr(uint32_t off, uint32_t v)
@@ -1511,10 +1542,13 @@ ud_setup(void)
 	uint32_t n = 0;
 	bool ok = true;
 
-	if (req != 0x5b || value == 0)  /* audio staging sends ~10^5 chunks: log the first only */
+	if ((req != 0x5b || value == 0) && un_log_setup(req))  /* audio staging sends ~10^5 chunks: log the first only */
 		printf("SWEET USB: setup %02x %02x %04x len %u\n", type, req, value, length);
 	ud.data_in = (type & 0x80) != 0;
 	ud.audio_out = false;
+#if FUXI_USBNET
+	ud.usbnet_out = false;
+#endif
 #if defined(FUXI_SALAMI)
 	/* Lanes not ported to the OnePlus 11 (salami) STALL before any of their code
 	 * runs: 0x52 MDP/PLL0 boost, 0x55 'TE' (the FTS SPI event FIFO; 'TP' is
@@ -1708,6 +1742,19 @@ ud_setup(void)
         /* audio lane: 'AS' snapshot, 'AU' staging status, 'AB' ADSP boot, 'AR' report */
     } else if (type == 0x40 && req == 0x5b && au_out_ok(value, (uint16_t)(st[4] | st[5] << 8), length)) {
         ud.audio_out = true; ud.out_index = (uint16_t)(st[4] | st[5] << 8); ud.out_length = length;
+#if FUXI_USBNET
+    } else if (type == 0x40 && req == UN_REQ_OUT) {
+        /* Route U: one frame for the loader's RX ring; only a malformed request STALLs,
+         * un_out_data keeps or drops the frame after the data stage (usbnet.h). */
+        if (un_out_ok(&un, value, length)) {
+            ud.usbnet_out = true; ud.out_index = (uint16_t)(st[4] | st[5] << 8); ud.out_length = length;
+        } else ok = false;
+    } else if (type == 0xc0 && req == UN_REQ_IN) {
+        /* Route U: header lines and the kernel's TX slots (all zero before the launch and
+         * the handoff), always exactly wLength bytes; 0 only for a malformed request. */
+        n = un_in(&un, monitor_report[MON_LAUNCH] != 0, value, (uint16_t)(st[4] | st[5] << 8), length, data);
+        ok = n != 0;
+#endif
     } else if (type == 0xc0 && req == 0x48) {
         memcpy(data, monitor_error, sizeof(monitor_error)); n=sizeof(monitor_error);
 #if FUXI_USB_DIAG
@@ -1762,8 +1809,12 @@ ud_setup(void)
 		}
 		ud_start(1, UD_DATA, n, TRBCTL_DATA);
 	} else {
-		/* OUT TRB length is a max-packet multiple; only audio chunks are used. */
-		ud_start(0, UD_DATA, ud.audio_out ? ((uint32_t)length + 63u) & ~63u : 64u, TRBCTL_DATA);
+		/* OUT TRB length is a max-packet multiple; only audio chunks and route U frames are used. */
+		bool chunk = ud.audio_out;
+#if FUXI_USBNET
+		chunk = chunk || ud.usbnet_out;
+#endif
+		ud_start(0, UD_DATA, chunk ? ((uint32_t)length + 63u) & ~63u : 64u, TRBCTL_DATA);
 	}
 }
 
@@ -1823,6 +1874,18 @@ ud_event(uint32_t ev)
 					au_out_data(ud.out_index, (const volatile uint8_t *)(ud.dma + UD_DATA), ud.out_length);
 				ud.audio_out = false;
 			}
+#if FUXI_USBNET
+			if (ud.usbnet_out) {
+				/* Route U: the same residue rule; a short stage, a busy or absent kernel
+				 * and a full ring drop the frame and count it (never a STALL). */
+				uint32_t want = ((uint32_t)ud.out_length + 63u) & ~63u;
+				uint32_t left = *(volatile uint32_t *)(ud.dma + UD_TRB_OUT + 8) & 0xffffff;
+				ud_sync(UD_DATA, want);
+				(void)un_out_data(&un, monitor_report[MON_LAUNCH] != 0, want - left == ud.out_length,
+				    (const volatile uint8_t *)(ud.dma + UD_DATA), ud.out_length, ud.out_index);
+				ud.usbnet_out = false;
+			}
+#endif
 			ud.state = EP0_WAIT_STATUS3;
 			break;
 		case EP0_STATUS:

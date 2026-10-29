@@ -124,10 +124,11 @@ static void lck_mtx_sleep(pthread_mutex_t *m, int flags, event_t e, int t) {
 static void thread_wakeup(event_t e) { (void)e; pthread_cond_broadcast(&wake_cond); }
 static void thread_set_thread_name(thread_t t, const char *n) { (void)t; (void)n; }
 static void thread_deallocate(thread_t t) { pthread_detach(t); }
-static void (*worker)(void *,wait_result_t);
-static void *run(void *p) { worker(p,0); return NULL; }
+/* Each thread runs its own function: the station's and route U's RX thread may start together. */
+struct model_thread { void (*f)(void *,wait_result_t); void *p; };
+static void *run(void *a) { struct model_thread m=*(struct model_thread *)a; free(a); m.f(m.p,0); return NULL; }
 static int kernel_thread_start(void (*f)(void *,wait_result_t),void *p,thread_t *t) {
- worker=f; return pthread_create(t,NULL,run,p);
+ struct model_thread *m=malloc(sizeof(*m)); assert(m); m->f=f; m->p=p; return pthread_create(t,NULL,run,m);
 }
 static int memset_s(void *p,size_t n,int c,size_t count) { assert(count<=n); memset(p,c,count); return 0; }
 static int copyin(user_addr_t p,void *out,size_t n) {
@@ -156,6 +157,35 @@ static int mbuf_copydata(mbuf_t p,size_t off,size_t n,void *out) { memcpy(out,(c
 static void FuxiNetworkStackStart(void) { registry++; }
 static void fuxi_wifi_net_input(const uint8_t *p,size_t n) { assert(p[12]==0x88 && n>=14); received++; }
 static void fuxi_wifi_net_link_state(bool up) { link_up=up; }
+/* Route U (fuxiwifiios=2): /chosen "fuxi-usbnet", the region mapping and the RX thread's waits.
+   No property here: tools/test-fuxi-usbnet.py drives that backend with one. */
+typedef const void *DTEntry;
+typedef uintptr_t vm_offset_t;
+typedef size_t vm_size_t;
+#define kSuccess 1
+#define NSEC_PER_MSEC 1000000ull
+#define THREAD_CONTINUE_NULL NULL
+static const void *model_usbnet_prop;
+static unsigned model_usbnet_size, model_usbnet_maps, model_usbnet_lookups;
+static uintptr_t model_usbnet_region;
+static uint64_t model_usbnet_pa;
+static atomic_uint model_usbnet_waits[2];  /* 1 ms, 20 ms */
+static int SecureDTLookupEntry(DTEntry from,const char *path,DTEntry *out) {
+ assert(!from && !strcmp(path,"/chosen")); model_usbnet_lookups++; *out=&model_usbnet_prop; return kSuccess;
+}
+static int SecureDTGetProperty(DTEntry entry,const char *name,const void **value,unsigned *size) {
+ assert(entry==&model_usbnet_prop && !strcmp(name,"fuxi-usbnet"));
+ if (!model_usbnet_prop) return 0;
+ *value=model_usbnet_prop; *size=model_usbnet_size; return kSuccess;
+}
+static vm_offset_t ml_io_map_wcomb(vm_offset_t pa,vm_size_t size) {
+ assert(pa==model_usbnet_pa && size==0x24000); model_usbnet_maps++; return model_usbnet_region;
+}
+static int assert_wait_timeout(event_t e,int how,uint32_t interval,uint64_t scale) {
+ assert(e && how==THREAD_UNINT && scale==NSEC_PER_MSEC && (interval==1 || interval==20));
+ atomic_fetch_add(&model_usbnet_waits[interval==20],1); return 0;
+}
+static int thread_block(void *c) { assert(!c); struct timespec pause={.tv_nsec=200000}; nanosleep(&pause,NULL); return 0; }
 '''
 
 TEST = r'''
@@ -197,8 +227,8 @@ static bool said_since(size_t from,const char *what) { return strstr(logbuf+from
 int main(void) {
  assert(sizeof(struct apple80211req)==40 && offsetof(struct apple80211req,req_data)==32);
  fuxi_wifi_ios_init(); assert(!attached && !registry && !fuxi_wifi_sta_present());
- opt=2; fuxi_wifi_ios_init(); assert(!attached);
- /* without fuxiwifiios=1: nothing is made, nothing said, no timer */
+ opt=3; fuxi_wifi_ios_init(); assert(!attached);
+ /* without fuxiwifiios=1 (or 2, route U: tools/test-fuxi-usbnet.py): nothing is made, nothing said, no timer */
  assert(loglen==0 && !calls_made && !calls_armed);
  opt=1; fuxi_wifi_ios_init(); assert(attached==1 && registry==1);
  fuxi_wifi_ios_init(); assert(attached==1);
@@ -610,7 +640,7 @@ def main():
         source += stripped('fuxi_wifi_ios.h') + stripped('fuxi_wifi_apple80211.h')
         source += 'bool fuxi_wifi_net_attach(const struct fuxi_wifi_net_link *);\n'
         source += stripped('fuxi_wifi_sta.c') + stripped('fuxi_wifi_apple80211.c')
-        source += stripped('fuxi_wifi_ios.c') + TEST
+        source += stripped('fuxi_usbnet_ring.h') + stripped('fuxi_wifi_ios.c') + TEST
         compile_run(source, directory, 'ios')
         compile_run(source, directory, 'ios-salami', ['-DFUXI_SALAMI=1'])   # K-W1b summary back-off
         wpa_test(directory)

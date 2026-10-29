@@ -5,11 +5,15 @@
 #include "console.h"
 #include "../fuxi-probe/monitor.h"
 #include "../fuxi-probe/gpu-handoff.h"
+#include "../fuxi-probe/usbnet.h"
 void probe_main(uintptr_t fdt);
 uint64_t probe_fdt_address(void);
 uint32_t probe_fdt_bytes(void);
 #if defined(FUXI_SALAMI)
 const char *probe_splash_overlap(void);
+#endif
+#if FUXI_USBNET
+uint32_t probe_usbnet_handoff(uintptr_t adt, uint64_t adt_size);
 #endif
 
 #if defined(FUXI_BOOT_LOGO)
@@ -232,6 +236,12 @@ static const char *loader_boot(void)
 	/* ADT, then boot_args, behind the kernel; everything below topOfKernelData is ours. */
 	uintptr_t adt_pa = p->kernel_end + pa_of_va_base;
 	copy64(adt_pa, rd_start + p->adt_off, p->adt_size);
+#if FUXI_USBNET
+	/* Route U (usbnet.h): check, write and publish the usbnet region, then put its
+	 * {pa, size} over the ADT copy's /chosen "fuxi-usbnet" placeholder. The outcome
+	 * is the region's adt_status (request 0x5e), never monitor_error. */
+	(void)probe_usbnet_handoff(adt_pa, p->adt_size);
+#endif
 	uintptr_t ba_pa = (adt_pa + p->adt_size + PAGE_16K - 1) & ~(PAGE_16K - 1);
 	uintptr_t top = ba_pa + PAGE_16K;
 

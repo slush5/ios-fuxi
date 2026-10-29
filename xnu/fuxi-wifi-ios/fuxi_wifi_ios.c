@@ -1,14 +1,23 @@
-/* Fuxi Wi-Fi iOS shim entry and synthetic Ethernet link. No radio access. */
+/* Fuxi Wi-Fi iOS shim entry and synthetic Ethernet link. No radio access.
+ * fuxiwifiios=2 (route U) carries that link's frames over the loader's USB monitor. */
 #if defined(FUXI)
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/errno.h>
 #include <sys/fuxi_wifi_ios.h>
 #include <sys/fuxi_wifi_net.h>
+#include <sys/fuxi_usbnet_ring.h>
+#include <kern/clock.h>
 #include <kern/locks.h>
+#include <kern/sched_prim.h>
+#include <kern/thread.h>
 #include <pexpert/pexpert.h>
+#include <pexpert/device_tree.h>
 
 extern void FuxiNetworkStackStart(void);
+extern void thread_set_thread_name(thread_t thread, const char *name);
+/* arm/machine_routines.h declares it for osfmk and pexpert only (other bsd/dev units do the same for ml_io_map) */
+extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 static const struct fuxi_wifi_backend *backend;
 static bool enabled;
 
@@ -188,16 +197,160 @@ static const struct fuxi_wifi_backend fake_backend = {
 	.tx_frame = fake_tx, .start = fake_start,
 };
 
+/* Route U (fuxiwifiios=2, docs-lanes/wifi-ios.md): the same synthetic station ("Fuxi
+ * Loopback" is scanned and joined as above), but en0's frames cross the USB cable. The
+ * loader keeps a ring region outside XNU RAM (shim/fuxi-probe/usbnet.h) that its USB
+ * monitor shares with a bridge on the host (tools/fuxi_usbnet_ring.py): tx_frame fills the
+ * TX ring, one thread drains the RX ring. Only tx_frame and start differ from the synthetic
+ * backend; a handoff or region header failure keeps the synthetic loopback. No MMIO: the
+ * region is DRAM the loader owns, mapped Normal non-cacheable (sys/fuxi_usbnet_ring.h). */
+static LCK_MTX_DECLARE(usbnet_lock, &fake_group);
+static uintptr_t usbnet;                        /* the region; 0 = synthetic loopback */
+static const struct fuxi_wifi_input *usbnet_up; /* en0's input */
+static struct fuxi_wifi_input usbnet_input;     /* the station's: link changes pass usbnet_link */
+static struct fuxi_wifi_backend usbnet_backend;
+static uint32_t usbnet_kstate;
+static uint64_t usbnet_tx_until;                /* a frame went out: poll fast until then */
+
+static bool
+usbnet_open(void)
+{
+	DTEntry chosen;
+	const void *value = NULL;
+	unsigned int size = 0;
+	uint64_t pa = 0;
+	const char *why;
+
+	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
+	    SecureDTGetProperty(chosen, "fuxi-usbnet", &value, &size) != kSuccess) {
+		why = "no /chosen fuxi-usbnet (mkadt-salami.py --usbnet)";
+	} else {
+		why = fxnet_handoff(value, size, &pa);
+	}
+	if (why == NULL) {
+		/* No soft failure to fall back from: io_map allocates its VA with KMA_NOFAIL and
+		 * pmap_map panics on a failed pmap_enter (0096 notes the same); 144 KiB of the
+		 * 8 MiB io submap. */
+		usbnet = ml_io_map_wcomb((vm_offset_t)pa, FXNET_SIZE);
+		why = fxnet_header(usbnet, pa);
+	}
+	if (why != NULL) {
+		printf("FUXI WIFI IOS: usbnet: %s; synthetic loopback instead\n", why);
+		usbnet = 0;
+		return false;
+	}
+	fxnet_attach(usbnet);
+	printf("FUXI WIFI IOS: usbnet: loader region pa %#llx size %#x, en0 frames over the USB monitor\n",
+	    (unsigned long long)pa, FXNET_SIZE);
+	return true;
+}
+
+/* kstate: bit0 once the RX thread runs, bit1 = en0's link (the loader and the host read it). */
+static void
+usbnet_set(uint32_t bit, bool on)
+{
+	lck_mtx_lock(&usbnet_lock);
+	usbnet_kstate = on ? usbnet_kstate | bit : usbnet_kstate & ~bit;
+	fxnet_kstate(usbnet, usbnet_kstate);
+	lck_mtx_unlock(&usbnet_lock);
+}
+
+static void
+usbnet_link(bool up)
+{
+	usbnet_set(FXNET_KSTATE_LINK, up);
+	usbnet_up->link_state(up);
+}
+
+static void
+usbnet_start(const struct fuxi_wifi_input *in)
+{
+	usbnet_up = in;
+	usbnet_input.rx_frame = in->rx_frame;
+	usbnet_input.link_state = usbnet_link;
+	fake_start(&usbnet_input);
+}
+
+static bool
+usbnet_tx(const uint8_t *frame, size_t length)
+{
+	uint64_t now, second;
+	int put;
+
+	lck_mtx_lock(&usbnet_lock);
+	put = fxnet_tx_put(usbnet, frame, length);
+	lck_mtx_unlock(&usbnet_lock);
+	clock_get_uptime(&now);
+	clock_interval_to_absolutetime_interval(1, NSEC_PER_SEC, &second);
+	__atomic_store_n(&usbnet_tx_until, now + second, __ATOMIC_RELAXED);
+	return put == FXNET_TX_OK;
+}
+
+/* The RX thread polls rx_head every 1 ms while frames moved either way in the last second,
+ * else every 20 ms: no busy loop and no timer storm when idle (tight polls drain the
+ * battery). A frame is copied out of the mapping, handed to en0, then its slot consumed;
+ * a bad slot is consumed too and counted (rx_bad). */
+static void
+usbnet_rx(__unused void *parameter, __unused wait_result_t result)
+{
+	uint8_t frame[FXNET_FRAME_MAX];
+	uint64_t now, second, busy_until = 0;
+
+	clock_interval_to_absolutetime_interval(1, NSEC_PER_SEC, &second);
+	usbnet_set(FXNET_KSTATE_UP, true);
+	for (;;) {
+		size_t length = 0;
+		bool moved = false;
+		int got;
+
+		for (unsigned int n = 0; n < FXNET_SLOTS; n++) {
+			got = fxnet_rx_take(usbnet, frame, &length);
+			if (got == FXNET_RX_EMPTY) {
+				break;
+			}
+			if (got == FXNET_RX_OK) {
+				usbnet_up->rx_frame(frame, length);
+			}
+			fxnet_rx_done(usbnet, got == FXNET_RX_OK);
+			moved = true;
+		}
+		clock_get_uptime(&now);
+		if (moved) {
+			busy_until = now + second;
+		}
+		(void)assert_wait_timeout((event_t)&usbnet_kstate, THREAD_UNINT,
+		    now < busy_until || now < __atomic_load_n(&usbnet_tx_until, __ATOMIC_RELAXED) ? 1 : 20, NSEC_PER_MSEC);
+		(void)thread_block(THREAD_CONTINUE_NULL);
+	}
+}
+
 void
 fuxi_wifi_ios_init(void)
 {
+	const struct fuxi_wifi_backend *ops = &fake_backend;
+	thread_t thread;
 	int on = 0;
 	PE_parse_boot_argn("fuxiwifiios", &on, sizeof(on));
-	if (on != 1 || enabled) {
+	if ((on != 1 && on != 2) || enabled) {
 		return;
 	}
 	enabled = true;
-	printf("FUXI WIFI IOS: enabled, synthetic backend; Apple80211 16.7 ABI unverified\n");
-	(void)fuxi_wifi_ios_attach(&fake_backend);
+	if (on == 2 && usbnet_open()) {
+		usbnet_backend = fake_backend;
+		usbnet_backend.tx_frame = usbnet_tx;
+		usbnet_backend.start = usbnet_start;
+		ops = &usbnet_backend;
+	}
+	printf("FUXI WIFI IOS: enabled, %s backend; Apple80211 16.7 ABI unverified\n",
+	    ops == &fake_backend ? "synthetic" : "usbnet");
+	if (!fuxi_wifi_ios_attach(ops) || ops == &fake_backend) {
+		return;
+	}
+	if (kernel_thread_start(usbnet_rx, NULL, &thread) != KERN_SUCCESS) {
+		printf("FUXI WIFI IOS: usbnet: no RX thread; kstate stays 0 and the loader drops host frames\n");
+		return;
+	}
+	thread_set_thread_name(thread, "wifi-usbnet-rx");
+	thread_deallocate(thread);
 }
 #endif /* FUXI */

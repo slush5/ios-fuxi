@@ -5,6 +5,7 @@ SECTIONS {
  .rodata : { *(.rodata*) }
  .gpu_fw : { *(.gpu_fw) }
  .data : { *(.data*) }
+ .usbnet : { *(.usbnet) }
  . = ALIGN(16384);
  _bss_start = .;
  .bss : { *(.bss*) *(COMMON) }

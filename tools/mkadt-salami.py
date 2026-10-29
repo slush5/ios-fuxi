@@ -38,7 +38,11 @@ refuses salami. Differences:
     so the WLAN lane fits after the cmdline is full. Numbers become 4-byte LE int32,
     strings NUL-terminated and no longer than the kernel buffer; unknown keys, other
     types and repeats are refused. Each property costs 36 bytes plus its value rounded
-    up to 4 (a number: 40 bytes) inside the same 16 KiB cap; the bytes are printed.
+    up to 4 (a number: 40 bytes) inside the same 16 KiB cap; the bytes are printed;
+  * --usbnet (route U, docs-lanes/wifi-ios.md) adds /chosen "fuxi-usbnet": exactly 16 bytes,
+    the ASCII placeholder "FXNET-PLACEHOLDR" (52 bytes of ADT). A FUXI_USBNET loader writes
+    {u64 pa, u64 size} of its usbnet ring region over it in its ADT copy, only when the
+    copy holds exactly one (shim/fuxi-probe/usbnet.h); fuxiwifiios=2 reads it.
 
 Root extents: --root-extents takes the extents.json that tools/salami-install-root.sh
 writes (salami-pin output; bytes, userdata-relative). The pinned file is the image
@@ -92,6 +96,9 @@ WLAN_KNOBS = {
     'fuxiwlanbdf': 63, 'fuxiwlanregdb': 63, 'fuxiwlanm3': 63, 'fuxiwlanamss': 63,
 }
 WLAN_NUMBER = re.compile(r'-?(?:0[xX][0-9a-fA-F]+|0|[1-9][0-9]*)')
+# Route U: the /chosen property a FUXI_USBNET loader patches (shim/fuxi-probe/usbnet.h un_adt_find).
+USBNET_PROP = 'fuxi-usbnet'
+USBNET_PLACEHOLDER = b'FXNET-PLACEHOLDR'
 # The proven salami payload cmdline (also in tools/run-ios-salami.py): ufsrw=1 rootrw=1
 # (booted iOS to the lock screen 2026-10-28), fuxikick=0. The cmdline itself is written
 # by tools/mkpayload.py.
@@ -240,6 +247,18 @@ def add_wlan_defaults(root, props):
     return added
 
 
+def add_usbnet(root):
+    """--usbnet: /chosen "fuxi-usbnet" = the 16-byte placeholder; returns the bytes added."""
+    chosen = next((n for n in root.children if n.name == 'chosen'), None)
+    if chosen is None:
+        raise ValueError('no /chosen node to carry fuxi-usbnet')
+    if chosen.prop(USBNET_PROP) is not None:
+        raise ValueError(f'/chosen already has {USBNET_PROP}')
+    assert len(USBNET_PLACEHOLDER) == 16
+    chosen.props.append((USBNET_PROP, 0, USBNET_PLACEHOLDER))
+    return adt_prop_bytes(USBNET_PLACEHOLDER)
+
+
 def parse_fb(text, stride_text):
     try:
         w, h = (int(v) for v in text.lower().split('x'))
@@ -281,6 +300,9 @@ def main():
                     help='write these fuxiwlan* knobs into /defaults (may repeat); the salami kernel reads '
                          'each from the boot-args first, else from here. Numbers 4-byte LE, strings '
                          'NUL-terminated; each property costs 36 bytes + its value rounded up to 4')
+    ap.add_argument('--usbnet', action='store_true',
+                    help='add /chosen fuxi-usbnet, a 16-byte placeholder a FUXI_USBNET loader overwrites with '
+                         'its usbnet ring region {pa, size} (route U); pairs with fuxiwifiios=2')
     ap.add_argument('--print-cmdline', action=PrintCmdline,
                     help='print the recommended salami first-boot payload cmdline and exit')
     args = ap.parse_args()
@@ -336,6 +358,7 @@ def main():
                 defaults.props.append((name, 0, struct.pack('<I', value)))
         wlan_added = add_wlan_defaults(root, wlan_defaults(args.wlan_defaults)) if args.wlan_defaults else []
         wlan_bytes = sum(n for _, n in wlan_added)
+        usbnet_bytes = add_usbnet(root) if args.usbnet else 0
         has_ufs = any(n.name == 'fuxi-ufs' for n in root.children)
         validate_salami(args.live_fdt, has_ufs)
         blob = adt.serialize(root)
@@ -356,6 +379,7 @@ def main():
           + ('no sweet-fbcon (no XNU text console)' if args.no_fbcon else f'fb {w}x{h} stride {stride}')
           + (f'; /product children {",".join(extra)}' if extra else '')
           + ('; touch defaults' if args.touch_defaults else '')
+          + (f'; /chosen fuxi-usbnet placeholder {usbnet_bytes} bytes' if usbnet_bytes else '')
           + (f'; /defaults wlan knobs {wlan_bytes} bytes (' + ', '.join(f'{k} {n}' for k, n in wlan_added) + ')'
              if wlan_added else ''))
 

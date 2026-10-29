@@ -3,6 +3,9 @@
 
 The image must match --payload and --kernel. Only the selected 1 GiB XNU RAM
 window and the validated fixed splash framebuffer can be read; no storage writes or unrestricted physical-memory requests.
+Memory is read-only to the host except request 0x5d (route U, docs-lanes/wifi-ios.md): one
+Ethernet frame into the loader's own fixed usbnet RX ring, nowhere else; 0x5e reads that ring
+(both through tools/fuxi_usbnet_ring.py, never from this tool).
 Private output includes native reports, staged progress and console bytes.
 After the handoff it reads the loader note once (request 0x48, loader-note.txt):
 a boot-logo loader that did not hand its logo to XNU (sweetlogo_*) says why there.
