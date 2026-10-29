@@ -1,0 +1,7 @@
+Xcode 15.4
+Build version 15F31d
+iig: /Applications/Xcode_15.4.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/iig
+xnu: xnu-8796.141.3
+repository: 375f0c5a3d69006a78d822c1856cb5191a0ba0ac
+builder: 663906528d1cd5ea8fde7de6f16de73db9511549
+target: kernel-metal4

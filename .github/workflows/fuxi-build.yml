@@ -33,6 +33,11 @@ on:
         type: choice
         options: [macos-15, macos-26]
         default: macos-15
+      iig_cache:
+        description: IIG source for the xcode16 rebuild; committed = tools/ci/iig-cache-xcode15 and no macos-14 build job (the route after macos-14 retires)
+        type: choice
+        options: [run, committed]
+        default: run
 
 permissions:
   contents: read
@@ -67,6 +72,8 @@ jobs:
 
   build:
     needs: plan
+    # Skipped when the xcode16 job replays the committed Xcode 15 IIG cache.
+    if: ${{ inputs.iig_cache != 'committed' }}
     name: ${{ matrix.target }}
     # Xcode 15 iig matches XNU 8796's IORPC ABI; never silently use Xcode 16.
     # macos-14 retirement is tracked in xnu/README.md.
@@ -146,6 +153,7 @@ jobs:
           path: deps/ci-downloads
           key: fuxi-source-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('tools/ci/pins.env', 'tools/ci/build.sh') }}
       - name: Download this run's Xcode 15 IIG cache
+        if: ${{ inputs.iig_cache != 'committed' }}
         uses: actions/download-artifact@v4
         with:
           name: iig-cache-xcode15-${{ matrix.target }}
@@ -153,7 +161,9 @@ jobs:
       - name: Build kernel with newer Xcode and replayed IIG (no boot-image packing)
         env:
           IIG: ${{ github.workspace }}/tools/xnu-iig-cache.py
-          XNU_IIG_CACHE: ${{ github.workspace }}/deps/iig-cache-xcode15-${{ matrix.target }}
+          # Captured from the macos-14 Xcode 15.4 kernel job of run 40839814031 (commit 375f0c5);
+          # no patch touches iokit/DriverKit, so it serves every later patch set.
+          XNU_IIG_CACHE: ${{ inputs.iig_cache == 'committed' && format('{0}/tools/ci/iig-cache-xcode15', github.workspace) || format('{0}/deps/iig-cache-xcode15-{1}', github.workspace, matrix.target) }}
         run: bash tools/ci/build.sh "$TARGET"
       - name: Record toolchain and kernel hashes
         run: |
