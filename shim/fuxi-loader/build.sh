@@ -28,6 +28,16 @@ if [[ -n ${FUXI_SALAMI_TOUCH_AUTO:-} ]]; then
  [[ $FUXI_SALAMI_TOUCH_AUTO =~ ^[01]$ ]] || { echo 'FUXI_SALAMI_TOUCH_AUTO must be 0 or 1' >&2; exit 1; }
  [[ $FUXI_SALAMI_TOUCH_AUTO == 1 ]] || touch=-ta0
 fi
+# FUXI_USB_REATTACH=0 or 1 (salami only, probe.c default 1 on salami): the cpu@100 USB
+# monitor re-runs usb_start when the link wedges (probe.c usb_reattach, usb-reattach.h).
+# 1 builds the default image; 0 (USB started once at boot, as before; request 0x59 stays)
+# gets its own out dir and image name (-ra0).
+reattach=
+if [[ -n ${FUXI_USB_REATTACH:-} ]]; then
+ [[ $board == salami ]] || { echo 'FUXI_USB_REATTACH is for FUXI_BOARD=salami only' >&2; exit 1; }
+ [[ $FUXI_USB_REATTACH =~ ^[01]$ ]] || { echo 'FUXI_USB_REATTACH must be 0 or 1' >&2; exit 1; }
+ [[ $FUXI_USB_REATTACH == 1 ]] || reattach=-ra0
+fi
 # FUXI_BOOT_LOGO=/abs/mask FUXI_BOOT_LOGO_W=W FUXI_BOOT_LOGO_H=H (salami only): the
 # loader fills the ABL splash black and draws this W*H-byte 8-bit coverage mask
 # (255 = logo) centred as grey, with no loader text (loader.c boot_logo_draw); pair
@@ -75,7 +85,7 @@ fi
 for input in "${inputs[@]}"; do
  [[ $input == /* && -f $input ]] || { echo 'Packing inputs must be existing absolute file paths' >&2; exit 1; }
 done
-out=../out/$board-loader$stage$logo$touch
+out=../out/$board-loader$stage$logo$touch$reattach
 mkdir -p "$out"
 # Reject a payload made from a different board, truncated segments, or unsafe RAM.
 python3 - "$payload" "$board" <<'PY'
@@ -132,6 +142,7 @@ flags=(--target=aarch64-none-elf -O2 -ffreestanding -fno-builtin -nostdlib
 if [[ $board == salami ]]; then flags+=(-DFUXI_SALAMI=1); fi
 if [[ -n $stage ]]; then flags+=("-DFUXI_SALAMI_MDSS_STAGE=$FUXI_SALAMI_MDSS_STAGE"); fi
 if [[ -n ${FUXI_SALAMI_TOUCH_AUTO:-} ]]; then flags+=("-DFUXI_SALAMI_TOUCH_AUTO=$FUXI_SALAMI_TOUCH_AUTO"); fi
+if [[ -n ${FUXI_USB_REATTACH:-} ]]; then flags+=("-DFUXI_USB_REATTACH=$FUXI_USB_REATTACH"); fi
 if [[ -n $logo ]]; then
  flags+=(-DFUXI_BOOT_LOGO=1 "-DFUXI_BOOT_LOGO_W=$FUXI_BOOT_LOGO_W" "-DFUXI_BOOT_LOGO_H=$FUXI_BOOT_LOGO_H")
 fi
@@ -209,5 +220,5 @@ LOGOPY
 # A GPU-less image never takes the name of the firmware-bearing one runners expect.
 if [[ $no_gpu_fw == 1 ]]; then suffix=-nogpufw; else suffix=; fi
 python3 "$MKBOOTIMG" --header_version 4 --kernel "$out/Image" \
- --os_version 16.0.0 --os_patch_level 2026-08 -o "$out/$board-xnu-boot$stage$logo$touch$suffix.img"
-ls -lh "$out/Image" "$out/$board-xnu-boot$stage$logo$touch$suffix.img"
+ --os_version 16.0.0 --os_patch_level 2026-08 -o "$out/$board-xnu-boot$stage$logo$touch$reattach$suffix.img"
+ls -lh "$out/Image" "$out/$board-xnu-boot$stage$logo$touch$reattach$suffix.img"

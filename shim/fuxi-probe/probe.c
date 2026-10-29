@@ -11,6 +11,31 @@
 #include "gpu-handoff.h"
 #define printf(...) ((void)0)
 #define rsr(r) ({ uint64_t v; __asm__ volatile("mrs %0, " r : "=r"(v)); v; })
+/* FUXI_USB_REATTACH (0 or 1; default 1 on salami, 0 on Fuxi): when the monitor link
+ * wedges, the cpu@100 loop re-runs usb_start after usb_poll has returned (usb-reattach.h
+ * names the causes). 0: USB starts once, at boot, as before. FUXI_USB_DIAG (salami, or
+ * FUXI_USB_REATTACH=1): the counters and event rings behind the read-only request 0x59,
+ * with or without the restart; no MMIO of its own beyond the 0x59 register reads. */
+#ifndef FUXI_USB_REATTACH
+#if defined(FUXI_SALAMI)
+#define FUXI_USB_REATTACH 1
+#else
+#define FUXI_USB_REATTACH 0
+#endif
+#endif
+#if FUXI_USB_REATTACH != 0 && FUXI_USB_REATTACH != 1
+#error "FUXI_USB_REATTACH must be 0 or 1"
+#endif
+#if defined(FUXI_SALAMI) || FUXI_USB_REATTACH
+#define FUXI_USB_DIAG 1
+#include "usb-reattach.h"
+static struct ura ura;
+static uint32_t ura_out[URA_WORDS];
+#define UDIAG(x) (x)
+#else
+#define FUXI_USB_DIAG 0
+#define UDIAG(x) ((void)0)
+#endif
 static void *memset(void *dst, int c, size_t n)
 {
  volatile uint8_t *d=dst;
@@ -346,6 +371,9 @@ static void ram_probe(void)
  }
 }
 static void usb_poll(void);
+#if FUXI_USB_REATTACH
+static void usb_reattach(void); /* cpu@100, after usb_poll has returned */
+#endif
 static void thermal_monitor_idle(void); /* thermal lane */
 static __attribute__((noreturn)) void reboot(void);
 volatile uint64_t monitor_report[MON_FIELDS] __attribute__((aligned(64)));
@@ -1134,6 +1162,9 @@ void probe_secondary_main(void)
    monitor_report[MON_ACTIVE]=1;
    __asm__ volatile("dsb sy" ::: "memory");
    usb_poll();
+#if FUXI_USB_REATTACH
+   usb_reattach(); /* outside the event loop: usb_poll has acked GEVNTCOUNT */
+#endif
    thermal_monitor_idle(); /* thermal lane: no-op unless 0x57 'MI' selected a mode */
   } else delay(1000);
   if (monitor_report[MON_DEADLINE] && rsr("cntpct_el0") >= monitor_report[MON_DEADLINE]) reboot();
@@ -1156,6 +1187,8 @@ static void core_probe(void)
  delay(20000);
 }
 #define GCTL            0xc110
+#define GSTS            0xc118          /* read by request 0x59 only */
+#define GUSB2PHYCFG     0xc200          /* read by request 0x59 only */
 #define GEVNTADRLO      0xc400
 #define GEVNTADRHI      0xc404
 #define GEVNTSIZ        0xc408
@@ -1391,6 +1424,7 @@ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
 			uint32_t status = (v >> 12) & 0xf;
 			if (status) {
 				printf("SWEET USB: ep%u cmd 0x%x status %u\n", ep, cmd & 0xf, status);
+				UDIAG(ura_epcmd(&ura, ep, cmd, status, false));
 				return -1;
 			}
 			return 0;
@@ -1398,6 +1432,7 @@ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
 		delay(1);
 	}
 	printf("SWEET USB: ep%u cmd 0x%x timeout\n", ep, cmd & 0xf);
+	UDIAG(ura_epcmd(&ura, ep, cmd, 0, true));
 	return -1;
 }
 
@@ -1675,6 +1710,15 @@ ud_setup(void)
         ud.audio_out = true; ud.out_index = (uint16_t)(st[4] | st[5] << 8); ud.out_length = length;
     } else if (type == 0xc0 && req == 0x48) {
         memcpy(data, monitor_error, sizeof(monitor_error)); n=sizeof(monitor_error);
+#if FUXI_USB_DIAG
+    } else if (type == 0xc0 && req == 0x59 && value == 0 && st[4] == 0 && st[5] == 0) {
+        /* Read-only USB monitor record (usb-reattach.h ura_reply, 388 bytes): restart and
+         * event counters, the event rings, and seven DWC3 register reads. No write. */
+        const uint32_t regs[URA_REGS]={dwc_rd(DSTS),dwc_rd(DCTL),dwc_rd(GSTS),dwc_rd(GUSB2PHYCFG),
+                                       dwc_rd(GEVNTADRLO),dwc_rd(GEVNTADRHI),dwc_rd(GEVNTSIZ)};
+        n=ura_reply(&ura,ura_out,regs,ud.state,rsr("cntpct_el0"),rsr("cntfrq_el0"),FUXI_USB_REATTACH);
+        memcpy(data, ura_out, n);
+#endif
 #if defined(FUXI_XNU_LOADER)
     } else if (type == 0xc0 && req == 0x49 && value == 0x584e && monitor_report[MON_ACTIVE] && !gpu_gmu_started) {
         monitor_report[MON_LAUNCH]=1;
@@ -1729,9 +1773,13 @@ ud_event(uint32_t ev)
 	if (ev & 1) {                   /* device event */
 		uint32_t type = (ev >> 8) & 0xf;
 		if (type == 1) {        /* USB reset */
+			/* Record only: a restart from here would run inside the event loop. */
+			UDIAG(ura_reset(&ura, ud.state == EP0_SETUP, probe_info.configured != 0, ud.state,
+			    rsr("cntpct_el0")));
 			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
 			probe_info.configured = 0;
 		} else if (type == 2) { /* connect done */
+			UDIAG(ura_conndone(&ura));
 			uint32_t speed = dwc_rd(DSTS) & 7;
             probe_info.speed = speed;
 			/* ep0 max packet: 64 at high/full speed (modify action) */
@@ -1741,6 +1789,8 @@ ud_event(uint32_t ev)
 			    (1u << 8) | (1u << 10) | (1u << 25), 0);
 			printf("SWEET USB: connected, speed %u\n", speed);
 		} else if (type == 0) {
+			UDIAG(ura_disconnect(&ura, ud.state == EP0_SETUP, probe_info.configured != 0, ud.state,
+			    rsr("cntpct_el0")));
 			printf("SWEET USB: disconnect\n");
 		}
 		return;
@@ -1795,13 +1845,22 @@ ud_event(uint32_t ev)
 static void usb_poll(void)
 {
  uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffff;
+#if FUXI_USB_DIAG
+ ura_guard(&ura, count > UD_EVT_SIZE || (count & 3), count);
+#endif
  if (count > UD_EVT_SIZE || (count & 3)) return;
  ud_sync(UD_EVT, UD_EVT_SIZE);
  for (uint32_t done = 0; done < count; done += 4) {
   uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
   ud.evt_pos = (ud.evt_pos + 4) % UD_EVT_SIZE;
   ud.events++;
+#if FUXI_USB_DIAG
+  ura_event(&ura, ev, rsr("cntpct_el0"));
   ud_event(ev);
+  ura_ep0(&ura, ud.state == EP0_SETUP, rsr("cntpct_el0"));
+#else
+  ud_event(ev);
+#endif
  }
  if (count) dwc_wr(GEVNTCOUNT, count);
 }
@@ -1822,6 +1881,7 @@ usb_start(uintptr_t dwc)
 	printf("SWEET USB: soft reset %s after %d ms, GCTL 0x%08x DCFG 0x%08x\n",
 	    (dwc_rd(DCTL) & DCTL_CSFTRST) ? "STUCK" : "done", i, dwc_rd(GCTL), dwc_rd(DCFG));
 	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
+		UDIAG(ura.start_rc = URA_START_STUCK);
 		return;
 	}
 
@@ -1844,6 +1904,7 @@ usb_start(uintptr_t dwc)
 	    ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0) ||
 	    ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
 		printf("SWEET USB: endpoint 0 setup failed\n");
+		UDIAG(ura.start_rc = URA_START_EP0);
 		return;
 	}
 	dwc_wr(DALEPENA, 0x3);
@@ -1866,8 +1927,27 @@ usb_start(uintptr_t dwc)
 		delay(1000);
 	}
 	printf("SWEET USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", dwc_rd(DSTS), i, ud.dma_pa);
+	UDIAG(ura.start_rc = i < 500 ? URA_START_OK : URA_START_HALTED);
 
 }
+
+#if FUXI_USB_REATTACH
+/* cpu@100 main loop only, right after usb_poll() has returned: usb_poll acks GEVNTCOUNT
+ * with the count it read, so a usb_start from inside its event loop (ud_event) would ack
+ * that old count into the new event buffer. When usb-reattach.h ura_due names a cause,
+ * re-run the boot path usb_start unchanged (CSFTRST drops D+, the host enumerates again;
+ * event buffer, ep0 configuration, VBUS override, RUN_STOP) and count it by cause. */
+static void usb_reattach(void)
+{
+ uint64_t now=rsr("cntpct_el0");
+ uint32_t why=ura_due(&ura,ud.state==EP0_SETUP,now,rsr("cntfrq_el0"));
+ if (!why) return;
+ if (why&(URA_GUARD|URA_TIMEOUT)) ura_snapshot(&ura,URA_SNAP_RESTART,ud.state,now);
+ usb_start(ud.dwc);
+ probe_info.configured=0; /* CSFTRST left the device unconfigured: a later reset is not a configured one */
+ ura_restarted(&ura,why,ud.state==EP0_SETUP,rsr("cntpct_el0"));
+}
+#endif
 
 static __attribute__((noreturn)) void reboot(void)
 {
@@ -1909,6 +1989,7 @@ void probe_main(uintptr_t fdt)
   if (!monitor_report[MON_ACTIVE] && monitor_report[MON_DELEGATE]!=2) {
    usb_poll();
    if (monitor_report[MON_DELEGATE]==1 && ud.state==EP0_SETUP) {
+    UDIAG(ura_handover(&ura)); /* causes seen on cpu0 are stale: the link just worked */
     __asm__ volatile("dsb sy" ::: "memory");
     monitor_report[MON_DELEGATE]=2;
    }

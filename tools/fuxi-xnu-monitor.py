@@ -15,10 +15,20 @@ sleeps (0.5 s, doubled up to 4 s after each failure of a monitor that answered)
 and --reconnect-seconds bounds the whole outage, then the run exits as before.
 pyusb's NotImplementedError (LIBUSB_ERROR_NOT_SUPPORTED) and ValueError (no
 langid) during re-enumeration count as failed transfers, never as success.
+Every USB error in the console loop and while looking for the monitor again is
+logged with its errno and elapsed milliseconds (progress.jsonl usb_error and
+usb_retry_error records, and stdout; one that ends the run also on stderr, before its
+traceback). After every reconnect and at the end of the
+console loop (unless the run gives up on the device) the loader's read-only USB
+record (request 0x59: restart and event counters, event rings, DWC3 registers) goes
+into progress.jsonl decoded (usb_diag); a loader that STALLs it (no 0x59) or gives a
+reply that does not decode is not asked again, nor after three link errors in a row.
 On salami, or when the payload ADT does not tell the board, --framebuffer and
 --tour-shots are skipped unless --force-fb.
 """
 import argparse
+import contextlib
+import errno
 import json
 from pathlib import Path
 import re
@@ -42,6 +52,95 @@ RETRY_SLEEP, RETRY_SLEEP_MAX = 0.5, 4.0
 # ring (SWEET_LOG_SIZE) still holds it, up to this many bytes back (the rest is slack
 # for what the kernel writes while the host reads); otherwise the last 64 KiB as usual.
 CATCH_UP = 0x200000
+# Loader request 0x59 (shim/fuxi-probe/usb-reattach.h ura_reply): the read-only USB monitor
+# record. 388 bytes, never a multiple of the 64-byte ep0 packet; the first 128 are the summary.
+USB_DIAG_REQUEST, USB_DIAG_BYTES, USB_DIAG_TIMEOUT_MS = 0x59, 388, 1000
+USB_DIAG_FAILURES = 3          # link errors on 0x59 in a row before the session stops asking
+USB_DIAG_MAGIC, USB_DIAG_END = 0x31415255, 0x5a415255  # 'URA1', 'URAZ'
+USB_DIAG_CAUSES = ('reset', 'disconnect', 'guard', 'timeout')
+USB_DIAG_SNAP = ('none', 'reset', 'disconnect', 'restart')
+USB_DIAG_START = ('ok', 'csftrst_stuck', 'ep0_config_failed', 'halted')
+USB_DIAG_REGS = ('dsts', 'dctl', 'gsts', 'gusb2phycfg', 'gevntadrlo', 'gevntadrhi', 'gevntsiz')
+USB_EP0_STATES = ('setup', 'data', 'wait_status2', 'wait_status3', 'status')
+# DWC3 event buffer entries (Linux dwc3 core.h DWC3_DEVICE_EVENT_* / DWC3_DEPEVT_*).
+USB_DEVICE_EVENTS = {0: 'disconnect', 1: 'reset', 2: 'connect_done', 3: 'link_status', 4: 'wakeup',
+                     5: 'hibernation_request', 6: 'suspend', 7: 'sof', 9: 'erratic_error',
+                     10: 'command_complete', 11: 'overflow'}
+USB_EP_EVENTS = {1: 'xfer_complete', 2: 'xfer_in_progress', 3: 'xfer_not_ready', 4: 'fifo',
+                 6: 'stream', 7: 'command_complete'}
+
+
+def usb_event_name(ev):
+    """Readable name of one raw DWC3 event buffer entry."""
+    if ev & 1:
+        kind = (ev >> 8) & 0xf
+        name = USB_DEVICE_EVENTS.get(kind, f'device_event_{kind}')
+        return f'{name} link {(ev >> 16) & 0xf}' if kind == 3 else name
+    ep, kind, status = (ev >> 1) & 0x1f, (ev >> 6) & 0xf, (ev >> 12) & 0xf
+    return f'ep{ep} {USB_EP_EVENTS.get(kind, f"type_{kind}")} status {status}'
+
+
+def usb_diag_decode(raw):
+    """Decode a request 0x59 reply (usb-reattach.h ura_reply). The 128-byte summary is
+    required; the snapshot and live event rings are decoded as far as the reply goes."""
+    if len(raw) < 128:
+        raise ValueError(f'0x59 reply of {len(raw)} bytes, want at least 128')
+    w = struct.unpack_from(f'<{len(raw) // 4}I', raw)
+    if w[0] != USB_DIAG_MAGIC:
+        raise ValueError(f'0x59 reply magic {w[0]:#010x}')
+    frq = w[18] or 19200000
+    now, snap_t, last = w[19] | w[20] << 32, w[21] | w[22] << 32, w[23] | w[24] << 32
+    ms = lambda ticks: round(ticks * 1000 / frq, 3)  # noqa: E731
+    pick = lambda names, i: names[i] if i < len(names) else i  # noqa: E731
+    state = lambda s: pick(USB_EP0_STATES, s)  # noqa: E731
+    causes = lambda bits: [c for i, c in enumerate(USB_DIAG_CAUSES) if bits >> i & 1]  # noqa: E731
+    size = (w[1] >> 8) & 0xff
+
+    def ring(base, count, ref):
+        out = []
+        for i in range(min(count, size)):
+            if base + 2 * i + 1 >= len(w):
+                break
+            ev, t = w[base + 2 * i], w[base + 2 * i + 1]
+            out.append({'raw': f'{ev:#010x}', 'event': usb_event_name(ev),
+                        'before_ms': ms((ref - t) & 0xffffffff)})
+        return out
+    snap_why, snap_n = w[17] & 0xff, (w[17] >> 8) & 0xff
+    epcmd = w[15]
+    d = {'version': w[1] & 0xff, 'ring': size, 'reattach': bool(w[1] >> 16 & 1),
+         'restarts': dict(zip(USB_DIAG_CAUSES, w[2:6])), 'restart_failed': w[6],
+         'last_restart': None if not last else {
+             'causes': causes(w[7] & 0xff), 'start': pick(USB_DIAG_START, w[7] >> 8 & 0xff),
+             'age_ms': ms(now - last)},
+         'resets': w[8], 'disconnects': w[9], 'connect_done': w[10],
+         'ep0_at_last_reset': state(w[11] & 0xff) if w[8] else None,
+         'ep0_at_last_disconnect': state(w[11] >> 8 & 0xff) if w[9] else None,
+         'ep0_now': state(w[11] >> 16 & 0xff), 'pending': causes(w[11] >> 24),
+         'guard_hits': w[12], 'guard_last_count': f'{w[13]:#x}',
+         'epcmd_failures': w[14],
+         'epcmd_last': None if not w[14] else {
+             'command': epcmd & 0xf, 'ep': epcmd >> 4 & 0x1f, 'status': epcmd >> 12 & 0xf,
+             'timeout': bool(epcmd >> 31)},
+         'events': w[16], 'cntfrq': frq, 'cntpct': now,
+         'regs': {name: f'{v:#010x}' for name, v in zip(USB_DIAG_REGS, w[25:32])},
+         'snapshot': None, 'live_events': [], 'complete': False}
+    if snap_why:
+        d['snapshot'] = {'why': pick(USB_DIAG_SNAP, snap_why), 'ep0': state(w[17] >> 16 & 0xff),
+                         'age_ms': ms(now - snap_t),
+                         'events': ring(32, snap_n, snap_t & 0xffffffff)}
+    d['live_events'] = ring(64, min(w[16], size), now & 0xffffffff)
+    d['complete'] = len(w) > 96 and w[96] == USB_DIAG_END
+    return d
+
+
+def usb_diag_brief(d):
+    """One line of a decoded 0x59 record for stdout."""
+    r = d['restarts']
+    return (f"restarts reset {r['reset']} disconnect {r['disconnect']} guard {r['guard']} "
+            f"timeout {r['timeout']} (failed {d['restart_failed']}); resets {d['resets']}, "
+            f"disconnects {d['disconnects']}, connect done {d['connect_done']}; ep0 at the last "
+            f"reset {d['ep0_at_last_reset']}; guard hits {d['guard_hits']}; ud_epcmd failures "
+            f"{d['epcmd_failures']}; DSTS {d['regs']['dsts']} GSTS {d['regs']['gsts']}")
 
 
 def fb_geometry(payload, rows=None):
@@ -269,13 +368,30 @@ def main():
     dev = devices[0]
     args.out.mkdir(parents=True, exist_ok=False)
 
+    def elapsed_ms(t0):
+        return round((time.monotonic() - t0) * 1000, 1)
+
+    def usb_error_info(error, op=None, ms=None):
+        """errno and elapsed milliseconds of a failed USB operation (op: '0x47', 'find', ...)."""
+        return {'errno': getattr(error, 'errno', None), 'elapsed_ms': ms, 'op': op,
+                'error_type': type(error).__name__}
+
+    def usb_error_text(info):
+        return f"errno {info.get('errno')}, {info.get('op') or 'usb'} after {info.get('elapsed_ms')} ms"
+
     def request(number, length, value=0, index=0, timeout=3000):
+        t0 = time.monotonic()
         try:
             data = bytes(dev.ctrl_transfer(0xc0, number, value, index, length, timeout=timeout))
+        except usb.core.USBError as error:
+            error.fuxi_usb = usb_error_info(error, f'{number:#x}', elapsed_ms(t0))
+            raise
         except (NotImplementedError, ValueError) as error:
             # pyusb on Windows/libusb1 while the device re-enumerates: LIBUSB_ERROR_NOT_SUPPORTED
             # is a NotImplementedError, a half-gone device can give a ValueError. A failed transfer.
-            raise usb.core.USBError(f'{type(error).__name__}: {error}') from error
+            failed = usb.core.USBError(f'{type(error).__name__}: {error}')
+            failed.fuxi_usb = usb_error_info(error, f'{number:#x}', elapsed_ms(t0))
+            raise failed from error
         if len(data) != length:
             raise ValueError(f'short USB response: {number:#x}')
         return data
@@ -468,19 +584,73 @@ def main():
             usb.util.dispose_resources(d)
         except Exception:
             pass
+    def record(obj):  # one progress.jsonl line (only called inside the console loop's with)
+        progress.write(json.dumps(obj) + '\n')
+        progress.flush()
+    def retry_error(op, error, ms):
+        """Log a USB error met while looking for the monitor again: errno, elapsed ms."""
+        info = getattr(error, 'fuxi_usb', None) or usb_error_info(error, op, ms)
+        print(f'USB retry: {op} failed ({error}) [{usb_error_text(info)}]', flush=True)
+        record({'usb_retry_error': str(error), **info, 'time': time.time()})
     def find_monitor():
         found = []
+        t0 = time.monotonic()
         try:
             devices = list(usb.core.find(find_all=True, idVendor=0x1209, idProduct=0x0001))
-        except usb_errors:
+        except usb_errors as e:
+            retry_error('find', e, elapsed_ms(t0))
             return found
         for d in devices:
+            t0 = time.monotonic()
             try:
                 if usb.util.get_string(d, d.iProduct) == 'Fuxi hardware probe':
                     found.append(d)
-            except usb_errors:
-                pass  # still enumerating
+            except usb_errors as e:  # still enumerating
+                retry_error('get_string', e, elapsed_ms(t0))
         return found
+    diag_served, diag_failures = True, 0  # see usb_diag
+    def usb_diag(when):
+        """Read the loader's USB record (request 0x59) once into progress.jsonl (usb_diag,
+        decoded) and stdout. A STALL or a reply that does not decode means this loader does
+        not serve it: never asked again. Any other error (the link itself) is logged and the
+        next reconnect asks again, up to USB_DIAG_FAILURES failures in a row. Never raises."""
+        nonlocal diag_served, diag_failures
+        if not diag_served:
+            return
+        rec = {'usb_diag': None, 'when': when}
+        t0 = time.monotonic()
+        try:
+            raw = bytes(dev.ctrl_transfer(0xc0, USB_DIAG_REQUEST, 0, 0, USB_DIAG_BYTES,
+                                          timeout=USB_DIAG_TIMEOUT_MS))
+        except Exception as e:  # pyusb USBError, NotImplementedError, ValueError
+            info = usb_error_info(e, f'{USB_DIAG_REQUEST:#x}', elapsed_ms(t0))
+            stall = info['errno'] == errno.EPIPE
+            diag_failures += 1
+            diag_served = not stall and diag_failures < USB_DIAG_FAILURES
+            rec.update(info, usb_diag_error=str(e), stall=stall, supported=False if stall else None)
+        else:
+            try:
+                rec['usb_diag'] = usb_diag_decode(raw)
+                diag_failures = 0
+            except Exception as e:  # short or foreign: not this record
+                diag_served = False
+                rec.update(usb_diag_error=f'{type(e).__name__}: {e}', reply_bytes=len(raw), supported=False)
+        if rec['usb_diag'] is not None:
+            print(f'USB diag ({when}): {usb_diag_brief(rec["usb_diag"])}', flush=True)
+        else:
+            info = f' [{usb_error_text(rec)}]' if 'errno' in rec else ''
+            print(f'USB diag ({when}): request 0x59 failed ({rec["usb_diag_error"]}){info}; '
+                  + ('asked again after the next reconnect' if diag_served else 'not asked again'), flush=True)
+        rec['time'] = time.time()
+        record(rec)
+    lost = False  # the run gives up on the device: no end-of-session 0x59 read
+    @contextlib.contextmanager
+    def session_end():
+        try:
+            yield
+        finally:
+            if not lost:
+                usb_diag('end')
     def other_boot(old, new):
         """Why NEW (0x46 after a reconnect) is not the monitor that OLD came from, or None."""
         if not new['active'] or new['usb_mpidr'] & 0xffffff != 0x100:
@@ -499,7 +669,8 @@ def main():
         budget) for one last try there; a failure at or after GIVE_UP gives up. AGAIN: the
         poll after an earlier reconnect in this outage failed too, so the first try waits."""
         nonlocal dev
-        print(f'USB transfer failed ({error}); looking for the monitor again for up to '
+        info = getattr(error, 'fuxi_usb', None) or usb_error_info(error)
+        print(f'USB transfer failed ({error}) [{usb_error_text(info)}]; looking for the monitor again for up to '
               f'{max(0, give_up - time.monotonic()):.0f} s', flush=True)
         t0, attempts, why = time.monotonic(), 0, 'no monitor enumerated'
         def pause(why, grow):
@@ -524,14 +695,17 @@ def main():
             grow = False
             if len(found) == 1:
                 dev = found[0]
+                t1 = time.monotonic()
                 try:
                     usb.util.claim_interface(dev, 0)  # the vendor interface (no endpoints)
                 except usb_errors as e:
                     why = f'claim: {e}'  # control transfers may still work: 0x46 decides
+                    retry_error('claim', e, elapsed_ms(t1))
                 try:
                     now = monitor()
                 except usb_errors as e:
                     why, grow = f'request 0x46: {e}', True
+                    retry_error('0x46', e, None)
                 else:
                     other = other_boot(last_status, now)
                     if other:
@@ -544,7 +718,8 @@ def main():
                 why = f'{len(found)} Fuxi native monitors' if found else 'no monitor enumerated'
             if not pause(why, grow):
                 return None
-    with (args.out / 'progress.jsonl').open('w') as progress, (args.out / 'boot.log').open('wb') as log:
+    with (args.out / 'progress.jsonl').open('w') as progress, (args.out / 'boot.log').open('wb') as log, \
+            session_end():  # exits first: the end-of-session 0x59 record still reaches progress.jsonl
         while time.monotonic() < until:
             status = None
             try:
@@ -559,7 +734,8 @@ def main():
                     try:
                         loader_note = request(0x48, 128).split(b'\0', 1)[0].decode(errors='replace')
                     except (usb.core.USBError, ValueError) as e:  # never let it end the console log
-                        loader_note = f'(request 0x48 failed: {e})'
+                        info = getattr(e, 'fuxi_usb', None)
+                        loader_note = f'(request 0x48 failed: {e}' + (f' [{usb_error_text(info)}])' if info else ')')
                     status['loader_note'] = loader_note
                     (args.out / 'loader-note.txt').write_text(loader_note + '\n')
                     if loader_note:
@@ -606,14 +782,15 @@ def main():
                     try:  # never let a thermal-lane request end the console log
                         cpu_apply(cpu_at.pop(0)[1], thermal_events)
                     except Exception as e:
-                        print('cpu level change failed:', e, flush=True)
+                        info = getattr(e, 'fuxi_usb', None)
+                        print('cpu level change failed:', e, *([f'[{usb_error_text(info)}]'] if info else []), flush=True)
                     (args.out / 'thermal-events.json').write_text(json.dumps(thermal_events, indent=1) + '\n')
                 if thermal_file and time.monotonic() >= next_thermal:
                     next_thermal = max(next_thermal + args.thermal_log, time.monotonic())
                     try:
                         t = thermal_sample()
                     except usb.core.USBError as e:
-                        t = {'error': str(e), 'temps': {}, 'invalid': [], 'cpu': []}
+                        t = {'error': str(e), **getattr(e, 'fuxi_usb', {}), 'temps': {}, 'invalid': [], 'cpu': []}
                     t['time'] = time.time()
                     t['since_handoff'] = round(time.monotonic() - handoff, 1)
                     t['kernel_label'] = status.get('kernel_label')
@@ -631,16 +808,19 @@ def main():
                 again = outage is not None  # the poll after this outage's reconnect failed too
                 if not again:  # one outage, one budget and one backoff until a poll completes
                     outage, backoff = time.monotonic(), RETRY_SLEEP
-                progress.write(json.dumps({'usb_error': str(error), 'console_read': last_total,
+                info = getattr(error, 'fuxi_usb', None) or usb_error_info(error)
+                progress.write(json.dumps({'usb_error': str(error), **info, 'console_read': last_total,
                                            'partial_status': status, 'time': time.time()}) + '\n')
                 progress.flush()
                 back = (reconnect(error, outage + args.reconnect_seconds, again)
                         if args.reconnect_seconds > 0 else None)
                 if back is None:
+                    lost = True
                     raise
                 progress.write(json.dumps({'usb_reconnect': back, 'outage_s': round(time.monotonic() - outage, 1),
                                            'console_read': last_total, 'time': time.time()}) + '\n')
                 progress.flush()
+                usb_diag('reconnect')  # why the link dropped, from the loader's side
                 catch_up = True
                 renew = 0  # renew the reset deadline at the end of the next poll
     (args.out/'display-after.bin').write_bytes(request(0x42,432))
@@ -650,4 +830,11 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception as error:  # a USB error that ends the run: its errno and elapsed ms too
+        if getattr(error, 'fuxi_usb', None):
+            info = error.fuxi_usb
+            print(f"USB error ends the run: errno {info['errno']}, {info['op']} after {info['elapsed_ms']} ms "
+                  f"({info['error_type']})", file=sys.stderr, flush=True)
+        raise
