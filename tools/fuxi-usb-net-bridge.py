@@ -39,7 +39,7 @@ import struct
 import subprocess
 import sys
 import time
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, deque
 
 IS_WIN = sys.platform.startswith("win")
 
@@ -94,8 +94,11 @@ DHCP_LEASE = 86400
 DHCP_MAGIC = b"\x63\x82\x53\x63"
 
 
+LOG_PREFIX = ""                # e.g. "net: " when the bridge runs inside the monitor
+
+
 def log(msg: str) -> None:
-    sys.stdout.write(time.strftime("%H:%M:%S ") + msg + "\n")
+    sys.stdout.write(time.strftime("%H:%M:%S ") + LOG_PREFIX + msg + "\n")
     sys.stdout.flush()
 
 
@@ -245,27 +248,289 @@ class UdpFrameTransport(FrameTransport):
         return "udp listen=%s:%d peer=%s:%d" % (self.listen + self.peer)
 
 
-class RingTransport(FrameTransport):
-    """USB debug-link RAM ring transport.  NOT IMPLEMENTED YET.
+def load_ring_module():
+    """tools/fuxi_usbnet_ring.py, from this file's own directory (whatever the cwd is)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import fuxi_usbnet_ring
+    return fuxi_usbnet_ring
 
-    TODO(usb-ring): the monitor-side ring layout is still pending.  The plan:
-      * the phone-side monitor exposes two single-producer/single-consumer
-        rings (phone->PC and PC->phone) in RAM, each a header
-        {magic, size, head, tail} followed by length-prefixed frame slots;
-      * this class will read/write those rings through the existing USB debug
-        link (same channel the other windows-tools/ scripts use), polling
-        every poll_interval seconds (fileno() stays None);
-      * recv_frames() drains complete frames from phone->PC and advances tail;
-        send_frame() appends to PC->phone if space is available, else returns
-        False (the bridge's TCP retransmission covers drops).
-    Nothing else in the bridge needs to change when this lands.
+
+class RingTransport(FrameTransport):
+    """Route U: Ethernet frames over the loader's USB monitor (fuxi_usbnet_ring.py).
+
+    Wraps fuxi_usbnet_ring.UsbnetTransport: give it either ctrl (a pyusb-style
+    ctrl_transfer callable) and lock (shared with every other user of the USB
+    device), or an existing UsbnetTransport as transport=.  fileno() is None:
+    the bridge polls.  poll_interval is adaptive: FAST_POLL while frames came
+    from the phone in the last ACTIVE_WINDOW seconds or frames wait to go to
+    it, else SLOW_POLL.  After a poll that returned frames the bridge polls
+    again at once (up to BURST polls in a row), so a full phone ring drains
+    quickly while other users of the lock still get their turn.
+
+    send_frame() never blocks on the phone: a frame the phone cannot take now
+    (UsbnetTransport.send_frame False: not ready or 32 frames in flight) waits
+    in a bounded FIFO (tx_cap, oldest dropped and counted) and goes out, in
+    order, after the next poll; while the last header shows the phone not
+    ready or its kernel down, frames are dropped (counted) instead, so a
+    phone that went away is polled slowly, not hammered.  A USB error pauses
+    the transport, keeping every state: with ready= (a callable) it resumes
+    once ready() is true, otherwise after RETRY_SECONDS.  A STALL on either
+    request (also the 0x5d STALL the ring module reports as busy) disables it
+    for good: a correct loader never STALLs them.  on_error(e), if given, is
+    told about each error (a STALL as fuxi_usbnet_ring.Stall or the USB
+    error itself).  The only requests made are the ring module's 0x5d and 0x5e.
     """
 
-    poll_interval = 0.002
+    FAST_POLL = 0.0015
+    SLOW_POLL = 0.015
+    ACTIVE_WINDOW = 0.1
+    RETRY_SECONDS = 0.5
+    BURST = 8
 
-    def __init__(self, *args, **kwargs):
-        raise NotImplementedError(
-            "RingTransport: USB RAM-ring spec pending (see TODO). Use --transport udp.")
+    def __init__(self, ctrl=None, lock=None, transport=None, in_length=None,
+                 tx_cap: int = 256, ready=None, on_error=None):
+        ring = load_ring_module()
+        if transport is None:
+            if ctrl is None:
+                raise ValueError("RingTransport needs ctrl or transport")
+            transport = ring.UsbnetTransport(ctrl, lock, in_length or ring.IN_MAX)
+        self.ring_mod = ring
+        self.ring = transport
+        self.pending = deque()
+        self.tx_cap = tx_cap
+        self.ready = ready
+        self.on_error = on_error
+        self.paused = False
+        self.stalled = False            # a STALL on 0x5d/0x5e: off for good (see _fail)
+        self.retry_at = 0.0
+        self.last_rx = -1e9
+        self.burst = 0
+        self.last_error = None
+        self.c = Counter()
+
+    def _phone_can_take(self) -> bool:
+        """The last header shows the loader ready and the phone's kernel up."""
+        h = self.ring.last
+        return bool(h is not None and h.get("kernel_up"))
+
+    @property
+    def poll_interval(self) -> float:
+        if self.paused or self.stalled:
+            return self.SLOW_POLL
+        if self.burst:
+            return 0.0
+        if time.monotonic() - self.last_rx < self.ACTIVE_WINDOW:
+            return self.FAST_POLL
+        if self.pending and self._phone_can_take():
+            return self.FAST_POLL
+        return self.SLOW_POLL
+
+    def _fail(self, where: str, e) -> None:
+        """A USB error: pause, keeping every state.  A STALL (EPIPE) is different: a
+        correct route U loader never STALLs a well-formed 0x5d/0x5e (SPEC A1), so it means
+        a loader without FUXI_USBNET, or a request this host gets wrong, and on WinUSB
+        the device is gone until a replug.  Retrying only repeats it: the transport
+        stops for good (no further request), and on_error still hears about it."""
+        self.c["usb_errors"] += 1
+        if not self.paused:
+            self.c["pauses"] += 1
+        self.paused = True
+        self.burst = 0
+        self.retry_at = time.monotonic() + self.RETRY_SECONDS
+        self.last_error = "%s: %r" % (where, e)
+        if self.ring_mod.is_stall(e) and not self.stalled:
+            self.stalled = True
+            self.c["tx_dropped_stall"] += len(self.pending)
+            self.pending.clear()
+            log("route U %s STALLed (loader without FUXI_USBNET?): ring transport disabled" % where)
+        if self.on_error is not None:
+            try:
+                self.on_error(e)
+            except Exception:
+                pass
+
+    def _resume_ok(self) -> bool:
+        if self.stalled:
+            return False
+        if not self.paused:
+            return True
+        if self.ready is not None:
+            try:
+                ok = bool(self.ready())
+            except Exception:
+                ok = False
+        else:
+            ok = time.monotonic() >= self.retry_at
+        if ok:
+            self.paused = False
+            self.c["resumes"] += 1
+        return ok
+
+    def _send_one(self, frame: bytes, where: str):
+        """One UsbnetTransport.send_frame.  True: sent; False: busy, keep the frame;
+        None: the frame is gone (a STALL, which the ring module reports as busy, or a
+        USB error: the transport is paused or stopped then)."""
+        stalls = self.ring.stats["stall"]
+        try:
+            sent = self.ring.send_frame(frame)
+        except Exception as e:
+            self._fail(where, e)
+            return False if not self.stalled else None
+        if self.ring.stats["stall"] != stalls:
+            self.c["tx_dropped_stall"] += 1
+            self._fail(where, self.ring_mod.Stall("0x5d"))
+            return None
+        return sent
+
+    def _flush(self) -> None:
+        while self.pending and not self.paused and not self.stalled:
+            sent = self._send_one(self.pending[0], "send")
+            if sent is None:            # stalled: _fail emptied the queue
+                return
+            if not sent:
+                return
+            self.pending.popleft()
+
+    def _drop_pending_not_ready(self) -> None:
+        # The phone cannot take frames (loader not ready or rebooted, kernel down): what
+        # waits is stale by the time it comes back, and keeping it would poll fast for ever.
+        if self.pending:
+            self.c["tx_flushed_not_ready"] += len(self.pending)
+            self.pending.clear()
+
+    def recv_frames(self) -> list:
+        if not self._resume_ok():
+            return []
+        try:
+            frames = self.ring.poll()
+        except Exception as e:
+            self._fail("poll", e)
+            return []
+        if frames:
+            self.last_rx = time.monotonic()
+            self.burst = self.burst + 1 if self.burst < self.BURST else 0
+        else:
+            self.burst = 0
+        if self._phone_can_take():
+            self._flush()
+        else:
+            self._drop_pending_not_ready()
+        return frames
+
+    def send_frame(self, frame: bytes) -> bool:
+        n = len(frame)
+        if not self.ring_mod.FRAME_MIN <= n <= self.ring_mod.FRAME_MAX:
+            self.c["tx_bad_size"] += 1
+            return False
+        if self.stalled:
+            self.c["tx_dropped_stall"] += 1
+            return False
+        if not self._phone_can_take():
+            # Not ready / kernel down at the last poll: nothing to send to (and no
+            # extra 0x5e per frame); the bridge's TCP retransmits once it is back.
+            self.c["tx_dropped_not_ready"] += 1
+            return False
+        frame = bytes(frame)
+        if not self.pending and not self.paused:
+            sent = self._send_one(frame, "send")
+            if sent:
+                return True
+            if sent is None:
+                return False
+        self.pending.append(frame)
+        if len(self.pending) > self.tx_cap:
+            self.pending.popleft()
+            self.c["tx_queue_drops"] += 1
+        return True
+
+    def describe(self) -> str:
+        s = self.ring.stats
+        return ("ring in=%d out=%d polls=%d busy=%d stall=%d not_ready=%d phone_drops=%d "
+                "resync=%d bad_seq=%d bad_fnv=%d bad_entry=%d | txq=%d qdrops=%d usb_err=%d "
+                "resumes=%d not_ready_drops=%d%s"
+                % (s["frames_in"], s["frames_out"], s["polls"], s["busy"], s["stall"],
+                   s["not_ready"], s["phone_drops"], s["resync"], s["bad_seq"], s["bad_fnv"],
+                   s["bad_entry"], len(self.pending), self.c["tx_queue_drops"],
+                   self.c["usb_errors"], self.c["resumes"],
+                   self.c["tx_flushed_not_ready"] + self.c["tx_dropped_not_ready"],
+                   " STALLED (disabled)" if self.stalled else " PAUSED" if self.paused else ""))
+
+
+class SimPhone:
+    """--transport sim test hook: the phone's kernel side (KernelSim) of a simulated
+    route U ring, fed from a UDP frame socket (the netns TAP relay of
+    tools/usbnet-bridge-test).  Datagrams from the socket are what en0 sends
+    (KernelSim.tx); frames the bridge delivered to the phone (KernelSim.rx) go back
+    to the socket.  Runs in a daemon thread and takes the ring's lock around every
+    kernel-side access, as the loader's requests do.  A frame the kernel TX ring has
+    no room for waits in a bounded backlog (en0's send queue)."""
+
+    def __init__(self, kernel, lock, listen, peer, backlog: int = 512, interval: float = 0.001):
+        self.kernel = kernel
+        self.lock = lock
+        self.listen = listen
+        self.peer = (socket.gethostbyname(peer[0]), int(peer[1]))
+        self.backlog = deque()
+        self.backlog_cap = backlog
+        self.interval = interval
+        self.c = Counter()
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
+            try:
+                s.setsockopt(socket.SOL_SOCKET, opt, 4 << 20)
+            except OSError:
+                pass
+        s.bind(listen)
+        s.setblocking(False)
+        self.sock = s
+
+    def step(self, wait: float) -> None:
+        r, _, _ = select.select([self.sock], [], [], wait)
+        if r:
+            for _ in range(512):
+                try:
+                    data, addr = self.sock.recvfrom(65535)
+                except (BlockingIOError, InterruptedError):
+                    break
+                except OSError:
+                    break
+                if addr[0] != self.peer[0] or addr[1] != self.peer[1]:
+                    self.c["foreign"] += 1
+                    continue
+                self.backlog.append(data)
+                if len(self.backlog) > self.backlog_cap:
+                    self.backlog.popleft()
+                    self.c["backlog_drops"] += 1
+        with self.lock:
+            while self.backlog:
+                got = self.kernel.tx(self.backlog[0])
+                if got == "full":
+                    break
+                self.backlog.popleft()
+                self.c["tx_" + got] += 1
+            frames = self.kernel.rx()
+        for fr in frames:
+            try:
+                self.sock.sendto(fr, self.peer)
+                self.c["rx"] += 1
+            except OSError:
+                self.c["rx_send_err"] += 1
+
+    def run(self) -> None:
+        while True:
+            self.step(0 if self.backlog else self.interval)
+
+    def start(self):
+        import threading
+        th = threading.Thread(target=self.run, name="sim-phone", daemon=True)
+        th.start()
+        return th
+
+    def describe(self) -> str:
+        return ("sim phone udp listen=%s:%d peer=%s:%d " % (self.listen + self.peer)
+                + " ".join("%s=%d" % kv for kv in sorted(self.c.items())))
 
 
 # ----------------------------------------------------------------------------
@@ -357,6 +622,9 @@ class Bridge:
         self.dns_pending = {}
         self.next_stats = time.monotonic() + stats_every if stats_every > 0 else None
         self.next_timer_scan = 0.0
+        self.next_t_poll = 0.0         # polled transports (fileno None): next recv_frames
+        self.stats_hook = None         # called after each periodic stats line
+        self.running = True
         self.started = time.monotonic()
 
     # ---------------------------------------------------------------- output
@@ -1344,7 +1612,15 @@ class Bridge:
             return [], [], []
         if total <= 500:
             try:
-                return select.select(r, w, x, timeout)
+                if timeout >= 0.016:
+                    return select.select(r, w, x, timeout)
+                # Winsock select() rounds short timeouts up to the ~15.6 ms timer
+                # tick; time.sleep() is high resolution (3.11+): poll, then sleep.
+                res = select.select(r, w, x, 0)
+                if timeout > 0 and not (res[0] or res[1] or res[2]):
+                    time.sleep(timeout)
+                    res = select.select(r, w, x, 0)
+                return res
             except (OSError, ValueError):
                 time.sleep(0.001)
                 return [], [], []
@@ -1368,7 +1644,7 @@ class Bridge:
             % (self.t.describe(), GW_MAC.hex(":"), self.upstream_dns,
                ", LAN allowed" if self.allow_lan else ""))
         tfd = self.t.fileno()
-        while True:
+        while self.running:
             now = time.monotonic()
             r, w, x = [], [], []
             if tfd is not None:
@@ -1393,18 +1669,25 @@ class Bridge:
                     if f.rcvbuf:
                         w.append(f.sock)
             if tfd is None:
-                timeout = self.t.poll_interval
+                # Polled transport (route U): recv_frames at most every poll_interval
+                # (the transport adapts it to traffic), however often sockets wake us.
+                timeout = max(0.0, min(self.next_t_poll - now, 0.1))
             else:
                 timeout = 0.01 if self.flows or self.dns_pending else 0.1
             rr, ww, xx = self.poll(r, w, x, timeout)
             frames = []
-            if (tfd is None or self.t in rr) and time.monotonic() >= self.t_err_until:
+            due = self.t in rr
+            if tfd is None:
+                due = time.monotonic() >= self.next_t_poll
+            if due and time.monotonic() >= self.t_err_until:
                 try:
                     frames = self.t.recv_frames()
                 except Exception as e:  # transport gone: back off, keep state
                     self.transport_error("recv", e)
                     self.t_err_until = time.monotonic() + 0.2
                     frames = []
+                if tfd is None:
+                    self.next_t_poll = time.monotonic() + self.t.poll_interval
             for fr in frames:
                 try:
                     self.handle_frame(fr)
@@ -1470,6 +1753,15 @@ class Bridge:
             if self.next_stats is not None and now >= self.next_stats:
                 self.next_stats = now + self.stats_every
                 self.print_stats()
+                if self.stats_hook is not None:
+                    try:
+                        self.stats_hook()
+                    except Exception:
+                        pass
+
+    def stop(self):
+        """Make run() return after its current iteration (any thread may call it)."""
+        self.running = False
 
     def guard(self, o, fn, *args):
         """Run one per-socket/per-flow handler; a bug there kills only that flow."""
@@ -1505,6 +1797,8 @@ class Bridge:
                c["handler_exception"], c["tcp_keepalive"],
                c["tcp_idle_abort"] + c["tcp_halfclose_abort"] + c["tcp_keepalive_abort"],
                c["tcp_evicted"], drops, top))
+        if isinstance(self.t, RingTransport) or self.verbose:
+            log("transport: " + self.t.describe())
 
 
 # ----------------------------------------------------------------------------
@@ -1564,11 +1858,15 @@ def detect_upstream_dns() -> str:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="User-mode IPv4 gateway for the iOS-on-OnePlus-11 en0 interface.")
-    ap.add_argument("--transport", choices=("udp", "ring"), default="udp")
+    ap.add_argument("--transport", choices=("udp", "sim"), default="udp",
+                    help="udp: frames as UDP datagrams; sim: route U over the ring "
+                         "simulator (fuxi_usbnet_ring.sim_pair), whose phone side "
+                         "exchanges frames as UDP datagrams on --listen/--peer. With a "
+                         "phone, route U runs inside fuxi-xnu-monitor.py --net.")
     ap.add_argument("--listen", default="127.0.0.1:47001",
-                    help="UDP transport: local HOST:PORT to receive frames on")
+                    help="UDP/sim transport: local HOST:PORT to receive frames on")
     ap.add_argument("--peer", default="127.0.0.1:47002",
-                    help="UDP transport: HOST:PORT that frames are sent to")
+                    help="UDP/sim transport: HOST:PORT that frames are sent to")
     ap.add_argument("--upstream-dns", default=None,
                     help="resolver for queries sent to 192.168.88.1 (default: OS, else 1.1.1.1)")
     ap.add_argument("--allow-lan", action="store_true",
@@ -1590,7 +1888,12 @@ def main(argv=None) -> int:
     if a.transport == "udp":
         t = UdpFrameTransport(parse_hostport(a.listen), parse_hostport(a.peer))
     else:
-        t = RingTransport()
+        ring = load_ring_module()
+        usbnet, _loader, kernel = ring.sim_pair()
+        t = RingTransport(transport=usbnet)
+        phone = SimPhone(kernel, usbnet.lock, parse_hostport(a.listen), parse_hostport(a.peer))
+        phone.start()
+        log("sim: route U ring simulator, " + phone.describe())
     b = Bridge(t, dns, allow_lan=a.allow_lan, fake_ping_external=a.fake_ping_external,
                verbose=a.verbose, stats_every=a.stats_every)
     try:
@@ -1598,6 +1901,8 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         log("interrupted")
         b.print_stats()
+        if a.transport == "sim":
+            log(phone.describe())
     finally:
         t.close()
     return 0

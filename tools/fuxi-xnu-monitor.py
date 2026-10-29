@@ -28,6 +28,17 @@ into progress.jsonl decoded (usb_diag); a loader that STALLs it (no 0x59) or giv
 reply that does not decode is not asked again, nor after three link errors in a row.
 On salami, or when the payload ADT does not tell the board, --framebuffer and
 --tour-shots are skipped unless --force-fb.
+--net (route U): after the handoff the phone gets internet through this process. The
+user-mode bridge of tools/fuxi-usb-net-bridge.py runs in a daemon thread on this same
+device handle (WinUSB opens it exclusively) with a RingTransport whose requests are
+only 0x5d and 0x5e (500 ms timeout); one lock serializes them with every request of
+this tool. A USB error in the bridge pauses it (its flows and ring state kept) until
+the next console poll goes through, or until a reconnect has found the monitor again;
+then it resumes on that handle. A STALL on 0x5d/0x5e (a loader built without
+FUXI_USBNET; the loader reports no route U capability to check first) turns the
+bridge off for the rest of the run. Every way out of the console loop (its end,
+Ctrl+C, an error) pauses and stops the bridge and records its summary before the
+end-of-session 0x59. Without --net no request changes.
 """
 import argparse
 import contextlib
@@ -37,6 +48,7 @@ from pathlib import Path
 import re
 import struct
 import sys
+import threading
 import time
 import zlib
 
@@ -71,6 +83,182 @@ USB_DEVICE_EVENTS = {0: 'disconnect', 1: 'reset', 2: 'connect_done', 3: 'link_st
                      10: 'command_complete', 11: 'overflow'}
 USB_EP_EVENTS = {1: 'xfer_complete', 2: 'xfer_in_progress', 3: 'xfer_not_ready', 4: 'fifo',
                  6: 'stream', 7: 'command_complete'}
+
+
+# ---- --net: route U bridge inside the monitor ----
+NET_REQUESTS = {(0x40, 0x5d), (0xc0, 0x5e)}   # the only requests the bridge thread sends
+NET_CTRL_TIMEOUT_MS = 500
+
+
+class NetLinkDown(OSError):
+    """A bridge request while the link is paused (USB error, the monitor reconnecting)."""
+
+    def __init__(self):
+        super().__init__(errno.ENOTCONN, 'route U paused')
+
+
+def load_bridge_module():
+    """tools/fuxi-usb-net-bridge.py (dashes in the name: importlib)."""
+    import importlib.util
+    here = Path(__file__).resolve().parent
+    if str(here) not in sys.path:
+        sys.path.insert(0, str(here))
+    spec = importlib.util.spec_from_file_location('fuxi_usb_net_bridge', here / 'fuxi-usb-net-bridge.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def is_stall(error):
+    """A STALLed control request (libusb LIBUSB_ERROR_PIPE / errno EPIPE), as
+    fuxi_usbnet_ring.is_stall says (kept here so the monitor needs no import without --net)."""
+    return getattr(error, 'backend_error_code', None) == -9 or getattr(error, 'errno', None) == errno.EPIPE
+
+
+class NetLink:
+    """--net: the bridge thread and the device handle it shares with the monitor.
+
+    ctrl() is the RingTransport's ctrl callable: it runs under lock (UsbnetTransport
+    holds it around each request), sends only 0x5d/0x5e on the current dev, and raises
+    NetLinkDown while paused. The monitor calls pause() before it releases the device,
+    resume() after a console poll that went through, and set_dev() with the handle a
+    reconnect found; the bridge's own USB errors pause it the same way (on_error)."""
+
+    def __init__(self, dev, lock, upstream_dns=None, verbose=False, allow_lan=False,
+                 stats_seconds=30.0, out=None, bridge_module=None):
+        self.dev = dev
+        self.lock = lock
+        self.up = True
+        self.upstream_dns = upstream_dns
+        self.verbose = verbose
+        self.allow_lan = allow_lan
+        self.stats_seconds = stats_seconds
+        self.out = out or (lambda msg: print(msg, flush=True))
+        self.mod = bridge_module
+        self.bridge = None
+        self.transport = None
+        self.thread = None
+        self.started = False
+        self.errors = 0
+        self.pauses = 0
+        self.resumes = 0
+        self.swaps = 0
+        self.last_error = None
+        self.failed = None
+        self.disabled = None        # why route U is off for good (a STALL), or None
+        self.stopping = False
+
+    def ctrl(self, bmRequestType, bRequest, wValue, wIndex, data_or_wLength):
+        if (bmRequestType, bRequest) not in NET_REQUESTS:
+            raise ValueError(f'--net bridge: request {bmRequestType:#04x}/{bRequest:#04x} refused')
+        if not self.up or self.disabled:
+            raise NetLinkDown()
+        return self.dev.ctrl_transfer(bmRequestType, bRequest, wValue, wIndex, data_or_wLength,
+                                      timeout=NET_CTRL_TIMEOUT_MS)
+
+    def ready(self):
+        return self.up and not self.disabled
+
+    def on_error(self, error):
+        """The bridge thread met a USB error (outside the lock): pause until the monitor
+        sees the device answer again."""
+        if isinstance(error, NetLinkDown):
+            return
+        self.errors += 1
+        self.last_error = f'{type(error).__name__}: {error}'
+        if is_stall(error):
+            # A correct route U loader never STALLs 0x5d/0x5e: this one has no FUXI_USBNET
+            # (probe.c STALLs vendor requests it does not serve), and on WinUSB a STALL can
+            # drop the device. Never send them again in this run.
+            with self.lock:
+                first = self.disabled is None
+                self.disabled = 'route U STALLed'
+                self.up = False
+            if first:
+                self.pauses += 1
+                self.out('net: route U STALLed (loader without FUXI_USBNET?), bridge disabled')
+            if self.bridge is not None:
+                self.bridge.stop()
+            return
+        if self.up:
+            self.up = False
+            self.pauses += 1
+            self.out(f'net: USB error in the bridge ({self.last_error}, errno '
+                     f'{getattr(error, "errno", None)}); paused until the monitor answers again')
+
+    def pause(self, why):
+        with self.lock:             # no bridge request is in flight after this
+            if self.up:
+                self.pauses += 1
+                self.out(f'net: paused ({why})')
+            self.up = False
+
+    def resume(self):
+        """A console poll went through on the same handle."""
+        if not self.up and self.started and not self.disabled:
+            self.up = True
+            self.resumes += 1
+            self.out('net: resumed')
+
+    def set_dev(self, dev):
+        """A reconnect found the monitor again: resume on the new handle, state kept."""
+        with self.lock:
+            if dev is not self.dev:
+                self.swaps += 1
+            self.dev = dev
+            if self.disabled:       # route U STALLed: stays off on the new handle too
+                return
+            was = self.up
+            self.up = True
+        if not was:
+            self.resumes += 1
+        if self.started:
+            self.out('net: resumed on the reconnected device')
+
+    def start(self):
+        if self.started or self.disabled:
+            return
+        self.started = True
+        self.thread = threading.Thread(target=self._run, name='fuxi-net-bridge', daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        try:
+            mod = self.mod or load_bridge_module()
+            self.mod = mod
+            mod.LOG_PREFIX = 'net: '
+            dns = self.upstream_dns or mod.detect_upstream_dns()
+            self.transport = mod.RingTransport(ctrl=self.ctrl, lock=self.lock, ready=self.ready,
+                                               on_error=self.on_error)
+            self.bridge = mod.Bridge(self.transport, dns, allow_lan=self.allow_lan,
+                                     verbose=self.verbose, stats_every=self.stats_seconds)
+            if self.stopping or self.disabled:  # stop() or a STALL came first
+                return
+            self.bridge.run()
+        except Exception as error:  # never take the console loop down
+            self.failed = f'{type(error).__name__}: {error}'
+            self.out(f'net: bridge thread stopped: {self.failed}')
+
+    def stop(self, timeout=2.0):
+        self.stopping = True
+        if self.bridge is not None:
+            self.bridge.stop()
+        if self.thread is not None:
+            self.thread.join(timeout)
+        if self.bridge is not None:
+            self.bridge.print_stats()
+
+    def summary(self):
+        d = {'errors': self.errors, 'pauses': self.pauses, 'resumes': self.resumes,
+             'device_swaps': self.swaps, 'up': self.up, 'last_error': self.last_error,
+             'failed': self.failed, 'disabled': self.disabled}
+        if self.transport is not None:
+            d['ring'] = dict(self.transport.ring.stats)
+            d['tx_queue'] = len(self.transport.pending)
+            d['tx_queue_drops'] = self.transport.c['tx_queue_drops']
+        if self.bridge is not None:
+            d['bridge'] = {k: v for k, v in self.bridge.c.items()}
+        return d
 
 
 def usb_event_name(ev):
@@ -317,7 +505,14 @@ def main():
     ap.add_argument('--monitor-idle',type=int,choices=(0,1,2),help='cpu@100 idle between USB polls: 0 busy, 1 delay 500 us, 2 WFE + timer event stream')
     ap.add_argument('--cpu-level',metavar='SPEC',help="before handoff: EPSS perf level per domain, e.g. '0:3,1:@1200,2:@1200' (LUT index, or @MHz = highest non-turbo row <= MHz)")
     ap.add_argument('--cpu-at',action='append',default=[],metavar='SECONDS=SPEC',help='after handoff: apply SPEC (as --cpu-level, or idle:MODE) at SECONDS after handoff (repeatable)')
+    ap.add_argument('--net',action='store_true',help='route U: after the handoff run the user-mode network bridge (tools/fuxi-usb-net-bridge.py) in this process over requests 0x5d/0x5e, so the phone gets internet (pass a long --seconds)')
+    ap.add_argument('--net-upstream-dns',metavar='IP',help='--net: resolver for queries to 192.168.88.1 (default: the OS resolver, else 1.1.1.1)')
+    ap.add_argument('--net-verbose',action='store_true',help='--net: log every flow')
+    ap.add_argument('--net-allow-lan',action='store_true',help='--net: permit RFC1918 / link-local destinations')
+    ap.add_argument('--net-stats-seconds',type=float,default=30.0,metavar='SECONDS',help='--net: bridge stats line every SECONDS (default %(default)s, 0 off)')
     args = ap.parse_args()
+    if args.net and args.no_handoff:
+        ap.error('--net starts after the XNU handoff: drop --no-handoff')
     import usb.core  # lazy: --help needs no pyusb
     import usb.util
     payload = args.payload.read_bytes()
@@ -370,6 +565,9 @@ def main():
         ap.error('expected exactly one Fuxi native monitor')
     dev = devices[0]
     args.out.mkdir(parents=True, exist_ok=False)
+    # --net: one lock for every request of this tool and of the bridge thread
+    usb_lock = threading.Lock() if args.net else contextlib.nullcontext()
+    net = None
 
     def elapsed_ms(t0):
         return round((time.monotonic() - t0) * 1000, 1)
@@ -385,7 +583,8 @@ def main():
     def request(number, length, value=0, index=0, timeout=3000):
         t0 = time.monotonic()
         try:
-            data = bytes(dev.ctrl_transfer(0xc0, number, value, index, length, timeout=timeout))
+            with usb_lock:
+                data = bytes(dev.ctrl_transfer(0xc0, number, value, index, length, timeout=timeout))
         except usb.core.USBError as error:
             error.fuxi_usb = usb_error_info(error, f'{number:#x}', elapsed_ms(t0))
             raise
@@ -536,7 +735,8 @@ def main():
         events=[]
         until=time.monotonic()+args.touch_test
         while power[0]==6 and time.monotonic()<until:
-            b=bytes(dev.ctrl_transfer(0xc0,0x55,0x5445,0,256,timeout=3000))
+            with usb_lock:
+                b=bytes(dev.ctrl_transfer(0xc0,0x55,0x5445,0,256,timeout=3000))
             for i in range(0,len(b),8):
                 events.append((round(time.monotonic(),3),b[i:i+8].hex()))
                 print('touch event',b[i:i+8].hex(),flush=True)
@@ -552,6 +752,11 @@ def main():
         raise SystemExit('--no-handoff: stopping before the XNU handoff')
     request(0x49, 88, 0x584e)
     handoff = time.monotonic()
+    if args.net:
+        net = NetLink(dev, usb_lock, upstream_dns=args.net_upstream_dns, verbose=args.net_verbose,
+                      allow_lan=args.net_allow_lan, stats_seconds=args.net_stats_seconds)
+        net.start()
+        print('net: route U bridge started (gateway 192.168.88.1, phone 192.168.88.2)', flush=True)
     next_thermal = handoff
     thermal_file = (args.out / 'thermal.jsonl').open('w') if args.thermal_log else None
     last_total = 0
@@ -623,8 +828,9 @@ def main():
         rec = {'usb_diag': None, 'when': when}
         t0 = time.monotonic()
         try:
-            raw = bytes(dev.ctrl_transfer(0xc0, USB_DIAG_REQUEST, 0, 0, USB_DIAG_BYTES,
-                                          timeout=USB_DIAG_TIMEOUT_MS))
+            with usb_lock:
+                raw = bytes(dev.ctrl_transfer(0xc0, USB_DIAG_REQUEST, 0, 0, USB_DIAG_BYTES,
+                                              timeout=USB_DIAG_TIMEOUT_MS))
         except Exception as e:  # pyusb USBError, NotImplementedError, ValueError
             info = usb_error_info(e, f'{USB_DIAG_REQUEST:#x}', elapsed_ms(t0))
             stall = info['errno'] == errno.EPIPE
@@ -721,8 +927,16 @@ def main():
                 why = f'{len(found)} Fuxi native monitors' if found else 'no monitor enumerated'
             if not pause(why, grow):
                 return None
+    def net_end():
+        """--net: pause the bridge (no request of it in flight afterwards), stop it and record
+        its summary, on every way out of the console loop and before session_end's 0x59."""
+        net.pause('session end')
+        net.stop()
+        record({'net': net.summary(), 'time': time.time()})
     with (args.out / 'progress.jsonl').open('w') as progress, (args.out / 'boot.log').open('wb') as log, \
-            session_end():  # exits first: the end-of-session 0x59 record still reaches progress.jsonl
+            session_end(), contextlib.ExitStack() as net_end_stack:  # exits first: the end-of-session 0x59 record still reaches progress.jsonl
+        if net:  # Ctrl+C, a ValueError and a reconnect that gives up stop the bridge too
+            net_end_stack.callback(net_end)
         while time.monotonic() < until:
             status = None
             try:
@@ -803,6 +1017,8 @@ def main():
                     request(0x54, 8, args.reset_minutes)
                     renew = time.monotonic() + 600
                 outage = None  # the whole poll (and any renewal) went through: the outage is over
+                if net:
+                    net.resume()  # a bridge USB error paused it: this handle answers again
                 time.sleep(.25)
             except (usb.core.USBError, NotImplementedError) as error:
                 # Windows re-enumerates the device after selective suspend (or a 0x4e read
@@ -815,6 +1031,8 @@ def main():
                 progress.write(json.dumps({'usb_error': str(error), **info, 'console_read': last_total,
                                            'partial_status': status, 'time': time.time()}) + '\n')
                 progress.flush()
+                if net:
+                    net.pause('monitor USB error, reconnecting')
                 back = (reconnect(error, outage + args.reconnect_seconds, again)
                         if args.reconnect_seconds > 0 else None)
                 if back is None:
@@ -823,6 +1041,9 @@ def main():
                 progress.write(json.dumps({'usb_reconnect': back, 'outage_s': round(time.monotonic() - outage, 1),
                                            'console_read': last_total, 'time': time.time()}) + '\n')
                 progress.flush()
+                if net:
+                    net.set_dev(dev)  # the bridge resumes on the new handle, its state kept
+                    net.start()
                 usb_diag('reconnect')  # why the link dropped, from the loader's side
                 catch_up = True
                 renew = 0  # renew the reset deadline at the end of the next poll

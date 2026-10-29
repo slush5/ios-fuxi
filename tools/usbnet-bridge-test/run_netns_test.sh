@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
 # End-to-end test of fuxi-usb-net-bridge.py inside WSL Ubuntu (run as root).
 #
-#   wsl -d Ubuntu -u root -- bash "/mnt/c/Users/Jordan/ios oneplus 11/op11_home_kit_14711/OnePlus11_iOS_home_kit/windows-tools/bridge-test/run_netns_test.sh"
+#   wsl -d Ubuntu -u root -- bash ".../tools/usbnet-bridge-test/run_netns_test.sh" [udp|sim]
+#   wsl -d Ubuntu -u root -- bash ".../tools/usbnet-bridge-test/run_netns_sim_test.sh"
+#
+# Transport (first argument, default udp):
+#   udp  the bridge takes the relay's frames directly as UDP datagrams;
+#   sim  route U without a phone: the bridge runs --transport sim, i.e. its
+#        RingTransport polls fuxi_usbnet_ring.LoaderRingSim (0x5d/0x5e, byte-exact)
+#        while a KernelSim inside the bridge process plays the phone's kernel:
+#        relay datagrams -> KernelSim.tx, KernelSim.rx -> relay datagrams.
 #
 # Layout:
 #   netns "phone":  tap0 (plays the iPhone's en0)
@@ -10,11 +18,13 @@
 #                                                                       |
 #                                                       ordinary sockets -> internet
 set -u
+TRANSPORT="${1:-udp}"
+case "$TRANSPORT" in udp|sim) ;; *) echo "usage: $0 [udp|sim]"; exit 2;; esac
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BRIDGE="$HERE/../fuxi-usb-net-bridge.py"
 TOOLS="$HERE/netns_tools.py"
 HOOK_SRC="$HERE/dhcp_hook.sh"
-WORK=/tmp/fuxi-bridge-test
+WORK=/tmp/fuxi-bridge-test-$TRANSPORT
 NS=phone
 TAP=tap0
 BR_ADDR=127.0.0.1:47001
@@ -46,7 +56,7 @@ rm -rf "$WORK"; mkdir -p "$WORK"
 tr -d '\r' < "$HOOK_SRC" > "$WORK/dhcp_hook.sh"; chmod +x "$WORK/dhcp_hook.sh"
 export LEASE_FILE="$WORK/lease.env"
 
-say "kernel $(uname -r), $(python3 --version)"
+say "transport $TRANSPORT, kernel $(uname -r), $(python3 --version)"
 [ -c /dev/net/tun ] || { modprobe tun 2>/dev/null; }
 [ -c /dev/net/tun ] || { echo "no /dev/net/tun"; exit 2; }
 
@@ -60,7 +70,7 @@ echo "nameserver 192.168.88.1" > "/etc/netns/$NS/resolv.conf"
 printf 'passwd: files\ngroup: files\nhosts: files dns\n' > "/etc/netns/$NS/nsswitch.conf"
 
 # ---------------------------------------------------------------- bridge + relay
-python3 -u "$BRIDGE" --transport udp --listen "$BR_ADDR" --peer "$RELAY_ADDR" \
+python3 -u "$BRIDGE" --transport "$TRANSPORT" --listen "$BR_ADDR" --peer "$RELAY_ADDR" \
   --stats-every 5 --verbose > "$WORK/bridge.log" 2>&1 &
 BRIDGE_PID=$!; PIDS+=("$BRIDGE_PID")
 python3 -u "$TOOLS" relay --netns "/run/netns/$NS" --tap "$TAP" \
@@ -200,6 +210,17 @@ sleep 5.5
 say "---- bridge log (last stats + any exceptions) ----"
 grep -E 'Traceback|exception|Error' "$WORK/bridge.log" | head -20
 grep 'stats' "$WORK/bridge.log" | tail -1
+grep 'transport:' "$WORK/bridge.log" | tail -1
+if [ "$TRANSPORT" = sim ]; then
+  # route U health: the host never got a STALL and never lost sync with the ring
+  RL=$(grep 'transport: ring' "$WORK/bridge.log" | tail -1)
+  getn() { echo "$RL" | grep -o " $1=[0-9]*" | cut -d= -f2; }
+  if [ -n "$RL" ] && [ "$(getn stall)" = 0 ] && [ "$(getn phone_drops)" = 0 ] && [ "$(getn bad_seq)" = 0 ]      && [ "$(getn bad_fnv)" = 0 ] && [ "$(getn bad_entry)" = 0 ] && [ "$(getn usb_err)" = 0 ]; then
+    pass "route U ring clean: in=$(getn in) out=$(getn out) polls=$(getn polls) busy=$(getn busy) qdrops=$(getn qdrops) (stall/phone_drops/bad_seq/bad_fnv/usb_err all 0)"
+  else
+    fail "route U ring counters: $RL"
+  fi
+fi
 kill -0 "$BRIDGE_PID" 2>/dev/null || { fail "bridge process died"; tail -30 "$WORK/bridge.log"; }
 
 echo
