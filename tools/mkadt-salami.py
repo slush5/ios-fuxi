@@ -31,7 +31,14 @@ refuses salami. Differences:
   * refuses an ADT above the loader's 16 KiB cap (loader.c:117), more than 512
     extents (FX_MAX_EXTENTS, sweet_ufs.c), and extents outside, at block 0 of,
     or overlapping in userdata (sda14, 57097632 4 KiB blocks: GPT 4234843..61332474,
-    dm-default-key length 456781056 x 512 B, measure/dm_userdata.txt).
+    dm-default-key length 456781056 x 512 B, measure/dm_userdata.txt);
+  * --wlan-defaults "KEY=VALUE ..." writes fuxiwlan* knobs into /defaults (K-W1b): the
+    salami kernel reads every fuxiwlan* knob from the boot-args first and, only when it
+    is absent there, from the /defaults property of the same name (fuxi_wlan.c wl_arg),
+    so the WLAN lane fits after the cmdline is full. Numbers become 4-byte LE int32,
+    strings NUL-terminated and no longer than the kernel buffer; unknown keys, other
+    types and repeats are refused. Each property costs 36 bytes plus its value rounded
+    up to 4 (a number: 40 bytes) inside the same 16 KiB cap; the bytes are printed.
 
 Root extents: --root-extents takes the extents.json that tools/salami-install-root.sh
 writes (salami-pin output; bytes, userdata-relative). The pinned file is the image
@@ -44,6 +51,7 @@ required only for an older extents.json without root_bytes. Either way it must b
 import argparse
 import importlib.util
 import json
+import re
 import struct
 import sys
 from pathlib import Path
@@ -69,6 +77,21 @@ COMPATIBLE = b'D22AP\0iPhone10,3\0oneplus,salami\0xiaomi,fuxi\0qcom,sm8550\0Appl
 # Touch baseline for the ADT /defaults node (touch_s3908_design.md 5.2-5.3): TCM backend
 # and the salami SweetHID surface size in mm. Integer knobs are 4-byte LE u32.
 TOUCH_DEFAULTS = (('fuxitic', 2), ('sweethid_mmw', 70), ('sweethid_mmh', 156))
+# K-W1b: every fuxiwlan* knob of xnu/fuxi-wlan/fuxi_wlan.c, as the salami kernel reads it from
+# /defaults when the boot-arg is absent (wl_arg, PE_get_default). 'i' = an int: 4-byte LE int32.
+# A number = a string of at most that many characters, written NUL-terminated: the kernel buffer
+# less its truncation sentinel (char[16] selectors 15, fuxiwlanseq char[96] 95, firmware
+# basenames char[65] 63). PE_get_default reads a larger property as absent, so it is refused here.
+WLAN_KNOBS = {
+    'fuxiwlan': 'i', 'fuxiwlansalami': 'i', 'fuxiwlanrails': 'i', 'fuxiwlanqrtr': 'i',
+    'fuxiwlanmlo': 'i', 'fuxiwlanw15': 'i', 'fuxiwlanw16': 'i', 'fuxiwlanstop22': 'i',
+    'fuxiwlankeep': 'i', 'fuxiwlanicc': 'i', 'fuxiwlaniccbw': 'i', 'fuxiwlanaspm': 'i',
+    'fuxiwlanoldiova': 'i', 'fuxiwlanclk': 'i', 'fuxiwlaniboff': 'i',
+    'fuxiwlanseq': 95, 'fuxiwlanpre': 15, 'fuxiwlanfw': 15, 'fuxiwlanbhi': 15,
+    'fuxiwlanvec': 15, 'fuxiwlancnss': 15, 'fuxiwlanprobe': 15,
+    'fuxiwlanbdf': 63, 'fuxiwlanregdb': 63, 'fuxiwlanm3': 63, 'fuxiwlanamss': 63,
+}
+WLAN_NUMBER = re.compile(r'-?(?:0[xX][0-9a-fA-F]+|0|[1-9][0-9]*)')
 # The proven salami payload cmdline (also in tools/run-ios-salami.py): ufsrw=1 rootrw=1
 # (booted iOS to the lock screen 2026-10-28), fuxikick=0. The cmdline itself is written
 # by tools/mkpayload.py.
@@ -165,6 +188,58 @@ def root_size(path, root_bytes):
     return rb
 
 
+def adt_prop_bytes(value):
+    """Bytes one property adds to the serialized ADT (adt.serialize): 32-byte name, u32 size,
+    the value padded to 4."""
+    return 32 + 4 + len(value) + (-len(value) & 3)
+
+
+def wlan_defaults(texts):
+    """--wlan-defaults: whitespace-separated KEY=VALUE tokens (cmdline syntax, the option may repeat)
+    -> [(knob, encoded value)] in the given order, typed by WLAN_KNOBS."""
+    props, seen = [], set()
+    for token in ' '.join(texts).split():
+        key, sep, value = token.partition('=')
+        if not sep:
+            raise ValueError(f'--wlan-defaults wants KEY=VALUE tokens, got {token!r}')
+        kind = WLAN_KNOBS.get(key)
+        if kind is None:
+            raise ValueError(f'--wlan-defaults: {key!r} is not a fuxiwlan* knob of fuxi_wlan.c '
+                             f'({", ".join(sorted(WLAN_KNOBS))})')
+        if key in seen:
+            raise ValueError(f'--wlan-defaults: {key} given twice')
+        seen.add(key)
+        if kind == 'i':
+            if not WLAN_NUMBER.fullmatch(value):
+                raise ValueError(f'--wlan-defaults: {key}={value!r} must be a decimal or 0x number')
+            number = int(value, 0)
+            if not -2 ** 31 <= number < 2 ** 31:
+                raise ValueError(f'--wlan-defaults: {key}={value} does not fit the kernel int')
+            props.append((key, struct.pack('<i', number)))
+        else:
+            if not 0 < len(value) <= kind or not all(32 < ord(c) < 127 for c in value):
+                raise ValueError(f'--wlan-defaults: {key}={value!r} must be 1..{kind} printable characters '
+                                 'without spaces (the kernel buffer)')
+            props.append((key, value.encode('ascii') + b'\0'))
+    if not props:
+        raise ValueError('--wlan-defaults is empty')
+    return props
+
+
+def add_wlan_defaults(root, props):
+    """Append the knobs to /defaults; returns [(knob, bytes added)]. A knob already there is refused."""
+    defaults = next((n for n in root.children if n.name == 'defaults'), None)
+    if defaults is None:
+        raise ValueError('no /defaults node to carry the fuxiwlan* knobs')
+    added = []
+    for name, value in props:
+        if defaults.prop(name) is not None:
+            raise ValueError(f'/defaults already has {name}')
+        defaults.props.append((name, 0, value))
+        added.append((name, adt_prop_bytes(value)))
+    return added
+
+
 def parse_fb(text, stride_text):
     try:
         w, h = (int(v) for v in text.lower().split('x'))
@@ -202,6 +277,10 @@ def main():
                          'boot-logo loader; keep the node for verbose then logo)')
     ap.add_argument('--touch-defaults', action='store_true',
                     help='write the S3908 touch baseline into /defaults (fuxitic=2, sweethid_mmw/h)')
+    ap.add_argument('--wlan-defaults', action='append', metavar='"KEY=VALUE ..."',
+                    help='write these fuxiwlan* knobs into /defaults (may repeat); the salami kernel reads '
+                         'each from the boot-args first, else from here. Numbers 4-byte LE, strings '
+                         'NUL-terminated; each property costs 36 bytes + its value rounded up to 4')
     ap.add_argument('--print-cmdline', action=PrintCmdline,
                     help='print the recommended salami first-boot payload cmdline and exit')
     args = ap.parse_args()
@@ -255,12 +334,15 @@ def main():
             for name, value in TOUCH_DEFAULTS:
                 defaults.props = [(k, fl, v) for k, fl, v in defaults.props if k != name]
                 defaults.props.append((name, 0, struct.pack('<I', value)))
+        wlan_added = add_wlan_defaults(root, wlan_defaults(args.wlan_defaults)) if args.wlan_defaults else []
+        wlan_bytes = sum(n for _, n in wlan_added)
         has_ufs = any(n.name == 'fuxi-ufs' for n in root.children)
         validate_salami(args.live_fdt, has_ufs)
         blob = adt.serialize(root)
         if len(blob) > ADT_MAX:
             raise ValueError(f'ADT is {len(blob)} bytes; the loader accepts at most {ADT_MAX} '
-                             f'({n_extents} extents at 24 bytes each)')
+                             f'({n_extents} extents at 24 bytes each'
+                             + (f'; --wlan-defaults {wlan_bytes} of them' if wlan_added else '') + ')')
     except (ValueError, KeyError, StopIteration, struct.error, OSError) as error:
         ap.exit(1, f'{ap.prog}: {error}\n')
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -273,7 +355,9 @@ def main():
           f'root extents {n_extents}; '
           + ('no sweet-fbcon (no XNU text console)' if args.no_fbcon else f'fb {w}x{h} stride {stride}')
           + (f'; /product children {",".join(extra)}' if extra else '')
-          + ('; touch defaults' if args.touch_defaults else ''))
+          + ('; touch defaults' if args.touch_defaults else '')
+          + (f'; /defaults wlan knobs {wlan_bytes} bytes (' + ', '.join(f'{k} {n}' for k, n in wlan_added) + ')'
+             if wlan_added else ''))
 
 
 if __name__ == '__main__':

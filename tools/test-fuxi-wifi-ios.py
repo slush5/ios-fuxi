@@ -48,21 +48,43 @@ static int log_printf(const char *format, ...) {
 #define NSEC_PER_SEC 1000000000ull
 #define THREAD_CALL_PRIORITY_LOW 3
 #define THREAD_CALL_OPTIONS_ONCE 1u
+#define THREAD_CALL_DELAY_LEEWAY 0x20u
 typedef void *thread_call_param_t;
 typedef void (*thread_call_func_t)(thread_call_param_t, thread_call_param_t);
 typedef struct fake_call { thread_call_func_t func; } *thread_call_t;
 static struct fake_call the_call;
 static unsigned calls_made, calls_armed;
-static uint64_t now_abs, armed_at;
+static uint64_t now_abs, armed_at, armed_leeway;
 static void clock_get_uptime(uint64_t *t) { *t = now_abs; }
 static void absolutetime_to_nanoseconds(uint64_t a, uint64_t *ns) { *ns = a; }
 static void clock_interval_to_deadline(uint32_t interval, uint32_t scale, uint64_t *d) { *d = now_abs + (uint64_t)interval * scale; }
+static void clock_interval_to_absolutetime_interval(uint32_t interval, uint32_t scale, uint64_t *r) { *r = (uint64_t)interval * scale; }
 static thread_call_t thread_call_allocate_with_options(thread_call_func_t f, thread_call_param_t p, int priority, unsigned options) {
  assert(f && !p && priority == THREAD_CALL_PRIORITY_LOW && options == THREAD_CALL_OPTIONS_ONCE);
  calls_made++; the_call.func = f; return &the_call;
 }
+/* Salami (K-W1b) arms the summary's timer with leeway and backs off to every 10 minutes; Fuxi keeps the
+   plain call every 60 s. Each build calling the other's arming function is a test failure. */
+#if defined(FUXI_SALAMI)
+#define SUMMARY_LATER 600u
+#define LEEWAY(s) ((uint64_t)(s) / 10 * NSEC_PER_SEC)
+#else
+#define SUMMARY_LATER 60u
+#define LEEWAY(s) ((uint64_t)(s) * 0)
+#endif
 static int thread_call_enter_delayed(thread_call_t c, uint64_t deadline) {
- assert(c == &the_call); calls_armed++; armed_at = deadline; return 0;
+#if defined(FUXI_SALAMI)
+ (void)c; (void)deadline; assert(!"salami: thread_call_enter_delayed without leeway"); return 0;
+#else
+ assert(c == &the_call && deadline > now_abs); calls_armed++; armed_at = deadline; armed_leeway = 0; return 0;
+#endif
+}
+static int thread_call_enter_delayed_with_leeway(thread_call_t c, thread_call_param_t p, uint64_t deadline, uint64_t leeway, uint32_t flags) {
+#if !defined(FUXI_SALAMI)
+ assert(!"fuxi: the summary's timer is unchanged (no leeway)");
+#endif
+ assert(c == &the_call && !p && flags == THREAD_CALL_DELAY_LEEWAY && deadline > now_abs && leeway && leeway < deadline - now_abs);
+ calls_armed++; armed_at = deadline; armed_leeway = leeway; return 0;
 }
 #define FUXI 1
 #define KERNEL 1
@@ -186,10 +208,10 @@ int main(void) {
  assert(fuxi_wifi_sta_ask_scan(&bad_scan)==EINVAL);
  struct apple80211req invalid={.req_if_name="ue0"};
  assert(fuxi_wifi_apple80211_ioctl(SIOCGA80211,&invalid)==ENXIO);
- /* the summary's timer waits for the first request, and is armed once, 20 s on */
+ /* the summary's timer waits for the first request, and is armed once, 20 s on (salami: 2 s leeway) */
  assert(!calls_made);
  assert(request(false,999,NULL,0,NULL)==EOPNOTSUPP);
- assert(calls_made==1 && calls_armed==1 && armed_at==20*NSEC_PER_SEC);
+ assert(calls_made==1 && calls_armed==1 && armed_at==20*NSEC_PER_SEC && armed_leeway==LEEWAY(20));
  struct apple80211_scan_request scan={.version=1};
  assert(request(true,10,&scan,sizeof(scan)-1,NULL)==EINVAL);
  scan.ssid_length=33; assert(request(true,10,&scan,sizeof(scan),NULL)==EINVAL); scan.ssid_length=0;
@@ -324,11 +346,12 @@ int main(void) {
  /* a poll is said its first 24 times and every hundredth time after */
  for (unsigned i=0;i<250;i++) assert(!request(false,15,NULL,0,&val) && val==1);
  assert(said_times("fixture gets 15 (OP_MODE)")==26);
- /* the summary: 20 s after the first request, then every 60 s, said only when there was a request since */
+ /* the summary: 20 s after the first request, 60 s later, then every 60 s (salami: every 10 minutes, a
+    tenth of each wait as leeway), said only when there was a request since */
  assert(calls_made==1 && calls_armed==1);
  now_abs=21*NSEC_PER_SEC; before=loglen;
  the_call.func(NULL,NULL);
- assert(calls_made==1 && calls_armed==2 && armed_at==now_abs+60*NSEC_PER_SEC);
+ assert(calls_made==1 && calls_armed==2 && armed_at==now_abs+60*NSEC_PER_SEC && armed_leeway==LEEWAY(60));
  char want[400];
  snprintf(want,sizeof(want),"FUXI WIFI IOS: apple80211: summary 1, 21 s after the first request: %u requests of %u kinds, "
   "%u answered, %u refused, %u failed; events posted: power %u, link %u, join %u, scan %u\n",noted,kind_seen,noted_answered,
@@ -352,15 +375,28 @@ int main(void) {
   line=end+1;
  }
  assert(kinds_said==kind_seen);
- /* nothing asked since: nothing said, the timer runs on */
- before=loglen; the_call.func(NULL,NULL); assert(loglen==before && calls_armed==3);
+ /* nothing asked since: nothing said, the timer runs on (salami: now every 10 minutes) */
+ now_abs=81*NSEC_PER_SEC; before=loglen; the_call.func(NULL,NULL);
+ assert(loglen==before && calls_armed==3 && armed_at==(81+SUMMARY_LATER)*NSEC_PER_SEC && armed_leeway==LEEWAY(SUMMARY_LATER));
  assert(!request(false,13,NULL,0,&val));
- now_abs=141*NSEC_PER_SEC; before=loglen; the_call.func(NULL,NULL);
- assert(said_since(before,"FUXI WIFI IOS: apple80211: summary 2, 141 s after the first request: ") && calls_armed==4);
+ now_abs=armed_at; before=loglen; the_call.func(NULL,NULL);
+ snprintf(want,sizeof(want),"FUXI WIFI IOS: apple80211: summary 2, %u s after the first request: ",81+SUMMARY_LATER);
+ assert(said_since(before,want) && calls_armed==4);
+ assert(armed_at==now_abs+SUMMARY_LATER*NSEC_PER_SEC && armed_leeway==LEEWAY(SUMMARY_LATER));
+ for (unsigned i=0;i<3;i++) {
+  now_abs=armed_at; before=loglen; the_call.func(NULL,NULL);
+  assert(loglen==before && calls_armed==5+i && armed_at==now_abs+SUMMARY_LATER*NSEC_PER_SEC && armed_leeway==LEEWAY(SUMMARY_LATER));
+ }
+ assert(calls_made==1);
  fuxi_wifi_apple80211_summary(); assert(said_times("apple80211: summary 3,")==0);
  /* nothing a network carries was said: its name, its passphrase */
  assert(!strstr(logbuf,"Fuxi Loopback") && !strstr(logbuf,"password"));
  puts("PASS: production station, ioctl layouts/events, fake frame callbacks and gates");
+#if defined(FUXI_SALAMI)
+ puts("PASS: salami summary timer 20 s, 60 s, then every 10 min, a tenth of each wait as leeway");
+#else
+ puts("PASS: fuxi summary timer unchanged: 20 s, then every 60 s, no leeway");
+#endif
  return 0;
 }
 '''
@@ -370,13 +406,13 @@ def stripped(name):
     return re.sub(r'^#include[^\n]*\n', '', (SRC / name).read_text(), flags=re.M)
 
 
-def compile_run(source, directory, name):
+def compile_run(source, directory, name, defs=()):
     path = directory / (name + '.c')
     path.write_text(source)
     binary = directory / name
     subprocess.run([os.environ.get('CC', 'clang'), '-std=gnu11', '-g', '-O1', '-Wall', '-Wextra',
                     '-Wno-unused-function', '-Wno-unused-parameter', '-fsanitize=address,undefined',
-                    '-pthread', '-I', str(SRC), str(path), '-o', str(binary)], check=True)
+                    '-pthread', *defs, '-I', str(SRC), str(path), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True, timeout=30)
 
 
@@ -576,6 +612,7 @@ def main():
         source += stripped('fuxi_wifi_sta.c') + stripped('fuxi_wifi_apple80211.c')
         source += stripped('fuxi_wifi_ios.c') + TEST
         compile_run(source, directory, 'ios')
+        compile_run(source, directory, 'ios-salami', ['-DFUXI_SALAMI=1'])   # K-W1b summary back-off
         wpa_test(directory)
         net_test(directory)
         root_test(directory)

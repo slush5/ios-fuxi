@@ -678,7 +678,7 @@
 +limitations under the License."
 --- /dev/null
 +++ b/bsd/dev/fuxi_wifi_apple80211.c
-@@ -0,0 +1,943 @@
+@@ -0,0 +1,981 @@
 +/*
 + * Ported from HackiOS xnu/files/bsd/dev/redwood_apple80211.c (APSL-2.0)
 + * Fuxi adaptations, 2026-10-23: opt-in iOS shim; see docs-lanes/wifi-ios.md.
@@ -1444,8 +1444,8 @@
 +
 +/*
 + * How often each kind of request came and how it fared. Said as a summary some seconds after the first
-+ * request and then every minute in which there was one, because the lines said along the way are
-+ * thinned out (a poll goes on for ever) and can be lost with the middle of a long log.
++ * request and then every minute in which there was one (salami backs off: summary_tick), because the
++ * lines said along the way are thinned out (a poll goes on for ever) and can be lost in a long log.
 + */
 +#define SUMMARY_FIRST_S         20
 +#define SUMMARY_EVERY_S         60
@@ -1553,6 +1553,37 @@
 +	kfree_data(copy, sizeof(kinds));
 +}
 +
++#if defined(FUXI_SALAMI)
++/*
++ * Salami (K-W1b): the timer backs off, 20 s after the first request, 60 s after that and then every
++ * 10 minutes, so that a boot left running for days is not woken every minute for it; a tenth of each
++ * wait is leeway the kernel may use to fold it into another wakeup. (The Fuxi build is unchanged.)
++ */
++#define SUMMARY_LATER_S         600
++#define SUMMARY_LEEWAY_PART     10
++
++/* The summary's timer, `seconds` from now, with a tenth of that as leeway (a summary is never urgent). */
++static void
++summary_arm(thread_call_t call, uint32_t seconds)
++{
++	uint64_t deadline, leeway;
++
++	clock_interval_to_deadline(seconds, NSEC_PER_SEC, &deadline);
++	clock_interval_to_absolutetime_interval(seconds / SUMMARY_LEEWAY_PART, NSEC_PER_SEC, &leeway);
++	(void)thread_call_enter_delayed_with_leeway(call, NULL, deadline, leeway, THREAD_CALL_DELAY_LEEWAY);
++}
++
++static void
++summary_tick(__unused thread_call_param_t zero, __unused thread_call_param_t one)
++{
++	static bool second_said;   /* (only this callback touches it; a THREAD_CALL_OPTIONS_ONCE call never runs twice at once) */
++	uint32_t next = second_said ? SUMMARY_LATER_S : SUMMARY_EVERY_S;
++
++	second_said = true;
++	fuxi_wifi_apple80211_summary();
++	summary_arm(summary_call, next);
++}
++#else
 +static void
 +summary_tick(__unused thread_call_param_t zero, __unused thread_call_param_t one)
 +{
@@ -1562,13 +1593,16 @@
 +	clock_interval_to_deadline(SUMMARY_EVERY_S, NSEC_PER_SEC, &deadline);
 +	(void)thread_call_enter_delayed(summary_call, deadline);
 +}
++#endif
 +
 +/* At the first request: the summary's timer, which runs for good after that. */
 +static void
 +summary_start(void)
 +{
 +	thread_call_t call;
++#if !defined(FUXI_SALAMI)
 +	uint64_t deadline;
++#endif
 +
 +	if (__atomic_load_n(&summary_started, __ATOMIC_ACQUIRE) || __atomic_exchange_n(&summary_started, true, __ATOMIC_ACQ_REL)) {
 +		return;
@@ -1579,8 +1613,12 @@
 +		return;
 +	}
 +	summary_call = call;
++#if defined(FUXI_SALAMI)
++	summary_arm(call, SUMMARY_FIRST_S);
++#else
 +	clock_interval_to_deadline(SUMMARY_FIRST_S, NSEC_PER_SEC, &deadline);
 +	(void)thread_call_enter_delayed(call, deadline);
++#endif
 +}
 +
 +/* An Apple80211 request for the radio's interface, from the process that is running now. */

@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,5466 @@
+@@ -0,0 +1,5527 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -65,12 +65,17 @@
 + *                 4 diagnostics only; all include MODE context diagnostics
 + * Salami (FUXI_SALAMI, OnePlus 11, K-W1): the driver runs only when
 + * fuxiwlansalami=1 is present as well; its absence or any other value refuses
-+ * before the thread starts, as do fuxiwlanrails (any value), fuxiwlanseq with
-+ * cyclerails and any invalid selector. Step 1 expects the salami cmd-db
-+ * (ldob15 0x40b00), step 2 votes S4E 950 mV (salami live DT), and
-+ * rh_send_request checks every RPMh command before the first TCS write: only
-+ * a salami WLAN rail ON at its live-DT mV or a BCM address; never an OFF,
-+ * mode or headroom vote, never 0x40a00 (salami ldob12, panel vddio). The
++ * before the thread starts, as do fuxiwlanseq with cyclerails and any invalid
++ * selector. Step 1 expects the salami cmd-db (ldob15 0x40b00), step 2 votes
++ * S4E 950 mV (salami live DT), and rh_send_request checks every RPMh command
++ * before the first TCS write: only a salami WLAN rail at its live-DT mV,
++ * enable 1 or mode 7 (HPM), or a BCM address; never an OFF, another mode or
++ * a headroom vote, never 0x40a00 (salami ldob12, panel vddio).
++ * fuxiwlanrails=1/2 re-votes the six WCN rails ON (mV, enable 1, mode 7) from
++ * the salami cmd-db table (K-W1b: sheng, same SoC and chip, needed the HPM
++ * votes or two rails stayed off and the link never trained). Every fuxiwlan*
++ * knob is read from the boot-args first, else from the ADT /defaults property
++ * of the same name (wl_arg; tools/mkadt-salami.py --wlan-defaults). The
 + * firmware names are boot-args (basenames under /usr/local/share/fuxi/wlan),
 + * defaults = the files salami Android loads:
 + *   fuxiwlanbdf=bdwlan.b0e  fuxiwlanregdb=regdb.bin  fuxiwlanm3=phy_ucode20.elf
@@ -137,6 +142,40 @@
 +/* Fault-contained aligned access, osfmk/arm64/machine_routines_asm.s. */
 +extern unsigned fuxi_gpu_access(uintptr_t, uint64_t *, unsigned, unsigned);
 +void fuxi_wlan_init(void);
++#if defined(FUXI_SALAMI)
++/* ---- K-W1b salami knob source ----
++ * The salami cmdline has about 33 characters free, so every fuxiwlan* knob is
++ * read from the boot-args first and, only when absent there, from the ADT
++ * /defaults property of the same name (PE_get_default, the fuxi_touch.c
++ * ft_knob pattern; tools/mkadt-salami.py --wlan-defaults writes them):
++ * numbers 4-byte LE, strings NUL-terminated. PE_get_default copies at most
++ * SIZE bytes and treats a larger property as absent; every caller keeps its
++ * own truncation sentinel. Absent from both = absent, exactly as before. The
++ * two macros route every parser call below (wlan.c has none) through here;
++ * the parenthesized names call the real parsers. */
++static bool
++wl_arg_adt(const char *name, void *buf, int size)
++{
++	if (size <= 0 || !PE_get_default(name, buf, (unsigned int)size)) { return false; }
++	printf("FUXI WLAN: salami %s from ADT /defaults\n", name);
++	return true;
++}
++static bool
++wl_arg(const char *name, void *buf, int size)
++{
++	if ((PE_parse_boot_argn)(name, buf, size)) { return true; }
++	return wl_arg_adt(name, buf, size);
++}
++static bool
++wl_arg_str(const char *name, char *buf, int size)
++{
++	if ((PE_parse_boot_arg_str)(name, buf, size)) { return true; }
++	return wl_arg_adt(name, buf, size);
++}
++#define PE_parse_boot_argn(name, buf, size) wl_arg((name), (buf), (size))
++#define PE_parse_boot_arg_str(name, buf, size) wl_arg_str((name), (buf), (size))
++/* ---- end K-W1b salami knob source ---- */
++#endif
 +
 +#define rsr(r) ({ uint64_t rsr_v_; __asm__ volatile("mrs %0, " r : "=r"(rsr_v_)); rsr_v_; })
 +#define delay fw_delay
@@ -428,13 +467,16 @@
 + * Every command rh_send_request would put in a TCS is checked first. A
 + * regulator request may only set one of the eight salami WLAN rails
 + * (wlan.c wl_salami_rail, cmd-db by name) to its salami live-DT voltage
-+ * (+0) or enable it (+4 = 1). Refused: any OFF (+4 = 0), mode (+8) or
-+ * headroom (+0xc) write, any other address, and 0x40a00 (salami ldob12, the
-+ * panel vddio) whatever the register. ldob15 also feeds the eUSB2 repeater
-+ * of the USB monitor, the WCD938x codec, the TFA amps and NFC, so it is only
-+ * ever voted ON. A batch (M6i ICC) may only address BCMs (cmd-db slave 5,
-+ * 0x5xxxx). This table is independent of the step 2/4 literals in wlan.c:
-+ * a mismatch fails the step closed instead of sending another voltage.
++ * (+0), enable it (+4 = 1) or put it in HPM (+8 = 7, K-W1b: the
++ * fuxiwlanrails ON-only re-vote; sheng needed it for the link to train).
++ * Refused: any OFF (+4 = 0), any other mode value, any headroom (+0xc)
++ * write, any other address, and 0x40a00 (salami ldob12, the panel vddio)
++ * whatever the register. ldob15 also feeds the eUSB2 repeater of the USB
++ * monitor, the WCD938x codec, the TFA amps and NFC, so it is only ever voted
++ * ON: exactly 1800 mV, enable 1, mode 7. A batch (M6i ICC) may only address
++ * BCMs (cmd-db slave 5, 0x5xxxx). This table is independent of the step 2/4
++ * literals in wlan.c and of wl_rails: a mismatch fails the step closed
++ * instead of sending another voltage.
 + * mV, wl_salami_rail order: salami live DT chip_cfg@1 vdd-wlan-io, -dig,
 + * -aon, -rfa2, vdd-wlan, -rfa1, then pcie0 vreg-0p9 and vreg-1p2. */
 +static const uint16_t wl_salami_mv[8] = {1800, 950, 980, 1350, 1000, 1900, 880, 1200};
@@ -447,13 +489,14 @@
 +	} else if (base != WL_SALAMI_LDOB12) {
 +		for (unsigned i = 0; i < 8; i++) {
 +			if (base != wl_salami_rail[i]) { continue; }
-+			if ((reg == 0 && cmd->data == (uint32_t)wl_salami_mv[i]) || (reg == 4 && cmd->data == 1)) {
++			if ((reg == 0 && cmd->data == (uint32_t)wl_salami_mv[i]) || (reg == 4 && cmd->data == 1) ||
++			    (reg == 8 && cmd->data == 7)) {
 +				return true;
 +			}
 +			break;
 +		}
 +	}
-+	printf("FUXI WLAN: salami refused RPMh %s addr %#x data %#x (only a salami WLAN rail ON at its DT mV, or a BCM)\n",
++	printf("FUXI WLAN: salami refused RPMh %s addr %#x data %#x (only a salami WLAN rail at its DT mV, enable 1 or mode 7, or a BCM)\n",
 +	    regulator ? "regulator" : "batch", cmd->addr, cmd->data);
 +	return false;
 +}
@@ -987,8 +1030,9 @@
 +	return false;
 +}
 +#if defined(FUXI_SALAMI)
-+/* K-W1: a 65-byte firmware basename from boot-arg ARG, else FALLBACK (a
-+ * literal, SIZE = sizeof it). false = truncated or not a plain basename. */
++/* K-W1: a 65-byte firmware basename from knob ARG (boot-arg, else ADT
++ * /defaults: wl_arg_str), else FALLBACK (a literal, SIZE = sizeof it).
++ * false = truncated or not a plain basename. */
 +static bool
 +wl_salami_name(const char *arg, char *name, const char *fallback, size_t size)
 +{
@@ -1000,7 +1044,7 @@
 +		printf("FUXI WLAN: salami invalid %s basename; refused\n", arg);
 +		return false;
 +	}
-+	printf("FUXI WLAN: salami %s %s (%s)\n", arg, name, given ? "boot-arg" : "salami default");
++	printf("FUXI WLAN: salami %s %s (%s)\n", arg, name, given ? "boot-arg or ADT" : "salami default");
 +	return true;
 +}
 +#endif
@@ -2642,12 +2686,20 @@
 + * Preserve M6o's downstream order and requested mV, including S4E=950.
 + * VRM register facts: voltage +0 (mV), enable +4, mode +8; PMIC HPM/PWM=7.
 + * rh_send already supports a waited single-register regulator request.
++ * Salami (K-W1b): ldob15 is 0x40b00 in the salami cmd-db (0x40a00 there is
++ * ldob12, the panel vddio); the other five addresses and all six mV are the
++ * same as salami's (live DT chip_cfg@1, wl_salami_mv), so only that row
++ * differs. wl_salami_vote_ok checks every vote again on its own.
 + */
 +static const struct {
 +	unsigned idx, addr, mv;
 +	const char *name;
 +} wl_rails[] = {
++#if defined(FUXI_SALAMI)
++	{0, 0x40b00, 1800, "ldob15"},
++#else
 +	{0, 0x40a00, 1800, "ldob15"},
++#endif
 +	{4, 0x44000, 1000, "smpg5"},
 +	{2, 0x40400, 980, "smpg2"},
 +	{1, 0x40200, 950, "smpe4"},
@@ -2698,6 +2750,13 @@
 +		printf("FUXI WLAN: rails ON-only refuses legacy cyclerails vote\n");
 +		return 1;
 +	}
++#if defined(FUXI_SALAMI)
++	/* Second fence behind the init refusal of cyclerails: never a rail OFF. */
++	if (!on) {
++		printf("FUXI WLAN: salami refuses the cyclerails rail OFF votes\n");
++		return 1;
++	}
++#endif
 +	for (unsigned n = 0; n < 6; n++) {
 +		unsigned i = on ? n : 5-n, addr = wl3_report[20+wl_rails[i].idx];
 +		if (addr != wl_rails[i].addr || fw_faults) { return 1; }
@@ -5458,7 +5517,8 @@
 +	 * binary). With it, step 1 expects the salami cmd-db (ldob15 0x40b00,
 +	 * never 0x40a00 = salami ldob12, the panel vddio), the firmware names
 +	 * default to the salami Android files, and rh_send_request refuses any
-+	 * OFF/mode vote or other address (wl_salami_vote_ok).
++	 * OFF vote, any mode but 7 or other address (wl_salami_vote_ok). Both
++	 * knobs, like every fuxiwlan* knob, may come from ADT /defaults (wl_arg).
 +	 */
 +	if (requested) {
 +		int salami = 0;
@@ -5474,18 +5534,19 @@
 +	unsigned limit = (arg == 1 || arg > (int)WL5_STEPS) ? WL5_STEPS : (unsigned)arg;
 +	wl_iova_configure();
 +#if defined(FUXI_SALAMI)
-+	/* Before the thread, any mapping or register access: fuxiwlanrails (any
-+	 * value) votes the Fuxi table and HPM modes, cyclerails votes the shared
-+	 * rails OFF, and a selector that did not parse is refused outright. */
++	/* Before the thread, any mapping or register access: cyclerails votes
++	 * the shared rails OFF, and a selector that did not parse is refused
++	 * outright. fuxiwlanrails=1/2 (K-W1b) re-votes the salami table ON only
++	 * (voltage, enable 1, mode 7); its other values are invalid selectors. */
 +	{
 +		bool invalid = wl_variant_invalid || wl_probe == WL_PROBE_INVALID;
-+		if (invalid || wl_rails_requested || (wl_seq_flags & WL_O_CYCLERAILS)) {
-+			printf("FUXI WLAN: refused on salami before any access (invalid selector %u, fuxiwlanrails %u, cyclerails %u)\n",
-+			    invalid, wl_rails_requested, !!(wl_seq_flags & WL_O_CYCLERAILS));
++		if (invalid || (wl_seq_flags & WL_O_CYCLERAILS)) {
++			printf("FUXI WLAN: refused on salami before any access (invalid selector %u, cyclerails %u)\n",
++			    invalid, !!(wl_seq_flags & WL_O_CYCLERAILS));
 +			return;
 +		}
 +	}
-+	printf("FUXI WLAN: salami K-W1 gate open (fuxiwlansalami=1)\n");
++	printf("FUXI WLAN: salami K-W1 gate open (fuxiwlansalami=1, fuxiwlanrails %u)\n", wl_rails_variant);
 +#endif
 +	printf("FUXI WLAN: enabled (fuxiwlan=%d), WCN7850 power-up + PCIe0 + MHI firmware, limit %u\n",
 +	    arg, limit);
