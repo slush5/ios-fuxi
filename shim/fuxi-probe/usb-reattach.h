@@ -129,10 +129,13 @@ static inline void ura_epcmd(struct ura *u, unsigned ep, uint32_t cmd, uint32_t 
 }
 
 /* cpu0 hands USB to cpu@100 with ep0 in SETUP (a 0x46 value 1 just went through): causes
- * seen before then are stale and must not restart the link under the host. */
+ * seen before then are stale and must not restart the link under the host. The host just
+ * completed a transfer, so the controller runs whatever the boot usb_start reported (a slow
+ * DevCtrlHlt can read as HALTED): forget that result too, or the failed-start retry in
+ * ura_due would restart the link about 2 s later, before the 0x49 handoff. */
 static inline void ura_handover(struct ura *u)
 {
- u->pending = 0; u->guard_run = 0; u->left_setup = 0;
+ u->pending = 0; u->guard_run = 0; u->left_setup = 0; u->start_rc = URA_START_OK;
 }
 
 /* Main loop only (never inside the event loop): the causes of a restart due now, or 0. */
