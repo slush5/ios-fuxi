@@ -118,6 +118,21 @@ main(int argc, char **argv)
 		close(socket_fd);
 		return 2;
 	}
+	/* what wifid of 20H392 reads at start and the shim now answers (gets only: nothing is changed) */
+	char country[3] = { 0 };
+	struct apple80211_phy_mode phy = { 0 };
+	struct apple80211_rssi_bounds bounds = { 0 };
+	if (request(socket_fd, false, 51, country, sizeof(country), NULL) < 0 ||
+	    request(socket_fd, false, 14, &phy, sizeof(phy), NULL) < 0 ||
+	    request(socket_fd, false, 106, &bounds, sizeof(bounds), NULL) < 0) {
+		goto out;
+	}
+	if (phy.version != 1 || bounds.version != 1 || country[2] != '\0') {
+		errno = EPROTO;
+		goto out;
+	}
+	printf("P-WIFI TEST: answers PASS (country %.2s, 802.11 modes %#x, RSSI bounds %d to %d dBm)\n", country,
+	    (unsigned)phy.supported, (int)bounds.rssi_min, (int)bounds.rssi_max);
 	struct { uint32_t version, radios, state[4]; } power = { 1, 1, { 1 } };
 	struct apple80211_scan_request scan = { .version = 1 };
 	struct apple80211_scan_result result = { .elements_length = 1024 };

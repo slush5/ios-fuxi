@@ -678,10 +678,12 @@
 +limitations under the License."
 --- /dev/null
 +++ b/bsd/dev/fuxi_wifi_apple80211.c
-@@ -0,0 +1,647 @@
+@@ -0,0 +1,943 @@
 +/*
 + * Ported from HackiOS xnu/files/bsd/dev/redwood_apple80211.c (APSL-2.0)
 + * Fuxi adaptations, 2026-10-23: opt-in iOS shim; see docs-lanes/wifi-ios.md.
++ * Fuxi, 2026-10-29: the requests wifid of 20H392 was seen to make and the shim refused are answered
++ * or refused on purpose (each says which below); a summary of the run is said now and then.
 + * Original file commentary is retained below. See LICENSE.HackiOS.
 + */
 +/*
@@ -716,10 +718,20 @@
 + * when the station has joined or failed, event 9 says so, and ASSOCIATE_RESULT (21) gives the
 + * outcome as one of Apple80211's result numbers, which the framework turns into its errors:
 + * 1 success, 21 "invalid PMK" (a wrong passphrase), 9 a timeout, 2 anything else.
++ *
++ * Fuxi, 20H392: wifid starts, opens the interface and polls it, and scans only when somebody
++ * asks it to (Settings' Wi-Fi page) or when its auto-join knows a network to look for; none of
++ * the answers below decides that. A refusal (EOPNOTSUPP) and "not joined" (ENXIO) both reach wifid
++ * as -3903, which it only logs. The user client that IO80211 asks FuxiWLAN for (type 0) stays
++ * unmade on purpose: without it the framework uses these ioctls and the kernel-event socket for
++ * everything, and a user client would have to speak IO80211's own protocol (15408-byte requests,
++ * a mapped event pipe) to be of any use.
 + */
 +#if defined(FUXI)
++#include <kern/clock.h>
 +#include <kern/kalloc.h>
 +#include <kern/locks.h>
++#include <kern/thread_call.h>
 +#include <libkern/libkern.h>
 +#include <sys/errno.h>
 +#include <sys/kern_event.h>
@@ -732,7 +744,7 @@
 +
 +#include <sys/fuxi_wifi_apple80211.h>
 +
-+/* (as far as they have come by: the names help reading the log) */
++/* (as far as they have come by: the names help reading the log; 96 and up as IO80211 of 20H392 names them) */
 +static const char *
 +type_name(int32_t type)
 +{
@@ -749,8 +761,10 @@
 +		{ 44, "HARDWARE_VERSION" }, { 46, "RSN_IE" }, { 47, "BACKGROUND_SCAN" }, { 48, "AP_IE_LIST" }, { 49, "STATS" },
 +		{ 50, "ASSOCIATION_STATUS" }, { 51, "COUNTRY_CODE" }, { 54, "RADIO_INFO" }, { 57, "MCS" }, { 66, "MCS_INDEX_SET" },
 +		{ 79, "STA_STATS" }, { 80, "ROAM_THRESH" }, { 85, "IE" }, { 86, "SCAN_REQ_MULTIPLE" }, { 87, "BTCOEX_MODE" },
-+		{ 90, "SCANCACHE_CLEAR" }, { 94, "VIRTUAL_IF_CREATE" }, { 95, "VIRTUAL_IF_DELETE" }, { 103, "CURRENT_NETWORK" },
-+		{ 106, "RSSI_BOUNDS" }, { 107, "ROAM" }, { 207, "CHANNELS_INFO" }, { 254, "HW_SUPPORTED_CHANNELS" },
++		{ 90, "SCANCACHE_CLEAR" }, { 94, "VIRTUAL_IF_CREATE" }, { 95, "VIRTUAL_IF_DELETE" }, { 96, "VIRTUAL_IF_ROLE" },
++		{ 97, "VIRTUAL_IF_PARENT" }, { 103, "CURRENT_NETWORK" }, { 106, "RSSI_BOUNDS" }, { 107, "ROAM" },
++		{ 115, "POWER_DEBUG_INFO" }, { 207, "CHANNELS_INFO" }, { 254, "HW_SUPPORTED_CHANNELS" }, { 365, "DISPLAY_STATE" },
++		{ 383, "SET_PROPERTY" },
 +	};
 +
 +	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
@@ -771,6 +785,12 @@
 +static LCK_MTX_DECLARE(apple80211_lock, &apple80211_lock_group);
 +static unsigned result_next;                    /* which of what the last scan heard a SCAN_RESULT request gets next */
 +static uint32_t join_result;                    /* of the last join asked for: 0 while it runs, then Apple80211's number */
++/*
++ * The country, as iOS last set it (SET COUNTRY_CODE). Until it does, a placeholder that every table
++ * of iOS's knows: nothing here transmits, and the synthetic radio's one channel is allowed everywhere.
++ * A real radio's backend will have to say its own.
++ */
++static char country[3] = "US";
 +
 +/* ---- channels ---------------------------------------------------------------------------------------- */
 +
@@ -798,6 +818,43 @@
 +	channel->channel = channel_number(frequency);
 +	channel->flags = CHANNEL_20MHZ | (frequency < 4000 ? CHANNEL_2GHZ : CHANNEL_5GHZ) | (flags & FUXI_WIFI_STA_CHANNEL_PASSIVE ?
 +	    0 : CHANNEL_ACTIVE) | (flags & FUXI_WIFI_STA_CHANNEL_RADAR ? CHANNEL_DFS : 0);
++}
++
++/* ---- an access point's rates --------------------------------------------------------------------------- */
++
++/*
++ * The rates it says it has, in Mbit/s, at most `most` of them; how many. (Elements 1 and 50: units of
++ * 500 kbit/s, the top bit marks the ones everybody must have.)
++ */
++static unsigned
++bss_rates(const struct fuxi_wifi_sta_bss *bss, uint32_t *rates, unsigned most)
++{
++	unsigned count = 0;
++
++	for (unsigned at = 0; at + 2 <= bss->elements_length && at + 2 + bss->elements[at + 1] <= bss->elements_length;
++	    at += 2 + bss->elements[at + 1]) {
++		for (unsigned i = 0; (bss->elements[at] == 1 || bss->elements[at] == 50) && i < bss->elements[at + 1]; i++) {
++			unsigned rate = (bss->elements[at + 2 + i] & 0x7f) / 2;
++
++			if (rate != 0 && rate <= 54 && count < most) {
++				rates[count++] = rate;
++			}
++		}
++	}
++	return count;
++}
++
++/* The best of them (0: it says none). */
++static unsigned
++bss_best_rate(const struct fuxi_wifi_sta_bss *bss)
++{
++	uint32_t rates[64];
++	unsigned count = bss_rates(bss, rates, 64), best = 0;
++
++	for (unsigned i = 0; i < count; i++) {
++		best = rates[i] > best ? rates[i] : best;
++	}
++	return best;
 +}
 +
 +/* ---- what the caller is given back ------------------------------------------------------------------- */
@@ -843,17 +900,7 @@
 +	result->age_ms = bss->age_ms;
 +	result->elements_length = (uint16_t)(bss->elements_length <= room ? bss->elements_length : 0);
 +	memcpy(result->elements, bss->elements, result->elements_length);
-+	/* the rates it says it has (elements 1 and 50: units of 500 kbit/s, the top bit marks the ones everybody must have) */
-+	for (unsigned at = 0; at + 2 <= bss->elements_length && at + 2 + bss->elements[at + 1] <= bss->elements_length;
-+	    at += 2 + bss->elements[at + 1]) {
-+		for (unsigned i = 0; (bss->elements[at] == 1 || bss->elements[at] == 50) && i < bss->elements[at + 1]; i++) {
-+			unsigned rate = (bss->elements[at + 2 + i] & 0x7f) / 2;
-+
-+			if (rate != 0 && rate <= 54 && result->rate_count < 15) {
-+				result->rates[result->rate_count++] = rate;
-+			}
-+		}
-+	}
++	result->rate_count = (uint8_t)bss_rates(bss, result->rates, (unsigned)(sizeof(result->rates) / sizeof(result->rates[0])));
 +	error = give(request, result, sizeof(*result));
 +	kfree_data(result, sizeof(*result));
 +	return error;
@@ -862,7 +909,7 @@
 +/* ---- get ---------------------------------------------------------------------------------------------- */
 +
 +static int
-+get(struct apple80211req *request)
++get(struct apple80211req *request, char *said, size_t said_size)
 +{
 +	struct fuxi_wifi_sta_state *state;
 +	int error = 0;
@@ -961,6 +1008,41 @@
 +		kfree_data(bss, sizeof(*bss));
 +		return error;
 +	}
++	case 51: {                              /* the country: its two letters and a NUL (wifid reads it, then sets its own) */
++		char code[3];
++
++		lck_mtx_lock(&apple80211_lock);
++		memcpy(code, country, sizeof(code));
++		lck_mtx_unlock(&apple80211_lock);
++		return give(request, code, sizeof(code));
++	}
++	case 106: {                             /* what to make of a signal: the weakest, the strongest, and below what it is weak */
++		struct apple80211_rssi_bounds answer = { .version = 1, .rssi_min = -100, .rssi_max = 0, .rssi_threshold = -80 };
++
++		return give(request, &answer, sizeof(answer));
++	}
++	case 5:                                 /* power saving: off (the shim saves nothing) */
++	case 18:                                /* interference mitigation: off */
++		request->req_val = 0;
++		return 0;
++	case 6: {                               /* protection (RTS/CTS): off, no threshold */
++		struct apple80211_protmode answer = { .version = 1 };
++
++		return give(request, &answer, sizeof(answer));
++	}
++	/*
++	 * Refused on purpose (wifid and CoreWiFi take a refusal as "no such value"): the station boundary
++	 * knows no noise figure and no MCS (an access point's legacy rates only); en0 is the infrastructure
++	 * interface itself, not a virtual one with a role or a parent; there is no power to account for.
++	 */
++	case 17:
++	case 57:
++	case 96:
++	case 97:
++	case 115:
++		snprintf(said, said_size, " (on purpose: %s)", request->req_type == 17 ? "no noise figure" : request->req_type == 57 ?
++		    "no MCS" : request->req_type == 115 ? "no power accounting" : "not a virtual interface");
++		return EOPNOTSUPP;
 +	default:
 +		break;
 +	}
@@ -1020,6 +1102,31 @@
 +		error = state->phase != FUXI_WIFI_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
 +		break;
 +	}
++	case 8: {                               /* the rate: Mbit/s, the best its access point has (no rate control here) */
++		unsigned rate = state->phase == FUXI_WIFI_STA_JOINED ? bss_best_rate(&state->bss) : 0;
++
++		if (rate == 0) {
++			error = ENXIO;
++		} else {
++			request->req_val = (int32_t)rate;
++		}
++		break;
++	}
++	case 14: {                              /* the kinds of 802.11 the radio has (by its bands) and the one in use */
++		struct apple80211_phy_mode answer = { .version = 1, .supported = PHY_MODE_AUTO, .active = PHY_MODE_AUTO };
++		struct fuxi_wifi_sta_channel channels[96];
++		unsigned count = fuxi_wifi_sta_channels(channels, 96);
++
++		for (unsigned i = 0; i < count; i++) {
++			answer.supported |= channels[i].frequency < 4000 ? PHY_MODE_11B | PHY_MODE_11G : PHY_MODE_11A;
++		}
++		if (state->phase == FUXI_WIFI_STA_JOINED) {
++			answer.active = state->bss.frequency >= 4000 ? PHY_MODE_11A : bss_best_rate(&state->bss) > 11 ? PHY_MODE_11G :
++			    PHY_MODE_11B;
++		}
++		error = give(request, &answer, sizeof(answer));
++		break;
++	}
 +	default:
 +		error = EOPNOTSUPP;
 +		break;
@@ -1035,7 +1142,7 @@
 +{
 +	struct apple80211_scan_request *asked;
 +	struct fuxi_wifi_sta_scan *what;
-+	unsigned unknown = 0;
++	unsigned unknown = 0, any = 0;
 +	int error;
 +
 +	if (request->req_len != sizeof(*asked)) {
@@ -1061,20 +1168,28 @@
 +	}
 +	what->passive = asked->scan_type == 2;
 +	what->dwell_ms = asked->dwell_ms;
-+	/* (more channels than there is room to name: every channel) */
++	/*
++	 * (More channels than there is room to name: every channel. So is one numbered 0: IO80211 of 20H392
++	 * sends a scan of type 3 with exactly one, {1, 0, 0}, when it was given no channel of its own.)
++	 */
 +	for (unsigned i = 0; i < asked->channel_count && i < 400 && asked->channel_count <= 64; i++) {
 +		unsigned frequency = channel_frequency(&asked->channels[i]);
 +
-+		if (frequency != 0) {
++		if (asked->channels[i].channel == 0) {
++			any++;
++		} else if (frequency != 0) {
 +			what->frequencies[what->frequency_count++] = (uint16_t)frequency;
 +		} else {
 +			unknown++;
 +		}
 +	}
-+	snprintf(said, said_size, " (a scan: type %u, %u channels of which %u are not the radio's, %u ms on each, a name of %u bytes, "
-+	    "%u more names, flags %#llx)", asked->scan_type, asked->channel_count, unknown, asked->dwell_ms, asked->ssid_length,
++	if (any != 0) {
++		what->frequency_count = 0;
++	}
++	snprintf(said, said_size, " (a scan: type %u, %u channels, %u not the radio's, %u any; %u ms on each, a name of %u bytes, "
++	    "%u more names, flags %#llx)", asked->scan_type, asked->channel_count, unknown, any, asked->dwell_ms, asked->ssid_length,
 +	    asked->name_count, (unsigned long long)asked->flags);
-+	if (asked->channel_count != 0 && asked->channel_count <= 64 && what->frequency_count == 0) {
++	if (asked->channel_count != 0 && asked->channel_count <= 64 && what->frequency_count == 0 && any == 0) {
 +		error = EINVAL;                 /* (nothing of what is asked for is a channel of this radio's) */
 +	} else {
 +		lck_mtx_lock(&apple80211_lock);
@@ -1148,6 +1263,73 @@
 +	return error;
 +}
 +
++/* The country iOS has settled on: two letters (or a letter and a digit), kept and given back by GET. */
++static int
++set_country(const struct apple80211req *request, char *said, size_t said_size)
++{
++	struct apple80211_country asked = { 0 };
++	int error;
++
++	if (request->req_len < offsetof(struct apple80211_country, code) + 2 || request->req_len > 64) {
++		return EINVAL;
++	}
++	error = copyin(request->req_data, &asked, request->req_len < sizeof(asked) ? request->req_len : sizeof(asked));
++	if (error != 0) {
++		return error;
++	}
++	for (unsigned i = 0; i < 2; i++) {
++		char c = asked.code[i] >= 'a' && asked.code[i] <= 'z' ? (char)(asked.code[i] - 'a' + 'A') : asked.code[i];
++
++		if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) {
++			return EINVAL;
++		}
++		asked.code[i] = c;
++	}
++	lck_mtx_lock(&apple80211_lock);
++	country[0] = asked.code[0];
++	country[1] = asked.code[1];
++	country[2] = '\0';
++	lck_mtx_unlock(&apple80211_lock);
++	snprintf(said, said_size, " (the country: %c%c)", asked.code[0], asked.code[1]);
++	return 0;
++}
++
++/*
++ * One of wifid's properties of the interface (its IP configuration, wake schedule and the like), as an
++ * XML property list of one key: taken and dropped; the key's name goes to the log, never the value.
++ */
++static int
++set_property(const struct apple80211req *request, char *said, size_t said_size)
++{
++	struct apple80211_property *asked;
++	char key[64];
++	unsigned length, k = 0;
++	int error;
++
++	if (request->req_len < offsetof(struct apple80211_property, xml) || request->req_len > sizeof(*asked)) {
++		return EINVAL;
++	}
++	if ((asked = kalloc_data(sizeof(*asked), Z_WAITOK | Z_ZERO)) == NULL) {
++		return ENOMEM;
++	}
++	if ((error = copyin(request->req_data, asked, request->req_len)) == 0) {
++		length = request->req_len - (unsigned)offsetof(struct apple80211_property, xml);
++		length = asked->length < length ? asked->length : length;
++		for (unsigned at = 0; at + 5 <= length; at++) {
++			if (memcmp(asked->xml + at, "<key>", 5) == 0) {
++				for (at += 5; at < length && asked->xml[at] != '<' && k + 1 < sizeof(key); at++) {
++					key[k++] = (char)(asked->xml[at] > ' ' && asked->xml[at] < 0x7f ? asked->xml[at] : '?');
++				}
++				break;
++			}
++		}
++		key[k] = '\0';
++		snprintf(said, said_size, " (a property: %s, %u bytes of XML; taken, not used)", k != 0 ? key : "no key", asked->length);
++	}
++	kfree_data(asked, sizeof(*asked));
++	return error;
++}
++
 +static int
 +set(const struct apple80211req *request, char *said, size_t said_size)
 +{
@@ -1170,12 +1352,28 @@
 +	}
 +	case 10:
 +		return set_scan(request, said, said_size);
++	case 51:
++		return set_country(request, said, said_size);
++	case 383:
++		return set_property(request, said, said_size);
++	case 365:                               /* the display went on or off: nothing here depends on it */
++		snprintf(said, said_size, " (the display: %d; taken, not used)", request->req_val);
++		return 0;
++	case 25:                                /* host access point: 2 (no data) stops it, and none runs; none is started */
++		if (request->req_val == 2 && request->req_len == 0) {
++			snprintf(said, said_size, " (stop the access point: none runs)");
++			return 0;
++		}
++		snprintf(said, said_size, " (on purpose: no access point is made)");
++		return EOPNOTSUPP;
 +	default:
 +		return EOPNOTSUPP;
 +	}
 +}
 +
 +/* ---- events -------------------------------------------------------------------------------------------- */
++
++static unsigned posted[EVENT_SCAN_DONE + 1];   /* how many of each were posted (for the summary) */
 +
 +static void
 +post(uint32_t code, const void *data, uint32_t length)
@@ -1190,6 +1388,9 @@
 +	if (length != 0) {
 +		message.dv[1].data_length = length;
 +		message.dv[1].data_ptr = __DECONST(void *, data);
++	}
++	if (code < sizeof(posted) / sizeof(posted[0])) {
++		__atomic_fetch_add(&posted[code], 1, __ATOMIC_RELAXED);
 +	}
 +	kev_post_msg(&message);
 +}
@@ -1239,55 +1440,147 @@
 +	}
 +}
 +
-+/* ---- the requests as they arrive --------------------------------------------------------------------- */
++/* ---- the requests as they arrive, and a summary now and then ------------------------------------------ */
 +
 +/*
-+ * How often each kind of request came and how it fared: said when the run ends, because the
-+ * lines said along the way can be lost with the middle of a long log.
++ * How often each kind of request came and how it fared. Said as a summary some seconds after the first
++ * request and then every minute in which there was one, because the lines said along the way are
++ * thinned out (a poll goes on for ever) and can be lost with the middle of a long log.
 + */
-+static struct {
++#define SUMMARY_FIRST_S         20
++#define SUMMARY_EVERY_S         60
++#define SUMMARY_KINDS_A_LINE    5
++
++struct kind {
 +	int32_t type;
 +	bool set;
 +	unsigned times, answered;
 +	int last_error;
-+} kinds[96];
++};
++static struct kind kinds[96];
 +static unsigned kind_count;
++static unsigned requests, answered_all, refused_all, failed_all;   /* all of them */
++static unsigned summaries, summarized_at;                           /* how many said; `requests` at the last */
++static uint64_t first_request;                                      /* (absolute time) */
++static thread_call_t summary_call;
++static bool summary_started;
 +
-+static void
++/* Count it in; the how-manieth of its kind it is (0: there are too many kinds to count it alone). */
++static unsigned
 +note(const struct apple80211req *request, bool is_set, int error)
 +{
-+	unsigned i;
++	unsigned i, times = 0;
 +
 +	lck_mtx_lock(&apple80211_lock);
++	if (requests++ == 0) {
++		clock_get_uptime(&first_request);
++	}
++	answered_all += error == 0;
++	refused_all += error == EOPNOTSUPP;
++	failed_all += error != 0 && error != EOPNOTSUPP;
 +	for (i = 0; i < kind_count && !(kinds[i].type == request->req_type && kinds[i].set == is_set); i++) {
 +	}
 +	if (i < sizeof(kinds) / sizeof(kinds[0])) {
 +		if (i == kind_count) {
-+			kinds[kind_count++] = (typeof(kinds[0])) { .type = request->req_type, .set = is_set };
++			kinds[kind_count++] = (struct kind) { .type = request->req_type, .set = is_set };
 +		}
-+		kinds[i].times++;
++		times = ++kinds[i].times;
 +		kinds[i].answered += error == 0;
 +		kinds[i].last_error = error != 0 ? error : kinds[i].last_error;
 +	}
 +	lck_mtx_unlock(&apple80211_lock);
++	return times;
 +}
 +
++/* What was asked in this run so far, to the log; nothing if nothing was asked since it was last said. */
 +void
 +fuxi_wifi_apple80211_summary(void)
 +{
-+	static bool said;
++	struct kind *copy = kalloc_data(sizeof(kinds), Z_WAITOK);
++	unsigned count, asked, answered, refused, failed, number, event[sizeof(posted) / sizeof(posted[0])];
++	uint64_t start, now, elapsed_ns;
++	char line[320];
 +
-+	if (said) {
++	if (copy == NULL) {
 +		return;
 +	}
-+	said = true;
-+	for (unsigned i = 0; i < kind_count; i++) {
-+		printf("FUXI WIFI IOS: apple80211: in this run: %s %d (%s) %u times, answered %u times%s", kinds[i].set ? "set" : "get", kinds[i].type,
-+		    type_name(kinds[i].type), kinds[i].times, kinds[i].answered, kinds[i].last_error == 0 ? "\n" : "");
-+		if (kinds[i].last_error != 0) {
-+			printf("; the last refusal: %d%s\n", kinds[i].last_error, kinds[i].last_error == EOPNOTSUPP ? " (not built)" : "");
-+		}
++	lck_mtx_lock(&apple80211_lock);
++	if (requests == summarized_at) {
++		lck_mtx_unlock(&apple80211_lock);
++		kfree_data(copy, sizeof(kinds));
++		return;
 +	}
++	summarized_at = asked = requests;
++	number = ++summaries;
++	count = kind_count;
++	memcpy(copy, kinds, sizeof(kinds));
++	answered = answered_all;
++	refused = refused_all;
++	failed = failed_all;
++	start = first_request;
++	lck_mtx_unlock(&apple80211_lock);
++	for (unsigned i = 0; i < sizeof(event) / sizeof(event[0]); i++) {
++		event[i] = __atomic_load_n(&posted[i], __ATOMIC_RELAXED);
++	}
++	clock_get_uptime(&now);
++	absolutetime_to_nanoseconds(now - start, &elapsed_ns);
++
++	printf("FUXI WIFI IOS: apple80211: summary %u, %llu s after the first request: %u requests of %u kinds, %u answered, "
++	    "%u refused, %u failed; events posted: power %u, link %u, join %u, scan %u\n", number,
++	    (unsigned long long)(elapsed_ns / 1000000000ull), asked, count, answered, refused, failed, event[EVENT_POWER_CHANGED],
++	    event[EVENT_LINK_CHANGED], event[EVENT_ASSOC_DONE], event[EVENT_SCAN_DONE]);
++	/* (each kind: get or set, the type, its name, how often/how often answered, the last error if there was one) */
++	for (unsigned i = 0; i < count; i += SUMMARY_KINDS_A_LINE) {
++		size_t at = 0;
++
++		line[0] = '\0';
++		for (unsigned j = i; j < count && j < i + SUMMARY_KINDS_A_LINE && at < sizeof(line) - 1; j++) {
++			int n;
++
++			if (copy[j].last_error != 0) {
++				n = snprintf(line + at, sizeof(line) - at, "%s %s %d %s %u/%u (%d)", j == i ? "" : ",", copy[j].set ? "set" : "get",
++				    copy[j].type, type_name(copy[j].type), copy[j].times, copy[j].answered, copy[j].last_error);
++			} else {
++				n = snprintf(line + at, sizeof(line) - at, "%s %s %d %s %u/%u", j == i ? "" : ",", copy[j].set ? "set" : "get",
++				    copy[j].type, type_name(copy[j].type), copy[j].times, copy[j].answered);
++			}
++			if (n > 0) {
++				at = at + (size_t)n < sizeof(line) - 1 ? at + (size_t)n : sizeof(line) - 1;
++			}
++		}
++		printf("FUXI WIFI IOS: apple80211: summary %u:%s\n", number, line);
++	}
++	kfree_data(copy, sizeof(kinds));
++}
++
++static void
++summary_tick(__unused thread_call_param_t zero, __unused thread_call_param_t one)
++{
++	uint64_t deadline;
++
++	fuxi_wifi_apple80211_summary();
++	clock_interval_to_deadline(SUMMARY_EVERY_S, NSEC_PER_SEC, &deadline);
++	(void)thread_call_enter_delayed(summary_call, deadline);
++}
++
++/* At the first request: the summary's timer, which runs for good after that. */
++static void
++summary_start(void)
++{
++	thread_call_t call;
++	uint64_t deadline;
++
++	if (__atomic_load_n(&summary_started, __ATOMIC_ACQUIRE) || __atomic_exchange_n(&summary_started, true, __ATOMIC_ACQ_REL)) {
++		return;
++	}
++	call = thread_call_allocate_with_options(summary_tick, NULL, THREAD_CALL_PRIORITY_LOW, THREAD_CALL_OPTIONS_ONCE);
++	if (call == NULL) {
++		printf("FUXI WIFI IOS: apple80211: no timer for the summary: it is not said\n");
++		return;
++	}
++	summary_call = call;
++	clock_interval_to_deadline(SUMMARY_FIRST_S, NSEC_PER_SEC, &deadline);
++	(void)thread_call_enter_delayed(call, deadline);
 +}
 +
 +/* An Apple80211 request for the radio's interface, from the process that is running now. */
@@ -1296,8 +1589,9 @@
 +{
 +	static unsigned said;
 +	struct apple80211req *request = data;
-+	char who[32] = "?", what[200] = "";
++	char who[32] = "?", what[200] = "", outcome[24];
 +	bool is_set = command == SIOCSA80211;
++	unsigned times;
 +	int error;
 +
 +	if (command != SIOCSA80211 && command != SIOCGA80211) {
@@ -1310,17 +1604,19 @@
 +		return EPERM;
 +	}
 +	proc_selfname(who, sizeof(who));
-+	error = is_set ? set(request, what, sizeof(what)) : get(request);
-+	note(request, is_set, error);
-+	/* (a request that is repeated for ever is said a few hundred times) */
-+	if (said < 800) {
++	error = is_set ? set(request, what, sizeof(what)) : get(request, what, sizeof(what));
++	times = note(request, is_set, error);
++	summary_start();
++	/* (each kind is said the first few times and then every hundredth: a request that is repeated for ever is not said for ever) */
++	if ((times <= 24 || times % 100 == 0) && said < 4000) {
 +		said++;
-+		printf("FUXI WIFI IOS: apple80211: %s %s %d (%s), value %d, %u bytes%s: %s", who, is_set ? "sets" : "gets", request->req_type,
-+		    type_name(request->req_type), request->req_val, request->req_len, what, error == 0 ? "answered\n" : error ==
-+		    EOPNOTSUPP ? "REFUSED\n" : "");
-+		if (error != 0 && error != EOPNOTSUPP) {
-+			printf("error %d\n", error);
++		if (error == 0 || error == EOPNOTSUPP) {
++			snprintf(outcome, sizeof(outcome), "%s", error == 0 ? "answered" : "REFUSED");
++		} else {
++			snprintf(outcome, sizeof(outcome), "error %d", error);
 +		}
++		printf("FUXI WIFI IOS: apple80211: %s %s %d (%s), value %d, %u bytes%s: %s\n", who, is_set ? "sets" : "gets", request->req_type,
++		    type_name(request->req_type), request->req_val, request->req_len, what, outcome);
 +	}
 +	return error;
 +}
@@ -1328,7 +1624,7 @@
 +#endif /* FUXI */
 --- /dev/null
 +++ b/bsd/sys/fuxi_wifi_apple80211.h
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,180 @@
 +/*
 + * Ported from HackiOS xnu/files/bsd/dev/redwood_apple80211.c (APSL-2.0)
 + * Fuxi, 2026-10-23: shared diagnostic ABI; 16.7 payloads UNVERIFIED.
@@ -1444,6 +1740,54 @@
 +	uint32_t reason, subreason;
 +	uint8_t unused_3[4];
 +};
++
++/*
++ * Fuxi, 2026-10-29: the layouts from here on were read out of IO80211.framework of 20H392 (16.7):
++ * Apple80211GetWithIOCTL and Apple80211SetWithIOCTL, Apple80211SetProperty. Against the same framework
++ * the scan request (__getScanData), a scan's result (__addScanResultToList), the channel list (254)
++ * and the channels' description (207) above were checked and match; the association request and the
++ * link event were not.
++ */
++
++/* PHY_MODE (14): 12 bytes. The kinds of 802.11 as apple80211_var.h numbers them (APPLE80211_MODE_*). */
++#define PHY_MODE_AUTO           0x1u
++#define PHY_MODE_11A            0x2u
++#define PHY_MODE_11B            0x4u
++#define PHY_MODE_11G            0x8u
++
++struct apple80211_phy_mode {
++	uint32_t version, supported, active;
++};
++
++/* RSSI_BOUNDS (106): 16 bytes, dBm */
++struct apple80211_rssi_bounds {
++	int32_t version, rssi_min, rssi_max, rssi_threshold;
++};
++
++/* PROTMODE (6): 12 bytes */
++struct apple80211_protmode {
++	uint32_t version, mode, threshold;
++};
++
++/* COUNTRY_CODE (51) as it is set: 8 bytes. (As it is got: the two letters and a NUL alone, in 3 bytes.) */
++struct apple80211_country {
++	uint32_t version;
++	char code[3];
++	uint8_t unused;
++};
++
++/* SET_PROPERTY (383): 4104 bytes; an XML property list of one key, `length` bytes with its NUL */
++struct apple80211_property {
++	uint32_t version, length;
++	char xml[4096];
++};
++
++_Static_assert(sizeof(struct apple80211_phy_mode) == 12 && sizeof(struct apple80211_rssi_bounds) == 16 &&
++    sizeof(struct apple80211_protmode) == 12, "PHY_MODE, RSSI_BOUNDS and PROTMODE as 20H392 has them");
++_Static_assert(sizeof(struct apple80211_country) == 8 && offsetof(struct apple80211_country, code) == 4,
++    "COUNTRY_CODE as 20H392 sets it");
++_Static_assert(sizeof(struct apple80211_property) == 4104 && offsetof(struct apple80211_property, xml) == 8,
++    "SET_PROPERTY as 20H392 has it");
 +
 +_Static_assert(sizeof(struct apple80211_assoc) == 592 && offsetof(struct apple80211_assoc, key) == 0x48,
 +    "the association request as iOS 16.5 has it");
@@ -2402,7 +2746,7 @@
 +#endif /* FUXI */
 --- /dev/null
 +++ b/bsd/sys/fuxi_wifi_sta.h
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,127 @@
 +/*
 + * Ported from HackiOS xnu/files/bsd/sys/redwood_sta.h (APSL-2.0)
 + * Fuxi adaptations, 2026-10-23: opt-in iOS shim; see docs-lanes/wifi-ios.md.
@@ -2525,7 +2869,8 @@
 +
 +/* ---- the listener: bsd/dev/fuxi_wifi_apple80211.c ---- */
 +void     fuxi_wifi_apple80211_event(enum fuxi_wifi_sta_event event, int status);
-+void     fuxi_wifi_apple80211_summary(void);                              /* what was asked in this run, to the log */
++void     fuxi_wifi_apple80211_summary(void);                              /* what was asked in this run so far, to the log
++                                                                         * (a timer says it every minute while requests come) */
 +#endif
 +
 +#endif

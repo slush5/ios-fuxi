@@ -114,6 +114,54 @@ struct apple80211_link_changed {
 	uint8_t unused_3[4];
 };
 
+/*
+ * Fuxi, 2026-10-29: the layouts from here on were read out of IO80211.framework of 20H392 (16.7):
+ * Apple80211GetWithIOCTL and Apple80211SetWithIOCTL, Apple80211SetProperty. Against the same framework
+ * the scan request (__getScanData), a scan's result (__addScanResultToList), the channel list (254)
+ * and the channels' description (207) above were checked and match; the association request and the
+ * link event were not.
+ */
+
+/* PHY_MODE (14): 12 bytes. The kinds of 802.11 as apple80211_var.h numbers them (APPLE80211_MODE_*). */
+#define PHY_MODE_AUTO           0x1u
+#define PHY_MODE_11A            0x2u
+#define PHY_MODE_11B            0x4u
+#define PHY_MODE_11G            0x8u
+
+struct apple80211_phy_mode {
+	uint32_t version, supported, active;
+};
+
+/* RSSI_BOUNDS (106): 16 bytes, dBm */
+struct apple80211_rssi_bounds {
+	int32_t version, rssi_min, rssi_max, rssi_threshold;
+};
+
+/* PROTMODE (6): 12 bytes */
+struct apple80211_protmode {
+	uint32_t version, mode, threshold;
+};
+
+/* COUNTRY_CODE (51) as it is set: 8 bytes. (As it is got: the two letters and a NUL alone, in 3 bytes.) */
+struct apple80211_country {
+	uint32_t version;
+	char code[3];
+	uint8_t unused;
+};
+
+/* SET_PROPERTY (383): 4104 bytes; an XML property list of one key, `length` bytes with its NUL */
+struct apple80211_property {
+	uint32_t version, length;
+	char xml[4096];
+};
+
+_Static_assert(sizeof(struct apple80211_phy_mode) == 12 && sizeof(struct apple80211_rssi_bounds) == 16 &&
+    sizeof(struct apple80211_protmode) == 12, "PHY_MODE, RSSI_BOUNDS and PROTMODE as 20H392 has them");
+_Static_assert(sizeof(struct apple80211_country) == 8 && offsetof(struct apple80211_country, code) == 4,
+    "COUNTRY_CODE as 20H392 sets it");
+_Static_assert(sizeof(struct apple80211_property) == 4104 && offsetof(struct apple80211_property, xml) == 8,
+    "SET_PROPERTY as 20H392 has it");
+
 _Static_assert(sizeof(struct apple80211_assoc) == 592 && offsetof(struct apple80211_assoc, key) == 0x48,
     "the association request as iOS 16.5 has it");
 _Static_assert(sizeof(struct apple80211_link_changed) == 32 && offsetof(struct apple80211_link_changed, reason) == 0x14,

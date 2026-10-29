@@ -120,7 +120,8 @@ bool     fuxi_wifi_sta_address(uint8_t *address);
 
 /* ---- the listener: bsd/dev/fuxi_wifi_apple80211.c ---- */
 void     fuxi_wifi_apple80211_event(enum fuxi_wifi_sta_event event, int status);
-void     fuxi_wifi_apple80211_summary(void);                              /* what was asked in this run, to the log */
+void     fuxi_wifi_apple80211_summary(void);                              /* what was asked in this run so far, to the log
+                                                                         * (a timer says it every minute while requests come) */
 #endif
 
 #endif

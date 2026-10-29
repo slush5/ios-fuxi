@@ -27,6 +27,43 @@ MODEL = r'''
 #include <pthread.h>
 #include <time.h>
 #include <stdatomic.h>
+#include <stdarg.h>
+/* Everything production code says is kept, so that what it says (and does not say) can be checked. */
+static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
+static char logbuf[1 << 20];
+static size_t loglen;
+static int log_printf(const char *format, ...) __attribute__((format(printf, 1, 2)));
+static int log_printf(const char *format, ...) {
+ char line[2048]; va_list list; va_start(list, format);
+ int n = vsnprintf(line, sizeof(line), format, list); va_end(list);
+ size_t k = strlen(line);
+ pthread_mutex_lock(&log_lock);
+ assert(loglen + k < sizeof(logbuf));
+ memcpy(logbuf + loglen, line, k); loglen += k; logbuf[loglen] = 0;
+ pthread_mutex_unlock(&log_lock);
+ fputs(line, stdout); return n;
+}
+#define printf log_printf
+/* The clock and one thread call: time stands still until the test moves it; the call runs when the test says. */
+#define NSEC_PER_SEC 1000000000ull
+#define THREAD_CALL_PRIORITY_LOW 3
+#define THREAD_CALL_OPTIONS_ONCE 1u
+typedef void *thread_call_param_t;
+typedef void (*thread_call_func_t)(thread_call_param_t, thread_call_param_t);
+typedef struct fake_call { thread_call_func_t func; } *thread_call_t;
+static struct fake_call the_call;
+static unsigned calls_made, calls_armed;
+static uint64_t now_abs, armed_at;
+static void clock_get_uptime(uint64_t *t) { *t = now_abs; }
+static void absolutetime_to_nanoseconds(uint64_t a, uint64_t *ns) { *ns = a; }
+static void clock_interval_to_deadline(uint32_t interval, uint32_t scale, uint64_t *d) { *d = now_abs + (uint64_t)interval * scale; }
+static thread_call_t thread_call_allocate_with_options(thread_call_func_t f, thread_call_param_t p, int priority, unsigned options) {
+ assert(f && !p && priority == THREAD_CALL_PRIORITY_LOW && options == THREAD_CALL_OPTIONS_ONCE);
+ calls_made++; the_call.func = f; return &the_call;
+}
+static int thread_call_enter_delayed(thread_call_t c, uint64_t deadline) {
+ assert(c == &the_call); calls_armed++; armed_at = deadline; return 0;
+}
 #define FUXI 1
 #define KERNEL 1
 #define __unused __attribute__((unused))
@@ -72,10 +109,12 @@ static int kernel_thread_start(void (*f)(void *,wait_result_t),void *p,thread_t 
 }
 static int memset_s(void *p,size_t n,int c,size_t count) { assert(count<=n); memset(p,c,count); return 0; }
 static int copyin(user_addr_t p,void *out,size_t n) {
- if (!p || fail_copy) return EFAULT; memcpy(out,(void *)p,n); return 0;
+ if (!p || fail_copy) return EFAULT;
+ memcpy(out,(void *)p,n); return 0;
 }
 static int copyout(const void *in,user_addr_t p,size_t n) {
- if (!p || fail_copy) return EFAULT; memcpy((void *)p,in,n); return 0;
+ if (!p || fail_copy) return EFAULT;
+ memcpy((void *)p,in,n); return 0;
 }
 static void proc_selfname(char *p,int n) { snprintf(p,n,"fixture"); }
 static void *current_proc(void) { return NULL; }
@@ -109,15 +148,36 @@ static void settle(void) {
  }
  assert(!"station timeout");
 }
-static int request(bool set,int type,void *p,unsigned n,int *val) {
- struct apple80211req req = { .req_if_name="en0",.req_type=type,.req_len=n,.req_data=(uintptr_t)p };
+/* what the shim counts: every request that gets past the name and privilege checks */
+static unsigned noted, noted_answered, noted_refused, noted_failed, kind_seen;
+static int kinds_seen[128][2];
+static int request_with(bool set,int type,int value,void *p,unsigned n,int *val) {
+ struct apple80211req req = { .req_if_name="en0",.req_type=type,.req_val=value,.req_len=n,.req_data=(uintptr_t)p };
  int error=fuxi_wifi_apple80211_ioctl(set?SIOCSA80211:SIOCGA80211,&req);
- if(val) *val=req.req_val; return error;
+ if (!(set && !superuser)) {
+  unsigned i;
+  noted++; noted_answered+=error==0; noted_refused+=error==EOPNOTSUPP; noted_failed+=error!=0 && error!=EOPNOTSUPP;
+  for (i=0;i<kind_seen && !(kinds_seen[i][0]==type && kinds_seen[i][1]==set);i++) {}
+  if (i==kind_seen) { assert(kind_seen<128); kinds_seen[kind_seen][0]=type; kinds_seen[kind_seen++][1]=set; }
+ }
+ if(val) *val=req.req_val;
+ return error;
 }
+static int request(bool set,int type,void *p,unsigned n,int *val) { return request_with(set,type,0,p,n,val); }
+static unsigned said_times(const char *what) {
+ unsigned n=0;
+ pthread_mutex_lock(&log_lock);
+ for (const char *at=logbuf; (at=strstr(at,what))!=NULL; at+=strlen(what)) n++;
+ pthread_mutex_unlock(&log_lock);
+ return n;
+}
+static bool said_since(size_t from,const char *what) { return strstr(logbuf+from,what)!=NULL; }
 int main(void) {
  assert(sizeof(struct apple80211req)==40 && offsetof(struct apple80211req,req_data)==32);
  fuxi_wifi_ios_init(); assert(!attached && !registry && !fuxi_wifi_sta_present());
  opt=2; fuxi_wifi_ios_init(); assert(!attached);
+ /* without fuxiwifiios=1: nothing is made, nothing said, no timer */
+ assert(loglen==0 && !calls_made && !calls_armed);
  opt=1; fuxi_wifi_ios_init(); assert(attached==1 && registry==1);
  fuxi_wifi_ios_init(); assert(attached==1);
  assert(!fuxi_wifi_ios_attach(&fake_backend));
@@ -126,7 +186,10 @@ int main(void) {
  assert(fuxi_wifi_sta_ask_scan(&bad_scan)==EINVAL);
  struct apple80211req invalid={.req_if_name="ue0"};
  assert(fuxi_wifi_apple80211_ioctl(SIOCGA80211,&invalid)==ENXIO);
+ /* the summary's timer waits for the first request, and is armed once, 20 s on */
+ assert(!calls_made);
  assert(request(false,999,NULL,0,NULL)==EOPNOTSUPP);
+ assert(calls_made==1 && calls_armed==1 && armed_at==20*NSEC_PER_SEC);
  struct apple80211_scan_request scan={.version=1};
  assert(request(true,10,&scan,sizeof(scan)-1,NULL)==EINVAL);
  scan.ssid_length=33; assert(request(true,10,&scan,sizeof(scan),NULL)==EINVAL); scan.ssid_length=0;
@@ -139,7 +202,97 @@ int main(void) {
  assert(request(false,11,&result,sizeof(result),NULL)==0);
  assert(result.ssid_length==13 && !memcmp(result.ssid,"Fuxi Loopback",13));
  assert(result.rssi==-42 && result.channel.channel==1 && result.elements_length==4);
+ assert(result.rate_count==2 && result.rates[0]==1 && result.rates[1]==2);
  assert(request(false,11,&result,sizeof(result),NULL)==EIO);
+ /* IO80211's fallback scan (type 3, one channel {1, 0, 0}): every channel, so the BSS is heard */
+ scan.scan_type=3; scan.channel_count=1; scan.channels[0]=(struct apple80211_channel){ 1, 0, 0 };
+ assert(request(true,10,&scan,sizeof(scan),NULL)==0); settle();
+ assert(atomic_load(&events[10])==2);
+ result.elements_length=1024; assert(request(false,11,&result,sizeof(result),NULL)==0 && result.ssid_length==13);
+ assert(request(false,11,&result,sizeof(result),NULL)==EIO);
+ /* channel 0 next to a channel without the BSS: still every channel */
+ scan.channel_count=2; scan.channels[1]=(struct apple80211_channel){ 1, 6, CHANNEL_2GHZ };
+ assert(request(true,10,&scan,sizeof(scan),NULL)==0); settle();
+ result.elements_length=1024; assert(request(false,11,&result,sizeof(result),NULL)==0);
+ /* a channel without the BSS alone: a scan that hears nothing */
+ scan.scan_type=1; scan.channel_count=1; scan.channels[0]=scan.channels[1];
+ assert(request(true,10,&scan,sizeof(scan),NULL)==0); settle();
+ assert(atomic_load(&events[10])==4 && request(false,11,&result,sizeof(result),NULL)==EIO);
+ /* nothing that is a channel: refused, no scan */
+ scan.channels[0]=(struct apple80211_channel){ 1, 200, 0 };
+ assert(request(true,10,&scan,sizeof(scan),NULL)==EINVAL && atomic_load(&events[10])==4);
+ /* the BSS's own channel */
+ scan.channels[0]=(struct apple80211_channel){ 1, 1, CHANNEL_2GHZ };
+ assert(request(true,10,&scan,sizeof(scan),NULL)==0); settle();
+ result.elements_length=1024; assert(request(false,11,&result,sizeof(result),NULL)==0 && result.channel.channel==1);
+ scan.scan_type=0; scan.channel_count=0; memset(scan.channels,0,sizeof(scan.channels));
+ /* COUNTRY_CODE: a placeholder until iOS sets one; then what it set; two letters or digits, any case */
+ char cc[3]={1,1,1};
+ assert(!request(false,51,cc,3,NULL) && !memcmp(cc,"US",3));
+ struct apple80211_country country={.version=1}; memcpy(country.code,"IL",3);
+ assert(!request(true,51,&country,sizeof(country),NULL));
+ assert(!request(false,51,cc,3,NULL) && !memcmp(cc,"IL",3));
+ memcpy(country.code,"x0",3); assert(!request(true,51,&country,sizeof(country),NULL));
+ assert(!request(false,51,cc,3,NULL) && !memcmp(cc,"X0",3));
+ memcpy(country.code,"I-",3); assert(request(true,51,&country,sizeof(country),NULL)==EINVAL);
+ assert(request(true,51,&country,5,NULL)==EINVAL && request(true,51,&country,65,NULL)==EINVAL);
+ assert(request(true,51,NULL,8,NULL)==EFAULT);
+ memcpy(country.code,"IL",3);
+ superuser=0; assert(request(true,51,&country,sizeof(country),NULL)==EPERM); superuser=1;
+ fail_copy=1; assert(request(true,51,&country,sizeof(country),NULL)==EFAULT); fail_copy=0;
+ assert(!request(false,51,cc,3,NULL) && !memcmp(cc,"X0",3));
+ assert(!request(true,51,&country,6,NULL)); assert(!request(false,51,cc,3,NULL) && !memcmp(cc,"IL",3));
+ assert(request(false,51,NULL,3,NULL)==EFAULT);
+ assert(said_times("(the country: IL)")>=1);
+ /* SET_PROPERTY: taken; its key goes to the log, its value never */
+ struct apple80211_property *property=calloc(1,sizeof(*property));
+ static const char xml[]="<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>IO80211InterfaceIPV4Params</key>"
+  "<dict><key>Router</key><string>10.9.8.7</string></dict></dict></plist>";
+ property->version=1; property->length=sizeof(xml); memcpy(property->xml,xml,sizeof(xml));
+ size_t before=loglen;
+ assert(!request(true,383,property,sizeof(*property),NULL));
+ assert(said_since(before,"(a property: IO80211InterfaceIPV4Params, ") && !strstr(logbuf,"10.9.8.7") && !strstr(logbuf,"Router"));
+ property->length=5000; assert(!request(true,383,property,sizeof(*property),NULL));
+ memcpy(property->xml,"<key>Short</key>",16); property->length=4096;
+ before=loglen; assert(!request(true,383,property,8+16,NULL)); assert(said_since(before,"(a property: Short, "));
+ memset(property->xml,'A',sizeof(property->xml)); memcpy(property->xml,"<key>",5); memcpy(property->xml+80,"</key>",6);
+ before=loglen; assert(!request(true,383,property,sizeof(*property),NULL));
+ char longest[96]="(a property: "; size_t key_at=strlen(longest);
+ memset(longest+key_at,'A',63); memcpy(longest+key_at+63,", ",3);
+ assert(said_since(before,longest));
+ memcpy(property->xml,"<key>a\tb</key>",14);
+ before=loglen; assert(!request(true,383,property,sizeof(*property),NULL)); assert(said_since(before,"(a property: a?b, "));
+ memset(property->xml,'a',sizeof(property->xml)); memcpy(property->xml+4091,"<key>",5);
+ before=loglen; assert(!request(true,383,property,sizeof(*property),NULL)); assert(said_since(before,"(a property: no key, "));
+ assert(request(true,383,property,sizeof(*property)+1,NULL)==EINVAL && request(true,383,property,7,NULL)==EINVAL);
+ assert(request(true,383,NULL,sizeof(*property),NULL)==EFAULT);
+ fail_copy=1; assert(request(true,383,property,sizeof(*property),NULL)==EFAULT); fail_copy=0;
+ free(property);
+ /* PHY_MODE: 11b/g by the one 2.4 GHz channel; none in use until joined */
+ struct apple80211_phy_mode phy={0};
+ assert(!request(false,14,&phy,sizeof(phy),NULL) && phy.version==1);
+ assert(phy.supported==(PHY_MODE_AUTO|PHY_MODE_11B|PHY_MODE_11G) && phy.active==PHY_MODE_AUTO);
+ /* RSSI_BOUNDS, PROTMODE, POWERSAVE, INT_MIT */
+ struct apple80211_rssi_bounds bounds={0};
+ assert(!request(false,106,&bounds,sizeof(bounds),NULL) && bounds.version==1);
+ assert(bounds.rssi_min==-100 && bounds.rssi_max==0 && bounds.rssi_threshold==-80);
+ struct apple80211_protmode protmode; memset(&protmode,0xff,sizeof(protmode));
+ assert(!request(false,6,&protmode,sizeof(protmode),NULL) && protmode.version==1 && !protmode.mode && !protmode.threshold);
+ int value=7; assert(!request_with(false,5,7,NULL,0,&value) && value==0);
+ value=7; assert(!request_with(false,18,7,NULL,0,&value) && value==0);
+ /* RATE: only while joined */
+ assert(request(false,8,NULL,0,NULL)==ENXIO);
+ /* refused on purpose, and the log says so */
+ before=loglen;
+ assert(request(false,96,NULL,0,NULL)==EOPNOTSUPP && request(false,97,cc,3,NULL)==EOPNOTSUPP);
+ assert(request(false,115,NULL,0,NULL)==EOPNOTSUPP && request(false,17,NULL,0,NULL)==EOPNOTSUPP);
+ assert(request(false,57,NULL,0,NULL)==EOPNOTSUPP);
+ assert(said_since(before,"gets 96 (VIRTUAL_IF_ROLE), value 0, 0 bytes (on purpose: not a virtual interface): REFUSED\n"));
+ assert(said_since(before,"gets 115 (POWER_DEBUG_INFO), value 0, 0 bytes (on purpose: no power accounting): REFUSED\n"));
+ /* DISPLAY_STATE: taken; HOST_AP_MODE: only "stop" (2, no data) */
+ assert(!request_with(true,365,1,NULL,0,NULL));
+ assert(!request_with(true,25,2,NULL,0,NULL));
+ assert(request_with(true,25,1,NULL,0,NULL)==EOPNOTSUPP && request_with(true,25,2,cc,3,NULL)==EOPNOTSUPP);
  struct apple80211_channels channels;
  assert(!request(false,27,&channels,sizeof(channels),NULL) && channels.count==1);
  assert(request(false,27,NULL,sizeof(channels),NULL)==EFAULT);
@@ -149,6 +302,11 @@ int main(void) {
  join.key_length=65; join.key_cipher=10; assert(request(true,20,&join,sizeof(join),NULL)==EINVAL);
  join.key_length=0; assert(!request(true,20,&join,sizeof(join),NULL)); settle();
  int val; assert(!request(false,21,NULL,0,&val) && val==1); assert(link_up);
+ /* joined: the rate and the mode come from the BSS's rates (1 and 2 Mbit/s: 11b) */
+ int rate=0; assert(!request(false,8,NULL,0,&rate) && rate==2);
+ memset(&phy,0,sizeof(phy)); assert(!request(false,14,&phy,sizeof(phy),NULL) && phy.active==PHY_MODE_11B);
+ struct apple80211_scan_result current={.elements_length=1024};
+ assert(!request(false,103,&current,sizeof(current),NULL) && current.ssid_length==13 && current.rate_count==2);
  uint8_t frame[1514]={0}; frame[12]=0x88;frame[13]=0xb5;
  assert(transmit(frame,60) && received==1);
  assert(!transmit(frame,1515)); assert(!transmit(frame,13));
@@ -163,6 +321,45 @@ int main(void) {
  assert(request(true,10,&scan,sizeof(scan),NULL)==ENETDOWN);
  power.state[0]=1;assert(!request(true,19,&power,sizeof(power),NULL));settle();
  assert(fuxi_wifi_sta_powered());
+ /* a poll is said its first 24 times and every hundredth time after */
+ for (unsigned i=0;i<250;i++) assert(!request(false,15,NULL,0,&val) && val==1);
+ assert(said_times("fixture gets 15 (OP_MODE)")==26);
+ /* the summary: 20 s after the first request, then every 60 s, said only when there was a request since */
+ assert(calls_made==1 && calls_armed==1);
+ now_abs=21*NSEC_PER_SEC; before=loglen;
+ the_call.func(NULL,NULL);
+ assert(calls_made==1 && calls_armed==2 && armed_at==now_abs+60*NSEC_PER_SEC);
+ char want[400];
+ snprintf(want,sizeof(want),"FUXI WIFI IOS: apple80211: summary 1, 21 s after the first request: %u requests of %u kinds, "
+  "%u answered, %u refused, %u failed; events posted: power %u, link %u, join %u, scan %u\n",noted,kind_seen,noted_answered,
+  noted_refused,noted_failed,atomic_load(&events[1]),atomic_load(&events[4]),atomic_load(&events[9]),atomic_load(&events[10]));
+ assert(said_since(before,want));
+ assert(noted_answered && noted_refused && noted_failed && atomic_load(&events[10])==5 && atomic_load(&events[9])==2);
+ snprintf(want,sizeof(want)," get 96 VIRTUAL_IF_ROLE 1/0 (%d)",EOPNOTSUPP); assert(said_since(before,want));
+ snprintf(want,sizeof(want)," set 25 HOST_AP_MODE 3/1 (%d)",EOPNOTSUPP); assert(said_since(before,want));
+ assert(said_since(before," get 106 RSSI_BOUNDS 1/1,") || said_since(before," get 106 RSSI_BOUNDS 1/1\n"));
+ assert(said_since(before," get 15 OP_MODE 250/250"));
+ assert(said_since(before," set 365 DISPLAY_STATE 1/1"));
+ /* every kind is said once, at most five a line, no line too long */
+ unsigned kinds_said=0;
+ for (char *line=logbuf+before; *line; ) {
+  char *end=strchr(line,'\n'); assert(end && end-line<330);
+  if (!strncmp(line,"FUXI WIFI IOS: apple80211: summary 1:",37)) {
+   unsigned here=0;
+   for (char *at=line; at<end; at++) here+=(!strncmp(at," get ",5) || !strncmp(at," set ",5));
+   assert(here>=1 && here<=5); kinds_said+=here;
+  }
+  line=end+1;
+ }
+ assert(kinds_said==kind_seen);
+ /* nothing asked since: nothing said, the timer runs on */
+ before=loglen; the_call.func(NULL,NULL); assert(loglen==before && calls_armed==3);
+ assert(!request(false,13,NULL,0,&val));
+ now_abs=141*NSEC_PER_SEC; before=loglen; the_call.func(NULL,NULL);
+ assert(said_since(before,"FUXI WIFI IOS: apple80211: summary 2, 141 s after the first request: ") && calls_armed==4);
+ fuxi_wifi_apple80211_summary(); assert(said_times("apple80211: summary 3,")==0);
+ /* nothing a network carries was said: its name, its passphrase */
+ assert(!strstr(logbuf,"Fuxi Loopback") && !strstr(logbuf,"password"));
  puts("PASS: production station, ioctl layouts/events, fake frame callbacks and gates");
  return 0;
 }
