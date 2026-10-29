@@ -68,9 +68,11 @@ enum {
  * row is 256-aligned (all its own surfaces are). MaterialKit snapshot surfaces ask
  * for CGBitmapGetAlignedBytesPerRow (32-byte) rows, so CARenderServerSnapshot
  * left them unrendered and the opaque App Library background stayed black.
- * Explicit rows are a minimum (clients query the row back), and the allocation
- * covers the height padded to 4 rows that a Turnip linear import requires;
- * sweetsurfrow=0 keeps the requested layout. */
+ * sweetsurfrow=1 makes explicit rows a minimum, and the allocation covers the
+ * height padded to 4 rows that a Turnip linear import requires. Not every client
+ * queries the row back: CoreUI decodes asset-catalog atlases at its own 32-byte
+ * row, so a widened ARGB atlas comes out sheared. sweetsurfrow=0 keeps the
+ * requested layout. Default 1, but 0 on FUXI_SALAMI (no GPU importer). */
 #define SWEET_SURFACE_GPU_ROW_ALIGN     256
 #define SWEET_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
 #define SWEET_SURFACE_STATE_USE         0x18
@@ -572,7 +574,11 @@ sweet_surface_gpu_rows(void)
 {
 	static int enabled = -1;
 	if (enabled < 0) {
+#if defined(FUXI_SALAMI)
+		uint32_t v = 0;
+#else
 		uint32_t v = 1;
+#endif
 		(void)PE_parse_boot_argn("sweetsurfrow", &v, sizeof(v));
 		enabled = v != 0;
 	}

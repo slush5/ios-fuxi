@@ -6,6 +6,12 @@ window and the validated fixed splash framebuffer can be read; no storage writes
 Private output includes native reports, staged progress and console bytes.
 After the handoff it reads the loader note once (request 0x48, loader-note.txt):
 a boot-logo loader that did not hand its logo to XNU (sweetlogo_*) says why there.
+When a USB transfer fails in the console loop (the host re-enumerates the device
+after selective suspend, or after a 0x4e read on salami), the monitor is found
+again, checked with status request 0x46 to be the same boot, and the console
+resumes at the last byte read; a reconnect never sends 0x49 (handoff) or 0x46
+value 1. --reconnect-seconds bounds each outage, then the run exits as before.
+On salami --framebuffer and --tour-shots are skipped unless --force-fb.
 """
 import argparse
 import json
@@ -23,6 +29,11 @@ FB_FUXI = (1080, 2400, 4320)   # Fuxi panel and ABL stride: used when the ADT ha
 # ADT has no sweet-fbcon (tools/mkadt-salami.py --no-fbcon, boot-logo loader).
 FB_SALAMI = (1080, 2412, 4320)
 FB_SLOT = 0xa00000             # one ABL splash scanout slot, the most request 0x4e can serve
+RECONNECT_SECONDS = 180        # default --reconnect-seconds: longest USB outage in the console loop
+# After a reconnect the console resumes at the last byte read while the kernel's 4 MiB
+# ring (SWEET_LOG_SIZE) still holds it, up to this many bytes back (the rest is slack
+# for what the kernel writes while the host reads); otherwise the last 64 KiB as usual.
+CATCH_UP = 0x200000
 
 
 def fb_geometry(payload, rows=None):
@@ -179,6 +190,8 @@ def main():
     ap.add_argument('--framebuffer',action='store_true',help='save the validated inherited framebuffer after collecting logs')
     ap.add_argument('--tour-shots',action='store_true',help='also save framebuffer-shotN-NAME.png at each "FUXI TOUR: shot N NAME" console line (fuxitour=S)')
     ap.add_argument('--fb-rows',type=int,metavar='ROWS',help='framebuffer rows to save (default: the payload ADT sweet-fbcon height; without that node 2412 on salami, 2400 on Fuxi)')
+    ap.add_argument('--force-fb',action='store_true',help='salami: do --framebuffer/--tour-shots anyway (the 0x4e read drops USB under XNU there, so they are skipped without this)')
+    ap.add_argument('--reconnect-seconds',type=float,default=RECONNECT_SECONDS,metavar='SECONDS',help='after a USB error in the console loop, look for the same monitor again for up to SECONDS per outage (default %(default)s; 0 exits on the first error)')
     ap.add_argument('--skip-clocks',action='store_true',help='do not take the AHB-ungating clock snapshot before handoff')
     ap.add_argument('--reset-minutes',type=int,help='move the monitor PSCI reset deadline to now + N minutes (1-60)')
     ap.add_argument('--touch-test',type=float,metavar='SECONDS',help='before handoff: touch snapshot, power-up, then poll touch events for SECONDS')
@@ -219,6 +232,12 @@ def main():
                  'probe stages S5 (INTF) and S6 (DSI) pass; pass --i-know-s5-s6 to override')
     if 'fuxiperf=1' in cmdline.split() and (args.cpu_level or args.cpu_at):
         ap.error('fuxiperf=1 owns EPSS: do not pass --cpu-level or --cpu-at')
+    if salami and (args.framebuffer or args.tour_shots):
+        print('warning: --framebuffer/--tour-shots read the scanout buffer with request 0x4e, and the '
+              '0x4e read drops USB under XNU on salami (the host re-enumerates the device)', flush=True)
+        if not args.force_fb:
+            print('salami: skipping --framebuffer and --tour-shots (pass --force-fb to read it anyway)', flush=True)
+            args.framebuffer = args.tour_shots = False
     fb_w, fb_h, fb_s = FB_FUXI
     if args.framebuffer or args.tour_shots:
         try:
@@ -420,80 +439,169 @@ def main():
         (args.out/(name+'.png')).write_bytes(png)
     tour_tail, tour_done = b'', set()
     loader_note = None
+    last_status, outage, catch_up = before, None, False
+    def release(d):
+        try:  # drop the stale handle (and any claimed interface) of a device that went away
+            usb.util.dispose_resources(d)
+        except Exception:
+            pass
+    def find_monitor():
+        found = []
+        try:
+            devices = list(usb.core.find(find_all=True, idVendor=0x1209, idProduct=0x0001))
+        except usb.core.USBError:
+            return found
+        for d in devices:
+            try:
+                if usb.util.get_string(d, d.iProduct) == 'Fuxi hardware probe':
+                    found.append(d)
+            except (usb.core.USBError, ValueError):
+                pass  # still enumerating
+        return found
+    def other_boot(old, new):
+        """Why NEW (0x46 after a reconnect) is not the monitor that OLD came from, or None."""
+        if not new['active'] or new['usb_mpidr'] & 0xffffff != 0x100:
+            return 'USB polling is not on cpu@100'
+        if (new['image'], new['end']) != (old['image'], old['end']):
+            return 'another loader image'
+        if new['launch'] < old['launch'] or (new['stage'] < old['stage'] and new['stage'] != 99):
+            return f'stage {new["stage"]} after {old["stage"]}'
+        if old['stage'] >= 8 and (new['boot_args'], new['entry']) != (old['boot_args'], old['entry']):
+            return 'another XNU handoff'
+        return None
+    def reconnect(error, give_up):
+        """Find this boot's monitor again after a USB error in the console loop. Only 0x46
+        status reads (value 0): never 0x49 (handoff) or 0x46 value 1. The new status, or None."""
+        nonlocal dev
+        print(f'USB transfer failed ({error}); looking for the monitor again for up to '
+              f'{max(0, give_up - time.monotonic()):.0f} s', flush=True)
+        t0, attempts, why = time.monotonic(), 0, 'no monitor enumerated'
+        while True:
+            release(dev)
+            attempts += 1
+            found = find_monitor()
+            if len(found) == 1:
+                dev = found[0]
+                try:
+                    usb.util.claim_interface(dev, 0)  # the vendor interface (no endpoints)
+                except usb.core.USBError as e:
+                    why = f'claim: {e}'  # control transfers may still work: 0x46 decides
+                try:
+                    now = monitor()
+                except (usb.core.USBError, ValueError) as e:
+                    why = f'request 0x46: {e}'
+                else:
+                    other = other_boot(last_status, now)
+                    if other:
+                        print(f'USB: the monitor that came back is not this boot ({other}); giving up', flush=True)
+                        return None
+                    print(f'USB reconnected after {time.monotonic() - t0:.1f} s ({attempts} attempts), '
+                          f'stage {now["stage"]}; the console resumes at byte {last_total}', flush=True)
+                    return now
+            else:
+                why = f'{len(found)} Fuxi native monitors' if found else 'no monitor enumerated'
+            if time.monotonic() >= give_up:
+                print(f'USB: no monitor after {time.monotonic() - t0:.0f} s ({why}); giving up', flush=True)
+                return None
+            time.sleep(.5)
     with (args.out / 'progress.jsonl').open('w') as progress, (args.out / 'boot.log').open('wb') as log:
         while time.monotonic() < until:
-            status = monitor()
-            if status['stage'] == 99:
-                status['error'] = request(0x48, 128).split(b'\0', 1)[0].decode(errors='replace')
-            if status['stage'] >= 8 and status['stage'] != 99 and loader_note is None:
-                # Once, after the handoff: a boot-logo loader that did not append
-                # sweetlogo_* for XNU says why in monitor_error (loader.c boot_logo_args);
-                # empty when it appended them, or for a loader without that hand-over.
-                try:
-                    loader_note = request(0x48, 128).split(b'\0', 1)[0].decode(errors='replace')
-                except (usb.core.USBError, ValueError) as e:  # never let it end the console log
-                    loader_note = f'(request 0x48 failed: {e})'
-                status['loader_note'] = loader_note
-                (args.out / 'loader-note.txt').write_text(loader_note + '\n')
-                if loader_note:
-                    print('loader note:', loader_note, flush=True)
-            if status['stage'] >= 8 and status['stage'] != 99:
-                early = read_ram(offsets['_fuxi_early_status'], 128)
-                status['kernel_stage'] = struct.unpack_from('<Q', early)[0]
-                status['kernel_label'] = early[8:].split(b'\0', 1)[0].decode(errors='replace')
-                total = struct.unpack('<Q', read_ram(offsets['_sweet_log_total'], 8))[0]
-                status['console_total'] = total
-                if not last_total <= total < 0x10000000:
-                    raise ValueError(f'invalid console counter: {total}')
-                start = max(last_total, total - 65536)
-                if start > last_total:
-                    status['missed_console_bytes'] = start - last_total
-                while start < total:
-                    index = start % 0x400000
-                    length = min(total-start, 0x400000-index)
-                    data = read_ram(offsets['_sweet_log_ring']+index, length)
-                    log.write(data)
-                    tour_tail = (tour_tail+data)[-4096:] if args.tour_shots else b''
-                    start += length
+            status = None
+            try:
+                status = monitor()
+                last_status = status
+                if status['stage'] == 99:
+                    status['error'] = request(0x48, 128).split(b'\0', 1)[0].decode(errors='replace')
+                if status['stage'] >= 8 and status['stage'] != 99 and loader_note is None:
+                    # Once, after the handoff: a boot-logo loader that did not append
+                    # sweetlogo_* for XNU says why in monitor_error (loader.c boot_logo_args);
+                    # empty when it appended them, or for a loader without that hand-over.
+                    try:
+                        loader_note = request(0x48, 128).split(b'\0', 1)[0].decode(errors='replace')
+                    except (usb.core.USBError, ValueError) as e:  # never let it end the console log
+                        loader_note = f'(request 0x48 failed: {e})'
+                    status['loader_note'] = loader_note
+                    (args.out / 'loader-note.txt').write_text(loader_note + '\n')
+                    if loader_note:
+                        print('loader note:', loader_note, flush=True)
+                if status['stage'] >= 8 and status['stage'] != 99:
+                    early = read_ram(offsets['_fuxi_early_status'], 128)
+                    status['kernel_stage'] = struct.unpack_from('<Q', early)[0]
+                    status['kernel_label'] = early[8:].split(b'\0', 1)[0].decode(errors='replace')
+                    total = struct.unpack('<Q', read_ram(offsets['_sweet_log_total'], 8))[0]
+                    status['console_total'] = total
+                    if not last_total <= total < 0x10000000:
+                        raise ValueError(f'invalid console counter: {total}')
+                    start = max(last_total, total - (CATCH_UP if catch_up else 65536))
+                    if start > last_total:
+                        status['missed_console_bytes'] = start - last_total
+                        last_total = start
+                    while start < total:
+                        index = start % 0x400000
+                        length = min(total-start, 0x400000-index, 0x10000)
+                        data = read_ram(offsets['_sweet_log_ring']+index, length)
+                        log.write(data)
+                        tour_tail = (tour_tail+data)[-4096:] if args.tour_shots else b''
+                        start += length
+                        last_total = start  # a reconnect resumes here
+                    log.flush()
+                    catch_up = False
+                    for m in re.finditer(rb'FUXI TOUR: shot (\d+) ([a-z-]+)\n', tour_tail):
+                        if m.group(1) not in tour_done:
+                            tour_done.add(m.group(1))
+                            shot_start = time.monotonic()
+                            save_framebuffer('framebuffer-shot%s-%s' % (m.group(1).decode(), m.group(2).decode()))
+                            print('tour shot', m.group(1).decode(), m.group(2).decode(), 'saved in %.1f s' % (time.monotonic()-shot_start), flush=True)
+                if args.display_poll:
+                    status['display'] = display_poll()
+                progress.write(json.dumps(status)+'\n')
+                progress.flush()
+                outage = None
+                brief = {k: status[k] for k in ('stage','kernel_stage','kernel_label','console_total','error') if k in status}
+                if brief != previous:
+                    print(brief, flush=True)
+                    previous = brief
+                if status['stage'] == 99:
+                    break
+                if cpu_at and time.monotonic() - handoff >= cpu_at[0][0]:
+                    try:  # never let a thermal-lane request end the console log
+                        cpu_apply(cpu_at.pop(0)[1], thermal_events)
+                    except Exception as e:
+                        print('cpu level change failed:', e, flush=True)
+                    (args.out / 'thermal-events.json').write_text(json.dumps(thermal_events, indent=1) + '\n')
+                if thermal_file and time.monotonic() >= next_thermal:
+                    next_thermal = max(next_thermal + args.thermal_log, time.monotonic())
+                    try:
+                        t = thermal_sample()
+                    except usb.core.USBError as e:
+                        t = {'error': str(e), 'temps': {}, 'invalid': [], 'cpu': []}
+                    t['time'] = time.time()
+                    t['since_handoff'] = round(time.monotonic() - handoff, 1)
+                    t['kernel_label'] = status.get('kernel_label')
+                    thermal_file.write(json.dumps(t) + '\n'); thermal_file.flush()
+                    print('thermal +%ds' % t['since_handoff'], thermal_brief(t), flush=True)
+                if args.reset_minutes and time.monotonic() > renew:
+                    request(0x54, 8, args.reset_minutes)
+                    renew = time.monotonic() + 600
+                time.sleep(.25)
+            except usb.core.USBError as error:
+                # Windows re-enumerates the device after selective suspend (or a 0x4e read
+                # on salami); the loader monitor and XNU keep running.
                 log.flush()
-                last_total = total
-                for m in re.finditer(rb'FUXI TOUR: shot (\d+) ([a-z-]+)\n', tour_tail):
-                    if m.group(1) not in tour_done:
-                        tour_done.add(m.group(1))
-                        shot_start = time.monotonic()
-                        save_framebuffer('framebuffer-shot%s-%s' % (m.group(1).decode(), m.group(2).decode()))
-                        print('tour shot', m.group(1).decode(), m.group(2).decode(), 'saved in %.1f s' % (time.monotonic()-shot_start), flush=True)
-            if args.display_poll:
-                status['display'] = display_poll()
-            progress.write(json.dumps(status)+'\n')
-            progress.flush()
-            brief = {k: status[k] for k in ('stage','kernel_stage','kernel_label','console_total','error') if k in status}
-            if brief != previous:
-                print(brief, flush=True)
-                previous = brief
-            if status['stage'] == 99:
-                break
-            if cpu_at and time.monotonic() - handoff >= cpu_at[0][0]:
-                try:  # never let a thermal-lane request end the console log
-                    cpu_apply(cpu_at.pop(0)[1], thermal_events)
-                except Exception as e:
-                    print('cpu level change failed:', e, flush=True)
-                (args.out / 'thermal-events.json').write_text(json.dumps(thermal_events, indent=1) + '\n')
-            if thermal_file and time.monotonic() >= next_thermal:
-                next_thermal = max(next_thermal + args.thermal_log, time.monotonic())
-                try:
-                    t = thermal_sample()
-                except usb.core.USBError as e:
-                    t = {'error': str(e), 'temps': {}, 'invalid': [], 'cpu': []}
-                t['time'] = time.time()
-                t['since_handoff'] = round(time.monotonic() - handoff, 1)
-                t['kernel_label'] = status.get('kernel_label')
-                thermal_file.write(json.dumps(t) + '\n'); thermal_file.flush()
-                print('thermal +%ds' % t['since_handoff'], thermal_brief(t), flush=True)
-            if args.reset_minutes and time.monotonic() > renew:
-                request(0x54, 8, args.reset_minutes)
-                renew = time.monotonic() + 600
-            time.sleep(.25)
+                if outage is None:  # one outage lasts until a poll completes again
+                    outage = time.monotonic()
+                progress.write(json.dumps({'usb_error': str(error), 'console_read': last_total,
+                                           'partial_status': status, 'time': time.time()}) + '\n')
+                progress.flush()
+                back = (reconnect(error, outage + args.reconnect_seconds)
+                        if args.reconnect_seconds > 0 else None)
+                if back is None:
+                    raise
+                progress.write(json.dumps({'usb_reconnect': back, 'outage_s': round(time.monotonic() - outage, 1),
+                                           'console_read': last_total, 'time': time.time()}) + '\n')
+                progress.flush()
+                catch_up = True
+                renew = 0  # renew the reset deadline at the end of the next poll
     (args.out/'display-after.bin').write_bytes(request(0x42,432))
     if args.framebuffer:
         save_framebuffer('framebuffer')

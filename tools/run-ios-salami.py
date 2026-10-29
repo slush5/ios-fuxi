@@ -45,7 +45,9 @@ Checks (all fail closed, before the phone leaves Android):
         (string sweetlogo_pa) draws kernel text for sweetfb_verbose_secs, then
         the loader's Apple logo until iOS draws. A kernel without 0115 only
         gets a warning: its text covers the loader logo for the whole boot;
-  * the payload cmdline has no fuxipanel120=1 (Xiaomi M3 panel DCS sequence), and
+  * the payload cmdline has no fuxipanel120=1 (Xiaomi M3 panel DCS sequence), no
+    fuxiperf=1 (the fuxi_perf governor: EPSS writes and TSENS reads, unproven on
+    salami, perf_plan.md tier 3), and
     ufsrw / rootrw with any nonzero, bare or unparsable value (PE_parse_boot_argn
     semantics) need --allow-rw (only after a read-only boot logged
     'FUXI UFS: root file in userdata: N extents' with the expected N).
@@ -273,6 +275,12 @@ def check_cmdline(cmdline, allow_rw):
     if not kicks:
         print('warning: payload cmdline has no fuxikick; the salami kernel default 0 (no MDSS '
               'access) applies. Add fuxikick=0 to document it.', flush=True)
+    # fuxi_perf_start runs the governor only when fuxiperf reads as the integer 1.
+    perf = [n if v is None else f'{n}={v}' for n, v in args if n == 'fuxiperf' and boot_arg_int(v) == 1]
+    if perf:
+        fail(f'payload cmdline has {" ".join(perf)}: the fuxi_perf governor writes EPSS perf states and '
+             f'reads TSENS from XNU, and these EPSS/TSENS accesses are unproven on salami (perf_plan.md '
+             f'tier 3: probe stage P1 and the read-only P2 boot come first)')
     if any(n == 'rootrw' and boot_arg_on(v) for n, v in args) and not allow_rw:
         fail('payload cmdline has rootrw (root mounted read-write); pass --allow-rw (the proven '
              'salami boot uses ufsrw=1 rootrw=1, writes bounded to the pinned extents)')

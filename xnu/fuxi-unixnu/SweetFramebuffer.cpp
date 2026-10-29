@@ -561,7 +561,8 @@ sweet_fb_tegate_configure(AppleCLCD *fb)
   te->budget = te->period < cap ? te->period : cap;
   te->now = mach_absolute_time;
   te->sleep_until = sweet_fb_te_sleep;
-  te->read_line = sweet_fb_te_read;
+  /* Last (release): the armed vsync tick and present() test read_line (acquire) before any other field. */
+  fuxi_unixnu_te_publish(te, sweet_fb_te_read);
  }
  uint64_t earlyNs = 0;
  absolutetime_to_nanoseconds(te->early, &earlyNs);
@@ -800,7 +801,7 @@ sweet_fb_rearm(AppleCLCD *fb, IOTimerEventSource *sender)
 		 * sweetfb_tegate: each tick lands just before a counter window (fuxi_unixnu_te_tick). */
 		uint64_t now = mach_absolute_time();
   if (!(fb->fScanout || fb->fWakePresent) || now >= fb->fNextTick)
-   fb->fNextTick = fb->fTeGate.read_line && !fb->fTeGate.disabled ? fuxi_unixnu_te_tick(&fb->fTeGate) :
+   fb->fNextTick = fuxi_unixnu_te_on(&fb->fTeGate) ? fuxi_unixnu_te_tick(&fb->fTeGate) :
        fuxi_unixnu_next_tick(fb->fNextTick, fb->fTickAbs, now);
 		sender->wakeAtTime(kIOTimeOptionsWithLeeway, fb->fNextTick, 0);
 		return;
@@ -815,7 +816,7 @@ sweet_fb_rearm(AppleCLCD *fb, IOTimerEventSource *sender)
 	}
 	uint64_t now = mach_absolute_time();
  if (!(fb->fScanout || fb->fWakePresent) || now >= fb->fNextTick)
-  fb->fNextTick = fb->fTeGate.read_line && !fb->fTeGate.disabled ? fuxi_unixnu_te_tick(&fb->fTeGate) :
+  fb->fNextTick = fuxi_unixnu_te_on(&fb->fTeGate) ? fuxi_unixnu_te_tick(&fb->fTeGate) :
       fuxi_unixnu_next_tick(fb->fNextTick, fb->fTickAbs, now);
 	sender->wakeAtTime(kIOTimeOptionsWithLeeway, fb->fNextTick, 0);
 	IOLockUnlock(fb->fLock);
@@ -1393,7 +1394,7 @@ AppleCLCD::present(const SwapRecord &record)
 			}
 #if defined(FUXI)
 			/* sweetfb_tegate: once per frame, before the first CPU store into the panel buffer. */
-			if (copied != 2 && !refused && !teGated && fTeGate.read_line && !fTeGate.disabled) {
+			if (copied != 2 && !refused && !teGated && fuxi_unixnu_te_on(&fTeGate)) {
 				teGated = true;
 				teWait = fuxi_unixnu_te_gate(&fTeGate);
 				if (fTeGate.disabled)

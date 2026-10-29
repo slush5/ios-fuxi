@@ -77,6 +77,27 @@ struct fuxi_unixnu_te {
 	uint32_t hits, misses, streak, disabled;
 };
 
+/*
+ * The gate is configured while other threads may already test it (the vsync
+ * timer is armed before calibration). The configuring thread stores every
+ * other field first and read_line last, with release order
+ * (fuxi_unixnu_te_publish); users test it with an acquire load
+ * (fuxi_unixnu_te_on) before reading any other field, so a gate seen set is
+ * seen fully configured. read_line never changes once set.
+ */
+static inline void
+fuxi_unixnu_te_publish(struct fuxi_unixnu_te *te, uint32_t (*fn)(void))
+{
+	__atomic_store_n(&te->read_line, fn, __ATOMIC_RELEASE);
+}
+
+/* 1: published and not disabled. */
+static inline int
+fuxi_unixnu_te_on(const struct fuxi_unixnu_te *te)
+{
+	return __atomic_load_n(&te->read_line, __ATOMIC_ACQUIRE) && !te->disabled;
+}
+
 static inline void
 fuxi_unixnu_te_sample(struct fuxi_unixnu_te_cal *c, uint64_t now, uint32_t line)
 {
