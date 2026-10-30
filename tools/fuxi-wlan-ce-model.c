@@ -84,6 +84,11 @@ test_printf(const char *fmt, ...)
 
 static void model_event(char kind);
 #define WLCE_RDP_LOAD(ce, id) (model_event('L'), (ce)->rdp[(id)])
+/* C2c: every device-written word of the RX arena is a load the read barrier must follow; the one host pointer
+ * publish into it (wrp[0]) is checked when it happens (model_rx_publish) */
+#define WLRX_LOAD(p) (model_event('L'), *(p))
+static void model_rx_publish(volatile uint32_t *p, uint32_t v);
+#define WLRX_PUBLISH(p, v) model_rx_publish((p), (v))
 #include "fuxi_wlan_ce.h"
 
 /* ---- what the production excerpts expect from fuxi_wlan.c ---- */
@@ -99,6 +104,7 @@ static unsigned wl15_variant, wl12_stage, wl_w11_error, wl_seq_flags;
 static bool wl_w15, wl_w12, wl_w11_ok, wl_w11_attempted, wl_mhi_valid;
 static uint64_t wl_iova_next, wl_iova_base = 0xa0000000ull, wl_iova_end = 0xb0000000ull;
 static struct wl_dma wl_ce_arena, wl_msi_sink, wl_tables, wl_rxvectors, wl_rddm, wl_target[WL_TARGET_MAX];
+static struct wl_dma wl_rx_arena, wl_link_arena;  /* C2c */
 static struct wl_dma wl14_regdb, wl14_bdf, wl14_m3, wl_ipcr, wl_contexts, wl_vectors, wl_amss, wl_image;
 static uint32_t wl_mrd(uint32_t off);
 static void wl_mwr(uint32_t off, uint32_t v);
@@ -183,6 +189,36 @@ struct cfg {
 	bool dbs_same_pdev;                 /* both DBS PHYs report dbs_pdev */
 	bool ext_single_only;               /* EXT lists SINGLE alone: no preferred-mode PHY (L19's fw_pdev[0] stays 0) */
 	unsigned on_line;                   /* a device-side action when a given line is printed (model_line) */
+	/* C2c */
+	unsigned rx_rule;                   /* MGMT_RX: 0 always (C2), 1 needs links, 2 buffers and links, 3 buffers, 4 chain masks, 5 never */
+	uint32_t wbm_pre[9];                /* what the nine WBM pre-reads return (D1) */
+	unsigned wbm_rb_bad;                /* 1 BASE_LSB, 2 MISC reads back wrong */
+	unsigned wbm_fault_after;           /* fw_faults latched after that many ring 120 writes */
+	bool r2_unreadable;                 /* R2 HP/TP read ~0u at the watches */
+	bool rx_alloc_fail, link_map_fail;  /* the RX arena allocation / the link arena map fails */
+	bool late_write;                    /* RXDMA writes a posted buffer during containment, before bus master off */
+	bool links_used;                    /* each received frame takes a link descriptor (with 0x200) */
+	unsigned links_returned;            /* link descriptors WBM puts back on ring 120 (writes the ring, moves R2 HP) */
+	uint32_t rx_take, rx_post[2];       /* refill entries the firmware takes at setup, and posts to each MAC ring */
+	unsigned rx_frames;                 /* frames RXDMA receives per channel (mac0 on 2.4 GHz, mac1 on 5 GHz) */
+	unsigned rx_frames_ch0;             /* extra frames on channel 0 (mac0) */
+	uint32_t mac_rbm, mac_cookie_xor;   /* MAC ring entries the firmware writes: RBM override (0 = as taken), cookie XOR */
+	unsigned mac_foreign;               /* MAC0 foreign entries, posted last: in turn 64 bytes into a slot, the start of
+	                                     * never-posted slot 4095, a posted slot's start with address bits 39:32 = 1 */
+	unsigned guard_on_sring;            /* the W11 guard fails once the firmware took that SRING_SETUP (1..4) */
+	uint32_t ci_tx;                     /* CHAN_INFO START tx-frame (D4) */
+	uint32_t stats_tx_frame;            /* the pdev stats base tx-frame (D4), every other tx counter 0 */
+	uint32_t phy_rx_mask;               /* the MAC/PHY caps' rx chain mask, ANDed with the tx one (0 = the same) */
+	unsigned setup_delay;               /* the firmware takes and posts refill entries this many ms after the 4th SRING_SETUP */
+	unsigned ce4_inflight;              /* at the HTT version line CE4 shows 16 sends in flight */
+	unsigned spill;                     /* bit 0 a slot's upper half, bit 1 slot 4095, bit 2 the tail's start, bit 3 the
+	                                     * tail's end, bit 4 the gaps (rdp[170], 0x1c040) */
+	bool write32;                       /* frames write bytes 32..35 only */
+	unsigned err_n;                     /* RXDMA error entries pushed during the scan, code err_code, RBM err_rbm */
+	uint32_t err_code, err_rbm;
+	uint32_t rdp_err_raw;               /* rdp[186] written raw (bad) at channel 5 */
+	uint32_t refill_tp_raw[2];          /* rdp[160] rewritten raw at channel 3 and channel 30 (backwards / past hp) */
+	unsigned take_more;                 /* refill entries taken during the scan and kept (kept rises) */
 };
 static struct cfg C;
 static unsigned restores;
@@ -202,6 +238,8 @@ static unsigned fw_c2_step, fw_chan_seen, fw_chan_cmds, fw_scan_cmds, fw_stop_cm
 static unsigned fw_stats_req;
 static uint64_t fw_stats_at;
 static uint32_t fw_stats_pdev = 1;  /* the pdev the last REQUEST_STATS named; UPDATE_STATS carries it back */
+static uint32_t fw_cmd_log[64];
+static unsigned fw_cmd_n;
 struct mbeacon { unsigned idx; uint32_t rx_channel, snr, status, chan_freq, mode, len; uint8_t f[400]; };
 static struct mbeacon beacons[96];
 static unsigned n_beacons;
@@ -269,6 +307,8 @@ model_reg_ok(uint32_t off)
 static void q_push(unsigned ce, uint32_t delay, const uint8_t *d, uint32_t len, int stslen);
 static void fw_rx(unsigned ce, uint32_t eid, const uint8_t *d, uint32_t len);
 static void fw_rings_ready(void);
+static void dev_acts(void);
+static void wbm_access(uint32_t off, bool wr, uint32_t *v, bool shadow);
 
 static void
 write_rdp(struct dring *r, uint32_t v)
@@ -401,6 +441,7 @@ deliver(const struct qmsg *m)
 static void
 dev_tick(void)
 {
+	dev_acts();  /* C2c: RXDMA, WBM and the firmware's ring use, in time order */
 	while (q_head != q_tail && q[q_head % 512].due <= now && deliver(&q[q_head % 512])) { q_head++; }
 	if (C.rdp_glitch == 1 && fw_ready_sent && q_head) { write_rdp(&dr[4], 4096); }
 	if (C.rdp_glitch == 2 && fw_ready_sent && q_head) { write_rdp(&dr[4], 63u * 4u); }
@@ -482,9 +523,10 @@ fw_rings_ready(void)
 static void
 m_mac_phy(uint32_t hw_mode, uint32_t phy, uint32_t bands, uint32_t mask)
 {
+	const uint32_t rxm = C.phy_rx_mask ? C.phy_rx_mask & mask : mask;  /* C2c: the rx mask apart from the tx one */
 	m_tlv(0x210, 108); m_u32(hw_mode); m_u32(hw_mode ? C.dbs_pdev + (C.dbs_same_pdev ? 0u : phy) : 1u); m_u32(phy); m_u32(0);
 	m_u32(bands); m_zero(7 * 4);
-	m_u32(mask); m_u32(mask); m_zero(6 * 4); m_u32(mask); m_u32(mask); m_zero(5 * 4);
+	m_u32(mask); m_u32(rxm); m_zero(6 * 4); m_u32(mask); m_u32(rxm); m_zero(5 * 4);
 }
 
 static void
@@ -594,6 +636,361 @@ fw_refund(unsigned need, uint32_t delay)
 	q_push(2, delay, d, 16, -1);
 }
 
+/* ---- C2c device: the RX and link arenas, WBM ring 120, RXDMA and the firmware's use of the rings ----
+ * Written down here again from L19 and rx_path_plan.md 2.5-2.7 (not taken from the header): the arena layout and
+ * the device's permission per region (a device read of an unposted half or slot, a write to a host-only word, or
+ * any access outside the arenas fails the test, except the injected spills), the four SRING_SETUP words, the WBM
+ * pre-read and write order, the idle and refill entries the host must have written before each publish. */
+#define RXA 0x1040000u
+#define LNA 0x440000u
+#define M_IDLE_R0 0x00a34d3cu
+#define M_IDLE_HP 0x00a370b8u
+static const uint32_t m_pre_addr[9] = { M_IDLE_R0, M_IDLE_R0 + 4u, M_IDLE_R0 + 0x10u, M_IDLE_HP, M_IDLE_HP + 4u, 0x00a34240u,
+	0x00a34244u, 0x00a34250u, 0x00a34254u };
+static const uint32_t m_wbm_waddr[8] = { M_IDLE_R0, M_IDLE_R0 + 4u, M_IDLE_R0 + 8u, M_IDLE_R0 + 0x30u, M_IDLE_R0 + 0x34u,
+	M_IDLE_HP, M_IDLE_HP + 4u, M_IDLE_R0 + 0x10u };
+static const uint32_t m_mac_off[2] = { 0xc000u, 0x10000u }, m_mac_id[2] = { 161u, 169u };
+static uint8_t *rx_host, *ln_host;
+static uint64_t rx_iova, ln_iova;
+static bool rx_mapped, ln_mapped, rx_pub, smmu_undone, fw_rx_ready, idle_live, idle_pub, rx_inject;
+static unsigned rx_allocs, rx_frees, ln_allocs, ln_frees, wbm_reads, wbm_writes, wbm_rbs, wbm_watch_reads, wbm_pubs;
+static unsigned fw_sring_n, fw_pset_n, fw_frames_written, fw_nobuf, fw_links, fw_taken_n, fw_posted_n, fw_htt_conf_q;
+static uint32_t m_idle_hp, m_idle_tp, fw_refill_tp, fw_mac_hp[2], fw_mac_tp[2], fw_err_hp, fw_pset_w[2][4];
+static uint32_t fw_taken[4096][2];
+static uint8_t slot_listed[4096];
+static uint32_t wbm_log[64][3];
+static unsigned wbm_log_n;
+struct dact { uint64_t due; unsigned kind; uint32_t a, b; };
+static struct dact acts[256];
+static unsigned n_acts, acts_done;
+enum { A_FRAMES, A_ERR, A_SPILL, A_RDP, A_TAKE, A_SETUP };
+/* What RXDMA writes from a received frame (into buffers, link descriptors, error-entry frame fields): no log line may
+ * show any of it (the owner rule: counts only). The error entry's frame fields (L19 hal_desc.h:1033, 1039, 1044):
+ * MPDU byte count 0x2bad in w5 21:8, fragment 0xb in w6 10:7, sequence 0x5ee in w6 30:19. */
+#define M_FRAME_WORD 0x5eedf00du
+#define M_ERR_W5 (0x00c00000u | 0x2badu << 8)            /* DEST_IND 3 | the byte count */
+#define M_ERR_W6_FRAME (0xbu << 7 | 0x5eeu << 19)
+#define M_ERR_W6_KEEP (1u << 13)                          /* SW_EXCEPTION_RING_VLD: not from the frame */
+
+static void act(uint64_t due, unsigned kind, uint32_t a, uint32_t b) { CHECK(n_acts < 256, "model actions"); acts[n_acts++] = (struct dact){ due, kind, a, b }; }
+
+/* A device access to the RX arena by offset, checked against what the device may do there. */
+static uint8_t *
+rxd(uint32_t off, uint32_t len, bool wr, const char *what)
+{
+	bool ok = false;
+	CHECK(rx_host && rx_mapped && (epcmd & 4u), "RX arena DMA unmapped or with bus mastering off");
+	CHECK(len && off + len <= RXA, what);
+	if (off < 0x400u) {
+		ok = wr && len == 4 && (off == 4u * 160u || off == 4u * 161u || off == 4u * 169u || off == 4u * 186u);
+	} else if (off < 0x400u + 4u * 47u) {
+		uint32_t i = (off - 0x400u) / 4u;
+		ok = len == 4 && !(off & 3u) && (wr ? i == 1 || i == 9 : i == 0 || i == 1 || i == 9 || i == 26);
+	} else if (off >= 0x4000u && off + len <= 0xc000u) {
+		ok = !wr;
+	} else if (off >= 0xc000u && off + len <= 0x14000u) {
+		ok = true;
+	} else if (off >= 0x14000u && off + len <= 0x1c000u) {
+		ok = wr;
+	} else if (off >= 0x20000u && off < 0x1020000u) {
+		uint32_t slot = (off - 0x20000u) / 0x1000u, o = (off - 0x20000u) % 0x1000u;
+		ok = wr && slot < 4095u && o + len <= 2048u;
+	}
+	CHECK(ok || rx_inject, what);
+	return rx_host + off;
+}
+
+/* A device access to the link arena: ring 120 read/write, listed descriptors read/write, slot 32767 never. */
+static uint8_t *
+lnd(uint32_t off, uint32_t len, const char *what)
+{
+	CHECK(ln_host && ln_mapped && (epcmd & 4u) && idle_pub, "link arena DMA unmapped, unpublished or with bus mastering off");
+	CHECK(len && (off + len <= 0x40000u || (off >= 0x40000u && off + len <= LNA && (off - 0x40000u) / 128u < 32767u &&
+	    (off - 0x40000u) / 128u == (off + len - 1u - 0x40000u) / 128u)), what);
+	return ln_host + off;
+}
+
+/* The host's one pointer publish into the RX arena: wrp[0] = 8190 right after the write barrier, with every refill
+ * entry, sentinel and zero word in place, and before any SRING_SETUP. */
+static void
+model_rx_publish(volatile uint32_t *p, uint32_t v)
+{
+	CHECK(rx_host && (uintptr_t)p == (uintptr_t)(rx_host + 0x400u), "a host pointer publish into the RX arena other than wrp[0]");
+	CHECK(last_ev == 'W', "wrp[0] published without the write barrier right before it");
+	CHECK(!rx_pub && !fw_sring_n && !wl_rx.stopping, "wrp[0] published twice, after an SRING_SETUP or after the containment latch");
+	CHECK(v == 8190u, "wrp[0] is not 4095 entries in words");
+	for (uint32_t o = 0; o < 0x20000u; o++) {
+		if (o >= 0x4000u && o < 0x4000u + 8u * 4095u) { continue; }
+		CHECK(!rx_host[o], "rdp, wrp, a ring or a gap not zero at the wrp[0] publish");
+	}
+	for (uint32_t k = 0; k < 4096u; k++) {
+		const uint8_t *s = rx_host + 0x20000u + 0x1000u * k;
+		uint64_t a = rx_iova + 0x20000u + 0x1000ull * k;
+		if (k < 4095u) {
+			const uint8_t *e = rx_host + 0x4000u + 8u * k;
+			CHECK(g32(e) == (uint32_t)a && g32(e + 4) == (((uint32_t)(a >> 32) & 0xffu) | 6u << 8 | k << 12),
+			    "refill entry not in place at the wrp[0] publish");
+		}
+		for (unsigned j = 0; j < 4096u; j++) { CHECK(s[j] == (k < 4095u && j < 64u ? 0xa5u : 0u), "sentinel or zero not in place at the wrp[0] publish"); }
+	}
+	for (uint32_t o = 0x1020000u; o < RXA; o++) { CHECK(!rx_host[o], "tail not zero at the wrp[0] publish"); }
+	*p = v;
+	rx_pub = true;
+}
+
+static bool
+m_refused(void)  /* the pre-reads (D1): ~0u anywhere, SRNG_ENABLE, a ring base, scatter mode: no WBM write */
+{
+	for (unsigned i = 0; i < 9; i++) { if (C.wbm_pre[i] == ~0u) { return true; } }
+	return (C.wbm_pre[2] & 0x40u) || C.wbm_pre[0] || (C.wbm_pre[1] & 0xffu) || (C.wbm_pre[5] & 2u);
+}
+
+/* WBM ring 120: the nine pre-reads in order, then (unless they refuse) the eight writes in L19's order with L19's
+ * values, BASE_LSB and MISC read back, one HP publish of 65534 (shadow 19, or R2 with fuxiwlanw15=1) right after the
+ * write barrier with all 32767 entries in place, then R2 HP/TP reads at the watches; nothing after wl26_contain. */
+static void
+wbm_access(uint32_t off, bool wr, uint32_t *v, bool shadow)
+{
+	CHECK(!wl_rx.stopping, "a WBM access after wl26_contain");
+	CHECK(wl20_bits & WL20_IDLELINK, "a WBM access without w20 0x200");
+	if (wbm_log_n < 64) { wbm_log[wbm_log_n][0] = off; wbm_log[wbm_log_n][1] = wr ? *v : 0u; wbm_log[wbm_log_n][2] = wr | (shadow ? 2u : 0u); wbm_log_n++; }
+	if (!wr) {
+		CHECK(!shadow, "model: shadow read");
+		if (!wbm_writes && wbm_reads < 9u) {
+			CHECK(off == m_pre_addr[wbm_reads], "a WBM read before or outside the nine pre-reads, or out of their order");
+			*v = C.wbm_pre[wbm_reads++];
+			return;
+		}
+		CHECK(wbm_writes == 8u, "a WBM read after a refusal or in the middle of the ring 120 writes");
+		if (wbm_rbs < 2u) {
+			CHECK(off == (wbm_rbs ? M_IDLE_R0 + 0x10u : M_IDLE_R0), "the readback is not BASE_LSB, then MISC");
+			*v = wbm_rbs ? (C.wbm_rb_bad == 2 ? 0x03u : 0x43u) : (uint32_t)ln_iova ^ (C.wbm_rb_bad == 1 ? 0x1000u : 0u);
+			wbm_rbs++;
+			return;
+		}
+		CHECK(idle_pub && (off == M_IDLE_HP || off == M_IDLE_HP + 4u), "a WBM read other than R2 HP/TP after the setup");
+		*v = C.r2_unreadable ? ~0u : off == M_IDLE_HP ? m_idle_hp : m_idle_tp;
+		wbm_watch_reads++;
+		return;
+	}
+	if (wbm_writes < 8u) {
+		const uint32_t want[8] = { (uint32_t)ln_iova, 0x01000000u, 2u, 0x01000002u, 0u, 0u, 0u, 0x43u };
+		CHECK(wbm_reads == 9u && !m_refused(), "a WBM write before the nine pre-reads, or although they refuse");
+		CHECK(!(C.wbm_fault_after && wbm_writes >= C.wbm_fault_after), "a WBM write after the latched fault");
+		if (shadow || off != m_wbm_waddr[wbm_writes] || *v != want[wbm_writes]) {
+			fprintf(stderr, "ring 120 write %u: %#x = %#x (shadow %u), want %#x = %#x\n", wbm_writes, off, *v, shadow,
+			    m_wbm_waddr[wbm_writes], want[wbm_writes]);
+			fail("ring 120 write order or value is not L19's");
+		}
+		wbm_writes++;
+		if (C.wbm_fault_after && wbm_writes == C.wbm_fault_after) { fw_faults++; }
+		idle_live = wbm_writes == 8u;
+		return;
+	}
+	CHECK(off == M_IDLE_HP && wbm_rbs == 2u && !idle_pub, "a WBM write after the setup other than the one HP publish");
+	CHECK(shadow == !wl15_variant, "idle HP published by the wrong route for the shadow mode");
+	model_event('P');
+	CHECK(*v == 65534u, "idle HP is not 32767 entries in words");
+	for (uint32_t i = 0; i < 32768u; i++) {
+		const uint8_t *e = ln_host + 8u * i;
+		uint64_t a = ln_iova + 0x40000u + 128ull * i;
+		uint32_t cookie = ((32766u - i) + 0x4000u) << 3;
+		if (i < 32767u) {
+			CHECK(g32(e) == (uint32_t)a && g32(e + 4) == (((uint32_t)(a >> 32) & 0xffu) | 1u << 8 | cookie << 12),
+			    "idle entry not in place at the HP publish");
+		} else { CHECK(!g32(e) && !g32(e + 4), "idle entry 32767 listed"); }
+	}
+	for (uint32_t o = 0x40000u; o < LNA; o++) { CHECK(!ln_host[o], "link descriptors not zero at the HP publish"); }
+	idle_pub = true; m_idle_hp = *v; m_idle_tp = 0; wbm_pubs++;
+}
+
+/* SRING_SETUP words for the RX arena at rx_iova (rx_path_plan.md 2.6.2, the verifier's table), written down again. */
+static void
+m_sring_want(unsigned i, uint32_t *w)
+{
+	static const uint32_t t[4][7] = {
+		{ 0x0205000bu, 0x04000u, 0x00022000u, 0x400u, 0x280u, 0x003e0000u, 0x400u },
+		{ 0x0100010bu, 0x0c000u, 0x02021000u, 0x404u, 0x284u, 0x003e0000u, 0x200u },
+		{ 0x0100020bu, 0x10000u, 0x02021000u, 0x424u, 0x2a4u, 0x003e0000u, 0x200u },
+		{ 0x0007010bu, 0x14000u, 0x00082000u, 0x2e8u, 0x468u, 0x00200008u, 0x000u },
+	};
+	memset(w, 0, 13 * 4);
+	w[0] = t[i][0]; w[1] = (uint32_t)rx_iova + t[i][1]; w[3] = t[i][2]; w[4] = (uint32_t)rx_iova + t[i][3];
+	w[6] = (uint32_t)rx_iova + t[i][4]; w[11] = t[i][5]; w[12] = t[i][6];
+}
+
+static void
+fw_mac_post(unsigned m, const uint32_t *e)
+{
+	uint8_t *d;
+	CHECK((fw_mac_hp[m] + 2u) % 4096u != fw_mac_tp[m], "model: MAC ring full");
+	d = rxd(m_mac_off[m] + 4u * fw_mac_hp[m], 8, true, "MAC ring entry");
+	p32(d, e[0]); p32(d + 4, e[1]);
+	fw_mac_hp[m] = (fw_mac_hp[m] + 2u) % 4096u;
+	p32(rxd(0x400u + 4u * (m_mac_id[m] - 160u), 4, true, "wrp of a MAC ring"), fw_mac_hp[m]);
+}
+
+/* The firmware takes N refill entries at the TP: each the start of a posted slot, RBM 6, cookie = slot, once. */
+static void
+fw_take(unsigned n)
+{
+	for (unsigned k = 0; k < n; k++) {
+		const uint8_t *e = rxd(0x4000u + 4u * fw_refill_tp, 8, false, "refill entry");
+		uint32_t w0 = g32(e), w1 = g32(e + 4), slot = (w0 - (uint32_t)rx_iova - 0x20000u) / 0x1000u;
+		CHECK(fw_refill_tp != 8190u, "model: a take past the refill HP");
+		CHECK(w0 >= (uint32_t)rx_iova + 0x20000u && !((w0 - (uint32_t)rx_iova - 0x20000u) % 0x1000u) && slot < 4095u &&
+		    !(w1 & 0xffu), "refill entry is not the start of a posted slot");
+		CHECK(((w1 >> 8) & 0xfu) == 6u && (w1 >> 12) == slot, "refill entry RBM or cookie");
+		CHECK(!slot_listed[slot]++, "a slot listed twice");
+		fw_taken[fw_taken_n][0] = w0; fw_taken[fw_taken_n][1] = w1; fw_taken_n++;
+		fw_refill_tp += 2u;
+	}
+	if (n) { p32(rxd(4u * 160u, 4, true, "rdp[160]"), fw_refill_tp); }
+}
+
+/* After the 4th SRING_SETUP: wrp[0] read, C.rx_take entries taken, C.rx_post[m] of them written to each MAC ring
+ * (RBM / cookie as given), then C.mac_foreign foreign entries on mac0 (64 bytes into a slot, slot 4095's start, a
+ * posted slot's start with address bits 39:32 = 1, in turn: foreign by address alone, 2.8). */
+static void
+fw_rx_setup(void)
+{
+	CHECK(!fw_rx_ready && fw_sring_n == 4, "model: refill taken before the 4th SRING_SETUP or twice");
+	CHECK(g32(rxd(0x400u, 4, false, "wrp[0]")) == 8190u, "refill HP is not 4095 entries");
+	fw_take(C.rx_take);
+	for (unsigned m = 0; m < 2; m++) {
+		for (unsigned j = 0; j < C.rx_post[m]; j++) {
+			uint32_t e[2] = { fw_taken[fw_posted_n][0], fw_taken[fw_posted_n][1] };
+			if (C.mac_rbm) { e[1] = (e[1] & ~0xf00u) | C.mac_rbm << 8; }
+			e[1] ^= C.mac_cookie_xor << 12;
+			fw_mac_post(m, e);
+			fw_posted_n++;
+		}
+	}
+	for (unsigned j = 0; j < C.mac_foreign; j++) {
+		const uint32_t slot = j % 3u == 1u ? 4095u : 5u + j;
+		const uint32_t e[2] = { (uint32_t)rx_iova + 0x20000u + 0x1000u * slot + (j % 3u ? 0u : 64u),
+		    6u << 8 | slot << 12 | (j % 3u == 2u ? 1u : 0u) };
+		fw_mac_post(0, e);
+	}
+	fw_rx_ready = true;
+}
+
+static void
+fw_sring(const uint8_t *pl, uint32_t plen)
+{
+	uint32_t want[13];
+	CHECK(wl20_bits & WL20_RXRING, "SRING_SETUP without w20 0x100");
+	CHECK(plen == 52 && fw_sring_n < 4, "SRING_SETUP length, or more than four");
+	CHECK(fw_htt_req == 1 && q_head > fw_htt_conf_q && fw_c2_step == 0 && !fw_chan_cmds && !fw_pset_n,
+	    "SRING_SETUP before VERSION_CONF reached the host, or after the channel list or the chain masks");
+	CHECK(rx_pub && (!(wl20_bits & WL20_IDLELINK) || idle_pub || m_refused()), "SRING_SETUP before wrp[0] or the idle HP");
+	m_sring_want(fw_sring_n, want);
+	for (unsigned k = 0; k < 13; k++) {
+		if (g32(pl + 4 * k) != want[k]) {
+			fprintf(stderr, "SRING_SETUP %u word %u = %#x, want %#x\n", fw_sring_n, k, g32(pl + 4 * k), want[k]);
+			fail("SRING_SETUP word");
+		}
+	}
+	CHECK(!(g32(pl + 48) & (1u << 19)), "SRING_SETUP with RESPONSE_REQUIRED");
+	fw_sring_n++;
+	if (C.guard_on_sring == fw_sring_n) { guard_bad = true; }
+	if (fw_sring_n == 4) {
+		if (C.setup_delay) { act(now + C.setup_delay, A_SETUP, 0, 0); }  /* the host's 100 ms look must wait for it */
+		else { fw_rx_setup(); }
+	}
+}
+
+/* One frame RXDMA receives for MAC M: the next buffer of its MAC ring (bytes 0..255, or 32..35), with 0x200 a link
+ * descriptor from ring 120 (WBM may put back the first C.links_returned). No buffer: counted, nothing written. */
+static void
+fw_rx_frame(unsigned m)
+{
+	if (fw_rx_ready) {
+		if (fw_mac_tp[m] == fw_mac_hp[m]) { fw_nobuf++; }
+		else {
+			const uint8_t *e = rxd(m_mac_off[m] + 4u * fw_mac_tp[m], 8, false, "MAC ring entry");
+			uint32_t a = g32(e), slot = (a - (uint32_t)rx_iova - 0x20000u) / 0x1000u;
+			CHECK(a >= (uint32_t)rx_iova + 0x20000u && !((a - (uint32_t)rx_iova - 0x20000u) % 0x1000u) && slot < 4095u,
+			    "model: RXDMA would write to a foreign address");
+			if (C.write32) { p32(rxd(0x20000u + 0x1000u * slot + 32u, 4, true, "frame"), M_FRAME_WORD); }
+			else {
+				uint8_t *f = rxd(0x20000u + 0x1000u * slot, 256, true, "frame");
+				for (unsigned k = 0; k < 256u; k += 4u) { p32(f + k, M_FRAME_WORD); }
+			}
+			fw_mac_tp[m] = (fw_mac_tp[m] + 2u) % 4096u;
+			p32(rxd(4u * m_mac_id[m], 4, true, "rdp of a MAC ring"), fw_mac_tp[m]);
+			fw_frames_written++;
+		}
+	}
+	if (idle_pub && C.links_used && m_idle_tp != m_idle_hp) {
+		const uint8_t *e = lnd(4u * m_idle_tp, 8, "idle entry");
+		uint32_t a = g32(e), w1 = g32(e + 4), d = (a - (uint32_t)ln_iova - 0x40000u) / 128u;
+		CHECK(a >= (uint32_t)ln_iova + 0x40000u && !((a - (uint32_t)ln_iova - 0x40000u) % 128u) && d < 32767u &&
+		    ((w1 >> 8) & 0xfu) == 1u, "idle entry is not a listed 128-byte descriptor with RBM 1");
+		p32(lnd(0x40000u + 128u * d, 4, "link descriptor"), M_FRAME_WORD);
+		m_idle_tp = (m_idle_tp + 2u) % 65536u;
+		if (++fw_links <= C.links_returned) {
+			uint8_t *h = lnd(4u * m_idle_hp, 8, "idle entry return");
+			p32(h, a); p32(h + 4, w1);
+			m_idle_hp = (m_idle_hp + 2u) % 65536u;
+		}
+	}
+}
+
+/* One RXDMA error entry at rdp[186] (struct hal_reo_entrance_ring: w1 RBM 11:8, w5 with the frame's byte count, w6
+ * push 1:0 | code 6:2 with the frame's fragment and sequence numbers). */
+static void
+fw_err_push(void)
+{
+	uint8_t *d;
+	if (!fw_rx_ready || fw_err_hp / 8u >= 1023u) { return; }
+	d = rxd(0x14000u + 4u * fw_err_hp, 32, true, "RXDMA error entry");
+	p32(d, (uint32_t)rx_iova + 0x20000u); p32(d + 4, C.err_rbm << 8); p32(d + 8, 0); p32(d + 12, 0); p32(d + 16, 0);
+	p32(d + 20, M_ERR_W5); p32(d + 24, C.err_code << 2 | M_ERR_W6_FRAME | M_ERR_W6_KEEP); p32(d + 28, 0x7u << 20);
+	fw_err_hp += 8u;
+	p32(rxd(4u * 186u, 4, true, "rdp[186]"), fw_err_hp);
+}
+
+static void
+dev_acts(void)
+{
+	while (acts_done < n_acts && acts[acts_done].due <= now) {
+		const struct dact *x = &acts[acts_done++];
+		if (!(epcmd & 4u)) { continue; }
+		switch (x->kind) {
+		case A_FRAMES: for (unsigned i = 0; i < x->b; i++) { fw_rx_frame(x->a); } break;
+		case A_ERR: for (unsigned i = 0; i < x->a; i++) { fw_err_push(); } break;
+		case A_SPILL:  /* RXDMA writes past what it was given: 4 dwords in slot 7's upper half, 2 in slot 4095, 3 at the
+		                * tail's start, 2 near its end, and in the gaps 1 in rdp[170] and 3 after the error ring */
+			rx_inject = true;
+			if (C.spill & 1u) { memset(rxd(0x20000u + 0x1000u * 7u + 2048u, 16, true, "spill"), 0x33, 16); }
+			if (C.spill & 2u) { memset(rxd(0x20000u + 0x1000u * 4095u + 100u, 8, true, "spill"), 0x33, 8); }
+			if (C.spill & 4u) { memset(rxd(0x1020000u + 0x100u, 12, true, "spill"), 0x33, 12); }
+			if (C.spill & 8u) { memset(rxd(0x103ff00u, 8, true, "spill"), 0x33, 8); }
+			if (C.spill & 16u) { p32(rxd(4u * 170u, 4, true, "spill"), 0x33u); memset(rxd(0x1c040u, 12, true, "spill"), 0x33, 12); }
+			rx_inject = false;
+			break;
+		case A_RDP: rx_inject = true; p32(rxd(4u * x->a, 4, true, "raw rdp"), x->b); rx_inject = false; break;
+		case A_SETUP: fw_rx_setup(); break;
+		default: fw_take(x->a); break;
+		}
+	}
+}
+
+static bool
+fw_rule_ok(void)  /* C.rx_rule: what the firmware needs before it hands MGMT_RX to the host */
+{
+	const bool links = idle_pub, bufs = fw_rx_ready && fw_refill_tp, chain = fw_pset_n == 2;
+	switch (C.rx_rule) {
+	case 0: return true;
+	case 1: return links;
+	case 2: return links && bufs;
+	case 3: return bufs;
+	case 4: return chain;
+	default: return false;
+	}
+}
+
 static void
 fw_scan_event(uint32_t type, uint32_t reason, uint32_t freq, uint32_t vdev, uint32_t at)
 {
@@ -611,7 +1008,8 @@ fw_chan_info(uint32_t flags, uint32_t freq, int32_t nf, unsigned idx, unsigned f
 {
 	uint32_t cycle = 48000000u - 13000u * (idx % 7u), rx = 96000u * frames, busy = 1440000u + rx + 4000u * idx;
 	m_reset(); m_tlv(0x26, 56); m_u32(0); m_u32(freq); m_u32(flags); m_u32((uint32_t)nf);
-	m_u32(flags ? 0u : busy); m_u32(flags ? 0u : cycle); m_zero(2 * 4); m_u32(flags ? 0u : rx); m_zero(3 * 4);
+	m_u32(flags ? 0u : busy); m_u32(flags ? 0u : cycle); m_zero(2 * 4); m_u32(flags ? 0u : rx); m_zero(2 * 4);
+	m_u32(flags ? 0u : C.ci_tx);  /* tx_frame_cnt: 0 unless a C2c scenario sets it (D4) */
 	m_u32(flags ? 0u : 320u); m_u32(0);
 	wmi_out(0x4002, 0, at);
 }
@@ -677,9 +1075,19 @@ fw_scan_script(unsigned n)
 	if (C.scan_mode == 4) { fw_scan_event(1u << 1, 0, 0, 0, t); return; }
 	fw_scan_event(1u << 0, 0, 0, 0, t);
 	if (C.wrong_vdev) { fw_scan_event(1u << 3, 0, 2412, 3, t); }
+	const bool deliver_mgmt = fw_rule_ok();  /* C2c: MGMT_RX only with what the scenario's firmware needs */
 	for (unsigned i = 0; i < n; i++) {
 		uint32_t t0 = 5 + 150 * i, k = 0, heard = 0;
 		for (unsigned j = 0; j < n_beacons; j++) { heard += beacons[j].idx == i; }
+		/* C2c device actions on this channel (RXDMA frames, error entries, spills, raw pointer words, takes) */
+		if (C.rx_frames) { act(now + t0 + 3, A_FRAMES, i < 13 ? 0u : 1u, C.rx_frames); }
+		if (i == 0 && C.rx_frames_ch0) { act(now + t0 + 3, A_FRAMES, 0, C.rx_frames_ch0); }
+		if (i == 1 && C.take_more) { act(now + t0 + 4, A_TAKE, C.take_more, 0); }
+		if (i == 2 && C.err_n) { act(now + t0 + 4, A_ERR, C.err_n, 0); }
+		if (i == 3 && C.refill_tp_raw[0]) { act(now + t0 + 4, A_RDP, 160, C.refill_tp_raw[0]); }
+		if (i == 4 && C.spill) { act(now + t0 + 4, A_SPILL, 0, 0); }
+		if (i == 5 && C.rdp_err_raw) { act(now + t0 + 4, A_RDP, 186, C.rdp_err_raw); }
+		if (i == 30 && C.refill_tp_raw[1]) { act(now + t0 + 4, A_RDP, 160, C.refill_tp_raw[1]); }
 		fw_scan_event(1u << 3, 0, m_chan(i), 0, t0);
 		for (unsigned r = 0; r <= C.ci_repeat; r++) { fw_chan_info(0, m_chan(i), -96 - (int32_t)(i % 5), i, heard, t0 + 1); }
 		if (C.ci_repeat && i == 0) { fw_chan_info(2, m_chan(i), -96, i, heard, t0 + 1); }  /* C2b: flags neither START nor END */
@@ -687,7 +1095,7 @@ fw_scan_script(unsigned n)
 			m_reset(); m_tlv(0x400, 12); m_zero(12); wmi_out(0x402b, 0, t0 + 1);
 		}
 		for (unsigned j = 0; j < n_beacons; j++) {
-			if (beacons[j].idx == i) { fw_mgmt_rx(&beacons[j], t0 + 2 + k++); }
+			if (beacons[j].idx == i && deliver_mgmt) { fw_mgmt_rx(&beacons[j], t0 + 2 + k++); }
 		}
 		fw_chan_info(1, m_chan(i), 0, i, 0, t0 + 148);
 	}
@@ -699,9 +1107,26 @@ fw_c2_cmd(uint32_t id, const uint8_t *pl, uint32_t plen, unsigned need)
 {
 	const uint8_t *v = pl + 8;   /* the fixed TLV's value */
 	uint32_t exp_n = C.exp_n, pdev = C.exp_pdev;
+	const uint32_t rx_mask = C.phy_rx_mask ? C.phy_rx_mask & C.phy_mask : C.phy_mask;  /* the last DBS PHY's, as m_mac_phy */
+	if (id == 0x4003) {  /* C2c W26m: PDEV_SET_PARAM TX then RX chain mask (mac.c:8562-8590, wmi.c:1620-1650) */
+		CHECK(wl20_bits & WL20_CHAINMASK, "PDEV_SET_PARAM without w20 0x400");
+		CHECK(fw_c2_step == 0 && !fw_chan_cmds && fw_pset_n < 2, "PDEV_SET_PARAM after the channel list, or more than two");
+		CHECK((!(wl20_bits & WL20_HTTVER) || (fw_htt_req == 1 && q_head > fw_htt_conf_q)) &&
+		    (!(wl20_bits & WL20_RXRING) || fw_sring_n == 4), "PDEV_SET_PARAM before VERSION_CONF or the four SRING_SETUP");
+		CHECK(plen == 20 && g32(pl + 4) == (0x52u << 16 | 12u) && g32(v) == pdev && g32(v + 4) == fw_pset_n + 1u &&
+		    g32(v + 8) == (fw_pset_n ? rx_mask : C.phy_mask) && C.phy_mask,
+		    "PDEV_SET_PARAM is not {pdev, TX 1 with the PHY tx mask, then RX 2 with its rx mask}");
+		for (unsigned i = 0; i < 4; i++) { fw_pset_w[fw_pset_n][i] = g32(pl + 4 + 4 * i); }
+		fw_pset_n++;
+		fw_refund(need, 1);
+		return;
+	}
 	if (id == 0x3003) {  /* SCAN_CHAN_LIST (wmi.c:2880-2997, reg.c:183-238) */
 		CHECK(fw_init_ok == 1 && (fw_hw_mode_ok == 1 || (wl20_bits & WL20_NOHWMODE)), "channel list before INIT/HW mode");
 		CHECK(!(wl20_bits & WL20_HTTVER) || fw_htt_req == 1, "channel list before the HTT version exchange");
+		CHECK(!(wl20_bits & WL20_RXRING) || fw_sring_n == 4, "channel list before the four SRING_SETUP");
+		CHECK(!(wl20_bits & WL20_CHAINMASK) || !C.phy_mask || !C.phy_bands || fw_pset_n == 2,
+		    "channel list before the two PDEV_SET_PARAM");
 		CHECK(fw_c2_step == 0, "channel list out of order");
 		uint32_t k = g32(v), flags = g32(v + 4);
 		CHECK(g32(pl + 4) == (0x4fu << 16 | 12u) && k && fw_chan_seen + k <= exp_n && g32(v + 8) == pdev,
@@ -721,10 +1146,11 @@ fw_c2_cmd(uint32_t id, const uint8_t *pl, uint32_t plen, unsigned need)
 		if (fw_chan_seen == exp_n) { fw_c2_step = 1; }
 	} else if (id == 0x5001) {  /* VDEV_CREATE (wmi.c:923-1010, mac.c:9727-9780) */
 		static const uint8_t mac[8] = {0x02, 0x46, 0x55, 0x58, 0x49, 0x01, 0, 0};
-		uint32_t tx = (uint32_t)__builtin_popcount(C.phy_mask), want_tx[2];
-		if (!C.phy_bands || !tx) { tx = fw_chains; }
+		uint32_t tx = (uint32_t)__builtin_popcount(C.phy_mask), rx = (uint32_t)__builtin_popcount(rx_mask), want_tx[2], want_rx[2];
+		if (!C.phy_bands || !tx) { tx = rx = fw_chains; }
 		uint32_t bands = C.phy_bands && C.phy_mask ? C.phy_bands : 3u;
 		want_tx[0] = bands & 1 ? tx : 0; want_tx[1] = bands & 2 ? tx : 0;
+		want_rx[0] = bands & 1 ? rx : 0; want_rx[1] = bands & 2 ? rx : 0;
 		CHECK(fw_c2_step == 1, "VDEV_CREATE before the whole channel list");
 		CHECK(plen == 88 && g32(pl + 4) == (0x56u << 16 | 44u) && g32(v) == 0 && g32(v + 4) == 2 && g32(v + 8) == 0,
 		    "VDEV_CREATE length/tag/vdev 0/type STA/subtype 0");
@@ -734,7 +1160,7 @@ fw_c2_cmd(uint32_t id, const uint8_t *pl, uint32_t plen, unsigned need)
 		CHECK(g32(pl + 52) == (0x12u << 16 | 32u), "VDEV_CREATE txrx streams array header");
 		for (unsigned b = 0; b < 2; b++) {
 			const uint8_t *s = pl + 56 + 16 * b;
-			CHECK(g32(s) == (0x19bu << 16 | 12u) && g32(s + 4) == b && g32(s + 8) == want_tx[b] && g32(s + 12) == want_tx[b],
+			CHECK(g32(s) == (0x19bu << 16 | 12u) && g32(s + 4) == b && g32(s + 8) == want_tx[b] && g32(s + 12) == want_rx[b],
 			    "VDEV_TXRX_STREAMS");
 		}
 		fw_c2_step = 2;
@@ -807,6 +1233,7 @@ m_pdev_stats(bool distinct)
 	} else {
 		w[0] = (uint32_t)-98; w[2] = 2457600; w[3] = 5068800; w[4] = 47961000; w[5] = 112;
 		w[31] = 20; w[38] = 19; w[39] = 19; w[41] = 112; w[43] = 1;
+		w[1] = C.stats_tx_frame;  /* C2c D4: 0 unless a scenario sets it */
 	}
 	for (unsigned i = 0; i < 44; i++) { m_u32(w[i]); }
 }
@@ -920,6 +1347,7 @@ fw_rx(unsigned ce, uint32_t eid, const uint8_t *d, uint32_t len)
 		return;
 	}
 	if (eid != C.wmi_eid && eid == C.htt_eid) {  /* C2 w20 0x02: HTT VERSION_REQ (dp_tx.c:1277-1305) on CE4 */
+		if (ce == 4 && flags == 0 && plen >= 4 && (g32(pl) & 0xffu) == 0xbu) { fw_sring(pl, plen); return; }  /* C2c */
 		CHECK(ce == 4 && flags == 0 && plen == 8 && g32(pl) == 0 && g32(pl + 4) == (5u | 4u << 8 | 2u << 16),
 		    "HTT VERSION_REQ is not {msg 0, TCL metadata option tag 5 len 4 value 2} on CE4");
 		CHECK(fw_init_ok == 1 && fw_c2_step == 0, "HTT VERSION_REQ out of order");
@@ -927,6 +1355,7 @@ fw_rx(unsigned ce, uint32_t eid, const uint8_t *d, uint32_t len)
 		if (!C.htt_silent) {
 			uint8_t r[4];
 			p32(r, 0u | C.htt_minor << 8 | C.htt_major << 16);
+			fw_htt_conf_q = q_tail;
 			htc_out(1, C.htt_eid, r, 4, -1, 0, 2);
 		}
 		return;
@@ -937,6 +1366,7 @@ fw_rx(unsigned ce, uint32_t eid, const uint8_t *d, uint32_t len)
 	fw_credits -= need;
 	fw_wmi_msgs++;
 	uint32_t id = g32(pl) & 0xffffff;
+	if (fw_cmd_n < 64) { fw_cmd_log[fw_cmd_n++] = id; }  /* C2c: the WMI command stream, for comparisons */
 	if (id == 0x1) {
 		static const uint8_t mac[6] = {0x02, 0x11, 0x22, 0x33, 0x44, 0x55};
 		/* L19 completes service ready only from EXT, or EXT2 when service 220 is set (wmi.c:4940-4941, 5645) */
@@ -970,7 +1400,8 @@ fw_rx(unsigned ce, uint32_t eid, const uint8_t *d, uint32_t len)
 		fw_hw_mode_ok++;
 		m_reset(); m_tlv(0x206, 8); m_zero(8);
 		wmi_out(0x4010, (unsigned)need, 3);
-	} else if (id == 0x3001 || id == 0x3002 || id == 0x3003 || id == 0x5001 || id == 0x5008 || id == 0x9001 || id == 0x9002) {
+	} else if (id == 0x3001 || id == 0x3002 || id == 0x3003 || id == 0x5001 || id == 0x5008 || id == 0x9001 || id == 0x9002 ||
+	    id == 0x4003) {
 		CHECK(wl_w23, "a C2 command with qrtr 6");
 		fw_c2_cmd(id, pl, plen, (unsigned)need);
 	} else if (id == 0x16001) {
@@ -1009,7 +1440,18 @@ wl_mwr(uint32_t off, uint32_t v)
 	unsigned i = (off - SHADOW0) / 4;
 	CHECK(i < 36, "shadow register beyond the WLAN_CFG table");
 	shadow_writes++;
+	if (wl15_shadow_v3[i] == M_IDLE_HP) { wbm_access(M_IDLE_HP, true, &v, true); return; }  /* C2c: ring 120's HP */
 	ce_access(wl15_shadow_v3[i], true, &v, true);
+}
+
+/* A window access: the WBM block (C2c) or the CE registers. */
+static void
+win_access(uint64_t pa, bool wr, uint32_t *v)
+{
+	uint32_t off = (bar_win & 0x3fu) << 19 | (uint32_t)(pa - WL_BAR0 - 0x80000ull);
+	CHECK(bar_win & 0x40000000u, "window access with the window disabled");
+	if (off >= 0x00a30000u && off < 0x00a40000u) { wbm_access(off, wr, v, false); return; }
+	ce_access(off, wr, v, false);
 }
 
 static uint32_t
@@ -1017,8 +1459,7 @@ wl_prd(uint64_t pa)
 {
 	if (pa >= WL_BAR0 + 0x80000ull && pa < WL_BAR0 + 0x100000ull) {
 		uint32_t v = 0;
-		CHECK(bar_win & 0x40000000u, "window access with the window disabled");
-		ce_access((bar_win & 0x3fu) << 19 | (uint32_t)(pa - WL_BAR0 - 0x80000ull), false, &v, false);
+		win_access(pa, false, &v);
 		return v;
 	}
 	if (pa == WL_EPCFG + 4) { return epcmd; }
@@ -1031,8 +1472,7 @@ static void
 wl_pwr(uint64_t pa, uint32_t v)
 {
 	if (pa >= WL_BAR0 + 0x80000ull && pa < WL_BAR0 + 0x100000ull) {
-		CHECK(bar_win & 0x40000000u, "window access with the window disabled");
-		ce_access((bar_win & 0x3fu) << 19 | (uint32_t)(pa - WL_BAR0 - 0x80000ull), true, &v, false);
+		win_access(pa, true, &v);
 		return;
 	}
 	CHECK(pa == WL_EPCFG + 0x70 + 8 && (C.mrrs_old || !v), "physical write outside the model");
@@ -1044,16 +1484,40 @@ static int
 wl_contain_wr(uint64_t pa, uint32_t value)
 {
 	if (pa == WL_BAR0 + 0x310c) { bar_win = value; restore_lie = C.restore_lie_at && ++restores == C.restore_lie_at; return 0; }
-	if (pa == WL_BAR0 + 0x38) { mhictrl = 0; return 0; }
+	if (pa == WL_BAR0 + 0x38) {
+		/* C2c: RXDMA still writes a posted buffer during the MHI reset, before bus master off */
+		if (C.late_write && fw_rx_ready && (epcmd & 4u)) { memset(rxd(0x20000u + 0x1000u * 1u + 8u, 4, true, "late frame"), 0x77, 4); }
+		mhictrl = 0;
+		return 0;
+	}
 	if (pa == WL_EPCFG + 4) { if (!C.fail_bm) { epcmd = value; } return 0; }
 	CHECK(pa == TS_TLMM + 0x1000ull * 94 + 4, "containment write outside the model");
 	perst_io = value;
 	return 0;
 }
 
+/* C2c arenas: 2 MiB-aligned IOVA inside the pool, 0xa5 everywhere (the code must zero what it relies on). */
+static int
+w26_alloc(struct wl_dma *d, vm_size_t bytes)
+{
+	const bool rx = d == &wl_rx_arena;
+	CHECK(!d->va && bytes == (rx ? RXA : LNA) && (wl20_bits & (rx ? WL20_RXRING : WL20_IDLELINK)), "unexpected W26 allocation");
+	CHECK(!(wl_iova_next & 0x1fffffu) && wl_iova_next + bytes <= wl_iova_end, "W26 arena IOVA not 2 MiB aligned inside the pool");
+	CHECK(!rx || !(wl20_bits & WL20_IDLELINK) || ln_host, "RX arena allocated before the link arena");
+	if (rx && C.rx_alloc_fail) { return 1; }
+	void *p = aligned_alloc(16384, bytes);
+	CHECK(p != NULL, "host allocation");
+	memset(p, 0xa5, bytes);
+	d->va = (vm_offset_t)p; d->size = bytes; d->iova = wl_iova_next; d->pa = 0x890000000ull;
+	wl_iova_next += bytes;
+	if (rx) { rx_host = p; rx_iova = d->iova; rx_allocs++; } else { ln_host = p; ln_iova = d->iova; ln_allocs++; }
+	return 0;
+}
+
 static int
 wl_dma_alloc(struct wl_dma *d, vm_size_t bytes)
 {
+	if (d == &wl_rx_arena || d == &wl_link_arena) { return w26_alloc(d, bytes); }
 	CHECK(d == &wl_ce_arena && bytes == ARENA && !d->va, "unexpected DMA allocation");
 	CHECK(!(wl_iova_next & (ARENA - 1)) && wl_iova_next >= wl_iova_base && wl_iova_next + ARENA <= wl_iova_end,
 	    "arena IOVA not aligned to its size inside the pool");
@@ -1065,17 +1529,39 @@ wl_dma_alloc(struct wl_dma *d, vm_size_t bytes)
 	arena_host = p; arena_iova = d->iova; arena_allocs++;
 	return 0;
 }
-static int wl_dma_nc(struct wl_dma *d) { CHECK(d == &wl_ce_arena, "NC conversion of another buffer"); d->nc = true; return 0; }
+static int
+wl_dma_nc(struct wl_dma *d)
+{
+	CHECK(d == &wl_ce_arena || d == &wl_rx_arena || d == &wl_link_arena, "NC conversion of another buffer");
+	d->nc = true;
+	return 0;
+}
 static void
 wl_dma_free(struct wl_dma *d)
 {
 	if (!d->va) { return; }
+	if (d == &wl_rx_arena || d == &wl_link_arena) {  /* C2c: only after bus master off, PERST and the SMMU undo, zeroed */
+		const uint8_t *p = (const uint8_t *)d->va;
+		CHECK(!(epcmd & 4u) && !(perst_io & 2u) && smmu_undone, "W26 arena freed before bus master off, PERST and the SMMU undo");
+		for (vm_size_t i = 0; i < d->size; i++) { CHECK(!p[i], "W26 arena not zeroed before its free"); }
+		free((void *)d->va);
+		if (d == &wl_rx_arena) { rx_host = NULL; rx_mapped = false; rx_frees++; } else { ln_host = NULL; ln_mapped = false; ln_frees++; }
+		memset(d, 0, sizeof(*d));
+		return;
+	}
 	CHECK(d == &wl_ce_arena, "free of a buffer the model never allocated");
 	free((void *)d->va);
 	arena_host = NULL; arena_mapped = false; arena_frees++;
 	memset(d, 0, sizeof(*d));
 }
-static int wl12_map_target(struct wl_dma *d) { CHECK(d == &wl_ce_arena && d->nc, "map of an unconverted buffer"); arena_mapped = true; return 0; }
+static int
+wl12_map_target(struct wl_dma *d)
+{
+	CHECK((d == &wl_ce_arena || d == &wl_rx_arena || d == &wl_link_arena) && d->nc, "map of an unconverted buffer");
+	if (d == &wl_link_arena && C.link_map_fail) { return wl_w11_fail("target DMA leaf readback"); }
+	if (d == &wl_rx_arena) { rx_mapped = true; } else if (d == &wl_link_arena) { ln_mapped = true; } else { arena_mapped = true; }
+	return 0;
+}
 static int wl_w11_guard(void) { return fw_faults || guard_bad ? wl_w11_fail("AMSS/M0, ownership, discovery or access/SMMU fault") : 0; }
 static int wl_w11_events(void) { return wl_w11_guard(); }
 static void wl_w11_stop(void) { CHECK(!wl_ce_arena.va || wl_ce.stopping, "W11 stop before the CE containment latch"); stops++; }
@@ -1086,7 +1572,7 @@ static void wl5_status(unsigned step) { (void)step; }
 static int wl_smmu_fault(unsigned step) { (void)step; return 0; }
 static int wl_m6o_msi_undo(void) { return 0; }
 static int wl_m6o_undo(bool contained) { (void)contained; return 0; }
-static int wl_smmu_undo(void) { return 0; }
+static int wl_smmu_undo(void) { CHECK(!(epcmd & 4u) && !(perst_io & 2u), "SMMU undo before bus master off and PERST"); smmu_undone = true; return 0; }
 
 /* An io for pure-layer checks that must never reach hardware. */
 static int io_never_wr(void *ctx, uint32_t off, uint32_t v) { (void)ctx; (void)off; (void)v; fail("pure code reached hardware"); return 1; }
@@ -1102,7 +1588,19 @@ static void
 reset(void)
 {
 	if (wl_ce_arena.va) { free((void *)wl_ce_arena.va); memset(&wl_ce_arena, 0, sizeof(wl_ce_arena)); }
+	/* C2c: arenas a quarantined or failed scenario left, and the W26 model state */
+	if (wl_rx_arena.va) { free((void *)wl_rx_arena.va); memset(&wl_rx_arena, 0, sizeof(wl_rx_arena)); }
+	if (wl_link_arena.va) { free((void *)wl_link_arena.va); memset(&wl_link_arena, 0, sizeof(wl_link_arena)); }
+	rx_host = ln_host = NULL; rx_iova = ln_iova = 0;
+	rx_mapped = ln_mapped = rx_pub = smmu_undone = fw_rx_ready = idle_live = idle_pub = rx_inject = false;
+	rx_allocs = rx_frees = ln_allocs = ln_frees = wbm_reads = wbm_writes = wbm_rbs = wbm_watch_reads = wbm_pubs = 0;
+	fw_sring_n = fw_pset_n = fw_frames_written = fw_nobuf = fw_links = fw_taken_n = fw_posted_n = 0; fw_htt_conf_q = ~0u;
+	m_idle_hp = m_idle_tp = fw_refill_tp = fw_err_hp = 0;
+	memset(fw_mac_hp, 0, sizeof(fw_mac_hp)); memset(fw_mac_tp, 0, sizeof(fw_mac_tp)); memset(fw_pset_w, 0, sizeof(fw_pset_w));
+	memset(slot_listed, 0, sizeof(slot_listed)); wbm_log_n = 0; n_acts = acts_done = 0; fw_cmd_n = 0;
+	memset(&wl_rx, 0, sizeof(wl_rx)); wl26_wbm_writes = 0; wl26_heard_none = false;
 	memset(&C, 0, sizeof(C));
+	C.rx_take = 2048; C.rx_post[0] = C.rx_post[1] = 1024;
 	C.credits = 4; C.credit_size = 2048; C.ready_ce = 2; C.htt_eid = 1; C.wmi_eid = 2; C.max_msg = 2048; C.ready_stslen = -1;
 	C.phy_bands = 3; C.phy_mask = 3; C.htt_major = 3; C.htt_minor = 4; C.exp_n = 38; C.exp_pdev = 0;
 	C.dbs_pdev = 1;
@@ -1983,6 +2481,10 @@ model_line(const char *l, size_t len)
 		C.on_line = 0;
 		write_rdp(&dr[5], (dr[5].dev + dr[5].size - 4u) % dr[5].size);
 	}
+	if (C.ce4_inflight && len >= 26 && !strncmp(l, "FUXI WLAN: W23 htt version", 26)) {  /* C2c: CE4 shows 16 in flight */
+		C.ce4_inflight = 0;
+		wl_ce.pipe[4].posted += 16u;
+	}
 	if (C.on_line == 3 && len >= 37 && !strncmp(l, "FUXI WLAN: W23 scan foreign freq 5825", 37)) {
 		C.on_line = 0;
 		guard_bad = true;  /* the W11 guard fails in the scan wait after the last channel */
@@ -2350,6 +2852,801 @@ s_c2b_cap(void)
 	     "stats wait (63)");
 }
 
+/* ---- C2c scenarios (fuxiwlanqrtr=7, w20 0x100 RXRING, 0x200 IDLELINK, 0x400 CHAINMASK) ---- */
+static void c2c_reset(unsigned bits) { c2_reset(); wl20_bits = bits; }
+static void
+show(const char *title)  /* C2C_SHOW=1: the scenario's log on stderr (to read the lines while writing expectations) */
+{
+	if (getenv("C2C_SHOW")) { fprintf(stderr, "==== %s\n%s", title, logbuf); }
+}
+
+/* The owner rule (counts only): no log line shows what RXDMA wrote from a received frame: the frame word of the
+ * buffers and link descriptors (hex or decimal), an error entry's unmasked w5 or w6 (hex or decimal). */
+static void
+no_frame_text(void)
+{
+	static const char *const bad[] = { "5eedf00d", "1592651789", "0xebad00", "15445248", "0x2f7", "7958787" };
+	for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		if (strstr(logbuf, bad[i])) { fprintf(stderr, "frame text %s\n", bad[i]); fail("a received frame's content in the log (owner rule: counts only)"); }
+	}
+}
+
+/* Proven containment: the C1 checks, then both W26 arenas zeroed (wl_dma_free checks every byte) and freed only after
+ * bus master off, PERST and the SMMU undo (wl_dma_free and wl_smmu_undo check the order). */
+static void
+c2c_contained(void)
+{
+	const unsigned rx = rx_allocs, ln = ln_allocs;
+	/* the host-owned words the device reads stayed as published: wrp[0] (refill HP), wrp[26] (error ring TP, never
+	 * reaped), every refill entry; nothing but the device moved after the publish (2.8) */
+	if (rx_pub && rx_host) {
+		CHECK(g32(rx_host + 0x400u) == 8190u && !g32(rx_host + 0x400u + 4u * 26u), "a host write to wrp[0] or wrp[26] after the publish");
+		for (uint32_t k = 0; k < 4096u; k++) {
+			uint64_t a = rx_iova + 0x20000u + 0x1000ull * k;
+			CHECK(k == 4095u ? !g32(rx_host + 0x4000u + 8u * k) : g32(rx_host + 0x4000u + 8u * k) == (uint32_t)a,
+			    "a refill entry rewritten after the publish");
+		}
+	}
+	contained_and_freed();
+	no_frame_text();
+	CHECK(rx_frees == rx && ln_frees == ln && !wl_rx_arena.va && !wl_link_arena.va, "W26 arenas not freed after proven containment");
+	if (rx || ln) {
+		static const char *const order[] = {
+			"FUXI WLAN: W26 rx contain: host writes off; arenas held until bus master off, PERST and SMMU undo\n",
+			"FUXI WLAN: W20 ce contain posted ",
+			"FUXI WLAN: abort step 28 MHI reset done, bus master off yes, PERST asserted yes\n",
+			"FUXI WLAN: W26 arenas zeroed ",
+			"FUXI WLAN: abort buffers freed\n",
+		};
+		expect_order(order, sizeof(order) / sizeof(order[0]));
+	} else { expect_not("W26 rx contain"); expect_not("W26 arenas zeroed"); }
+}
+
+static void
+s_c2c_pure(void)
+{
+	static struct wlrx rx;
+	static const struct wlce_io io = { io_never_wr, io_never_rd, io_never_wr, io_model_w, io_model_r, NULL };
+	uint8_t *ra = aligned_alloc(16384, RXA), *la = aligned_alloc(16384, LNA);
+	uint32_t w[13], want[13], regs[WLRX_IDLE_REGS][2];
+	reset();
+	CHECK(ra && la, "alloc");
+	/* the allowlist is exactly the model's (the nine pre-read addresses; the eight write addresses), and the two
+	 * register sets do not meet */
+	for (uint32_t off = 0x00a30000u; off < 0x00a40000u; off += 4) {
+		bool r = false, wr = false;
+		for (unsigned i = 0; i < 9; i++) { r |= off == m_pre_addr[i]; }
+		for (unsigned i = 0; i < 8; i++) { wr |= off == m_wbm_waddr[i]; }
+		CHECK(wlrx_wbm_ok(off, false) == r && wlrx_wbm_ok(off, true) == wr && !wlce_reg_ok(off), "WBM allowlist differs from the model's");
+	}
+	for (uint32_t off = CE_BASE; off < CE_END; off += 4) { CHECK(!wlrx_wbm_ok(off, false) && !wlrx_wbm_ok(off, true), "WBM allowlist has a CE register"); }
+	CHECK(!wlrx_wbm_ok(M_IDLE_R0 + 2, false) && !wlrx_wbm_ok(0x00a34000u + 0x900u, true) && !wlrx_wbm_ok(0x00a3b020u, true),
+	    "a misaligned, TCL or REO register allowed");
+	/* D1: the pre-read reading */
+	{
+		uint32_t p[9] = {0};
+		CHECK(wlrx_idle_owned(p) == WLRX_IDLE_FREE, "zero pre-reads not free");
+		p[2] = 0x40; CHECK(wlrx_idle_owned(p) == WLRX_IDLE_SRNG, "SRNG_ENABLE"); p[2] = 0x3;
+		CHECK(wlrx_idle_owned(p) == WLRX_IDLE_FREE, "MISC without SRNG_ENABLE refused");
+		p[0] = 0x1000; CHECK(wlrx_idle_owned(p) == WLRX_IDLE_BASE, "base lsb"); p[0] = 0;
+		p[1] = 0x01000001; CHECK(wlrx_idle_owned(p) == WLRX_IDLE_BASE, "base msb 7:0"); p[1] = 0x01000000;
+		CHECK(wlrx_idle_owned(p) == WLRX_IDLE_FREE, "a size field alone refused");
+		p[5] = 2; CHECK(wlrx_idle_owned(p) == WLRX_IDLE_AMBIGUOUS, "scatter mode with base 0 and SRNG_ENABLE 0");
+		p[2] = 0x40; CHECK(wlrx_idle_owned(p) == WLRX_IDLE_SRNG, "scatter mode with SRNG_ENABLE"); p[2] = 0; p[5] = 0;
+		p[8] = ~0u; CHECK(wlrx_idle_owned(p) == WLRX_IDLE_UNREADABLE, "a ~0 scattered base read"); p[8] = 0x5;
+		CHECK(wlrx_idle_owned(p) == WLRX_IDLE_FREE, "a scattered base value alone refused");
+	}
+	/* layout, SRING_SETUP words, entries, ring 120 registers against the model's own table */
+	CHECK(wlrx_layout(&rx, ra, 0xa1a00000ull, RXA) == 0 && wlrx_link_layout(&rx, la, 0xa1400000ull, LNA) == 0, "pure layout");
+	CHECK(wlrx_layout(&rx, ra, 0xa1a00800ull, RXA) == 1 && wlrx_layout(&rx, ra, 0xa1a00000ull, RXA - 4) == 1 &&
+	    wlrx_layout(&rx, ra, 0xff000000ull, RXA) == 1, "RX layout bounds");
+	CHECK(wlrx_layout(&rx, ra, 0xa1a00000ull, RXA) == 0, "pure layout again");
+	rx_iova = 0xa1a00000ull; ln_iova = 0xa1400000ull;
+	for (unsigned i = 0; i < 4; i++) {
+		wlrx_sring_words(&rx, i, w);
+		m_sring_want(i, want);
+		CHECK(!memcmp(w, want, sizeof(w)), "SRING_SETUP words differ from the model's table");
+	}
+	wlrx_idle_regs(&rx, regs);
+	{
+		const uint32_t v[8] = { 0xa1400000u, 0x01000000u, 2u, 0x01000002u, 0u, 0u, 0u, 0x43u };
+		for (unsigned i = 0; i < 8; i++) { CHECK(regs[i][0] == m_wbm_waddr[i] && regs[i][1] == v[i], "ring 120 register list"); }
+	}
+	CHECK(wlrx_fill_refill(&rx) == 0 && wlrx_link_fill(&rx) == 0, "fills");
+	CHECK(g32(ra + 0x4000) == 0xa1a20000u && g32(ra + 0x4004) == (6u << 8) && g32(ra + 0x4000 + 8 * 4094) == 0xa1a20000u + 4094u * 0x1000u &&
+	    g32(ra + 0x4000 + 8 * 4094 + 4) == (6u << 8 | 4094u << 12) && !g32(ra + 0x4000 + 8 * 4095), "first/last refill entry");
+	CHECK(g32(la) == 0xa1440000u && g32(la + 4) == (1u << 8 | 0x5fff0u << 12) && g32(la + 8 * 32766) == 0xa1440000u + 32766u * 128u &&
+	    g32(la + 8 * 32766 + 4) == (1u << 8 | (0x4000u << 3) << 12) && !g32(la + 8 * 32767), "first/last idle entry");
+	CHECK(ra[0x20000] == 0xa5 && ra[0x20000 + 63] == 0xa5 && !ra[0x20000 + 64] && !ra[0x20000 + 2048] && !ra[0x20000 + 4095u * 4096u],
+	    "sentinel");
+	/* the guards and the gaps (2.7 "none"): the named pointer words and the rings are not gaps; a word past rdp, past
+	 * wrp, at the first page's end, after the error ring and at the tail's very end are */
+	{
+		static const uint32_t named[] = { 4u * 160u, 4u * 161u, 4u * 169u, 4u * 186u, 0x400u, 0x404u, 0x424u, 0x468u, 0x4000u,
+			0x1bffcu, 0x20000u };
+		static const uint32_t gaps[] = { 4u * 170u, 0x33cu, 0x4bcu, 0x3ffcu, 0x1c000u, 0x1fffcu };
+		uint32_t u, s, l, t, g;
+		wlrx_guard_count(&rx, &u, &s, &l, &t, &g);
+		CHECK(!u && !s && !l && !t && !g, "guards or gaps not clean after the fill");
+		for (unsigned i = 0; i < sizeof(named) / sizeof(named[0]); i++) { ra[named[i] + 1u] ^= 0x10u; }
+		for (unsigned i = 0; i < sizeof(gaps) / sizeof(gaps[0]); i++) { ra[gaps[i]] = 1; }
+		ra[0x103fffcu] = 1;
+		wlrx_guard_count(&rx, &u, &s, &l, &t, &g);
+		CHECK(!u && !s && !l && t == 1 && g == 6, "gap count: a named word counted, or a gap or the tail's end missed");
+		for (unsigned i = 0; i < sizeof(named) / sizeof(named[0]); i++) { ra[named[i] + 1u] ^= 0x10u; }
+		for (unsigned i = 0; i < sizeof(gaps) / sizeof(gaps[0]); i++) { ra[gaps[i]] = 0; }
+		ra[0x103fffcu] = 0;
+	}
+	/* watch arithmetic (2.8, D2) */
+	memset(rx.w, 0, sizeof(rx.w)); rx.rx_on = rx.idle_on = true;
+	rx.w[0].refill_tp = 4096; rx.w[0].mac_hp[0] = rx.w[0].mac_hp[1] = 2048; rx.w[0].idle_hp = 65534;
+	wlrx_watch_derive(&rx, 0);
+	CHECK(rx.w[0].refill_taken == 2048 && rx.w[0].refill_left == 2047 && rx.w[0].mac_avail[0] == 1024 && rx.w[0].kept == 0 &&
+	    rx.w[0].kept_valid && rx.w[0].idle_avail == 32767 && !rx.w[0].exhausted && !rx.w[0].bad && !rx.w[0].unreadable, "setup derive");
+	rx.w[1] = rx.w[0]; rx.w[1].mac_tp[0] = 2048; rx.w[1].err_hp = 8184; rx.w[1].idle_tp = 65534;
+	wlrx_watch_derive(&rx, 1);
+	CHECK(rx.w[1].exhausted == (WLRX_F_MAC0 | WLRX_F_ERR | WLRX_F_IDLE) && rx.w[1].err_fill == 1023, "mac0 drained, err full, idle empty");
+	rx.w[1] = rx.w[0]; rx.w[1].err_hp = 8176;
+	wlrx_watch_derive(&rx, 1);
+	CHECK(!rx.w[1].exhausted && rx.w[1].err_fill == 1022, "err fill 1022 is not full");
+	rx.w[0].kept = 1;  /* D2 baseline: the setup watch kept one buffer */
+	rx.w[1] = rx.w[0]; rx.w[1].refill_tp = 8190; rx.w[1].mac_hp[0] = rx.w[1].mac_hp[1] = 4094;  /* all taken, all posted */
+	wlrx_watch_derive(&rx, 1);
+	CHECK(!rx.w[1].exhausted && rx.w[1].refill_empty && rx.w[1].refill_left == 0 && rx.w[1].kept == 1, "refill-empty note");
+	rx.w[1].mac_hp[1] = 2048; rx.w[1].mac_tp[1] = 2048;  /* mac1 avail 0 too */
+	wlrx_watch_derive(&rx, 1);
+	CHECK(rx.w[1].exhausted == (WLRX_F_REFILL | WLRX_F_MAC1) && !rx.w[1].refill_empty, "refill left 0 with a MAC ring at 0");
+	rx.w[1].mac_hp[1] = 2050; rx.w[1].mac_tp[1] = 0;  /* kept 1023 > the setup's 1 */
+	wlrx_watch_derive(&rx, 1);
+	CHECK(rx.w[1].exhausted == WLRX_F_REFILL && rx.w[1].kept == 1023, "refill left 0 with kept rising");
+	/* D2: a MAC ring the firmware never used (hp == tp == 0) is not an exhausted one (2.8: avail 0 once its tp moved) */
+	rx.w[0].kept = 2048;  /* the setup watch: all 4095 taken, 2047 posted to mac0, none to mac1 */
+	rx.w[1] = rx.w[0]; rx.w[1].refill_tp = 8190; rx.w[1].mac_hp[0] = 4094; rx.w[1].mac_tp[0] = 26; rx.w[1].mac_hp[1] = rx.w[1].mac_tp[1] = 0;
+	wlrx_watch_derive(&rx, 1);
+	CHECK(!rx.w[1].exhausted && rx.w[1].refill_empty && rx.w[1].kept == 2048 && rx.w[1].mac_avail[0] == 2034,
+	    "refill left 0 with a never-used MAC ring is the refill-empty note");
+	rx.w[1] = rx.w[0]; rx.w[1].refill_tp = 8191; rx.w[1].mac_tp[1] = 4096; rx.w[1].err_hp = ~0u; rx.w[1].idle_tp = 3;
+	wlrx_watch_derive(&rx, 1);
+	CHECK(rx.w[1].bad == (WLRX_F_REFILL | WLRX_F_MAC1 | WLRX_F_IDLE) && rx.w[1].unreadable == WLRX_F_ERR && !rx.w[1].exhausted &&
+	    !rx.w[1].kept_valid, "bad and unreadable words");
+	/* D5 rows */
+	memset(&rx.c, 0, sizeof(rx.c)); memset(rx.w, 0, sizeof(rx.w)); rx.rx_on = rx.idle_on = false;
+	rx.idle_tried = true; rx.idle_own = WLRX_IDLE_SRNG;
+	CHECK(!strncmp(wlrx_next(&rx, 0x200), "fallback r1c2c-a", 16), "firmware-owned list: fallback");
+	rx.idle_own = WLRX_IDLE_AMBIGUOUS;
+	CHECK(!strncmp(wlrx_next(&rx, 0x302), "none: owner review (WBM idle pre-read", 37), "ambiguous: owner review");
+	rx.idle_tried = false; rx.chain_on = false;
+	CHECK(!strncmp(wlrx_next(&rx, 0x402), "none: kit void", 14), "chain mask not sent");
+	rx.chain_on = true;
+	CHECK(!strncmp(wlrx_next(&rx, 0x402), "1.2 rows L3/L4", 14), "rx-frame 0 everywhere");
+	rx.ci_rx_frame_max = 5;
+	CHECK(!strncmp(wlrx_next(&rx, 0x402), "r1c2c-all", 9), "rx-frame above 0");
+	rx.w[3].taken = true; rx.w[3].exhausted = WLRX_F_MAC0;
+	CHECK(!strncmp(wlrx_next(&rx, 0x302), "the same kit with w20 0x10", 26) && !strncmp(wlrx_next(&rx, 0x312), "none: owner review (a second", 28),
+	    "exhaustion: repeat with 0x10, then owner review");
+	rx.w[3].exhausted = 0; rx.rx_on = true; rx.c.guard_tail = 1;
+	CHECK(!strncmp(wlrx_next(&rx, 0x302), "none: stop", 10), "guard spill");
+	/* the HTT type count, and nothing after the latch */
+	rx.htt_t2h[0x24] = 0; wlrx_htt_count(&rx, (const uint8_t *)"\x24\0\0\0", 4); wlrx_htt_count(&rx, (const uint8_t *)"\x99", 1);
+	CHECK(rx.htt_t2h[0x24] == 1 && rx.htt_t2h_other == 1, "HTT type count");
+	rx.stopping = true;
+	CHECK(wlrx_fill_refill(&rx) == 1 && wlrx_link_fill(&rx) == 1 && wlrx_publish_refill(&rx, &io) == 1, "host writes after the latch");
+	free(ra); free(la);
+	reset();
+	puts("C2c pure: WBM allowlist = the model's (9 reads, 8 writes, no CE/TCL/REO register), D1 pre-read readings (SRNG_ENABLE, "
+	     "base, ambiguous scatter, ~0), layout bounds, the four SRING_SETUP words, ring 120's 8 registers, first/last refill and "
+	     "idle entries and the sentinel, guard and gap counts (named pointer words and rings excluded, the tail's end counted), "
+	     "watch arithmetic (D2 refill-empty vs exhaustion, a never-used MAC ring), D5 rows, HTT type count, latch");
+}
+
+/* The happy 0x702 run: the firmware needs buffers and links before it forwards MGMT_RX; RXDMA receives 2 frames per
+ * channel (mac0 on 2.4 GHz, mac1 on 5 GHz), each into a posted buffer with a link descriptor. */
+static void
+c2c_happy_run(unsigned w15)
+{
+	c2c_reset(0x702); wl15_variant = w15;
+	C.rx_rule = 2; C.links_used = true; C.rx_frames = 2;
+	C.setup_delay = 50;  /* the refill entries are taken 50 ms after the 4th SRING_SETUP: the setup watch must wait */
+	happy_frames();
+	CHECK(run() == 0, "C2c 0x702 happy path failed");
+}
+
+static void
+s_c2c_happy(void)
+{
+	for (unsigned v = 0; v < 2; v++) {
+		c2c_happy_run(v);
+		show(v ? "0x702 w15=1" : "0x702");
+		static const char *const lines[] = {
+			"FUXI WLAN: W20 ce init ok rings 7 writes 70 window restore checked\n",
+			"FUXI WLAN: W26 link arena IOVA 0xa1400000 bytes 0x440000 Normal-NC mapped\n",
+			"FUXI WLAN: W26 rx arena IOVA 0xa1a00000 bytes 0x1040000 Normal-NC mapped; rdp 0xa1a00000 wrp 0xa1a00400\n",
+			("FUXI WLAN: W26 wbm idle before: base-lsb 0 base-msb 0 misc 0 r2-hp 0 r2-tp 0 idle-list-cntl 0 idle-list-size 0 "
+			 "scatter-base 0/0; not owned\n"),
+			("FUXI WLAN: W26 wbm idle ring 120 base 0xa1400000 65536 words, 32767 link descriptors (rbm 1, our cookie) misc 0x43 "
+			 "readback ok, hp 65534 via "),
+			("FUXI WLAN: W26 refill ring 160 filled 4095 buffers (rbm 6, 2048 B at a 4096 B stride, sentinel 0xa5 x64, slots "
+			 "0xa1a20000-0xa2a1e000) hp 8190 in wrp[0]\n"),
+			"FUXI WLAN: W20 ce rx posted CE1 62 CE2 62\n",
+			"FUXI WLAN: W23 htt version 3.4 (w20 0x02)\n",
+			"FUXI WLAN: W26 htt sring setup refill 160 info0 0x0205000b info1 0x00022000 intr 0x003e0000 low 1024\n",
+			"FUXI WLAN: W26 htt sring setup mac0 161 info0 0x0100010b info1 0x02021000 intr 0x003e0000 low 512\n",
+			"FUXI WLAN: W26 htt sring setup mac1 169 info0 0x0100020b info1 0x02021000 intr 0x003e0000 low 512\n",
+			"FUXI WLAN: W26 htt sring setup rxdma-err 186 info0 0x0007010b info1 0x00082000 intr 0x00200008 low 0\n",
+			("FUXI WLAN: W26 rx watch setup+100ms refill tp 4096 taken 2048 left 2047 mac0 hp 2048 tp 0 avail 1024 mac1 hp 2048 tp 0 "
+			 "avail 1024 err hp 0 fill 0; exhausted none\n"),
+			"FUXI WLAN: W26 idle watch setup+100ms hp 65534 tp 0 avail 32767; exhausted none\n",
+			"FUXI WLAN: W26 chain mask pdev 0 tx 0x3 rx 0x3 sent (PDEV_SET_PARAM 0x4003 ids 1, 2)\n",
+			"FUXI WLAN: W23 chan list 38 passive",
+			"FUXI WLAN: W23 scan started after ",
+			"FUXI WLAN: W26 rx watch started refill tp 4096 taken 2048 left 2047 mac0 hp 2048 tp 0 avail 1024 ",
+			"FUXI WLAN: W26 idle watch started hp 65534 tp 0 avail 32767; exhausted none\n",
+			"FUXI WLAN: W26 rx watch mid (foreign 19) refill tp 4096 taken 2048 left 2047 mac0 hp 2048 tp 52 avail 998 ",
+			"FUXI WLAN: W26 idle watch mid (foreign 19) ",
+			"FUXI WLAN: W23 scan completed reason 0 after ",
+			("FUXI WLAN: W26 rx watch completed refill tp 4096 taken 2048 left 2047 mac0 hp 2048 tp 52 avail 998 mac1 hp 2048 tp 100 "
+			 "avail 974 err hp 0 fill 0; exhausted none\n"),
+			"FUXI WLAN: W26 idle watch completed hp 65534 tp 152 avail 32691; exhausted none\n",
+			"FUXI WLAN: W24 scan summary frames 12 bss 9 ssids 5\n",
+			"FUXI WLAN: W23 stats after-scan wmi ",
+			"FUXI WLAN: W26 rx content mac0 entries 1024 valid 1024 foreign 0 rbm-other 0 cookie-other 0\n",
+			"FUXI WLAN: W26 rx content mac1 entries 1024 valid 1024 foreign 0 rbm-other 0 cookie-other 0\n",
+			"FUXI WLAN: W26 rx content refill taken 2048 kept 0; buffers written 76 of 4095\n",
+			"FUXI WLAN: W26 rx guard nonzero dwords: slot-upper 0 (slots 0), slot 4095 0, tail 0, gaps 0\n",
+			"FUXI WLAN: W26 rxdma err entries 0 (hp 0) push err 0 routing 0 flush 0 other 0; rbm link 0 buf 0 other 0\n",
+			"FUXI WLAN: W26 link content descriptors written 76 of 32767, unlisted slot clean; idle ring entries changed 0\n",
+			"FUXI WLAN: W26 counters htt-t2h 1 htt-rx 1 wmi-events ",
+			"FUXI WLAN: W26 htt-t2h types 0:1\n",
+			"FUXI WLAN: W23 complete; stop/contain\n",
+		};
+		expect_order(lines, sizeof(lines) / sizeof(lines[0]));
+		expect(v ? "hp 65534 via R2 0xa370b8 (fuxiwlanw15=1); writes 8 window restore checked\n" :
+		    "hp 65534 via shadow 19 (0x948); writes 8 window restore checked\n");
+		expect_not("W24 no beacon"); expect_not("TX COUNTERS"); expect_not("rxdma err codes"); expect_not("SPILL");
+		CHECK(fw_sring_n == 4 && fw_pset_n == 2 && wbm_writes == 8 && wbm_pubs == 1 && fw_frames_written == 76 && fw_links == 76 &&
+		    !fw_nobuf && wl_scan.frames == 12, "C2c firmware view");
+		CHECK(fw_pset_w[0][1] == 0 && fw_pset_w[0][2] == 1 && fw_pset_w[0][3] == 3 && fw_pset_w[1][2] == 2, "PDEV_SET_PARAM words");
+		CHECK(n_ev['L'] == n_ev['R'] || n_ev['R'] > n_ev['L'], "barriers");
+		c2c_contained();
+		static const char *const tail[] = {
+			"FUXI WLAN: W23 complete; stop/contain\n",
+			"FUXI WLAN: W26 rx contain: host writes off; arenas held until bus master off, PERST and SMMU undo\n",
+			"FUXI WLAN: W23 contain: scan over, no STOP_SCAN\n",
+			"FUXI WLAN: W20 ce contain posted ",
+			"FUXI WLAN: abort step 28 MHI reset done, bus master off yes, PERST asserted yes\n",
+			"FUXI WLAN: W26 rx guard after containment nonzero dwords: slot-upper 0 (slots 0), slot 4095 0, tail 0, gaps 0\n",
+			"FUXI WLAN: W26 arenas zeroed 0x1480000 bytes before free\n",
+			"FUXI WLAN: abort buffers freed\n",
+		};
+		expect_order(tail, sizeof(tail) / sizeof(tail[0]));
+	}
+	puts("C2c 0x702 (shadow 19, then fuxiwlanw15=1 R2): link and RX arenas, pre-reads not owned, ring 120 in L19's order with "
+	     "readback and the HP published after the entries, 4095 refill entries with sentinels and wrp[0], the four SRING_SETUP "
+	     "word by word after VERSION_CONF, the chain masks before the channel list, four watches, 76 frames into buffers with "
+	     "links, MGMT_RX forwarded, content/guard/err/link/counter lines, contained, recounted, zeroed and freed");
+}
+
+/* 0x200 alone: no HTT ring message, no RX arena, only ring 120 watches, the link content; per MGMT_RX rule. */
+static void
+s_c2c_idle(void)
+{
+	for (unsigned rule = 1; rule <= 5; rule++) {
+		c2c_reset(0x200); C.rx_rule = rule; C.links_used = true; C.rx_frames = 1;
+		add_frame(5, 47, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+		CHECK(run() == 0, "C2c 0x200 failed");
+		if (rule == 1) { show("0x200 needs links"); }
+		static const char *const lines[] = {
+			"FUXI WLAN: W26 link arena IOVA 0xa1400000 bytes 0x440000 Normal-NC mapped\n",
+			"FUXI WLAN: W26 wbm idle before: ",
+			"FUXI WLAN: W26 wbm idle ring 120 base 0xa1400000 ",
+			"FUXI WLAN: W20 ce rx posted CE1 62 CE2 62\n",
+			"FUXI WLAN: W22 complete; W23 scan next\n",
+			"FUXI WLAN: W26 idle watch setup hp 65534 tp 0 avail 32767; exhausted none\n",
+			"FUXI WLAN: W23 chan list 38 passive",
+			"FUXI WLAN: W26 idle watch started hp 65534 tp 0 avail 32767; exhausted none\n",
+			"FUXI WLAN: W26 idle watch mid (foreign 19) hp 65534 tp 36 avail 32749; exhausted none\n",
+			"FUXI WLAN: W26 idle watch completed hp 65534 tp 76 avail 32729; exhausted none\n",
+			"FUXI WLAN: W26 link content descriptors written 38 of 32767, unlisted slot clean; idle ring entries changed 0\n",
+			"FUXI WLAN: W26 counters htt-t2h 0 htt-rx 0 wmi-events ",
+			"FUXI WLAN: W26 htt-t2h types none\n",
+		};
+		expect_order(lines, sizeof(lines) / sizeof(lines[0]));
+		expect_not("W26 rx "); expect_not("sring setup"); expect_not("chain mask"); expect_not("W23 htt version");
+		CHECK(!rx_allocs && ln_allocs == 1 && !fw_sring_n && !fw_pset_n && fw_links == 38 && wl_htc.htt_fn == wl23_htt_rx,
+		    "0x200: no RX arena, no ring message, links taken, HTT types counted");
+		if (rule == 1) {
+			expect("FUXI WLAN: W24 scan summary frames 1 bss 1 ssids 1\n");
+			expect_not("W24 no beacon");
+		} else {
+			expect("FUXI WLAN: W24 scan summary frames 0 bss 0 ssids 0\n");
+			static const char *const hint[] = {
+				"FUXI WLAN: W26 htt-t2h types none\n",
+				("FUXI WLAN: W24 no beacon or probe response heard (chan-info 38); next rung r1c2c w20 0x302 (770) (links used, "
+				 "nothing forwarded: H1b or H4)\n"),
+				"FUXI WLAN: W23 complete; stop/contain\n",
+			};
+			expect_order(hint, sizeof(hint) / sizeof(hint[0]));
+		}
+		c2c_contained();
+		expect("FUXI WLAN: W26 arenas zeroed 0x440000 bytes before free\n");
+		expect_not("W26 rx guard after containment");
+	}
+	/* links never used: "links untouched" */
+	c2c_reset(0x200); C.rx_rule = 5;
+	CHECK(run() == 0, "C2c 0x200 untouched failed");
+	expect("next rung r1c2c w20 0x302 (770) (links untouched: RXDMA pushed nothing)\n");
+	c2c_contained();
+	puts("C2c 0x200 alone, each MGMT_RX rule (needs links: forwarded; buffers and links, buffers, chain masks, never: not): no "
+	     "RX arena, no HTT ring message, ring 120 watches only, link content, HTT types counted without w20 0x02, the D5 hint "
+	     "r1c2c 0x302 (links used / untouched), arena zeroed and freed");
+}
+
+/* D1: a refusing pre-read writes nothing to the WBM, drops 0x200 for the boot, the run goes on (with 0x302 the RX part
+ * still runs). */
+static void
+s_c2c_preread(void)
+{
+	static const struct { unsigned i; uint32_t v; const char *why, *next; } cases[] = {
+		{2, 0x40, "SRNG_ENABLE set (firmware owns the list)", "fallback r1c2c-a w20 0x102 (258), then 0x502 (1282) (the firmware owns the WBM idle list)"},
+		{0, 0x1234000, "base non-zero (firmware owns the list)", "fallback r1c2c-a w20 0x102 (258)"},
+		{5, 2, "scatter mode set with base 0 and SRNG_ENABLE 0 (AMBIGUOUS)", "none: owner review (WBM idle pre-read ambiguous or unreadable)"},
+		{7, ~0u, "a pre-read is ~0 (unreadable, ownership not established)", "none: owner review (WBM idle pre-read ambiguous"},
+	};
+	for (unsigned k = 0; k < 8; k++) {
+		char want[256];
+		const unsigned i = k % 4, rings = k >= 4;
+		c2c_reset(rings ? 0x302 : 0x200); C.rx_rule = 2; C.links_used = true; C.rx_frames = 1;
+		C.wbm_pre[cases[i].i] = cases[i].v;
+		if (cases[i].i == 5) { C.wbm_pre[6] = 0x123; C.wbm_pre[7] = 0x8000; }  /* list size and a scattered base are printed only */
+		CHECK(run() == 0, "C2c pre-read refusal failed the run");
+		if (k == 2) { show("0x200 ambiguous"); }
+		snprintf(want, sizeof(want), "FUXI WLAN: W26 wbm idle list not programmed: %s; w20 0x200 dropped for this boot\n", cases[i].why);
+		expect(want);
+		expect("; refused\n");
+		snprintf(want, sizeof(want), "next rung %s", cases[i].next);
+		expect(want);
+		CHECK(wbm_reads == 9 && !wbm_writes && !wbm_pubs && !idle_pub, "a WBM write after a refusing pre-read");
+		expect_not("W26 idle watch"); expect_not("W26 link content"); expect_not("W26 wbm idle ring 120");
+		CHECK(rings ? fw_sring_n == 4 && count_text("W26 rx watch") == 4 && rx_allocs == 1 : !fw_sring_n, "the RX part with 0x302");
+		c2c_contained();
+	}
+	expect("FUXI WLAN: W26 wbm idle before: base-lsb 0 base-msb 0 misc 0 r2-hp 0 r2-tp 0 idle-list-cntl 0 idle-list-size 0 "
+	       "scatter-base 0xffffffff/0; refused\n");
+	puts("C2c pre-reads (D1): SRNG_ENABLE, a ring base, scatter mode with base 0 (AMBIGUOUS), a ~0 read: nine reads, no WBM write, "
+	     "0x200 dropped, run goes on (0x302: rings and buffers still), fallback or owner-review hint");
+}
+
+/* 0x302 with the needs-links rule, 0x402 with needs-chain-masks, chain masks 0, 0x480 (EXT pdev). */
+static void
+s_c2c_bits(void)
+{
+	c2c_reset(0x302); C.rx_rule = 1; C.links_used = true; C.rx_frames = 1;
+	happy_frames();
+	CHECK(run() == 0, "C2c 0x302 failed");
+	expect("FUXI WLAN: W24 scan summary frames 12 bss 9 ssids 5\n");
+	expect_not("chain mask"); expect_not("W24 no beacon");
+	c2c_contained();
+	c2c_reset(0x402); C.rx_rule = 4;
+	happy_frames();
+	CHECK(run() == 0, "C2c 0x402 failed");
+	show("0x402");
+	static const char *const m[] = {
+		"FUXI WLAN: W23 htt version 3.4 (w20 0x02)\n",
+		"FUXI WLAN: W26 chain mask pdev 0 tx 0x3 rx 0x3 sent (PDEV_SET_PARAM 0x4003 ids 1, 2)\n",
+		"FUXI WLAN: W23 chan list 38 passive",
+		"FUXI WLAN: W24 scan summary frames 12 bss 9 ssids 5\n",
+		"FUXI WLAN: W26 counters htt-t2h 1 htt-rx 1 ",
+		"FUXI WLAN: W26 htt-t2h types 0:1\n",
+		"FUXI WLAN: W23 complete; stop/contain\n",
+	};
+	expect_order(m, sizeof(m) / sizeof(m[0]));
+	expect_not("W26 rx"); expect_not("W26 idle"); expect_not("W26 link"); expect_not("W26 arenas");
+	CHECK(fw_pset_n == 2 && !rx_allocs && !ln_allocs, "0x402: two PDEV_SET_PARAM, no arena");
+	c2c_contained();
+	/* the needs-chain-masks firmware without them: no MGMT_RX, hint per the readout */
+	c2c_reset(0x002); C.rx_rule = 4;
+	happy_frames();
+	CHECK(run() == 0, "C2c 0x002 needs-chain-masks failed");
+	expect("FUXI WLAN: W24 no beacon or probe response heard (chan-info 38); next rung C2c = RX data path\n");
+	expect_not("W26");
+	c2c_contained();
+	/* masks 0: nothing sent, a line, the WMI command stream otherwise the same as without 0x400 */
+	{
+		uint32_t a[64], b[64];
+		unsigned na, nb;
+		c2c_reset(0x002); C.phy_bands = 0;
+		CHECK(run() == 0, "0x002 without caps");
+		memcpy(a, fw_cmd_log, sizeof(a)); na = fw_cmd_n;
+		c2c_contained();
+		c2c_reset(0x402); C.phy_bands = 0;
+		CHECK(run() == 0, "0x402 without caps");
+		memcpy(b, fw_cmd_log, sizeof(b)); nb = fw_cmd_n;
+		expect("FUXI WLAN: W26 chain mask not sent: no MAC/PHY caps (tx 0 rx 0)\n");
+		expect("next rung none: kit void, owner review (chain mask not sent: no MAC/PHY caps)\n");
+		CHECK(na == nb && !memcmp(a, b, sizeof(uint32_t) * na) && !fw_pset_n, "0x400 without masks changed the command stream");
+		c2c_contained();
+	}
+	/* 0x480: the EXT MAC/PHY pdev, as VDEV_CREATE */
+	c2c_reset(0x480); C.exp_pdev = 1;
+	CHECK(run() == 0, "C2c 0x480 failed");
+	expect("FUXI WLAN: W26 chain mask pdev 1 tx 0x3 rx 0x3 sent (PDEV_SET_PARAM 0x4003 ids 1, 2)\n");
+	CHECK(fw_pset_w[0][1] == 1 && fw_pset_w[1][1] == 1, "0x480 PDEV_SET_PARAM pdev");
+	c2c_contained();
+	/* the PHYs' 1x1 masks with SERVICE_READY's 2 rf chains: the masks are the preferred hw mode's, not (1 << chains) - 1 */
+	c2c_reset(0x400); C.phy_mask = 1;
+	CHECK(run() == 0, "C2c 0x400 1x1 failed");
+	expect("FUXI WLAN: W26 chain mask pdev 0 tx 0x1 rx 0x1 sent (PDEV_SET_PARAM 0x4003 ids 1, 2)\n");
+	CHECK(fw_pset_w[0][3] == 1 && fw_pset_w[1][3] == 1, "1x1 chain masks");
+	c2c_contained();
+	/* tx mask 0x3, rx mask 0x1: each PDEV_SET_PARAM carries its own (TX 1 = tx, RX 2 = rx), VDEV_CREATE the streams */
+	c2c_reset(0x400); C.phy_rx_mask = 1;
+	CHECK(run() == 0, "C2c 0x400 tx 3 rx 1 failed");
+	expect("FUXI WLAN: W26 chain mask pdev 0 tx 0x3 rx 0x1 sent (PDEV_SET_PARAM 0x4003 ids 1, 2)\n");
+	expect("streams tx 2 rx 1\n");
+	CHECK(fw_pset_w[0][2] == 1 && fw_pset_w[0][3] == 3 && fw_pset_w[1][2] == 2 && fw_pset_w[1][3] == 1, "tx 3 / rx 1 chain masks");
+	c2c_contained();
+	puts("C2c bits: 0x302 forwards with links (needs-links firmware), 0x402 two PDEV_SET_PARAM before the channel list and "
+	     "forwards (needs-chain-masks firmware; without them C2b's hint), masks 0 send nothing and leave the WMI stream as "
+	     "without 0x400, 0x480 the EXT pdev, tx 0x3 with rx 0x1 each in its own parameter");
+}
+
+/* Readings: firmware ignores the rings, a foreign MAC entry, spills, a write at offset 32, kept > 0, RBM/cookie others,
+ * exhaustion (mac0 drained before the mid watch; err ring full; refill-empty note; a second inconclusive with 0x10),
+ * bad pointer words, R2 unreadable, the D4 TX line. */
+static void
+s_c2c_readings(void)
+{
+	c2c_reset(0x302); C.rx_rule = 5; C.rx_take = 0; C.rx_post[0] = C.rx_post[1] = 0;
+	CHECK(run() == 0, "rings ignored");
+	expect("FUXI WLAN: W26 rx watch completed refill tp 0 taken 0 left 4095 mac0 hp 0 tp 0 avail 0 mac1 hp 0 tp 0 avail 0 err hp 0 "
+	       "fill 0; exhausted none\n");
+	expect("next rung C2d step 1 after reading the W26 htt-t2h types (the firmware ignored the rings)\n");
+	c2c_contained();
+	/* foreign MAC entries, by address alone: 64 bytes into a slot, never-posted slot 4095's start, a posted slot's start
+	 * with address bits 39:32 set; counted, stop */
+	c2c_reset(0x302); C.rx_rule = 5; C.mac_foreign = 3; C.rx_frames = 1;
+	CHECK(run() == 0, "foreign");
+	expect("FUXI WLAN: W26 rx content mac0 entries 1027 valid 1024 foreign 3 rbm-other 0 cookie-other 0\n");
+	expect("next rung none: stop, owner review before any further kit (guard spill or foreign MAC entry)\n");
+	c2c_contained();
+	/* spills into a slot's upper half, slot 4095, the tail (its start and its end) and the gaps (rdp[170], after the
+	 * error ring): counted, SPILL, normal containment; the D3 recount */
+	c2c_reset(0x302); C.rx_rule = 5; C.spill = 31; C.rx_frames = 1;
+	CHECK(run() == 0, "spill");
+	show("spill");
+	expect("FUXI WLAN: W26 rx guard SPILL nonzero dwords: slot-upper 4 (slots 1), slot 4095 2, tail 5, gaps 4; stop; owner review "
+	       "before any further kit\n");
+	expect("next rung none: stop, owner review before any further kit (guard spill or foreign MAC entry)\n");
+	c2c_contained();
+	expect("FUXI WLAN: W26 rx guard after containment nonzero dwords: slot-upper 4 (slots 1), slot 4095 2, tail 5, gaps 4; SPILL: "
+	       "owner review before any further kit\n");
+	/* the gaps alone (an error ring overrun past entry 1023, a stray rdp write): SPILL and stop as well */
+	c2c_reset(0x302); C.rx_rule = 5; C.spill = 16; C.rx_frames = 1;
+	CHECK(run() == 0, "gap spill");
+	expect("FUXI WLAN: W26 rx guard SPILL nonzero dwords: slot-upper 0 (slots 0), slot 4095 0, tail 0, gaps 4; stop; owner review "
+	       "before any further kit\n");
+	expect("next rung none: stop, owner review before any further kit (guard spill or foreign MAC entry)\n");
+	c2c_contained();
+	expect("FUXI WLAN: W26 rx guard after containment nonzero dwords: slot-upper 0 (slots 0), slot 4095 0, tail 0, gaps 4; SPILL: "
+	       "owner review before any further kit\n");
+	/* a frame that writes bytes 32..35 only: written */
+	c2c_reset(0x302); C.rx_rule = 5; C.write32 = true; C.rx_frames = 1;
+	CHECK(run() == 0, "write32");
+	expect("FUXI WLAN: W26 rx content refill taken 2048 kept 0; buffers written 38 of 4095\n");
+	expect("next rung C2d step 1, then the H8 pdev-parameter rung (frames landed, not forwarded)\n");
+	c2c_contained();
+	/* kept > 0; RBM 4 and another cookie (counted, valid, no stop) */
+	c2c_reset(0x302); C.rx_rule = 5; C.rx_take = 3000; C.mac_rbm = 4; C.mac_cookie_xor = 1;
+	CHECK(run() == 0, "kept, rbm, cookie");
+	expect("FUXI WLAN: W26 rx content mac0 entries 1024 valid 1024 foreign 0 rbm-other 1024 cookie-other 1024\n");
+	expect("FUXI WLAN: W26 rx content refill taken 3000 kept 952; buffers written 0 of 4095\n");
+	expect("next rung r1c2c-m w20 0x402 (1026) if not yet booted, else BDF/calibration (buffers placed, nothing written)\n");
+	c2c_contained();
+	/* mac0 drained before the mid watch (100 buffers, 120 frames on channel 0): exhaustion, inconclusive */
+	c2c_reset(0x302); C.rx_rule = 5; C.rx_post[0] = 100; C.rx_frames_ch0 = 120;
+	CHECK(run() == 0, "mac0 drained");
+	show("mac0 drained");
+	expect("FUXI WLAN: W26 rx watch mid (foreign 19) refill tp 4096 taken 2048 left 2047 mac0 hp 200 tp 200 avail 0 mac1 hp 2048 tp 0 "
+	       "avail 1024 err hp 0 fill 0; exhausted mac0\n");
+	expect("next rung the same kit with w20 0x10 added (an exhaustion flag: inconclusive, nothing killed)\n");
+	c2c_contained();
+	/* the err ring full (1023 entries, codes counted), and a second inconclusive run with 0x10 */
+	c2c_reset(0x312); C.exp_n = 13; C.rx_rule = 5; C.rx_frames = 1; C.err_n = 1100; C.err_code = 0; C.err_rbm = 1;
+	CHECK(run() == 0, "err full");
+	show("err full");
+	expect("FUXI WLAN: W26 rx watch completed ");
+	expect("err hp 8184 fill 1023; exhausted err\n");
+	expect("FUXI WLAN: W26 rxdma err entries 1023 (hp 8184) push err 1023 routing 0 flush 0 other 0; rbm link 1023 buf 0 other 0\n");
+	expect("FUXI WLAN: W26 rxdma err codes overflow 1023\n");
+	/* w5 keeps DEST_IND without the frame's byte count; w6 the push reason, code and SW_EXCEPTION_RING_VLD without the
+	 * frame's fragment and sequence numbers (no_frame_text checks that neither raw word appears) */
+	expect("FUXI WLAN: W26 rxdma err entry 3 w1 0x100 w5 0xc00000 w6 0x2000 w7 0x700000\n");
+	expect_not("rxdma err entry 4 ");
+	expect("next rung none: owner review (a second inconclusive run, w20 0x10 already set)\n");
+	c2c_contained();
+	/* D2: every refill entry taken and posted (2047 + 2047, kept 1): refill-empty, not exhaustion */
+	c2c_reset(0x302); C.rx_rule = 5; C.rx_take = 4095; C.rx_post[0] = C.rx_post[1] = 2047; C.rx_frames = 1;
+	CHECK(run() == 0, "refill-empty");
+	expect("FUXI WLAN: W26 rx watch setup+100ms refill tp 8190 taken 4095 left 0 mac0 hp 4094 tp 0 avail 2047 mac1 hp 4094 tp 0 "
+	       "avail 2047 err hp 0 fill 0; exhausted none; refill-empty\n");
+	expect_not("exhausted refill");
+	c2c_contained();
+	/* the firmware takes more during the scan and keeps them: refill left 0 with kept rising = exhaustion */
+	c2c_reset(0x302); C.rx_rule = 5; C.rx_take = 4000; C.rx_post[0] = C.rx_post[1] = 2000; C.take_more = 95;
+	CHECK(run() == 0, "kept rising");
+	expect("FUXI WLAN: W26 rx watch completed refill tp 8190 taken 4095 left 0 ");
+	expect("; exhausted refill\n");
+	c2c_contained();
+	/* D2, the hoarding case: every refill entry taken, 2047 posted to mac0, mac1 never posted (hp == tp == 0, as a 2.4 GHz
+	 * scan may leave it): mac1 unused is not an exhausted MAC ring, so refill left 0 is the refill-empty note, no flag */
+	c2c_reset(0x302); C.rx_rule = 5; C.rx_take = 4095; C.rx_post[0] = 2047; C.rx_post[1] = 0; C.rx_frames = 1;
+	CHECK(run() == 0, "refill-empty, mac1 unused");
+	show("mac1 unused");
+	expect("FUXI WLAN: W26 rx watch completed refill tp 8190 taken 4095 left 0 mac0 hp 4094 tp 26 avail 2034 mac1 hp 0 tp 0 avail 0 "
+	       "err hp 0 fill 0; exhausted none; refill-empty\n");
+	expect_not("exhausted refill"); expect_not("w20 0x10 added");
+	c2c_contained();
+	/* the same with mac0 drained (100 posted, 120 frames on channel 0): an exhausted MAC ring, so refill left 0 flags too */
+	c2c_reset(0x302); C.rx_rule = 5; C.rx_take = 4095; C.rx_post[0] = 100; C.rx_post[1] = 0; C.rx_frames_ch0 = 120;
+	CHECK(run() == 0, "refill exhausted with mac0 drained");
+	expect("FUXI WLAN: W26 rx watch mid (foreign 19) refill tp 8190 taken 4095 left 0 mac0 hp 200 tp 200 avail 0 mac1 hp 0 tp 0 "
+	       "avail 0 err hp 0 fill 0; exhausted refill mac0\n");
+	expect("next rung the same kit with w20 0x10 added (an exhaustion flag: inconclusive, nothing killed)\n");
+	c2c_contained();
+	/* bad words: rdp[186] beyond the ring (clamped, bad), refill tp backwards then past the HP (printed raw, never acted on),
+	 * R2 unreadable at the watches (run continues) */
+	c2c_reset(0x702); C.rx_rule = 5; C.rdp_err_raw = 9000; C.refill_tp_raw[0] = 1000; C.refill_tp_raw[1] = 8193; C.r2_unreadable = true;
+	CHECK(run() == 0, "bad words");
+	show("bad words");
+	expect("FUXI WLAN: W26 rx watch mid (foreign 19) refill tp 1000 taken 500 left 3595 ");
+	expect("FUXI WLAN: W26 rx watch completed refill tp 8193 bad mac0 hp 2048 tp 0 avail 1024 mac1 hp 2048 tp 0 avail 1024 err hp 9000 "
+	       "bad; exhausted none\n");
+	expect("FUXI WLAN: W26 idle watch completed hp 4294967295 tp 4294967295 unreadable; exhausted none\n");
+	expect("FUXI WLAN: W26 rxdma err entries 0 (hp 9000 bad) ");
+	expect("FUXI WLAN: W26 rx content refill taken unknown (no usable completed watch); buffers written 0 of 4095\n");
+	expect("next rung none matched: owner review (rx_path_plan.md 2.11)\n");
+	CHECK(wbm_watch_reads == 8, "R2 read twice per watch");
+	c2c_contained();
+	/* D4: a non-zero CHAN_INFO tx-frame and stats tx counters on a W26 boot: a reading line, the run contains normally */
+	c2c_reset(0x402); C.ci_tx = 7; C.stats_mode = 5;
+	CHECK(run() == 0, "TX counters");
+	expect("FUXI WLAN: W26 TX COUNTERS NON-ZERO: owner review (chan-info tx-frame events 38; stats answers 2 with local-enqued 2 "
+	       "hw-queued 2 mpdu-enqued 2 hw-reaped 2 base tx-frame 2)\n");
+	c2c_contained();
+	/* D4: only the pdev stats base tx-frame (the pdev-wide twin of CHAN_INFO's) non-zero */
+	c2c_reset(0x402); C.stats_tx_frame = 9;
+	CHECK(run() == 0, "base tx-frame");
+	expect("FUXI WLAN: W26 TX COUNTERS NON-ZERO: owner review (chan-info tx-frame events 0; stats answers 2 with local-enqued 0 "
+	       "hw-queued 0 mpdu-enqued 0 hw-reaped 0 base tx-frame 2)\n");
+	c2c_contained();
+	c2c_reset(0x002); C.ci_tx = 7; C.stats_mode = 5;  /* without a W26 bit: C2b's lines only */
+	CHECK(run() == 0, "TX counters without W26");
+	expect_not("W26");
+	c2c_contained();
+	puts("C2c readings: rings ignored, foreign MAC entries by address (64 bytes in, slot 4095, bits 39:32; stop), spills "
+	     "(slot halves, slot 4095, both ends of the tail, the gaps; SPILL, D3 recount after containment), a write at offset 32 "
+	     "(written), kept 952 with RBM 4 and other cookies (counted, valid), mac0 drained before mid and the err ring full "
+	     "(exhaustion; a second inconclusive with 0x10; error entries printed without their frame fields), D2 refill-empty vs "
+	     "kept rising and vs a never-used MAC ring, bad and unreadable words, the D4 TX line (with the base tx-frame alone); "
+	     "each with its D5 hint");
+}
+
+static void
+fails_c2c(const char *why)
+{
+	CHECK(run() == 1, why);
+	c2c_contained();
+}
+
+static void
+s_c2c_failures(void)
+{
+	/* RX arena allocation failure: no HTT ring message, no WBM write (the link arena came first), contain */
+	c2c_reset(0x302); C.rx_alloc_fail = true;
+	fails_c2c("RX arena allocation failure accepted");
+	expect("FUXI WLAN: W20 failure: W26 rx arena allocation/NC/map; contain, no retry\n");
+	CHECK(!wbm_reads && !wbm_writes && !fw_sring_n && ln_allocs == 1, "WBM or ring message after an RX arena failure");
+	/* link arena map failure: no WBM access at all */
+	c2c_reset(0x200); C.link_map_fail = true;
+	fails_c2c("link arena map failure accepted");
+	expect("FUXI WLAN: W20 failure: target DMA leaf readback; contain, no retry\n");
+	CHECK(!wbm_reads && !wbm_writes, "WBM access after a link arena failure");
+	/* readback mismatch on BASE_LSB and on MISC: no HP publish */
+	c2c_reset(0x200); C.wbm_rb_bad = 1;
+	fails_c2c("BASE_LSB mismatch accepted");
+	expect("FUXI WLAN: W26 wbm idle readback mismatch base-lsb wrote 0xa1400000 read 0xa1401000\n");
+	CHECK(wbm_writes == 8 && !wbm_pubs && !idle_pub, "HP after a BASE_LSB mismatch");
+	c2c_reset(0x200); C.wbm_rb_bad = 2;
+	fails_c2c("MISC mismatch accepted");
+	expect("FUXI WLAN: W26 wbm idle readback mismatch misc wrote 0x43 read 0x3\n");
+	CHECK(!wbm_pubs, "HP after a MISC mismatch");
+	/* a fault latched after the 3rd WBM write: no later write */
+	c2c_reset(0x200); C.wbm_fault_after = 3;
+	fails_c2c("WBM fault accepted");
+	expect("FUXI WLAN: W26 wbm idle write 3 of 8 (0xa34d44) failed; contain\n");  /* the faulting write itself reports */
+	CHECK(wbm_writes == 3 && !wbm_pubs, "a WBM write after the latched fault");
+	/* 16 CE4 sends in flight at the first SRING_SETUP: not sent, contain */
+	c2c_reset(0x302); C.ce4_inflight = 1;
+	fails_c2c("CE4 in flight accepted");
+	expect("FUXI WLAN: W26 htt sring setup refill 160 not sent: CE4 slots all in flight\n");
+	CHECK(!fw_sring_n, "an SRING_SETUP with 16 CE4 slots in flight");
+	/* HTT major 2: no ring message */
+	c2c_reset(0x302); C.htt_major = 2;
+	fails_c2c("HTT major 2 accepted");
+	CHECK(!fw_sring_n && !fw_pset_n, "a ring message after HTT major 2");
+	/* the W11 guard fails once the firmware took the 2nd SRING_SETUP: no further message */
+	c2c_reset(0x702); C.guard_on_sring = 2;
+	fails_c2c("guard between the SRING_SETUPs accepted");
+	expect("FUXI WLAN: W23 failure: AMSS/M0, ownership, discovery or access/SMMU fault; contain, no retry\n");
+	CHECK(fw_sring_n == 2 && !fw_pset_n, "a message after the guard failure");
+	/* the W11 guard fails in the post-scan stats exchange of a 0x302 boot with CHAN_INFO tx-frame non-zero: the W26
+	 * content, guard, error, counter, D4 and D5 lines still print (host reads), after the failure line, before containment */
+	c2c_reset(0x302); C.rx_rule = 5; C.rx_frames = 1; C.ci_tx = 7; C.guard_on_stats = true;
+	CHECK(run() == 1, "a guard failure in the stats exchange accepted");
+	show("stats guard");
+	{
+		static const char *const lines[] = {
+			"FUXI WLAN: W23 stats request pdev-stat pdev 1 bands 0x1 vdev 0 sent\n",
+			"FUXI WLAN: W23 failure: AMSS/M0, ownership, discovery or access/SMMU fault; contain, no retry\n",
+			"FUXI WLAN: W26 rx content mac0 entries 1024 valid 1024 foreign 0 rbm-other 0 cookie-other 0\n",
+			"FUXI WLAN: W26 rx content refill taken 2048 kept 0; buffers written 38 of 4095\n",
+			"FUXI WLAN: W26 rx guard nonzero dwords: slot-upper 0 (slots 0), slot 4095 0, tail 0, gaps 0\n",
+			"FUXI WLAN: W26 rxdma err entries 0 (hp 0) ",
+			"FUXI WLAN: W26 counters htt-t2h 1 ",
+			"FUXI WLAN: W26 TX COUNTERS NON-ZERO: owner review (chan-info tx-frame events 38; stats answers 0 ",
+			("FUXI WLAN: W24 no beacon or probe response heard (chan-info 38); next rung C2d step 1, then the H8 pdev-parameter "
+			 "rung (frames landed, not forwarded)\n"),
+		};
+		expect_order(lines, sizeof(lines) / sizeof(lines[0]));
+	}
+	expect_not("W23 complete"); expect_not("W23 stats after-scan");
+	c2c_contained();
+	/* no COMPLETED on a 0x302 boot: the W26 lines before the snapshot and the failure, then normal containment */
+	c2c_reset(0x302); C.rx_rule = 5; C.rx_frames = 1; C.scan_mode = 3;
+	CHECK(run() == 1, "no COMPLETED accepted");
+	show("no COMPLETED");
+	{
+		static const char *const lines[] = {
+			"FUXI WLAN: W23 timeout scan COMPLETED ",
+			"FUXI WLAN: W26 rx watch completed refill tp 4096 taken 2048 left 2047 ",
+			"FUXI WLAN: W26 rx content mac0 entries 1024 valid 1024 foreign 0 rbm-other 0 cookie-other 0\n",
+			"FUXI WLAN: W26 rx guard nonzero dwords: slot-upper 0 (slots 0), slot 4095 0, tail 0, gaps 0\n",
+			"FUXI WLAN: W26 counters htt-t2h 1 ",
+			"FUXI WLAN: W20 snapshot scan COMPLETED: ",
+			"FUXI WLAN: W23 failure: scan COMPLETED; contain, no retry\n",
+		};
+		expect_order(lines, sizeof(lines) / sizeof(lines[0]));
+	}
+	c2c_contained();
+	puts("C2c failures: RX arena allocation (no WBM write, no ring message), link arena map (no WBM access), BASE_LSB and MISC "
+	     "readback mismatch (no HP), a fault after the 3rd WBM write (no later write), CE4 slots in flight, HTT major 2 and a "
+	     "guard failure after the 2nd SRING_SETUP (no further message), a guard failure in the stats exchange and no COMPLETED "
+	     "(the W26, D4 and D5 lines still before containment); every run contained, zeroed and freed");
+}
+
+/* Containment: unproven (both arenas quarantined, not zeroed), proven with RXDMA writing until bus master off (zeroed
+ * after it, freed); after wl26_contain no host write to either arena and no WBM access. */
+static void
+s_c2c_contain(void)
+{
+	c2c_reset(0x702); C.rx_rule = 2; C.links_used = true; C.rx_frames = 1; C.fail_bm = true;
+	CHECK(run() == 0, "C2c unproven containment run");
+	contain();
+	expect("FUXI WLAN: abort step 28 MHI reset done, bus master off unconfirmed, PERST asserted yes\n");
+	expect("FUXI WLAN: abort buffers quarantined until reboot");
+	expect_not("W26 arenas zeroed"); expect_not("guard after containment");
+	CHECK(wl_rx_arena.va && wl_link_arena.va && !rx_frees && !ln_frees && rx_host[0x20000u + 0x1000u * 100u] == 0xa5,
+	    "W26 arenas freed or zeroed although bus master off is unproven");
+	c2c_reset(0x702); C.rx_rule = 2; C.links_used = true; C.rx_frames = 1; C.late_write = true;
+	CHECK(run() == 0, "C2c late write run");
+	c2c_contained();  /* wl_dma_free: every byte zero, after bus master off, PERST, SMMU undo */
+	c2c_reset(0x702); C.rx_rule = 2; C.links_used = true; C.rx_frames = 1;
+	CHECK(run() == 0, "C2c latch run");
+	wl_ce_contain(28);
+	{
+		uint32_t v = 0x1234;
+		const unsigned wb = wbm_reads + wbm_writes + wbm_watch_reads;
+		CHECK(wlrx_fill_refill(&wl_rx) == 1 && wlrx_link_fill(&wl_rx) == 1 && wlrx_publish_refill(&wl_rx, &wl_ce_io) == 1,
+		    "a W26 host write after the latch");
+		CHECK(wl26_wbm(M_IDLE_HP, true, &v) == 1 && wl26_wbm(M_IDLE_HP, false, &v) == 1 && wbm_reads + wbm_writes + wbm_watch_reads == wb,
+		    "a WBM access after the latch");
+		wl26_watch(WLRX_P_COMPLETED);
+		CHECK(wbm_reads + wbm_writes + wbm_watch_reads == wb, "a watch after the latch");
+	}
+	c2c_contained();
+	puts("C2c containment: unproven keeps both arenas (not zeroed, not freed); proven zeroes them after bus master off, PERST "
+	     "and the SMMU undo although RXDMA wrote until bus master off, then frees them; after wl26_contain no fill, publish or "
+	     "WBM access");
+}
+
+/* Every W26 line at its widest: ~0u and out-of-ring words, every exhaustion flag, the widest label, all 19 error codes and
+ * the 64 HTT types at 0xffffffff, the widest pre-read and ring 120 lines; model_line fails any line past 254 bytes. */
+static void
+s_c2c_widest(void)
+{
+	uint32_t big[65];
+	for (unsigned i = 0; i < 65; i++) { big[i] = 0xffffffffu; }
+	c2c_happy_run(0);
+	wl_scan.foreign = 0xffffffffu;
+	for (unsigned k = 0; k < 3; k++) {  /* 0: every word ~0; 1: every word bad; 2: every flag (refill, mac0, mac1, err, idle) */
+		struct wlrx_watch *w = &wl_rx.w[WLRX_P_MID];
+		w->taken = false;
+		rx_inject = true;
+		p32(rxd(4u * 160u, 4, true, "w"), k == 0 ? ~0u : k == 1 ? 0xfffffffeu : 8190u);
+		p32(rxd(0x400u + 4u, 4, true, "w"), k == 0 ? ~0u : k == 1 ? 0xfffffffeu : 4094u);
+		p32(rxd(4u * 161u, 4, true, "w"), k == 2 ? 4094u : 0xfffffffdu);
+		p32(rxd(0x400u + 36u, 4, true, "w"), k == 2 ? 4094u : k == 1 ? 0xfffffffeu : ~0u);
+		p32(rxd(4u * 169u, 4, true, "w"), k == 2 ? 4094u : k == 1 ? 0xfffffffeu : ~0u);
+		p32(rxd(4u * 186u, 4, true, "w"), k == 0 ? ~0u : k == 1 ? 0xfffffffeu : 8184u);
+		rx_inject = false;
+		C.r2_unreadable = k == 0;
+		if (k == 2) { m_idle_tp = m_idle_hp; }
+		wl26_watch(WLRX_P_MID);
+	}
+	expect("FUXI WLAN: W26 idle watch mid (foreign 4294967295) hp 65534 tp 65534 avail 0; exhausted idle\n");
+	wl26_list("W26 rxdma err codes", wl26_err_code, big, 19, 0xffffffffu);
+	wl26_list("W26 htt-t2h types", NULL, big, 64, 0xffffffffu);
+	CHECK(count_text("FUXI WLAN: W26 rxdma err codes") >= 3 && count_text("FUXI WLAN: W26 htt-t2h types") >= 4, "list lines");
+	expect("FUXI WLAN: W26 rx watch mid (foreign 4294967295) refill tp unreadable mac0 hp 4294967295 tp 4294967293 unreadable ");
+	expect("; exhausted refill mac0 mac1 err\n");
+	c2c_contained();
+	c2c_reset(0x200);
+	for (unsigned i = 0; i < 9; i++) { C.wbm_pre[i] = 0xfffffffeu; }
+	C.wbm_pre[5] = 2; C.wbm_pre[2] = 0; C.wbm_pre[0] = 0; C.wbm_pre[1] = 0;
+	CHECK(run() == 0, "widest pre-read");
+	expect("scatter-base 0xfffffffe/0xfffffffe; refused\n");
+	c2c_contained();
+	puts("C2c line widths: watch lines with unreadable, bad and widest words and every flag, the widest label, 19 error codes "
+	     "and 64 HTT types at 0xffffffff over several lines, the widest pre-read line: every FUXI WLAN line within 254 bytes");
+}
+
+static void
+s_c2c_none(void)
+{
+	/* every qrtr 7 boot without a W26 bit: no W26 line, no W26 arena, the HTT handler as C2 */
+	static const unsigned bits[] = { 0x0, 0x2, 0x10, 0x80, 0x92, 0x42 };
+	for (unsigned i = 0; i < sizeof(bits) / sizeof(bits[0]); i++) {
+		c2c_reset(bits[i]); C.exp_n = bits[i] & 0x10 ? 13u : 38u; C.exp_pdev = bits[i] & 0x80 ? 1u : 0u;
+		happy_frames();
+		CHECK(run() == 0, "C2 run");
+		expect_not("W26");
+		CHECK(!rx_allocs && !ln_allocs && !wbm_reads && !fw_sring_n && !fw_pset_n && (bits[i] & 2 || !wl_htc.htt_fn), "W26 without a bit");
+		c2c_contained();
+	}
+	puts("C2c off: qrtr 7 with w20 0, 0x2, 0x10, 0x80, 0x92, 0x42: no W26 line, arena, WBM access, ring message or HTT handler");
+}
+
+/* For the L19 re-derivation in tools/test-fuxi-wlan-ce.py: the four SRING_SETUP, the two PDEV_SET_PARAM, the first and
+ * last refill and idle entries and the ring 120 register list, for an RX arena at 0xa1a00000 and links at 0xa1400000. */
+static void
+dump_c2c(void)
+{
+	static struct wlrx rx;
+	uint8_t *ra = aligned_alloc(16384, RXA), *la = aligned_alloc(16384, LNA), out[64];
+	uint32_t w[13], regs[WLRX_IDLE_REGS][2], len = 0;
+	CHECK(ra && la && !wlrx_layout(&rx, ra, 0xa1a00000ull, RXA) && !wlrx_link_layout(&rx, la, 0xa1400000ull, LNA) &&
+	    !wlrx_fill_refill(&rx) && !wlrx_link_fill(&rx), "dump layout");
+	for (unsigned i = 0; i < 4; i++) {
+		wlrx_sring_words(&rx, i, w);
+		for (unsigned k = 0; k < 13; k++) { fprintf(stdout, "sring%u %u %u\n", i, k, w[k]); }
+	}
+	for (unsigned i = 0; i < 2; i++) {
+		const uint32_t p[3] = { 0, i ? WLWMI_PDEV_PARAM_RX_CHAIN_MASK : WLWMI_PDEV_PARAM_TX_CHAIN_MASK, 3 };
+		CHECK(!wlwmi_encode_words(WLWMI_CMD_PDEV_SET_PARAM, WLWMI_TAG_PDEV_SET_PARAM_CMD, p, 3, out, sizeof(out), &len), "dump pset");
+		for (uint32_t k = 0; k < len / 4; k++) { fprintf(stdout, "pset%u %u %u\n", i, k, g32(out + 4 * k)); }
+	}
+	fprintf(stdout, "refill 0 %u\nrefill 1 %u\nrefill 2 %u\nrefill 3 %u\n", g32(ra + 0x4000), g32(ra + 0x4004),
+	    g32(ra + 0x4000 + 8 * 4094), g32(ra + 0x4000 + 8 * 4094 + 4));
+	fprintf(stdout, "idle 0 %u\nidle 1 %u\nidle 2 %u\nidle 3 %u\n", g32(la), g32(la + 4), g32(la + 8 * 32766), g32(la + 8 * 32766 + 4));
+	wlrx_idle_regs(&rx, regs);
+	for (unsigned i = 0; i < WLRX_IDLE_REGS; i++) { fprintf(stdout, "wbm %u %u\nwbmv %u %u\n", i, regs[i][0], i, regs[i][1]); }
+	for (unsigned i = 0; i < WLRX_PRE_N; i++) { fprintf(stdout, "pre %u %u\n", i, wlrx_pre_addr(i)); }
+	for (unsigned j = 0; j < 36; j++) { if (wl15_shadow_v3[j] == WLRX_WBM_IDLE_HP) { fprintf(stdout, "shadow 0 %u\n", j); } }
+	fprintf(stdout, "hp 0 %u\n", WLRX_NDESC * WLRX_IDLE_DW);
+	fflush(stdout);
+	free(ra); free(la);
+}
+
 static void
 dump_c2(void)
 {
@@ -2403,6 +3700,7 @@ main(int argc, char **argv)
 {
 	if (argc == 2 && !strcmp(argv[1], "dump-init")) { dump_init(); return 0; }
 	if (argc == 2 && !strcmp(argv[1], "dump-c2")) { dump_c2(); return 0; }
+	if (argc == 2 && !strcmp(argv[1], "dump-c2c")) { dump_c2c(); return 0; }
 	s_pure();
 	s_no_w20();
 	s_happy_shadow();
@@ -2427,6 +3725,16 @@ main(int argc, char **argv)
 	s_c2b_stats();
 	s_c2b_stats_failures();
 	s_c2b_cap();
+	s_c2c_pure();
+	s_c2c_none();
+	s_c2c_happy();
+	s_c2c_idle();
+	s_c2c_preread();
+	s_c2c_bits();
+	s_c2c_readings();
+	s_c2c_failures();
+	s_c2c_contain();
+	s_c2c_widest();
 	reset();
 	puts("W20 model: all scenarios passed");
 	return 0;

@@ -1,11 +1,14 @@
 # W20-W24: copy engines, HTC and WMI init to WMI READY (WCN7850, `fuxiwlanqrtr=6`, C1), one passive scan (`fuxiwlanqrtr=7`, C2)
 
 Status: C1 (c742af3) passed on the phone; C2 (39c80e5) ran clean on the phone (kit r1c2: 38 channels
-tuned, CHAN_INFO on all of them, no MGMT_RX at all); C2b (CHAN_INFO detail and a pdev stats request per
-PHY pdev on top of C2) is host-tested only (tools/test-fuxi-wlan-ce.py). Every line below that says what the target
-does is what the model does, built from Linux ath12k v6.19. C2 and C2b are described in their own
-sections below ([C2: W23/W24](#c2-w23w24-one-passive-scan-fuxiwlanqrtr7),
-[C2b](#c2b-chan_info-detail-and-the-pdev-stats-requests-fuxiwlanqrtr7-diagnostic)).
+tuned, CHAN_INFO on all of them, no MGMT_RX at all); C2b (7caf3ed: CHAN_INFO detail and a pdev stats
+request per PHY pdev on top of C2) is committed, its readout boot is next; C2c (W26: host RX rings, the
+WBM idle link-descriptor list and the pdev chain masks, w20 0x100/0x200/0x400, all default off) is
+host-tested only (tools/test-fuxi-wlan-ce.py). Every line below that says what the target does is what
+the model does, built from Linux ath12k v6.19. C2, C2b and C2c are described in their own sections below
+([C2: W23/W24](#c2-w23w24-one-passive-scan-fuxiwlanqrtr7),
+[C2b](#c2b-chan_info-detail-and-the-pdev-stats-requests-fuxiwlanqrtr7-diagnostic),
+[C2c: W26](#c2c-w26-host-rx-rings-the-wbm-idle-list-and-the-chain-masks-fuxiwlanqrtr7-w20-0x100-0x200-0x400)).
 
 After this boot's W15 WLAN_MODE reply, the radio lane programs the host side of copy engines CE0..CE4 on
 SRNG rings, posts RX buffers, completes HTC (READY, HTT and WMI connect, SETUP_COMPLETE_EX) and WMI init
@@ -28,7 +31,7 @@ file:line below is into that tree. UniXNU-sheng was not used for any line of cod
 | `fuxiwlanqrtr=6` | | W11..W15 as `=5`, then W20..W22. Needs all 28 steps (`fuxiwlan=1` or `28`); refused with `fuxiwlankeep=1` or `fuxiwlanstop22=1`. The W15 knobs (`fuxiwlanw15`, `fuxiwlanw16`) apply. |
 | `fuxiwlanqrtr=7` | | C2: all of `=6`, then W23/W24 (one passive scan). Same gate and refusals as `=6`; on salami also `fuxiwlansalami=1`. |
 | `fuxiwlanqrtr` outside 0..7 | 8 (C3), negative, 9+ | refused (`W20 fuxiwlanqrtr=N is not 0..7 in this build; refused`). Before C1 these ran silently with no QRTR. |
-| `fuxiwlanw20=N` | 0 default | With qrtr 6 or 7: 0x01 NOHTT (no HTT connect; WMI then gets the next endpoint), 0x04 MRRS128 (endpoint PCIe Device Control max read request 128 bytes before CE init, low half only), 0x40 NOHWMODE (no PDEV_SET_HW_MODE). With qrtr 7 only: 0x02 HTTVER (HTT version request after HW mode), 0x10 BAND24 (the 13 2.4 GHz channels only), 0x80 PDEVCAP (the EXT MAC/PHY pdev id instead of 0). Refused: 0x08 ACTIVE (would transmit probe requests) and 0x20 FULLBSSID (would log whole BSSIDs; the owner masks every BSSID) at every qrtr, the qrtr-7 bits with qrtr 6, 0x01 together with 0x02, any other bit. |
+| `fuxiwlanw20=N` | 0 default | With qrtr 6 or 7: 0x01 NOHTT (no HTT connect; WMI then gets the next endpoint), 0x04 MRRS128 (endpoint PCIe Device Control max read request 128 bytes before CE init, low half only), 0x40 NOHWMODE (no PDEV_SET_HW_MODE). With qrtr 7 only: 0x02 HTTVER (HTT version request after HW mode), 0x10 BAND24 (the 13 2.4 GHz channels only), 0x80 PDEVCAP (the EXT MAC/PHY pdev id instead of 0), and C2c's 0x100 RXRING (host RX rings with 4095 buffers and their 4 HTT SRING_SETUP; only with 0x02), 0x200 IDLELINK (the WBM idle link-descriptor list), 0x400 CHAINMASK (PDEV_SET_PARAM TX/RX chain mask). Refused: 0x08 ACTIVE (would transmit probe requests) and 0x20 FULLBSSID (would log whole BSSIDs; the owner masks every BSSID) at every qrtr, the qrtr-7 bits with qrtr 6, 0x01 together with 0x02, 0x100 without 0x02, any other bit. |
 
 Refusals set `wl_variant_invalid`; salami refuses at init before any access, the Fuxi build at step 17.
 Every boot without `fuxiwlanqrtr=6` or `7` logs and behaves as before C1, and every boot with qrtr absent
@@ -555,6 +558,285 @@ starting with `W23 chan-info ` or `W23 stats `, except that in the 9 that reach 
 each, one per DBS PHY pdev) the containment line's counters move by exactly the sum of those exchanges'
 `ce tx X rx Y`.
 
+## C2c: W26, host RX rings, the WBM idle list and the chain masks (`fuxiwlanqrtr=7`, w20 0x100, 0x200, 0x400)
+
+Why: C2 (r1c2) tuned all 38 channels and heard zero MGMT_RX, and r1c2b (w20 0x02) got VERSION_CONF 3.112
+and still zero. L19 never scans without two host resources C2 does not give: the WBM idle list of MSDU
+link descriptors that RXDMA pushes (dp.c:835 "for HW internal usage", programmed in dp_alloc before HTC,
+core.c:1291 < 1300) and host RX buffers on the refill and per-MAC rings it announces by HTT SRING_SETUP
+(dp_rx.c:4610-4646). L19 also sends PDEV_SET_PARAM TX/RX_CHAIN_MASK at mac start, before its channel list
+(mac.c:9418, 9422). C2c gives each of the three behind its own w20 bit, in L19's geometry and order, and
+reports from host memory alone whether the firmware took them, whether RXDMA wrote into them or past
+them, and what it reported as errors. Plan: op11-tools/salami-port/wlan/r1/rx_path_plan.md (stage W26),
+with the shop's decisions D1..D6 on the verifier's open items.
+
+Code: the C2c section of `fuxi_wlan_ce.h` (constants, `struct wlrx*`, `wlrx_layout`, `wlrx_fill_refill`,
+`wlrx_publish_refill`, `wlrx_sring_words`, `wlrx_link_layout/expect/fill`, `wlrx_pre_addr`,
+`wlrx_idle_regs`, `wlrx_wbm_ok`, `wlrx_idle_owned/why`, `wlrx_watch_read/derive`, `wlrx_guard_count`,
+`wlrx_content`, `wlrx_link_content`, `wlrx_htt_count`, `wlrx_note_ci/stats`, `wlrx_next`; pure,
+bounded, no allocation) and the W26 part of the W20 block of `fuxi_wlan.c` (`wl26_wbm`, `wl26_alloc`,
+`wl26_idle`, `wl26_setup`, `wl26_sring`, `wl26_chainmask`, `wl26_rings`, `wl26_watch`, `wl26_list`,
+`wl26_report`, `wl26_contain`, `wl26_free`; `wl_win` is the one window implementation both register
+accessors share). The arenas are `wl_rx_arena` and `wl_link_arena`, both in `wl_owned_alias`.
+
+### Gate and kits
+
+`WL23_BITS` gains 0x100 RXRING, 0x200 IDLELINK and 0x400 CHAINMASK; `WL20_BITS` (qrtr 6) does not, so
+qrtr 6 refuses all three. 0x100 needs 0x02 (L19 asks the HTT version before any ring announcement,
+core.c:955 then 1143); with 0x01 the existing 0x01 + 0x02 rule refuses it too. 0x200 and 0x400 need no
+other bit. keep/stop22, 0x08, 0x20 and unknown bits stay refused. A valid qrtr 7 boot with a W26 bit
+prints, after the W23 selected line:
+`W26 selected: rx rings 4095 buffers, rings 160/161/169/186 (w20 0x100)|no; wbm idle list 32767 link
+descriptors (w20 0x200)|no; chain mask pdev tx/rx (w20 0x400)|no; nothing selected to host rings`.
+
+| Kit | w20 | Decimal | Adds to C2 + C2b |
+|---|---|---|---|
+| r1c2c-b | 0x200 | 512 | the WBM idle list only (no HTT message at all) |
+| r1c2c-m | 0x402 | 1026 | HTT version + the two chain masks |
+| r1c2c | 0x302 | 770 | HTT version + idle list + RX rings with 4095 buffers + 4 SRING_SETUP |
+| r1c2c-all | 0x702 | 1794 | all of the above |
+| r1c2c-a / r1c2c-a5 | 0x102 / 0x502 | 258 / 1282 | fallbacks when the firmware owns the idle list |
+| repeats | 0x210 / 0x312 / 0x712 | 528 / 786 / 1810 | the 2.4 GHz repeat after an exhaustion flag |
+
+Route: a 3- or 4-digit w20 does not fit the cmdline (r1c2b's is 540 characters, 606 of s31's 607), so
+every C2c kit keeps r1c2's cmdline byte for byte (`fuxiwlan=28 fuxiwlanclk=1 fuxiwlanqrtr=7`, no w20)
+and puts `fuxiwlanw20=<decimal>` in ADT /defaults (`--wlan-defaults`, a 4-byte int); `wl_arg` reads it
+from there and logs `salami fuxiwlanw20 from ADT /defaults`. The order of the kits is the ladder of
+rx_path_plan.md 1.2, read from the C2b readout.
+
+### Sequence (L19 order)
+
+1. W20, after the seven CE rings are set up and read back, before the CE RX buffers are posted (L19:
+   ce_init_pipes core.c:1285, dp_alloc core.c:1291, core_start core.c:1300). Both arenas first (link
+   arena with 0x200, RX arena with 0x100; IOVA aligned to 2 MiB, Normal-NC, mapped with live SMMU
+   readback): an allocation, NC or map failure stops the run before any WBM access or HTT ring message
+   (`W20 failure: W26 rx arena allocation/NC/map`, `... link arena ...`). Then dp_alloc's own order:
+   - W26b (0x200): nine allowlisted pre-reads (D1: the seven of the plan plus the scattered ring base
+     0x00a34250/0x00a34254, hw.c:1217-1218), one line. Refusal, with the reason printed and no WBM write at
+     all: any read ~0u (`unreadable, ownership not established`), SRNG_ENABLE (`firmware owns the list`),
+     a non-zero ring base (`firmware owns the list`), scatter mode with base 0 and SRNG_ENABLE 0
+     (`AMBIGUOUS`, not called firmware-owned); `w20 0x200 dropped for this boot`, the run goes on. Else
+     ring 120's eight writes in L19's order (BASE_LSB, BASE_MSB, ID, IX0, IX1, R2 HP, R2 TP, MISC;
+     hal.c:1714-1806, no MSI and no TP_ADDR for this ring), BASE_LSB and MISC read back (a mismatch fails the
+     run before the HP), the 32767 entries, the write barrier, HP = 65534 through the shadow register
+     WLAN_CFG gave ring 120 (looked up in `wl15_shadow_v3`: index 19, BAR0 0x948) or, with fuxiwlanw15=1,
+     R2 HP 0x00a370b8 through the window.
+   - W26a (0x100): the RX arena zeroed, the 0xa5 sentinel over bytes 0..63 of slots 0..4094, 4095 refill
+     entries (slot start, RBM 6, cookie = slot), the write barrier, wrp[0] = 8190 (L19's access_end for an
+     LMAC source ring, hal.c:2173-2184). The device learns nothing of this until SRING_SETUP.
+2. W21/W22 unchanged; with any W26 bit the HTT handler is installed at the HTT connect, so every HTT T2H
+   message is counted by type (VERSION_CONF handling unchanged).
+3. W23, right after VERSION_CONF (where it would be without 0x02) and before the channel list: with 0x100
+   the four SRING_SETUP (refill 160, mac0 161, mac1 169, rxdma-err 186) back to back on the HTT endpoint
+   through `wl_ce_send` (one in flight, TX drained), no reply asked, then a 100 ms look (non-fatal); the
+   setup watch (without the wait for the idle list alone); with 0x400 PDEV_SET_PARAM TX_CHAIN_MASK then
+   RX_CHAIN_MASK for `wl23_pdev` with the preferred hw mode's masks (nothing sent when a mask is 0).
+4. The C2 scan unchanged; the watch `started` right after STARTED, `mid` inside the COMPLETED wait at the
+   first poll pass with foreign >= (n + 1) / 2 (19 of 38, 7 of 13), `completed` as soon as that wait
+   returns, before the W24 lines.
+5. After the C2b stats lines and the CHAN_INFO flush (also when the stats exchange ended the run, after
+   its failure line; on a COMPLETED timeout, before the snapshot): the content, guard, error-ring, link and
+   counter lines, the D4 line, the D5 hint (host reads only); `W23 complete`.
+6. Containment (2.10 of the plan): `wl26_contain` first in `wl_ce_contain` (no host write to either arena
+   and no WBM access from then on), STOP_SCAN, the CE latch, MHI reset, bus master off, PERST; only in
+   `wl5_abort`'s proven branch (bus master off and PERST confirmed, M6o undo clean, SMMU undo done) the
+   guards counted again (D3, host reads), both arenas zeroed through their NC mappings and freed; otherwise
+   quarantined until reboot with the rest.
+
+Register accesses, nothing else: the nine pre-reads, the eight writes, the two readbacks, the one HP
+publish, R2 HP and TP at each watch, through `wl26_wbm` (allowlist `wlrx_wbm_ok`, refused after the latch)
+and `wl_win` (0x310c saved, selected, verified and restored, as every CE access). No interrupt, MSI, GIC,
+power or PMIC access; the W11 device wake stays held as for every W20 access.
+
+### Wire, register and memory facts (all re-derived from L19 by the host test)
+
+| Ring | HAL id | HTT ring, type, pdev field | Entries x bytes | HP / TP words |
+|---|---|---|---|---|
+| refill | 160 | HOST1_TO_FW_RXBUF 5, SW_TO_SW 2, pdev 0 | 4096 x 8 | wrp[0] / rdp[160] |
+| mac0 | 161 | RXDMA_HOST_BUF 0, SW_TO_HW 1, pdev 1 | 2048 x 8 | wrp[1] / rdp[161] |
+| mac1 | 169 (161 + 8, PMAC stride) | RXDMA_HOST_BUF 0, SW_TO_HW 1, pdev 2 | 2048 x 8 | wrp[9] / rdp[169] |
+| rxdma err | 186 | NON_MONITOR_DEST 7, HW_TO_SW 0, pdev 1 | 1024 x 32 | rdp[186] / wrp[26] |
+| wbm idle | 120 | (registers) | 32768 x 8, 32767 listed | R2 0x00a370b8 / 0x00a370bc |
+
+rdp is u32[207] (HAL_SRNG_RING_ID_MAX = 183 + 3 x 8), wrp u32[47]. SRING_SETUP (msg 0xb, 13 words):
+info0 = msg | pdev << 8 | ring << 16 | type << 24 (pdev = mac for SW_TO_SW, mac + 1 otherwise); info1 =
+ring size in words | entry words << 16 | LOOP_CNT_DIS (bit 25) for SW_TO_HW; hp/tp addresses; MSI 0; intr
+= batch x entry words | (timer >> 3) << 16 (RXDMA_BUF batch 0, 500 us; RXDMA_DST batch 1, 256 us); info2
+= the low threshold (entries >> 3, in words) for RXDMA_BUF only; RESPONSE_REQUIRED never. With the RX
+arena at A: refill 0x0205000b, A + 0x4000, info1 0x00022000, hp A + 0x400, tp A + 0x280, intr 0x003e0000,
+low 1024; mac0 0x0100010b, A + 0xc000, 0x02021000, A + 0x404, A + 0x284, 0x003e0000, 512; mac1 0x0100020b,
+A + 0x10000, 0x02021000, A + 0x424, A + 0x2a4, 0x003e0000, 512; err 0x0007010b, A + 0x14000, 0x00082000,
+A + 0x2e8, A + 0x468, 0x00200008, 0. Entries (struct ath12k_buffer_addr): address 31:0; address 39:32 in
+7:0, RBM 11:8 (6 SW1_BM for buffers, 1 WBM_DEV0_IDLE_DESC_LIST for links), cookie 31:12 (ours: the slot
+for buffers, the DP_LINK_DESC_COOKIE_SET shape with id 32766 - i, page 0, for links). Ring 120 (WCN7850:
+R0 0x00a34d3c, TCL1 layout): BASE_LSB = ring IOVA, BASE_MSB = 0x01000000 (65536 words << 8), ID 2, IX0
+0x01000002 (timer 256 raw, batch 1 x 2), IX1 0, R2 HP 0, R2 TP 0, MISC 0x43 (RING_ID_DISABLE |
+LOOPCNT_DISABLE | SRNG_ENABLE). PDEV_SET_PARAM: cmd 0x4003, TLV 0x0052000c, {pdev, 1, tx mask}, then
+{pdev, 2, rx mask}.
+
+RX arena (0x1040000 bytes): rdp at 0, wrp at 0x400, refill ring 0x4000, mac0 0xc000, mac1 0x10000, err
+0x14000, 4096 slots of 4 KiB from 0x20000 (bytes 0..2047 of slots 0..4094 posted, 2048..4095 and slot 4095
+a guard, never posted), a 128 KiB tail. Link arena (0x440000): ring 120, then 32768 descriptor slots of
+128 bytes from 0x40000 (slot 32767 never listed). SRING_SETUP has no length field; C2c sends no ring
+selection, so any write past 2048 bytes lands in the slot's own guard first and is counted. The gaps the
+device was given no address in (the first 16 KiB except rdp 160/161/169/186 and wrp 0/1/9/26, and the 16 KiB
+after the error ring, where an error ring overrun past entry 1023 would land) are counted as well.
+
+### Lines
+
+```
+FUXI WLAN: W26 link arena IOVA I bytes 0x440000 Normal-NC mapped                                        (0x200)
+FUXI WLAN: W26 rx arena IOVA I bytes 0x1040000 Normal-NC mapped; rdp I wrp I                            (0x100)
+FUXI WLAN: W26 wbm idle before: base-lsb R base-msb R misc R r2-hp R r2-tp R idle-list-cntl R idle-list-size R scatter-base R/R; not owned|refused
+FUXI WLAN: W26 wbm idle list not programmed: REASON; w20 0x200 dropped for this boot                    (refused)
+FUXI WLAN: W26 wbm idle ring 120 base B 65536 words, 32767 link descriptors (rbm 1, our cookie) misc M readback ok, hp 65534 via shadow 19 (0x948)|R2 0xa370b8 (fuxiwlanw15=1); writes 8 window restore checked
+FUXI WLAN: W26 refill ring 160 filled 4095 buffers (rbm 6, 2048 B at a 4096 B stride, sentinel 0xa5 x64, slots S-E) hp 8190 in wrp[0]
+FUXI WLAN: W26 htt sring setup refill|mac0|mac1|rxdma-err ID info0 X info1 X intr X low N           (x4)
+FUXI WLAN: W26 rx watch POINT refill tp T taken N left L mac0 hp H tp T avail A mac1 hp H tp T avail A err hp H fill F; exhausted none|refill mac0 mac1 err[; refill-empty]
+FUXI WLAN: W26 idle watch POINT hp H tp T avail A; exhausted none|idle
+FUXI WLAN: W26 chain mask pdev P tx X rx X sent (PDEV_SET_PARAM 0x4003 ids 1, 2)
+FUXI WLAN: W26 rx content mac0|mac1 entries N valid V foreign F rbm-other R cookie-other C
+FUXI WLAN: W26 rx content refill taken T kept K; buffers written W of 4095
+FUXI WLAN: W26 rx guard [SPILL ]nonzero dwords: slot-upper N (slots S), slot 4095 N, tail N, gaps N[; stop; owner review before any further kit]
+FUXI WLAN: W26 rxdma err entries E (hp H[ bad]) push err A routing B flush C other D; rbm link N buf N other N
+FUXI WLAN: W26 rxdma err codes overflow N mpdu-len N ...                                (non-zero only, wrapped)
+FUXI WLAN: W26 rxdma err entry K w1 X w5 X w6 X w7 X                                    (the first four, frame fields masked)
+FUXI WLAN: W26 link content descriptors written D of 32767, unlisted slot clean|written; idle ring entries changed C
+FUXI WLAN: W26 counters htt-t2h N htt-rx N wmi-events N unknown N bad-reports N sring-sent N
+FUXI WLAN: W26 htt-t2h types T:N ...|none                                                (non-zero types, wrapped)
+FUXI WLAN: W26 TX COUNTERS NON-ZERO: owner review (chan-info tx-frame events N; stats answers N with local-enqued N hw-queued N mpdu-enqued N hw-reaped N base tx-frame N)
+FUXI WLAN: W24 no beacon or probe response heard (chan-info N); next rung NEXT       (D5, with a W26 bit only)
+FUXI WLAN: W26 rx contain: host writes off; arenas held until bus master off, PERST and SMMU undo
+FUXI WLAN: W26 rx guard after containment nonzero dwords: slot-upper N (slots S), slot 4095 N, tail N, gaps N[; SPILL: owner review before any further kit]
+FUXI WLAN: W26 arenas zeroed BYTES bytes before free
+```
+
+POINT is `setup+100ms` (with 0x100) or `setup`, `started`, `mid (foreign N)`, `completed`. A watch word
+that is ~0u prints `unreadable`, one that is not a multiple of its entry or not below its ring prints the
+raw word and `bad`; neither is ever acted on. Derived: refill taken = tp / 2, left = ((8190 - tp) mod
+8192) / 2; macN avail = ((hp - tp) mod 4096) / 2; err fill = hp / 8; idle avail = ((HP - TP) mod 65536) /
+2. Exhaustion flags: macN at avail 0 once its tp moved, err at fill >= 1023, idle at avail 0, and refill
+at left 0 only together with an exhausted MAC ring (avail 0 once its tp moved: a ring the firmware never
+used, hp = tp = 0, is not one) or `kept` (refill taken minus the MAC ring entries, hp / 2) above the setup
+watch's (D2); a refill left 0 without either is the `refill-empty` note. Content (host reads once, after
+the C2b lines): a MAC entry is valid when its address (bits 39:0) is the start of a posted slot 0..4094,
+foreign otherwise; RBM and cookie differences among valid ones are counted, never a stop; buffers written
+= posted slots whose bytes 0..63 are no longer all 0xa5. Nothing read from a received frame is printed:
+only counts, and the four raw error entries with the frame's fields masked out (w5 MPDU_BYTE_COUNT 21:8,
+w6 MPDU_FRAG_NUM 10:7 and MPDU_SEQ_NUM 30:19, hal_desc.h:1033-1044). A non-zero gap or guard count is a
+SPILL. The D4 line prints on a W26 boot when any CHAN_INFO tx-frame or any stats answer's local-enqued,
+hw-queued, mpdu-enqued, hw-reaped or base tx-frame is non-zero (a reading rule: the run contains
+normally). With a W26 bit the C2b hint moves after the W26 lines and
+names the next step of the plan's 2.11 table (D5): stop for a guard spill or a foreign MAC entry; the same
+kit with 0x10 after an exhaustion flag (owner review when 0x10 is already set); the r1c2c-a / 0x502
+fallback when the firmware owns the idle list (owner review when the pre-read was ambiguous or
+unreadable); r1c2c 0x302 after r1c2c-b; C2d step 1 when the firmware ignored the rings or frames landed
+without a forward; r1c2c-m (or BDF/calibration) when buffers were placed but nothing was written; for
+r1c2c-m, rows L3/L4 of 1.2 when rx-frame stayed 0 everywhere, else r1c2c-all; otherwise owner review.
+Boots without a W26 bit keep C2b's exact hint line. Every W26 line is at most 254 bytes with every field
+at its widest (240 by the host test's count).
+
+### Expected log, r1c2c-all (w20 0x702; the model's happy path, values from the model)
+
+```
+FUXI WLAN: salami fuxiwlanw20 from ADT /defaults
+FUXI WLAN: W20 selected qrtr=7 (CE/HTC/WMI init, then W23 passive scan) w20 0x702 valid 1
+FUXI WLAN: W23 selected passive scan of 38 channels, dwell 150 ms, nothing transmitted; BSSIDs OUI only, pdev 0, htt version asked
+FUXI WLAN: W26 selected: rx rings 4095 buffers, rings 160/161/169/186 (w20 0x100); wbm idle list 32767 link descriptors (w20 0x200); chain mask pdev tx/rx (w20 0x400); nothing selected to host rings
+  ... W15 and W20 lines through `W20 ce init ok rings 7 writes 70 window restore checked`, with the W12/W13 map lines of each arena ...
+FUXI WLAN: W26 link arena IOVA 0x... bytes 0x440000 Normal-NC mapped
+FUXI WLAN: W26 rx arena IOVA 0x... bytes 0x1040000 Normal-NC mapped; rdp 0x... wrp 0x...
+FUXI WLAN: W26 wbm idle before: base-lsb 0 base-msb 0 misc 0 r2-hp 0 r2-tp 0 idle-list-cntl 0 idle-list-size 0 scatter-base 0/0; not owned
+FUXI WLAN: W26 wbm idle ring 120 base 0x... 65536 words, 32767 link descriptors (rbm 1, our cookie) misc 0x43 readback ok, hp 65534 via shadow 19 (0x948); writes 8 window restore checked
+FUXI WLAN: W26 refill ring 160 filled 4095 buffers (rbm 6, 2048 B at a 4096 B stride, sentinel 0xa5 x64, slots 0x...-0x...) hp 8190 in wrp[0]
+FUXI WLAN: W20 ce rx posted CE1 62 CE2 62
+  ... W20 htc ready, W21, W22 lines as C2 ...
+FUXI WLAN: W23 htt version 3.M (w20 0x02)
+FUXI WLAN: W26 htt sring setup refill 160 info0 0x0205000b info1 0x00022000 intr 0x003e0000 low 1024
+FUXI WLAN: W26 htt sring setup mac0 161 info0 0x0100010b info1 0x02021000 intr 0x003e0000 low 512
+FUXI WLAN: W26 htt sring setup mac1 169 info0 0x0100020b info1 0x02021000 intr 0x003e0000 low 512
+FUXI WLAN: W26 htt sring setup rxdma-err 186 info0 0x0007010b info1 0x00082000 intr 0x00200008 low 0
+FUXI WLAN: W26 rx watch setup+100ms refill tp T taken N left L mac0 hp H tp T avail A mac1 hp H tp T avail A err hp E fill F; exhausted none
+FUXI WLAN: W26 idle watch setup+100ms hp 65534 tp T avail A; exhausted none
+FUXI WLAN: W26 chain mask pdev 0 tx 0x3 rx 0x3 sent (PDEV_SET_PARAM 0x4003 ids 1, 2)
+  ... C2 lines: chan list, vdev, nss/ps, scan start, `W23 scan started after T ms` ...
+FUXI WLAN: W26 rx watch started ...
+FUXI WLAN: W26 idle watch started ...
+  ... foreign-channel and chan-info lines ...
+FUXI WLAN: W26 rx watch mid (foreign 19) ...
+FUXI WLAN: W26 idle watch mid (foreign 19) ...
+  ... foreign-channel and chan-info lines ...
+FUXI WLAN: W23 scan completed reason 0 after T ms (foreign 38 chan-info 38)
+FUXI WLAN: W26 rx watch completed ...
+FUXI WLAN: W26 idle watch completed ...
+  ... W24 bss / summary / detail lines, the C2b stats lines, `W23 stats after-scan ...` ...
+FUXI WLAN: W26 rx content mac0 entries N valid V foreign 0 rbm-other R cookie-other C
+FUXI WLAN: W26 rx content mac1 entries N valid V foreign 0 rbm-other R cookie-other C
+FUXI WLAN: W26 rx content refill taken T kept K; buffers written W of 4095
+FUXI WLAN: W26 rx guard nonzero dwords: slot-upper 0 (slots 0), slot 4095 0, tail 0, gaps 0
+FUXI WLAN: W26 rxdma err entries E (hp H) push err A routing B flush C other D; rbm link N buf N other N
+FUXI WLAN: W26 link content descriptors written D of 32767, unlisted slot clean; idle ring entries changed C
+FUXI WLAN: W26 counters htt-t2h N htt-rx N wmi-events N unknown N bad-reports 0 sring-sent 4
+FUXI WLAN: W26 htt-t2h types 0:1 ...
+FUXI WLAN: W24 no beacon or probe response heard (chan-info 38); next rung NEXT       (only when frames is 0)
+FUXI WLAN: W23 complete; stop/contain
+FUXI WLAN: W26 rx contain: host writes off; arenas held until bus master off, PERST and SMMU undo
+FUXI WLAN: W23 contain: scan over, no STOP_SCAN
+FUXI WLAN: W20 ce contain posted P reaped R tx T
+FUXI WLAN: W11 QRTR BYE sent before containment
+FUXI WLAN: abort step 28 MHI reset done, bus master off yes, PERST asserted yes
+FUXI WLAN: W26 rx guard after containment nonzero dwords: slot-upper 0 (slots 0), slot 4095 0, tail 0, gaps 0
+FUXI WLAN: W26 arenas zeroed 0x1480000 bytes before free
+FUXI WLAN: abort buffers freed
+```
+
+r1c2c-b (w20 0x200, 512) prints of these only the selected line (`rx rings no; ... chain mask no`), with
+`htt version not asked` in the W23 one, the link arena / pre-read / ring 120 lines (or the not-programmed
+line), four `W26 idle watch` lines (the setup one without the 100 ms look, right before the channel
+list), the link content, counter and types lines, the D4/D5 lines where they apply, the contain line and
+`W26 arenas zeroed 0x440000 bytes before free`. r1c2c-m (0x402) prints the selected line, the chain mask
+line, the counter and types lines and the D4/D5 lines; it allocates nothing.
+
+### What the host tests cover, and what only the device can answer
+
+Host-tested (model and static checks, see Host tests): every word, register, address and order above,
+the refusal of each pre-read case, every failure path, the line widths, containment order and the zeroing
+before the free. Only the phone can say: whether the firmware takes the rings and the idle list at all,
+whether RXDMA lands frames without ring selection and with which length and TLV layout, whether it writes
+past 2048 bytes, whether WBM recycles descriptors (B7), what the error ring holds, and whether any of it
+makes the firmware forward MGMT_RX. The cookie values are ours and never come back (no release ring).
+
+### Deviations from the plan's text, all deliberate
+
+- Both arenas are allocated before the idle list is programmed, so the RX arena line prints before the
+  pre-read line (2.11 listed it after the ring 120 line): 2.7's rule that an allocation failure leaves the
+  WBM untouched holds for 0x302/0x702 too.
+- Ring 120 follows L19's order (registers, readback, entries, barrier, HP) as 2.6.4 lists it; 2.3's
+  sentence put the entries first. Either is safe (the ring is empty until the HP moves).
+- The pre-read line carries nine registers (D1), the content line is three lines (per MAC and the refill
+  line), the watch lines print the raw word with `bad`/`unreadable` instead of derived values when a word
+  is not usable, the counter line is followed by `W26 htt-t2h types` lines: all to keep the 254-byte rule.
+- When the completed watch's refill word is not usable the refill line says `refill taken unknown (no
+  usable completed watch)` instead of a meaningless kept.
+- A faulting WBM write is itself the one reported (`W26 wbm idle write N of 8 (ADDR) failed`), as for CE
+  writes.
+- The raw error entries (2.8: w1, w5, w6, w7) are printed with the frame's byte count, fragment and
+  sequence numbers masked out: the owner rule (counts only) is stricter than 2.8's wording.
+- The guard and D3 lines add `gaps N`: the regions 2.7 marks "device access: none" besides the slot guards
+  and the tail; non-zero is a SPILL like the others.
+- The D4 rule also watches the pdev stats base tx-frame (the pdev-wide twin of CHAN_INFO's tx-frame).
+- A failed stats exchange (C2b's transport failure) still prints the W26 lines, D4 and D5 before
+  containment, as the COMPLETED timeout does.
+
+### Proof that boots without a W26 bit are unchanged
+
+Four differentials against 7caf3ed (scripts in the shop's op11-tools/salami-port/wlan/r1/impl/c2c-impl):
+the W15 harness log (keep 0 and 1) byte for byte; the init/configure logs of 843 boot-arg sets with qrtr
+absent or 0..8 and w20 values without a W26 bit (the r1c2 and r1c2b kit sets included) on the salami and
+the Fuxi build, byte for byte; 7caf3ed's model with all its C1, C2 and C2b scenarios (88 logs) against
+7caf3ed's and C2c's production code, byte for byte; and C2c's model + code against 7caf3ed's model + code:
+the 88 shared scenario logs byte for byte, C2c only adds scenarios after them.
+
 ## Host tests
 
 `CC=cc python3 tools/test-fuxi-wlan-ce.py` (also in tools/ci/build.sh): the model in
@@ -650,6 +932,59 @@ only one or the wrong order of pdevs, no dedup, bands not ORed or from the wrong
 a send fault taken as a refusal, the after-scan line dropped, the stuck-TX answer dropped, a missing
 flush, a line past 254 bytes, a later event overwriting the first and an entry bound off by one are all
 caught.
+
+C2c in the same model: the RX and link arenas with the device's permission per region (a device read of
+an unposted half or slot, a write to a host-only word, or any access outside the arenas fails the test,
+except the injected spills; ring 120 is device read/write; nothing after bus master off), a WBM register
+file holding exactly the nine pre-read and eight write addresses (the pre-reads in order before any write,
+L19's write order and values, BASE_LSB then MISC read back, one HP publish of 65534 by the route the
+shadow mode says, right after the write barrier, with all 32767 entries in place; R2 HP/TP reads at the
+watches; nothing after `wl26_contain`), shadow 19 routed to it through `wl15_shadow_v3`, and a fake
+firmware that checks every SRING_SETUP word against its own table, after VERSION_CONF reached the host and
+before the channel list, takes refill entries (slot starts, RBM 6, the slot as cookie, each once), posts
+them to the MAC rings (with RBM, cookie or address changes by scenario), lets RXDMA receive frames into
+them (with 0x200 also taking link descriptors and maybe returning them to ring 120), pushes RXDMA error
+entries, checks both PDEV_SET_PARAM (cmd 0x4003, TLV 0x0052000c, {pdev, 1, tx} then {pdev, 2, rx}, after
+the SRING_SETUPs and before SCAN_CHAN_LIST) and forwards MGMT_RX per a rule (needs links, buffers and
+links, buffers, the chain masks, never). The host's wrp[0] publish is checked when it happens (barrier
+right before it, every entry, sentinel and zero in place), the host-owned words again before containment,
+and every arena byte at its free (zero, only after bus master off, PERST and the SMMU undo). Scenarios:
+0x702 with shadow 19 and with fuxiwlanw15=1; 0x200 alone with each rule (no RX arena, no ring message,
+idle watches, link content, HTT types counted without 0x02); the four pre-read refusals with 0x200 and
+with 0x302 (nine reads, no WBM write, 0x200 dropped, the RX part still runs; D1's ambiguous case);
+0x302 with the needs-links rule; 0x402 with the needs-chain-masks rule; masks 0 (nothing sent, the WMI
+command stream as without 0x400); 0x480 (the EXT pdev); 1x1 PHY masks with 2 rf chains; tx mask 0x3 with
+rx mask 0x1 (each parameter its own mask); refill entries taken 50 ms after the 4th SRING_SETUP (the
+setup watch waits for them); rings ignored; foreign MAC entries (64 bytes into a slot, slot 4095's start,
+address bits 39:32 set); spills into a slot's upper half, slot 4095, both ends of the tail and the gaps
+(SPILL, D3's second line), the gaps alone; a write at offset 32 only; kept 952 with RBM 4 and other
+cookies; mac0 drained before the mid watch; the error ring full (1023 entries, with 0x10: a second
+inconclusive; entries carry a byte count, fragment and sequence number that must not reach the log); D2
+refill-empty against kept rising and against a never-used MAC ring, and refill exhausted with mac0
+drained; rdp[186] past the ring, refill tp backwards and past the HP, R2 reads of ~0u; the D4 line (with
+the base tx-frame alone, and none without a W26 bit); an RX arena allocation failure and a link arena map
+failure (no WBM access, no ring message); BASE_LSB and MISC readback mismatches (no HP); a fault after the
+3rd WBM write; 16 CE4 sends in flight; HTT major 2; a guard failure after the 2nd SRING_SETUP; a guard
+failure in the stats exchange and no COMPLETED (the W26, D4 and D5 lines before containment); every
+received frame, link descriptor and error entry carries a marker no log line may show; unproven containment (arenas kept, not
+zeroed), proven with RXDMA writing until bus master off (zeroed after it, freed), and the latch (no fill,
+publish or WBM access after `wl26_contain`); every W26 line at its widest; qrtr 7 boots without a W26
+bit (no W26 line, arena, WBM access or ring message). Pure checks: the allowlist equals the model's set
+and meets no CE, TCL or REO register; the D1 readings; the four SRING_SETUP words, the ring 120 list, the
+first and last entries; the watch arithmetic with D2; the D5 rows; the latch. Static: the gate, W26's
+place in L19's order, one window implementation for the two allowlisted accessors, one shadow-19 publish,
+no WBM write before the pre-reads or after a refusal, no store into the arenas from the glue and the H
+fills only from W20 (refused after the latch), SRING_SETUP the only HTT message and RESPONSE_REQUIRED never,
+PDEV_SET_PARAM ids 1 then 2 only, D2/D4/D5, `wl26_contain` first, the free only in the proven branch after
+the D3 recount and the zeroing, no arena word as an argument of any W26 printf, every W26 line within 254
+bytes. L19: the error entry's frame-field masks, the ring ids (enum, PMAC stride,
+setups), rdp/wrp, the RX alloc and HTT announcement order, sizes (struct replicas compiled with the host
+compiler), the idle list on the ring path, HTT enums, fields and encoder rules, thresholds, remote pointer
+words, RBMs, entry fields, the WCN7850 WBM registers and L19's ring 120 write order and values, shadow 19,
+PDEV_SET_PARAM ids and order, then every word of the model's dump. test-fuxi-wlan-salami.py covers the
+gate for the W26 bits (salami and Fuxi builds, cmdline and ADT /defaults, the kit route with r1c2's
+cmdline and a decimal w20 in /defaults). Mutants (c2c-impl/mutants.py: the plan's 2.13 list, D1..D5, the
+gate, the allowlist and the HTT handler) are all caught.
 
 What only the device can answer: whether the firmware fetches from the rings at all with zero interrupt
 thresholds, which pipe carries HTC READY (both are polled), the credit numbers, the real pdev id, whether

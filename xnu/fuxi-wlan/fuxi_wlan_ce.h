@@ -3,7 +3,9 @@
  * rings, HTC and WMI init to WMI READY, polled. W23/W24 (fuxiwlanqrtr=7, C2):
  * on top of that the passive channel list, a station vdev, one passive scan,
  * MGMT_RX parsing and a BSS table; nothing is transmitted on the air. C2b:
- * the CHAN_INFO words and the pdev stats answer after the scan.
+ * the CHAN_INFO words and the pdev stats answer after the scan. C2c (W26,
+ * w20 0x100/0x200/0x400): host RX rings, the WBM idle link-descriptor list
+ * and the pdev chain masks, with the watch, content and guard counts.
  * Pure C: no XNU or Linux includes. The includer provides uint8_t..uint64_t,
  * size_t, bool and memcpy (bsd/dev/fuxi_wlan.c in the kernel,
  * tools/fuxi-wlan-ce-model.c on the host).
@@ -16,9 +18,15 @@
  *   ce.c, ce.h, hal_desc.h:
  *     Copyright (c) 2018-2021 The Linux Foundation. All rights reserved.
  *     Copyright (c) 2021-2022, 2024-2025 Qualcomm Innovation Center, Inc. All rights reserved.
- *   hal.c, hal.h, hw.c, hw.h, dp.h, dp_tx.c, reg.c:
+ *   hal.c, hal.h, hw.c, hw.h, dp.c, dp.h, dp_tx.c, reg.c:
  *     Copyright (c) 2018-2021 The Linux Foundation. All rights reserved.
  *     Copyright (c) 2021-2025 Qualcomm Innovation Center, Inc. All rights reserved.
+ *   hal_rx.c:
+ *     Copyright (c) 2018-2021 The Linux Foundation. All rights reserved.
+ *     Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ *   dp_mon.c:
+ *     Copyright (c) 2019-2021 The Linux Foundation. All rights reserved.
+ *     Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  *   htc.c:
  *     Copyright (c) 2018-2021 The Linux Foundation. All rights reserved.
  *     Copyright (c) 2021-2022, 2024 Qualcomm Innovation Center, Inc. All rights reserved.
@@ -2043,6 +2051,680 @@ wlstats_parse(struct wlstats *st, const uint8_t *p, uint32_t len)
 	for (uint32_t i = 0; i < WLWMI_PS_WORDS; i++) { st->w[i] = wlce_get32(pdev + 4 * i); }
 	st->bytes = bytes;
 	st->have = true;
+}
+
+/* ---- C2c (fuxiwlanqrtr=7): W26, host RX rings, the WBM idle list and the chain masks ----
+ * Adapted from Linux ath12k dp.c, dp.h, dp_rx.c, dp_tx.c, dp_mon.c, hal.c, hal.h,
+ * hal_desc.h, hal_rx.c, hw.c, mac.c and wmi.c (BSD-3-Clause-Clear), v6.19. What
+ * L19 gives the firmware before its first scan (dp_alloc core.c:1291 before
+ * core_start core.c:1300; ring announcements from pdev_create core.c:1143, after
+ * the HTT version exchange core.c:955), each behind its own w20 bit: 0x200 the
+ * WBM idle list (ring 120, 32767 MSDU link descriptors; dp.c:759-876,
+ * hal.c:1714-1806), 0x100 the refill ring with 4095 host buffers, the two
+ * per-MAC rings and the RXDMA error ring, announced by HTT SRING_SETUP
+ * (dp_rx.c:4610-4646, dp_tx.c:1159-1273), 0x400 PDEV_SET_PARAM TX/RX_CHAIN_MASK
+ * (mac.c:8562-8590, 9418). No ring selection, REO, TCL, release or monitor ring,
+ * no other pdev parameter. Ids, values and offsets are re-derived from L19 by the
+ * host test. The glue allocates two arenas (Normal-NC, SMMU-mapped); only the
+ * functions below lay them out and fill them, every device-written word is read
+ * after a read barrier, every count is a host read of host memory, nothing
+ * allocates and every index is bounded by its ring. */
+#define WLRX_W20_BAND24 0x10u            /* the w20 bits of fuxi_wlan.c that W26 reads */
+#define WLRX_W20_RXRING 0x100u
+#define WLRX_W20_IDLELINK 0x200u
+#define WLRX_W20_CHAINMASK 0x400u
+#define WLRX_RING_IDLE 120u              /* HAL_SRNG_RING_ID_WBM_IDLE_LINK (hal.h:470) */
+#define WLRX_RING_REFILL 160u            /* HAL_SRNG_SW2RXDMA_BUF0: RXDMA_BUF ring_num 0, mac 0 (dp_rx.c:4690-4693) */
+#define WLRX_RINGS_PER_PMAC 8u           /* HAL_SRNG_RINGS_PER_PMAC = 192 - 184 (hal.h:497-523) */
+#define WLRX_RING_MAC0 161u              /* RXDMA_BUF ring_num 1, mac 0 (dp_rx.c:4699-4711; hal.c:1421-1423, 1830-1832) */
+#define WLRX_RING_MAC1 (WLRX_RING_MAC0 + WLRX_RINGS_PER_PMAC)
+#define WLRX_RING_ERR 186u               /* HAL_SRNG_RING_ID_WMAC1_RXDMA2SW0: RXDMA_DST ring_num 0, mac 0 */
+#define WLRX_DMAC_START 160u             /* HAL_SRNG_RING_ID_DMAC_CMN_ID_START: wrp index = id - 160 (hal.c:2393, 2427) */
+#define WLRX_RDP_WORDS 207u              /* HAL_SRNG_RING_ID_MAX = 183 + 3 x 8 (hal.c:1564-1576) */
+#define WLRX_WRP_WORDS 47u               /* 3 x 8 + (183 - 160) (hal.c:1592-1604) */
+#define WLRX_REFILL_ENTRIES 4096u        /* DP_RXDMA_BUF_RING_SIZE (dp.h:189) */
+#define WLRX_MAC_ENTRIES 2048u           /* DP_RX_MAC_BUF_RING_SIZE (dp.h:190) */
+#define WLRX_ERR_ENTRIES 1024u           /* DP_RXDMA_ERR_DST_RING_SIZE (dp.h:192) */
+#define WLRX_IDLE_ENTRIES 32768u         /* 18560 link descriptors rounded up (dp.c:766-784) */
+#define WLRX_BUF_DW 2u                   /* sizeof(hal_wbm_buffer_ring) / 4 (hal_desc.h:2117-2119) */
+#define WLRX_ERR_DW 8u                   /* sizeof(hal_reo_entrance_ring) / 4 (hal_desc.h:1051-1059) */
+/* Error entry fields taken from the received frame, never stored or printed (counts only): w5
+ * MPDU_BYTE_COUNT 21:8 (hal_desc.h:1033), w6 MPDU_FRAG_NUM 10:7 and MPDU_SEQ_NUM 30:19 (hal_desc.h:1039, 1044). */
+#define WLRX_ERR_W5_FRAME 0x003fff00u
+#define WLRX_ERR_W6_FRAME 0x7ff80780u
+#define WLRX_IDLE_DW 2u                  /* sizeof(hal_wbm_link_desc) / 4 (hal_desc.h:1797-1799) */
+#define WLRX_NBUF 4095u                  /* a fresh source ring takes entries - 1 (hal.c:2039-2042, dp_rx.c:332-336) */
+#define WLRX_NDESC 32767u                /* get_next_entry stops at next hp == tp (hal.c:2077-2080) */
+#define WLRX_BUF_BYTES 2048u             /* DP_RX_BUFFER_SIZE (dp.h:206): the posted half of a slot */
+#define WLRX_SLOT_BYTES 4096u            /* slot stride: the upper 2048 bytes are a guard, never posted */
+#define WLRX_SLOTS 4096u                 /* slots 0..4094 posted, slot 4095 never */
+#define WLRX_SENTINEL 0xa5u
+#define WLRX_SENTINEL_BYTES 64u
+#define WLRX_LINK_DESC_BYTES 128u        /* HAL_LINK_DESC_SIZE and _ALIGN (hal.h:16-17) */
+#define WLRX_RBM_IDLE_DESC 1u            /* HAL_RX_BUF_RBM_WBM_DEV0_IDLE_DESC_LIST (hal.h:809-816, dp.c:1717-1722) */
+#define WLRX_RBM_SW1 6u                  /* HAL_RX_BUF_RBM_SW1_BM, WCN7850 rx_buf_rbm (hw.c:1291) */
+#define WLRX_COOKIE_START 0x4000u        /* DP_LINK_DESC_START, _SHIFT 3: the link cookie's shape (dp.h:97-101) */
+#define WLRX_COOKIE_SHIFT 3u
+/* RX arena (0x100): rdp u32[207] and wrp u32[47] on the first page, the four
+ * rings, 4096 slots of 4 KiB, a 128 KiB tail. Link arena (0x200): ring 120, then
+ * 32768 link descriptor slots of 128 bytes (32767 listed). */
+#define WLRX_ARENA_BYTES 0x1040000u
+#define WLRX_OFF_RDP 0x0000000u
+#define WLRX_OFF_WRP 0x0000400u
+#define WLRX_OFF_REFILL 0x0004000u
+#define WLRX_OFF_MAC0 0x000c000u
+#define WLRX_OFF_MAC1 0x0010000u
+#define WLRX_OFF_ERR 0x0014000u
+#define WLRX_OFF_BUFS 0x0020000u
+#define WLRX_OFF_TAIL 0x1020000u
+#define WLRX_LINK_BYTES 0x440000u
+#define WLRX_LINK_OFF_RING 0x000000u
+#define WLRX_LINK_OFF_DESC 0x040000u
+_Static_assert(WLRX_OFF_RDP + 4u * WLRX_RDP_WORDS <= WLRX_OFF_WRP && WLRX_OFF_WRP + 4u * WLRX_WRP_WORDS <= WLRX_OFF_REFILL &&
+    WLRX_OFF_REFILL + 4u * WLRX_BUF_DW * WLRX_REFILL_ENTRIES <= WLRX_OFF_MAC0 &&
+    WLRX_OFF_MAC0 + 4u * WLRX_BUF_DW * WLRX_MAC_ENTRIES <= WLRX_OFF_MAC1 &&
+    WLRX_OFF_MAC1 + 4u * WLRX_BUF_DW * WLRX_MAC_ENTRIES <= WLRX_OFF_ERR &&
+    WLRX_OFF_ERR + 4u * WLRX_ERR_DW * WLRX_ERR_ENTRIES <= WLRX_OFF_BUFS &&
+    WLRX_OFF_BUFS + WLRX_SLOTS * WLRX_SLOT_BYTES == WLRX_OFF_TAIL && WLRX_OFF_TAIL + 0x20000u == WLRX_ARENA_BYTES &&
+    WLRX_SLOT_BYTES == 0x1000u && 2u * WLRX_BUF_BYTES == WLRX_SLOT_BYTES && WLRX_NBUF == WLRX_SLOTS - 1u &&
+    !(WLRX_OFF_BUFS & 0xfffu) && WLRX_RDP_WORDS == 183u + 3u * WLRX_RINGS_PER_PMAC &&
+    WLRX_WRP_WORDS == 3u * WLRX_RINGS_PER_PMAC + 183u - WLRX_DMAC_START && WLRX_RING_ERR < WLRX_RDP_WORDS,
+    "W26 RX arena layout");
+_Static_assert(WLRX_LINK_OFF_RING + 4u * WLRX_IDLE_DW * WLRX_IDLE_ENTRIES <= WLRX_LINK_OFF_DESC &&
+    WLRX_LINK_OFF_DESC + WLRX_IDLE_ENTRIES * WLRX_LINK_DESC_BYTES == WLRX_LINK_BYTES && WLRX_NDESC == WLRX_IDLE_ENTRIES - 1u &&
+    (((WLRX_NDESC - 1u) + WLRX_COOKIE_START) << WLRX_COOKIE_SHIFT) <= 0xfffffu, "W26 link arena layout, 20-bit cookie");
+/* HTT SRING_SETUP (msg 0xb, struct htt_srng_setup_cmd 13 words; dp.h:470-478,
+ * 493-513, 642-676): ring ids HOST1_TO_FW_RXBUF 5, RXDMA_HOST_BUF 0,
+ * NON_MONITOR_DEST 7; types HW_TO_SW 0, SW_TO_HW 1, SW_TO_SW 2. Thresholds of
+ * ath12k_dp_srng_setup (dp.c:270-320, hal.h:762-769): RXDMA_BUF batch 0, timer
+ * 500 us, low threshold entries >> 3 (kept in words, hal.c:2379-2380);
+ * RXDMA_DST and WBM_IDLE_LINK batch 1, timer 256 us. */
+#define WLRX_HTT_SRING_SETUP 0xbu
+#define WLRX_HTT_RING_RXDMA_HOST_BUF 0u
+#define WLRX_HTT_RING_HOST1_TO_FW_RXBUF 5u
+#define WLRX_HTT_RING_NON_MONITOR_DEST 7u
+#define WLRX_HTT_HW_TO_SW 0u
+#define WLRX_HTT_SW_TO_HW 1u
+#define WLRX_HTT_SW_TO_SW 2u
+#define WLRX_HTT_LOOP_CNT_DIS (1u << 25)
+#define WLRX_HTT_RESPONSE_REQUIRED (1u << 19)   /* never set: L19 defines no T2H answer for it (dp.h:637-639, 1338-1352) */
+#define WLRX_SRING_WORDS 13u
+#define WLRX_TIMER_RX_US 500u
+#define WLRX_TIMER_OTHER_US 256u
+#define WLRX_BATCH_OTHER 1u
+/* WCN7850 WBM (hw.c:1194-1216, hal.h:59, 94-122, 222-225, 242, 287-298, 316,
+ * 346): ring 120's R0 at the UMAC WBM block + hal_wbm_idle_ring_base_lsb, the
+ * TCL1 R0 layout (BASE_MSB 4, ID 8, MISC 0x10, CONSUMER_INT_SETUP IX0 0x30, IX1
+ * 0x34, as WLCE_R0_*), R2 HP at + 0x30b8, TP 4 above; the idle list control and
+ * size registers and the scattered ring base (read only: scatter path). */
+#define WLRX_WBM_REG 0x00a34000u
+#define WLRX_WBM_IDLE_R0 (WLRX_WBM_REG + 0xd3cu)
+#define WLRX_WBM_IDLE_HP (WLRX_WBM_REG + 0x30b8u)
+#define WLRX_WBM_IDLE_TP (WLRX_WBM_IDLE_HP + 4u)
+#define WLRX_WBM_LIST_CNTL (WLRX_WBM_REG + 0x240u)
+#define WLRX_WBM_LIST_SIZE (WLRX_WBM_REG + 0x244u)
+#define WLRX_WBM_SCAT_LSB (WLRX_WBM_REG + 0x250u)
+#define WLRX_WBM_SCAT_MSB (WLRX_WBM_REG + 0x254u)
+#define WLRX_WBM_LIST_MODE (1u << 1)     /* HAL_WBM_LINK_DESC_IDLE_LIST_MODE: scatter (hal.h:346) */
+#define WLRX_MISC_RING_ID_DISABLE (1u << 0)
+#define WLRX_WBM_MISC (WLRX_MISC_RING_ID_DISABLE | WLCE_MISC_LOOPCNT_DIS | WLCE_MISC_SRNG_ENABLE)
+#define WLRX_IDLE_REGS 8u
+/* PDEV_SET_PARAM (wmi.h:63, 245, 322-324, 934-936, 1296, 3279-3284; wmi.c:1620-1650). */
+#define WLWMI_CMD_PDEV_SET_PARAM 0x4003u
+#define WLWMI_TAG_PDEV_SET_PARAM_CMD 0x52u
+#define WLWMI_PDEV_PARAM_TX_CHAIN_MASK 0x1u
+#define WLWMI_PDEV_PARAM_RX_CHAIN_MASK 0x2u
+#define WLWMI_PDEV_SET_PARAM_BYTES 16u
+_Static_assert(WLRX_SRING_WORDS * 4u == 52u && WLWMI_PDEV_SET_PARAM_BYTES == 16u && WLRX_WBM_MISC == 0x43u &&
+    WLRX_WBM_IDLE_R0 >> 19 == 0x14u && WLRX_WBM_IDLE_TP >> 19 == 0x14u && WLRX_WBM_LIST_CNTL >> 19 == 0x14u,
+    "W26 wire sizes and one window for every WBM register");
+
+/* A device-written word of the RX arena is one 32-bit load; the host model wraps it. A host
+ * pointer publish into the arena (wrp[0]) likewise. */
+#ifndef WLRX_LOAD
+#define WLRX_LOAD(p) (*(p))
+#endif
+#ifndef WLRX_PUBLISH
+#define WLRX_PUBLISH(p, v) (*(p) = (v))
+#endif
+
+enum { WLRX_R_REFILL, WLRX_R_MAC0, WLRX_R_MAC1, WLRX_R_ERR, WLRX_NRING };
+enum { WLRX_P_SETUP, WLRX_P_STARTED, WLRX_P_MID, WLRX_P_COMPLETED, WLRX_NPOINT };
+/* watch field bits (bad, unreadable, exhausted) */
+#define WLRX_F_REFILL 0x01u
+#define WLRX_F_MAC0 0x02u
+#define WLRX_F_MAC1 0x04u
+#define WLRX_F_ERR 0x08u
+#define WLRX_F_IDLE 0x10u
+/* the pre-reads, in this order, before any WBM write */
+enum { WLRX_PRE_BASE_LSB, WLRX_PRE_BASE_MSB, WLRX_PRE_MISC, WLRX_PRE_R2_HP, WLRX_PRE_R2_TP, WLRX_PRE_LIST_CNTL,
+    WLRX_PRE_LIST_SIZE, WLRX_PRE_SCAT_LSB, WLRX_PRE_SCAT_MSB, WLRX_PRE_N };
+/* their reading: free, or why nothing is written (D1: scatter mode with base 0 and SRNG_ENABLE 0 is
+ * ambiguous, not a firmware-owned list) */
+enum { WLRX_IDLE_FREE, WLRX_IDLE_SRNG, WLRX_IDLE_BASE, WLRX_IDLE_AMBIGUOUS, WLRX_IDLE_UNREADABLE };
+
+struct wlrx_ring {              /* one HAL SRNG the host lays out */
+	uint16_t id;                /* HAL ring id: 160, 161, 169, 186, 120 */
+	uint8_t src;                /* 1 L19 SRC ring (hp in wrp / R2), 0 DST (hp in rdp) */
+	uint8_t entry_dw;           /* 2 RXDMA_BUF and WBM_IDLE_LINK, 8 RXDMA_DST */
+	uint32_t entries, off;      /* entries; offset inside its arena */
+	uint32_t mac, htt_ring, htt_type, batch, timer_us;   /* SRING_SETUP fields (L19 mac_id, not the pdev field) */
+	bool low;                   /* LOW_THRESH_INTR_EN */
+	volatile uint32_t *va;
+	uint64_t iova, hp_iova, tp_iova;   /* remote pointer words; 0 for ring 120 */
+};
+struct wlrx_watch {             /* raw device-side words in dwords; ~0u = unreadable */
+	uint32_t refill_tp, mac_hp[2], mac_tp[2], err_hp, idle_hp, idle_tp;
+	uint32_t refill_taken, refill_left, mac_avail[2], err_fill, idle_avail;   /* derived, in entries */
+	uint32_t foreign;           /* the scan's FOREIGN_CHAN count at this watch */
+	int32_t kept;               /* refill taken - entries the firmware wrote to the MAC rings (hp / 2) */
+	uint8_t bad, unreadable, exhausted;   /* WLRX_F_* */
+	bool taken, kept_valid, refill_empty;
+};
+struct wlrx_content {
+	uint32_t mac_entries[2], mac_valid[2], mac_foreign[2], refill_taken;
+	int32_t kept;
+	uint32_t mac_rbm_other[2], mac_cookie_other[2];            /* among valid: printed only */
+	uint32_t bufs_written;                                     /* sentinel changed in bytes 0..63 */
+	uint32_t guard_upper, guard_upper_slots, guard_last, guard_tail;   /* non-zero dwords */
+	uint32_t guard_gap;         /* non-zero dwords where the device was given no address (2.7 "none") */
+	uint32_t err_hp, err_scanned, err_entries, err_push[4], err_code[20], err_rbm_link, err_rbm_buf, err_rbm_other;
+	uint32_t err_raw[4][4];     /* w1, w5, w6, w7 of the first four entries, frame fields masked */
+	bool err_bad;
+	uint32_t link_written, link_unlisted, idle_changed;
+};
+struct wlrx {
+	uint8_t *base; uint64_t iova; uint32_t bytes;                /* RX arena, 0x1040000 */
+	volatile uint32_t *rdp, *wrp; uint64_t rdp_iova, wrp_iova;   /* u32[207], u32[47] */
+	struct wlrx_ring ring[WLRX_NRING];                          /* refill, mac0, mac1, err */
+	uint8_t *bufs; uint64_t bufs_iova; uint32_t nbufs;          /* 4095 posted of 4096 slots, stride 4096 */
+	uint8_t *link; uint64_t link_iova; uint32_t link_bytes;     /* link arena 0x440000 */
+	struct wlrx_ring idle; uint32_t ndesc;                      /* 32767 */
+	uint32_t wbm_pre[WLRX_PRE_N];                               /* D1: seven pre-reads + the scattered base */
+	unsigned idle_own;                                          /* WLRX_IDLE_* of the pre-reads */
+	uint32_t chain_tx, chain_rx;                                /* sent values; 0 = not sent */
+	struct wlrx_watch w[WLRX_NPOINT];                           /* setup, started, mid, completed */
+	struct wlrx_content c;
+	uint32_t htt_t2h[64], htt_t2h_other, sring_sent;
+	uint32_t tx_ci, ci_rx_frame_max, stats_answers, tx_stats[5];   /* D4 / D5 notes from the C2b readouts */
+	bool rx_on, idle_on, idle_tried, chain_on, stopping;
+};
+
+static inline uint32_t
+wlrx_cookie(uint32_t i)
+{
+	return ((WLRX_NDESC - 1u - i) + WLRX_COOKIE_START) << WLRX_COOKIE_SHIFT;  /* id 32766 - i, page 0 */
+}
+
+/* struct ath12k_buffer_addr (hal_desc.h:11-20): address 31:0; address 39:32 in
+ * 7:0, return buffer manager 11:8, cookie 31:12 of word 1 (hal_rx.c:268-279,
+ * hal.c:1959-1970). Both cookies are ours: the slot index for buffers, the
+ * DP_LINK_DESC_COOKIE_SET shape for links. */
+static inline void
+wlrx_addr_entry(volatile uint32_t *e, uint64_t addr, uint32_t rbm, uint32_t cookie)
+{
+	e[0] = (uint32_t)addr;
+	e[1] = ((uint32_t)(addr >> 32) & 0xffu) | ((rbm & 0xfu) << 8) | ((cookie & 0xfffffu) << 12);
+}
+
+/* Lay out the RX arena (2.7): rdp, wrp, the rings with their remote pointer
+ * words (an L19 SRC ring has its HP in wrp[id - 160] and its TP in rdp[id], a
+ * DST ring the reverse; hal.c:1881-1911, 2374-2431) and the slots. */
+static inline int
+wlrx_layout(struct wlrx *rx, uint8_t *base, uint64_t iova, uint32_t bytes)
+{
+	static const struct { uint16_t id; uint8_t src, dw; uint32_t entries, off, mac, ring, type, batch, timer; bool low; }
+	    plan[WLRX_NRING] = {
+		{ WLRX_RING_REFILL, 1, WLRX_BUF_DW, WLRX_REFILL_ENTRIES, WLRX_OFF_REFILL, 0, WLRX_HTT_RING_HOST1_TO_FW_RXBUF,
+		  WLRX_HTT_SW_TO_SW, 0, WLRX_TIMER_RX_US, true },
+		{ WLRX_RING_MAC0, 1, WLRX_BUF_DW, WLRX_MAC_ENTRIES, WLRX_OFF_MAC0, 0, WLRX_HTT_RING_RXDMA_HOST_BUF,
+		  WLRX_HTT_SW_TO_HW, 0, WLRX_TIMER_RX_US, true },
+		{ WLRX_RING_MAC1, 1, WLRX_BUF_DW, WLRX_MAC_ENTRIES, WLRX_OFF_MAC1, 1, WLRX_HTT_RING_RXDMA_HOST_BUF,
+		  WLRX_HTT_SW_TO_HW, 0, WLRX_TIMER_RX_US, true },
+		{ WLRX_RING_ERR, 0, WLRX_ERR_DW, WLRX_ERR_ENTRIES, WLRX_OFF_ERR, 0, WLRX_HTT_RING_NON_MONITOR_DEST,
+		  WLRX_HTT_HW_TO_SW, WLRX_BATCH_OTHER, WLRX_TIMER_OTHER_US, false },
+	};
+	if (!base || (iova & 0xfffu) || bytes < WLRX_ARENA_BYTES || iova + WLRX_ARENA_BYTES > (1ull << 32)) { return 1; }
+	rx->base = base; rx->iova = iova; rx->bytes = WLRX_ARENA_BYTES;
+	rx->rdp = (volatile uint32_t *)(void *)(base + WLRX_OFF_RDP); rx->rdp_iova = iova + WLRX_OFF_RDP;
+	rx->wrp = (volatile uint32_t *)(void *)(base + WLRX_OFF_WRP); rx->wrp_iova = iova + WLRX_OFF_WRP;
+	for (unsigned i = 0; i < WLRX_NRING; i++) {
+		struct wlrx_ring *r = &rx->ring[i];
+		uint64_t rdp = rx->rdp_iova + 4ull * plan[i].id, wrp = rx->wrp_iova + 4ull * (plan[i].id - WLRX_DMAC_START);
+		r->id = plan[i].id; r->src = plan[i].src; r->entry_dw = plan[i].dw; r->entries = plan[i].entries;
+		r->off = plan[i].off; r->mac = plan[i].mac; r->htt_ring = plan[i].ring; r->htt_type = plan[i].type;
+		r->batch = plan[i].batch; r->timer_us = plan[i].timer; r->low = plan[i].low;
+		r->va = (volatile uint32_t *)(void *)(base + plan[i].off);
+		r->iova = iova + plan[i].off;
+		r->hp_iova = r->src ? wrp : rdp;
+		r->tp_iova = r->src ? rdp : wrp;
+	}
+	rx->bufs = base + WLRX_OFF_BUFS; rx->bufs_iova = iova + WLRX_OFF_BUFS; rx->nbufs = WLRX_NBUF;
+	return 0;
+}
+
+/* Host writes, all before the first SRING_SETUP: the whole arena zeroed, the
+ * 0xa5 sentinel over bytes 0..63 of each posted slot, 4095 refill entries (slot
+ * start, RBM 6, cookie = slot). The HP follows with wlrx_publish_refill. */
+static inline int
+wlrx_fill_refill(struct wlrx *rx)
+{
+	struct wlrx_ring *r = &rx->ring[WLRX_R_REFILL];
+	if (rx->stopping || !rx->base) { return 1; }
+	for (uint32_t i = 0; i < rx->bytes / 4u; i++) { ((volatile uint32_t *)(void *)rx->base)[i] = 0; }
+	for (uint32_t k = 0; k < WLRX_NBUF; k++) {
+		volatile uint8_t *s = rx->bufs + (size_t)k * WLRX_SLOT_BYTES;
+		for (uint32_t j = 0; j < WLRX_SENTINEL_BYTES; j++) { s[j] = WLRX_SENTINEL; }
+		wlrx_addr_entry(&r->va[WLRX_BUF_DW * k], rx->bufs_iova + (uint64_t)k * WLRX_SLOT_BYTES, WLRX_RBM_SW1, k);
+	}
+	return 0;
+}
+
+/* L19 access_end for an LMAC source ring: dma_wmb, then the HP into shared
+ * memory (hal.c:2173-2184): wrp[0] = 4095 entries in words. */
+static inline int
+wlrx_publish_refill(struct wlrx *rx, const struct wlce_io *io)
+{
+	if (rx->stopping || !rx->base) { return 1; }
+	io->wbarrier(io->ctx);
+	WLRX_PUBLISH(&rx->wrp[WLRX_RING_REFILL - WLRX_DMAC_START], WLRX_NBUF * WLRX_BUF_DW);
+	return 0;
+}
+
+/* HTT SRING_SETUP as ath12k_dp_tx_htt_srng_setup builds it (dp_tx.c:1159-1273):
+ * pdev = mac for SW_TO_SW, DP_SW2HW_MACID(mac) = mac + 1 otherwise; ring size in
+ * words, entry words, LOOP_CNT_DIS for SW_TO_HW only; MSI 0 (no ring of C2c is in
+ * an MSI group, dp.c:179-223); batch x entry words, timer >> 3; the low threshold
+ * only with LOW_THRESH_INTR_EN; RESPONSE_REQUIRED never. */
+static inline void
+wlrx_sring_words(const struct wlrx *rx, unsigned i, uint32_t *w)
+{
+	const struct wlrx_ring *r = &rx->ring[i < WLRX_NRING ? i : 0];
+	uint32_t pdev = r->htt_type == WLRX_HTT_SW_TO_SW ? r->mac : r->mac + 1u;
+	for (uint32_t k = 0; k < WLRX_SRING_WORDS; k++) { w[k] = 0; }
+	w[0] = WLRX_HTT_SRING_SETUP | (pdev & 0xffu) << 8 | (r->htt_ring & 0xffu) << 16 | (r->htt_type & 0xffu) << 24;
+	w[1] = (uint32_t)r->iova; w[2] = (uint32_t)(r->iova >> 32);
+	w[3] = ((r->entries * r->entry_dw) & 0xffffu) | (uint32_t)r->entry_dw << 16 |
+	    (r->htt_type == WLRX_HTT_SW_TO_HW ? WLRX_HTT_LOOP_CNT_DIS : 0u);
+	w[4] = (uint32_t)r->hp_iova; w[5] = (uint32_t)(r->hp_iova >> 32);
+	w[6] = (uint32_t)r->tp_iova; w[7] = (uint32_t)(r->tp_iova >> 32);
+	w[11] = ((r->batch * r->entry_dw) & 0x7fffu) | ((r->timer_us >> 3) & 0xffffu) << 16;
+	w[12] = r->low ? ((r->entries >> 3) * r->entry_dw) & 0xffffu : 0u;
+}
+
+/* Lay out and zero the link arena: ring 120 (a UMAC SRC ring, R2 pointers, no
+ * TP_ADDR) and the 128-byte descriptor slots. */
+static inline int
+wlrx_link_layout(struct wlrx *rx, uint8_t *base, uint64_t iova, uint32_t bytes)
+{
+	struct wlrx_ring *r = &rx->idle;
+	if (!base || (iova & 0xfffu) || bytes < WLRX_LINK_BYTES || iova + WLRX_LINK_BYTES > (1ull << 32)) { return 1; }
+	rx->link = base; rx->link_iova = iova; rx->link_bytes = WLRX_LINK_BYTES; rx->ndesc = WLRX_NDESC;
+	r->id = WLRX_RING_IDLE; r->src = 1; r->entry_dw = WLRX_IDLE_DW; r->entries = WLRX_IDLE_ENTRIES;
+	r->off = WLRX_LINK_OFF_RING; r->batch = WLRX_BATCH_OTHER; r->timer_us = WLRX_TIMER_OTHER_US; r->low = false;
+	r->va = (volatile uint32_t *)(void *)(base + WLRX_LINK_OFF_RING); r->iova = iova + WLRX_LINK_OFF_RING;
+	r->hp_iova = r->tp_iova = 0;
+	for (uint32_t i = 0; i < WLRX_LINK_BYTES / 4u; i++) { ((volatile uint32_t *)(void *)base)[i] = 0; }
+	return 0;
+}
+
+/* The idle list entry I as the host writes it: descriptor slot I, RBM 1, our
+ * cookie (2.6.3); entry 32767 stays 0. */
+static inline void
+wlrx_link_expect(const struct wlrx *rx, uint32_t i, uint32_t *e)
+{
+	volatile uint32_t v[2] = { 0, 0 };
+	if (i < WLRX_NDESC) {
+		wlrx_addr_entry(v, rx->link_iova + WLRX_LINK_OFF_DESC + (uint64_t)i * WLRX_LINK_DESC_BYTES, WLRX_RBM_IDLE_DESC,
+		    wlrx_cookie(i));
+	}
+	e[0] = v[0]; e[1] = v[1];
+}
+
+static inline int
+wlrx_link_fill(struct wlrx *rx)
+{
+	if (rx->stopping || !rx->link) { return 1; }
+	for (uint32_t i = 0; i < WLRX_NDESC; i++) {
+		uint32_t e[2];
+		wlrx_link_expect(rx, i, e);
+		rx->idle.va[WLRX_IDLE_DW * i] = e[0];
+		rx->idle.va[WLRX_IDLE_DW * i + 1u] = e[1];
+	}
+	return 0;
+}
+
+static inline uint32_t
+wlrx_pre_addr(unsigned i)
+{
+	static const uint32_t a[WLRX_PRE_N] = {
+		WLRX_WBM_IDLE_R0 + WLCE_R0_BASE_LSB, WLRX_WBM_IDLE_R0 + WLCE_R0_BASE_MSB, WLRX_WBM_IDLE_R0 + WLCE_R0_MISC,
+		WLRX_WBM_IDLE_HP, WLRX_WBM_IDLE_TP, WLRX_WBM_LIST_CNTL, WLRX_WBM_LIST_SIZE, WLRX_WBM_SCAT_LSB, WLRX_WBM_SCAT_MSB,
+	};
+	return i < WLRX_PRE_N ? a[i] : 0u;
+}
+
+/* Ring 120's eight writes in L19's order (hal.c:1714-1806): BASE_LSB, BASE_MSB
+ * (address 39:32, ring size in words 27:8), ID (entry words), IX0 (timer 256 raw
+ * 31:16, batch 1 x entry words 14:0), IX1 0 (no low threshold), R2 HP 0, R2 TP
+ * 0, MISC RING_ID_DISABLE | LOOPCNT_DISABLE | SRNG_ENABLE. No MSI registers (no
+ * MSI group), no TP_ADDR for ring 120 (hal.c:1724, 1771). */
+static inline void
+wlrx_idle_regs(const struct wlrx *rx, uint32_t regs[WLRX_IDLE_REGS][2])
+{
+	const struct wlrx_ring *r = &rx->idle;
+	const uint32_t words = r->entries * r->entry_dw;
+	const uint32_t v[WLRX_IDLE_REGS][2] = {
+		{ WLRX_WBM_IDLE_R0 + WLCE_R0_BASE_LSB, (uint32_t)r->iova },
+		{ WLRX_WBM_IDLE_R0 + WLCE_R0_BASE_MSB, ((uint32_t)(r->iova >> 32) & 0xffu) | (words & 0xfffffu) << 8 },
+		{ WLRX_WBM_IDLE_R0 + WLCE_R0_ID, r->entry_dw },
+		{ WLRX_WBM_IDLE_R0 + WLCE_R0_CONS_IX0, (r->timer_us & 0xffffu) << 16 | ((r->batch * r->entry_dw) & 0x7fffu) },
+		{ WLRX_WBM_IDLE_R0 + WLCE_R0_CONS_IX1, 0u },
+		{ WLRX_WBM_IDLE_HP, 0u },
+		{ WLRX_WBM_IDLE_TP, 0u },
+		{ WLRX_WBM_IDLE_R0 + WLCE_R0_MISC, WLRX_WBM_MISC },
+	};
+	for (unsigned i = 0; i < WLRX_IDLE_REGS; i++) { regs[i][0] = v[i][0]; regs[i][1] = v[i][1]; }
+}
+
+/* The WBM accessor's allowlist, nothing else in the WBM, REO or TCL blocks:
+ * reads of the nine pre-read addresses (which hold the readback and watch
+ * registers too), writes of ring 120's eight. */
+static inline bool
+wlrx_wbm_ok(uint32_t off, bool wr)
+{
+	static const uint32_t wa[WLRX_IDLE_REGS] = {
+		WLRX_WBM_IDLE_R0 + WLCE_R0_BASE_LSB, WLRX_WBM_IDLE_R0 + WLCE_R0_BASE_MSB, WLRX_WBM_IDLE_R0 + WLCE_R0_ID,
+		WLRX_WBM_IDLE_R0 + WLCE_R0_CONS_IX0, WLRX_WBM_IDLE_R0 + WLCE_R0_CONS_IX1, WLRX_WBM_IDLE_HP, WLRX_WBM_IDLE_TP,
+		WLRX_WBM_IDLE_R0 + WLCE_R0_MISC,
+	};
+	for (unsigned i = 0; wr && i < WLRX_IDLE_REGS; i++) { if (off == wa[i]) { return true; } }
+	for (unsigned i = 0; !wr && i < WLRX_PRE_N; i++) { if (off == wlrx_pre_addr(i)) { return true; } }
+	return false;
+}
+
+/* The pre-reads (B5, D1): any ~0u = ownership not established; SRNG_ENABLE or a
+ * non-zero ring base = the firmware owns the list; scatter mode with base 0 and
+ * SRNG_ENABLE 0 = ambiguous. Anything but FREE: no WBM write at all. */
+static inline unsigned
+wlrx_idle_owned(const uint32_t *pre)
+{
+	for (unsigned i = 0; i < WLRX_PRE_N; i++) { if (pre[i] == ~0u) { return WLRX_IDLE_UNREADABLE; } }
+	if (pre[WLRX_PRE_MISC] & WLCE_MISC_SRNG_ENABLE) { return WLRX_IDLE_SRNG; }
+	if (pre[WLRX_PRE_BASE_LSB] || (pre[WLRX_PRE_BASE_MSB] & 0xffu)) { return WLRX_IDLE_BASE; }
+	if (pre[WLRX_PRE_LIST_CNTL] & WLRX_WBM_LIST_MODE) { return WLRX_IDLE_AMBIGUOUS; }
+	return WLRX_IDLE_FREE;
+}
+
+static inline const char *
+wlrx_idle_why(unsigned own)
+{
+	switch (own) {
+	case WLRX_IDLE_SRNG: return "SRNG_ENABLE set (firmware owns the list)";
+	case WLRX_IDLE_BASE: return "base non-zero (firmware owns the list)";
+	case WLRX_IDLE_AMBIGUOUS: return "scatter mode set with base 0 and SRNG_ENABLE 0 (AMBIGUOUS)";
+	case WLRX_IDLE_UNREADABLE: return "a pre-read is ~0 (unreadable, ownership not established)";
+	default: return "free";
+	}
+}
+
+/* The device-side pointer words of the four rings (0x100), each followed by the
+ * read barrier (L19's dma_rmb, hal.c:2144-2164). Ring 120's R2 words come
+ * through the glue's WBM accessor. */
+static inline void
+wlrx_watch_read(const struct wlrx *rx, const struct wlce_io *io, struct wlrx_watch *w)
+{
+	w->refill_tp = WLRX_LOAD(&rx->rdp[WLRX_RING_REFILL]); io->rbarrier(io->ctx);
+	for (unsigned m = 0; m < 2; m++) {
+		const struct wlrx_ring *r = &rx->ring[WLRX_R_MAC0 + m];
+		w->mac_hp[m] = WLRX_LOAD(&rx->wrp[r->id - WLRX_DMAC_START]); io->rbarrier(io->ctx);
+		w->mac_tp[m] = WLRX_LOAD(&rx->rdp[r->id]); io->rbarrier(io->ctx);
+	}
+	w->err_hp = WLRX_LOAD(&rx->rdp[WLRX_RING_ERR]); io->rbarrier(io->ctx);
+}
+
+/* 0 = a pointer of a ring of SIZE words with entries of DW words; 1 = bad (not a
+ * multiple of the entry or not below the ring); 2 = unreadable (~0u). */
+static inline unsigned
+wlrx_word(uint32_t v, uint32_t size, uint32_t dw)
+{
+	return v == ~0u ? 2u : (v >= size || v % dw) ? 1u : 0u;
+}
+
+/* Remaining entries and exhaustion (2.8, D2): refill taken tp / 2, left ((8190 -
+ * tp) mod 8192) / 2; macN avail ((hp - tp) mod 4096) / 2, exhausted at 0 once
+ * its tp moved; err fill hp / 8, exhausted from 1023; idle avail ((HP - TP) mod
+ * 65536) / 2, exhausted at 0. Refill left 0 is exhaustion only with an exhausted
+ * MAC ring (avail 0 once its tp moved: a ring the firmware never used is not one)
+ * or kept above the setup watch's; else it is the refill-empty note. */
+static inline void
+wlrx_watch_derive(struct wlrx *rx, unsigned p)
+{
+	struct wlrx_watch *w = &rx->w[p < WLRX_NPOINT ? p : 0];
+	const struct wlrx_watch *s = &rx->w[WLRX_P_SETUP];
+	const uint32_t rsize = WLRX_REFILL_ENTRIES * WLRX_BUF_DW, msize = WLRX_MAC_ENTRIES * WLRX_BUF_DW;
+	const uint32_t esize = WLRX_ERR_ENTRIES * WLRX_ERR_DW, isize = WLRX_IDLE_ENTRIES * WLRX_IDLE_DW;
+	w->bad = w->unreadable = w->exhausted = 0;
+	w->refill_taken = w->refill_left = w->err_fill = w->idle_avail = w->mac_avail[0] = w->mac_avail[1] = 0;
+	w->kept = 0; w->kept_valid = w->refill_empty = false;
+	if (rx->rx_on) {
+		const uint32_t f[4] = { WLRX_F_REFILL, WLRX_F_MAC0, WLRX_F_MAC1, WLRX_F_ERR };
+		unsigned k = wlrx_word(w->refill_tp, rsize, WLRX_BUF_DW);
+		bool mac_ok[2];
+		if (k) { w->bad |= k == 1 ? f[0] : 0u; w->unreadable |= k == 2 ? f[0] : 0u; }
+		else { w->refill_taken = w->refill_tp / WLRX_BUF_DW; w->refill_left = (WLRX_NBUF * WLRX_BUF_DW + rsize - w->refill_tp) % rsize / WLRX_BUF_DW; }
+		for (unsigned m = 0; m < 2; m++) {
+			unsigned a = wlrx_word(w->mac_hp[m], msize, WLRX_BUF_DW), b = wlrx_word(w->mac_tp[m], msize, WLRX_BUF_DW);
+			mac_ok[m] = !a && !b;
+			if (a == 2 || b == 2) { w->unreadable |= f[1 + m]; } else if (a || b) { w->bad |= f[1 + m]; }
+			if (!mac_ok[m]) { continue; }
+			w->mac_avail[m] = (w->mac_hp[m] + msize - w->mac_tp[m]) % msize / WLRX_BUF_DW;
+			if (!w->mac_avail[m] && w->mac_tp[m]) { w->exhausted |= f[1 + m]; }
+		}
+		k = wlrx_word(w->err_hp, esize, WLRX_ERR_DW);
+		if (k) { w->bad |= k == 1 ? f[3] : 0u; w->unreadable |= k == 2 ? f[3] : 0u; }
+		else { w->err_fill = w->err_hp / WLRX_ERR_DW; if (w->err_fill >= WLRX_ERR_ENTRIES - 1u) { w->exhausted |= f[3]; } }
+		if (!(w->bad & f[0]) && !(w->unreadable & f[0]) && mac_ok[0] && mac_ok[1]) {
+			w->kept = (int32_t)(w->refill_taken - w->mac_hp[0] / WLRX_BUF_DW - w->mac_hp[1] / WLRX_BUF_DW);
+			w->kept_valid = true;
+		}
+		if (!((w->bad | w->unreadable) & f[0]) && !w->refill_left) {
+			if ((w->exhausted & (f[1] | f[2])) || (w->kept_valid && s->kept_valid && w->kept > s->kept)) { w->exhausted |= f[0]; }
+			else { w->refill_empty = true; }
+		}
+	}
+	if (rx->idle_on) {
+		unsigned a = wlrx_word(w->idle_hp, isize, WLRX_IDLE_DW), b = wlrx_word(w->idle_tp, isize, WLRX_IDLE_DW);
+		if (a == 2 || b == 2) { w->unreadable |= WLRX_F_IDLE; }
+		else if (a || b) { w->bad |= WLRX_F_IDLE; }
+		else {
+			w->idle_avail = (w->idle_hp + isize - w->idle_tp) % isize / WLRX_IDLE_DW;
+			if (!w->idle_avail) { w->exhausted |= WLRX_F_IDLE; }
+		}
+	}
+	w->taken = true;
+}
+
+/* Guard words (B1): non-zero dwords in bytes 2048..4095 of slots 0..4094 (and
+ * in how many slots), in slot 4095 and in the 128 KiB tail; and the gaps the
+ * device was given no address in (2.7 "none"): the first 16 KiB except the
+ * pointer words SRING_SETUP named (rdp 160/161/169/186, wrp 0/1/9/26), and the
+ * 16 KiB after the error ring. Counts only. */
+static inline void
+wlrx_guard_count(const struct wlrx *rx, uint32_t *upper, uint32_t *upper_slots, uint32_t *last, uint32_t *tail, uint32_t *gap)
+{
+	const volatile uint32_t *a = (const volatile uint32_t *)(const void *)rx->base;
+	*upper = *upper_slots = *last = *tail = *gap = 0;
+	for (uint32_t i = 0; i < WLRX_OFF_REFILL / 4u; i++) {
+		const uint32_t k = i - WLRX_OFF_WRP / 4u;   /* the wrp index for i at or past wrp[0] */
+		const bool named = i == WLRX_RING_REFILL || i == WLRX_RING_MAC0 || i == WLRX_RING_MAC1 || i == WLRX_RING_ERR ||
+		    (i >= WLRX_OFF_WRP / 4u && (k == WLRX_RING_REFILL - WLRX_DMAC_START || k == WLRX_RING_MAC0 - WLRX_DMAC_START ||
+		    k == WLRX_RING_MAC1 - WLRX_DMAC_START || k == WLRX_RING_ERR - WLRX_DMAC_START));
+		*gap += !named && a[i] != 0;
+	}
+	for (uint32_t i = (WLRX_OFF_ERR + 4u * WLRX_ERR_DW * WLRX_ERR_ENTRIES) / 4u; i < WLRX_OFF_BUFS / 4u; i++) { *gap += a[i] != 0; }
+	for (uint32_t k = 0; k < WLRX_SLOTS; k++) {
+		const volatile uint32_t *s = (const volatile uint32_t *)(const void *)(rx->bufs + (size_t)k * WLRX_SLOT_BYTES);
+		uint32_t from = k < WLRX_NBUF ? WLRX_BUF_BYTES / 4u : 0u, n = 0;
+		for (uint32_t i = from; i < WLRX_SLOT_BYTES / 4u; i++) { n += s[i] != 0; }
+		if (k < WLRX_NBUF) { *upper += n; *upper_slots += n != 0; } else { *last += n; }
+	}
+	for (uint32_t i = 0; i < (WLRX_ARENA_BYTES - WLRX_OFF_TAIL) / 4u; i++) {
+		*tail += ((const volatile uint32_t *)(const void *)(rx->base + WLRX_OFF_TAIL))[i] != 0;
+	}
+}
+
+/* The RX content after the scan (2.8): per-MAC entries split by address alone
+ * into valid (the start of a posted slot) and foreign; among valid, RBM other
+ * than 6 and cookie other than the slot, printed only; kept = refill taken -
+ * valid; buffers whose sentinel changed; the guards; the RXDMA error ring
+ * entries 0..min(fill, 1023) - 1 (all 1024 when its HP is bad, clamped to the
+ * ring): push reason, error code and RBM histograms, the first four raw with
+ * the frame's length, fragment and sequence numbers masked out. */
+static inline void
+wlrx_content(struct wlrx *rx, const struct wlce_io *io, uint32_t refill_taken)
+{
+	struct wlrx_content *c = &rx->c;
+	const struct wlrx_ring *e = &rx->ring[WLRX_R_ERR];
+	for (size_t i = 0; i < sizeof(*c); i++) { ((uint8_t *)c)[i] = 0; }
+	io->rbarrier(io->ctx);
+	for (unsigned m = 0; m < 2; m++) {
+		const struct wlrx_ring *r = &rx->ring[WLRX_R_MAC0 + m];
+		for (uint32_t i = 0; i < r->entries; i++) {
+			uint32_t w0 = r->va[WLRX_BUF_DW * i], w1 = r->va[WLRX_BUF_DW * i + 1u];
+			uint64_t a = w0 | (uint64_t)(w1 & 0xffu) << 32;
+			if (!w0 && !w1) { continue; }
+			c->mac_entries[m]++;
+			if (a < rx->bufs_iova || (a - rx->bufs_iova) % WLRX_SLOT_BYTES || (a - rx->bufs_iova) / WLRX_SLOT_BYTES >= WLRX_NBUF) {
+				c->mac_foreign[m]++;
+				continue;
+			}
+			c->mac_valid[m]++;
+			if (((w1 >> 8) & 0xfu) != WLRX_RBM_SW1) { c->mac_rbm_other[m]++; }
+			if ((w1 >> 12) != (uint32_t)((a - rx->bufs_iova) / WLRX_SLOT_BYTES)) { c->mac_cookie_other[m]++; }
+		}
+	}
+	c->refill_taken = refill_taken;
+	c->kept = (int32_t)(refill_taken - c->mac_valid[0] - c->mac_valid[1]);
+	for (uint32_t k = 0; k < WLRX_NBUF; k++) {
+		const volatile uint8_t *s = rx->bufs + (size_t)k * WLRX_SLOT_BYTES;
+		bool changed = false;
+		for (uint32_t j = 0; j < WLRX_SENTINEL_BYTES && !changed; j++) { changed = s[j] != WLRX_SENTINEL; }
+		c->bufs_written += changed;
+	}
+	wlrx_guard_count(rx, &c->guard_upper, &c->guard_upper_slots, &c->guard_last, &c->guard_tail, &c->guard_gap);
+	c->err_hp = WLRX_LOAD(&rx->rdp[WLRX_RING_ERR]); io->rbarrier(io->ctx);
+	c->err_bad = wlrx_word(c->err_hp, WLRX_ERR_ENTRIES * WLRX_ERR_DW, WLRX_ERR_DW) != 0;
+	c->err_scanned = c->err_bad ? WLRX_ERR_ENTRIES : c->err_hp / WLRX_ERR_DW;  /* a usable HP is at most 1023 entries */
+	for (uint32_t i = 0; i < c->err_scanned; i++) {
+		const volatile uint32_t *d = &e->va[WLRX_ERR_DW * i];
+		uint32_t w1 = d[1], w6 = d[6], rbm = (w1 >> 8) & 0xfu, code = (w6 >> 2) & 0x1fu, any = 0;
+		for (uint32_t k = 0; k < WLRX_ERR_DW; k++) { any |= d[k]; }
+		if (!any) { continue; }
+		if (c->err_entries < 4u) {
+			c->err_raw[c->err_entries][0] = w1; c->err_raw[c->err_entries][1] = d[5] & ~WLRX_ERR_W5_FRAME;
+			c->err_raw[c->err_entries][2] = w6 & ~WLRX_ERR_W6_FRAME; c->err_raw[c->err_entries][3] = d[7];
+		}
+		c->err_entries++;
+		c->err_push[w6 & 3u]++;
+		c->err_code[code < 19u ? code : 19u]++;
+		if (rbm == WLRX_RBM_IDLE_DESC) { c->err_rbm_link++; } else if (rbm == WLRX_RBM_SW1) { c->err_rbm_buf++; } else { c->err_rbm_other++; }
+	}
+}
+
+/* Link content (B7): descriptors 0..32766 with any non-zero dword, the unlisted
+ * slot 32767, ring 120 entries that differ from what the host wrote. */
+static inline void
+wlrx_link_content(struct wlrx *rx, const struct wlce_io *io)
+{
+	struct wlrx_content *c = &rx->c;
+	c->link_written = c->link_unlisted = c->idle_changed = 0;
+	io->rbarrier(io->ctx);
+	for (uint32_t d = 0; d < WLRX_IDLE_ENTRIES; d++) {
+		const volatile uint32_t *s = (const volatile uint32_t *)(const void *)(rx->link + WLRX_LINK_OFF_DESC +
+		    (size_t)d * WLRX_LINK_DESC_BYTES);
+		uint32_t e[2], any = 0;
+		for (uint32_t k = 0; k < WLRX_LINK_DESC_BYTES / 4u; k++) { any |= s[k]; }
+		if (d < WLRX_NDESC) { c->link_written += any != 0; } else { c->link_unlisted += any != 0; }
+		wlrx_link_expect(rx, d, e);
+		c->idle_changed += rx->idle.va[WLRX_IDLE_DW * d] != e[0] || rx->idle.va[WLRX_IDLE_DW * d + 1u] != e[1];
+	}
+}
+
+/* HTT T2H messages by type (word 0 bits 7:0, dp_rx.c:1931, dp.h:1357). */
+static inline void
+wlrx_htt_count(struct wlrx *rx, const uint8_t *msg, uint32_t len)
+{
+	uint32_t t = len ? msg[0] : 0xffu;
+	if (t < 64u) { rx->htt_t2h[t]++; } else { rx->htt_t2h_other++; }
+}
+
+/* D4/D5 notes from the C2b readouts: CHAN_INFO events with a non-zero
+ * tx-frame and the largest rx-frame; pdev stats answers with a non-zero
+ * local-enqued, hw-queued, mpdu-enqued, hw-reaped or base tx-frame (the pdev's
+ * twin of the CHAN_INFO one). */
+static inline void
+wlrx_note_ci(struct wlrx *rx, const uint32_t *ci)
+{
+	if (ci[WLWMI_CI_TX_FRAME_CNT]) { rx->tx_ci++; }
+	if (ci[WLWMI_CI_RX_FRAME_COUNT] > rx->ci_rx_frame_max) { rx->ci_rx_frame_max = ci[WLWMI_CI_RX_FRAME_COUNT]; }
+}
+
+static inline void
+wlrx_note_stats(struct wlrx *rx, const uint32_t *s)
+{
+	static const uint8_t f[5] = { WLWMI_PS_LOCAL_ENQUED, WLWMI_PS_HW_QUEUED, WLWMI_PS_MPDU_ENQUED, WLWMI_PS_HW_REAPED,
+		WLWMI_PS_TX_FRAME_COUNT };
+	rx->stats_answers++;
+	for (unsigned i = 0; i < 5; i++) { rx->tx_stats[i] += s[f[i]] != 0; }
+}
+
+/* D5: the next step after a boot that heard no beacon, the first matching
+ * row of rx_path_plan.md 2.11 for the kit's bits (0x200 rows for the idle-list
+ * kit without rings, 0x100 rows with rings, 0x400 rows for the chain-mask kit). */
+static inline const char *
+wlrx_next(const struct wlrx *rx, uint32_t bits)
+{
+	const struct wlrx_content *c = &rx->c;
+	const struct wlrx_watch *mid = &rx->w[WLRX_P_MID], *end = &rx->w[WLRX_P_COMPLETED];
+	const bool links = bits & WLRX_W20_IDLELINK, rings = bits & WLRX_W20_RXRING, chain = bits & WLRX_W20_CHAINMASK;
+	const uint32_t valid = c->mac_valid[0] + c->mac_valid[1];
+	if (rx->rx_on && (c->guard_upper || c->guard_last || c->guard_tail || c->guard_gap || c->mac_foreign[0] || c->mac_foreign[1])) {
+		return "none: stop, owner review before any further kit (guard spill or foreign MAC entry)";
+	}
+	if ((mid->taken && mid->exhausted) || (end->taken && end->exhausted)) {
+		return bits & WLRX_W20_BAND24 ? "none: owner review (a second inconclusive run, w20 0x10 already set)" :
+		    "the same kit with w20 0x10 added (an exhaustion flag: inconclusive, nothing killed)";
+	}
+	if (links && rx->idle_tried && !rx->idle_on) {
+		return rx->idle_own == WLRX_IDLE_SRNG || rx->idle_own == WLRX_IDLE_BASE ?
+		    "fallback r1c2c-a w20 0x102 (258), then 0x502 (1282) (the firmware owns the WBM idle list)" :
+		    "none: owner review (WBM idle pre-read ambiguous or unreadable)";
+	}
+	if (links && !rings && rx->idle_on && end->taken && !(end->bad | end->unreadable)) {
+		if (end->idle_tp && c->link_written) { return "r1c2c w20 0x302 (770) (links used, nothing forwarded: H1b or H4)"; }
+		if (!end->idle_tp && !c->link_written) { return "r1c2c w20 0x302 (770) (links untouched: RXDMA pushed nothing)"; }
+	}
+	if (rings && rx->rx_on && end->taken) {
+		if (!(end->bad & WLRX_F_REFILL) && !(end->unreadable & WLRX_F_REFILL) && !end->refill_tp &&
+		    !c->mac_entries[0] && !c->mac_entries[1]) {
+			return "C2d step 1 after reading the W26 htt-t2h types (the firmware ignored the rings)";
+		}
+		if (c->refill_taken && valid && !c->bufs_written) {
+			return "r1c2c-m w20 0x402 (1026) if not yet booted, else BDF/calibration (buffers placed, nothing written)";
+		}
+		if (c->bufs_written && (c->err_code[0] || c->err_rbm_link)) {
+			return links ? "C2d step 1 (RXDMA could not complete pushes)" :
+			    "r1c2c w20 0x302 (770) (RXDMA could not complete pushes)";
+		}
+		if (c->bufs_written && !c->err_entries) { return "C2d step 1, then the H8 pdev-parameter rung (frames landed, not forwarded)"; }
+	}
+	if (chain && !rx->chain_on) { return "none: kit void, owner review (chain mask not sent: no MAC/PHY caps)"; }
+	if (chain && !rings && !links) {
+		return rx->ci_rx_frame_max ? "r1c2c-all w20 0x702 (1794) if rx-frame rose above the C2b readout, else 1.2 rows L3/L4" :
+		    "1.2 rows L3/L4 (rx-frame 0 on every channel: H3 dead)";
+	}
+	return "none matched: owner review (rx_path_plan.md 2.11)";
 }
 
 #endif /* FUXI_WLAN_CE_H */
