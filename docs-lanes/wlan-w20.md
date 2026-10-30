@@ -1476,8 +1476,11 @@ or ETHERNET 2.
 
 Arena (0x474000 bytes): a 4 KiB rdp page, 280 SPT pages (0x118000), the ten rings each page-aligned and backed to full size
 (the two completion rings are 0x100000 each, the bulk), a tail; the lane's device-writable total rises by this much when
-0x4000 is set. The rdp page but the ten rings' pointer words, the padding between rings, the RX SPT entries and the tail are
-guard-counted (`W29 guard`), again after containment; non-zero is a SPILL.
+0x4000 is set. The rdp page but the ten rings' pointer words, the padding between rings, the SPT and the tail are
+guard-counted (`W29 guard`), again after containment; non-zero is a SPILL. The SPT count depends on whether cookie
+conversion filled it (`spt_filled`, set by `wlcm_spt_fill`): filled, `spt-lost` counts the RX SPT entries of the posted
+slots that no longer hold an address; not filled (cc dropped or not selected, no PPT written, the device never given those
+pages), `spt-nonzero` counts every non-zero dword of the 280 SPT pages, which must stay zero.
 
 ### Lines
 
@@ -1496,8 +1499,10 @@ FUXI WLAN: W29 htt ppdu stats cfg pdev-mask 0x1|0x2 msg 0x0e670211|0x0e670411 se
 FUXI WLAN: W29 mac-start lro cfg (seeds 0, lro-enable 0) idle-ps 1 pdev 0
 FUXI WLAN: W29 vdev 0 encap/decap native-wifi|ethernet (service 461 not set|set)
 FUXI WLAN: W29 common rings 10 of 10 programmed, writes N; cookie conversion on (cmem writes 280, returns decoded N)
-FUXI WLAN: W29 guard [SPILL ]nonzero dwords: rdp N, ring-gap N, spt-lost N, tail N[; stop; owner review before any further kit]
-FUXI WLAN: W29 guard after containment nonzero dwords: rdp N, ring-gap N, spt-lost N, tail N[; SPILL: ...]
+FUXI WLAN: W29 cc before: reo-cfg0@0xa38050 V, reo-cfg1@0xa38054 V, wbm-cfg0@0xa34040 V, wbm-cfg1@0xa34044 V, wbm-cfg2@0xa34090 V, convert@0xa34094 V
+FUXI WLAN: W29 cc before decode REG V HAL_..._CFG_*: NAME NAME=V ... [other V]                               (per non-zero register but CFG0)
+FUXI WLAN: W29 guard [SPILL ]nonzero dwords: rdp N, ring-gap N, spt-lost|spt-nonzero N, tail N[; stop; owner review before any further kit]
+FUXI WLAN: W29 guard after containment nonzero dwords: rdp N, ring-gap N, spt-lost|spt-nonzero N, tail N[; SPILL: ...]
 ```
 
 ### Deviations from L19, all deliberate
@@ -1528,6 +1533,80 @@ The host suite rebuilds every prior scenario (C1, C2, C2b, C2c, C2d, C2e) from t
 every new line is reached only under `wl20_bits & WL20_L19ORDER`, so a boot without 0x4000 behaves as at 0f48029. The salami
 and Fuxi gate tests (`tools/test-fuxi-wlan-salami.py`) cover the qrtr-7 gate for 0x4000 (cmdline and ADT /defaults, refused
 with qrtr 6, keep/stop22, and without 0x1000).
+
+### C2f bisect: the r1c2g reading, the guard fix, the cc values and `fuxiwlanw29`
+
+r1c2g (w20 0x7f02, `fuxiwlanmlo=4`) on the phone: cookie conversion was dropped (`W29 cookie conversion not programmed: a
+REO/WBM cookie register is already configured ...`), the common rings were programmed and read back, every mac-start piece,
+the PPDU stats, LRO, idle-PS and the vdev encap/decap (native-wifi, service 461 not set) were sent after their HTC credit
+waits, and then the firmware never sent SCAN_STARTED (started 0, events 0), the first rings boot that did not start the
+scan; the firmware stayed alive (M0, SYSERR 0, EE AMSS). A false SPILL then stopped the kit chain: `W29 guard after
+containment ... spt-lost 4095`: `wlcm_guard_count` counted every zero RX SPT entry as lost, but with cc dropped
+`wl29_cc_init` returns before `wlcm_spt_fill`, so those entries were never written.
+
+- Guard fix: `spt-lost` only when the SPT was filled (`spt_filled`); otherwise `spt-nonzero`, the non-zero SPT dwords
+  (see the arena paragraph above). Model: `s_c2f_guard` (cc dropped: no SPILL, a non-zero TX or RX SPT dword is one; cc on:
+  a cleared entry is one; cc not selected: as dropped), and the mutant that counts spt-lost without the fill brings the
+  4095 back and is caught.
+- CC values, read-only: right after the six cc_config pre-reads `W29 cc before:` prints each register's address and value,
+  for cc dropped and cc on alike, then one `W29 cc before decode` line per non-zero, readable register with named fields
+  (not CFG0, the CMEM base): the hal.h flags set by name and the fields as NAME=value (prefix `HAL_REO1_SW_COOKIE_CFG_`,
+  `HAL_WBM_SW_COOKIE_CFG_` or `HAL_WBM_SW_COOKIE_CONV_CFG_`), bits L19 does not name as `other`. The names and bit
+  positions are re-derived from L19's hal.h by `l19_c2f` (dump `ccfield`). Nothing is written by these lines.
+- `fuxiwlanw29` (an int, boot-arg or ADT /defaults like `fuxiwlanw20`, `--wlan-defaults fuxiwlanw29=N`): a bitmask of the
+  W29 pieces when w20 0x4000 is valid. Absent = all pieces, exactly the C2f boot (the C2f `W29 selected` line byte for
+  byte). Given, the selected line lists the set (`W29 selected: L19 dp_alloc order, fuxiwlanw29 0xN: common rings yes|no,
+  cookie conversion ..., pdev params ..., dfs-offload ..., ppdu-stats ..., lro ..., idle-ps ..., encap/decap ... (w20
+  0x4000); nothing transmitted`). Refused before any access (one `W20 fuxiwlanw29 ... refused` line, the run invalid): 0,
+  negative, a bit outside 0xff, 0x02 without 0x01, without a valid w20 0x4000, without qrtr 7.
+
+| Bit | Piece | Where (L19 order kept among the enabled pieces) |
+|---|---|---|
+| 0x01 | common rings (sw2wbm 121, tcl+comp x3, reinject 16, reo cmd 20, reo status 21) and their pre-reads | `wl29_common_pre/post` in `wl27_setup` |
+| 0x02 | cookie conversion (`wl29_cc_init`, `wl29_cc_config`); needs 0x01 (ownership comes from the common-ring pre-reads) | dp_alloc, service ready |
+| 0x04 | the two HTT PPDU_STATS_CFG | `wl29_macstart_pre`, after DFS |
+| 0x08 | pdev params PMF_QOS, DYNAMIC_BW, ARP_AC_OVERRIDE, MESH_MCAST | `wl29_macstart_pre` (MESH_MCAST after the PPDU stats) |
+| 0x10 | DFS phyerr offload | `wl29_macstart_pre` |
+| 0x20 | LRO config | `wl29_macstart_post`, after the channel list |
+| 0x40 | IDLE_PS | `wl29_macstart_post` |
+| 0x80 | vdev encap/decap | `wl29_encap_decap`, after VDEV_CREATE |
+
+The fifth arena and its guards stay with 0x4000 whatever the mask. With a partial mask the mac-start lines name what was
+not sent (`W29 mac-start pdev params not sent, dfs-offload sent, ppdu-stats 0, pdev 0 (fuxiwlanw29 0x11)`, `W29 mac-start
+lro cfg not sent, idle-ps 1, pdev 0 (fuxiwlanw29 0x41)`); with all of a group the C2f line is unchanged. Model:
+`s_c2f_mask_gate` (0x01 the common rings alone, no CMEM and no cc register beyond the two ring pre-reads; 0x84 no common-ring
+or cc access at all; 0x03 both) and `s_c2f_bisect` (a full qrtr 7 scan with w20 0x4002 for eleven masks: the fake firmware
+checks each mac-start / encap command word by word and in its place, and sees exactly the selected ones in L19's order); 15
+more C2F mutants (each piece's gate, the guard, the cc lines), all caught. `tools/test-fuxi-wlan-salami.py` covers the
+parse, the refusals and the /defaults route.
+
+Suggested bisect kits, all w20 0x7f02 (32514, ADT /defaults, the r1c2 cmdline plus `fuxiwlanmlo=4` as r1c2f/r1c2g), with
+`fuxiwlanw29` in ADT /defaults too:
+
+| Kit | fuxiwlanw29 | Decimal | Question |
+|---|---|---|---|
+| r1c2h-01 | 0x01 | 1 | common rings only: does the scan start again (as every earlier rings boot did)? |
+| r1c2h-05 | 0x05 | 5 | + the two HTT PPDU stats configs |
+| r1c2h-09 | 0x09 | 9 | + pdev params PMF_QOS / DYNAMIC_BW / ARP_AC_OVERRIDE / MESH_MCAST |
+| r1c2h-11 | 0x11 | 17 | + DFS phyerr offload |
+| r1c2h-21 | 0x21 | 33 | + LRO config |
+| r1c2h-41 | 0x41 | 65 | + IDLE_PS |
+| r1c2h-81 | 0x81 | 129 | + vdev encap/decap |
+
+Run 0x01 first. If it starts the scan, the single-piece kits name the piece that stops SCAN_STARTED; if 0x01 alone does
+not, the common rings themselves are the regression (and the mac-start kits wait). Cookie conversion (0x02) is left out:
+on r1c2g it was dropped for the boot anyway (the firmware had configured it), and the new `W29 cc before` lines say with
+what values.
+
+### Proof for the bisect change
+
+Differentials against 68cd15a, each tree built from its own sources (script in this session's scratchpad, recorded in the
+commit body): 68cd15a's model with all its scenarios, instrumented to dump every log, linked against 68cd15a's and this
+change's production code: byte for byte, except the added `W29 cc before` lines in the 0x4000 gate runs; the model's
+fuxiwlanw29-free parts (a full 0x4002 scan with every mac-start piece, the gate's happy and cc-dropped runs with their
+reports) against both: equal except the cc value lines and the cc-dropped guard line (`SPILL ... spt-lost 4095` becomes
+`spt-nonzero 0`); the salami and Fuxi init/configure gate over boot-arg sets without `fuxiwlanw29`, with and without
+0x4000, cmdline and ADT /defaults: byte for byte.
 
 ## Host tests
 

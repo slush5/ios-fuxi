@@ -3804,6 +3804,7 @@ struct wlcm {
 	uint32_t ppt_pre[WLCM_NSPT];                      /* PPT pre-reads */
 	uint32_t writes, cmem_writes;
 	bool cc_on, rings_on, stopping;
+	bool spt_filled;                                  /* wlcm_spt_fill ran: the guard checks the RX SPT entries */
 };
 
 /* The cookie-converted cookie of RX refill slot k (dp.c:1478, cc_cookie_gen). */
@@ -3886,6 +3887,7 @@ wlcm_spt_fill(struct wlcm *cm, const struct wlrx *rx)
 		const uint64_t a = rx->bufs_iova + (uint64_t)k * WLRX_SLOT_BYTES;
 		e[0] = (uint32_t)a; e[1] = (uint32_t)(a >> 32) & 0xffu;
 	}
+	cm->spt_filled = true;
 }
 
 /* The PPT entry address (CMEM) and value for SPT page i: page paddr >> 12. */
@@ -4051,6 +4053,43 @@ wlcm_cc_owned(const uint32_t pre[WLCM_CC_REGS])
 	return WLCM_FREE;
 }
 
+/* The named fields of the cc_config registers (hal.h:266-287, 329-335), by
+ * wlcm_cc_regs index, for the read-only "cc before" decode: N = the count, *F
+ * the fields, *PFX L19's macro prefix of that register's family. The CFG0
+ * registers hold the CMEM base and have no named fields (N = 0). */
+struct wlcm_cc_field { const char *name; uint8_t shift, width; };
+
+static inline unsigned
+wlcm_cc_fields(unsigned k, const struct wlcm_cc_field **f, const char **pfx)
+{
+	static const struct wlcm_cc_field reo1[6] = {
+		{ "CMEM_BASE_ADDR_MSB", 0, 8 }, { "COOKIE_PPT_MSB", 8, 5 }, { "COOKIE_SPT_MSB", 13, 5 }, { "ALIGN", 18, 1 },
+		{ "ENABLE", 19, 1 }, { "GLOBAL_ENABLE", 20, 1 },
+	};
+	static const struct wlcm_cc_field wbm1[4] = {
+		{ "CMEM_BASE_ADDR_MSB", 0, 8 }, { "COOKIE_PPT_MSB", 8, 5 }, { "COOKIE_SPT_MSB", 13, 5 }, { "ALIGN", 18, 1 },
+	};
+	static const struct wlcm_cc_field wbm2[3] = { { "RELEASE_PATH_EN", 0, 1 }, { "ERR_PATH_EN", 1, 1 }, { "CONV_IND_EN", 3, 1 } };
+	static const struct wlcm_cc_field conv[6] = {
+		{ "WBM2SW0_EN", 1, 1 }, { "WBM2SW1_EN", 2, 1 }, { "WBM2SW2_EN", 3, 1 }, { "WBM2SW3_EN", 4, 1 }, { "WBM2SW4_EN", 5, 1 },
+		{ "GLOBAL_EN", 8, 1 },
+	};
+	switch (k) {
+	case 1: *f = reo1; *pfx = "HAL_REO1_SW_COOKIE_CFG_"; return 6;
+	case 3: *f = wbm1; *pfx = "HAL_WBM_SW_COOKIE_CFG_"; return 4;
+	case 4: *f = wbm2; *pfx = "HAL_WBM_SW_COOKIE_CFG_"; return 3;
+	case 5: *f = conv; *pfx = "HAL_WBM_SW_COOKIE_CONV_CFG_"; return 6;
+	default: *f = NULL; *pfx = ""; return 0;
+	}
+}
+
+static inline const char *
+wlcm_cc_name(unsigned k)
+{
+	static const char *const n[WLCM_CC_REGS] = { "reo-cfg0", "reo-cfg1", "wbm-cfg0", "wbm-cfg1", "wbm-cfg2", "convert" };
+	return k < WLCM_CC_REGS ? n[k] : "?";
+}
+
 /* The PPT pre-reads' reading: all zero = free; any non-zero = owned; ~0u =
  * unreadable (treated as owned: ownership not established). */
 static inline unsigned
@@ -4065,9 +4104,19 @@ wlcm_cmem_owned(const struct wlcm *cm)
  * every region here should stay as the host left it:
  *  - rdp_gap: the rdp page except the ten rings' pointer words (all stay 0);
  *  - ring_gap: the page-alignment padding between the rings (stays 0);
- *  - spt_lost: RX SPT entries the host wrote (slots 0..NBUF-1) that no longer
- *    hold a non-zero address (a device overwrite would clear or change them);
+ *  - spt_lost: with the SPT filled (spt_filled, cookie conversion on), RX SPT
+ *    entries the host wrote (slots 0..NBUF-1) that no longer hold a non-zero
+ *    address (a device overwrite would clear or change them); without it (cc
+ *    dropped or not selected: no PPT written, the device was never given these
+ *    pages), every non-zero dword of the 280 SPT pages, which must stay zero
+ *    (wlcm_spt_what names the count in the line);
  *  - tail: the 64 KiB tail. */
+static inline const char *
+wlcm_spt_what(const struct wlcm *cm)
+{
+	return cm->spt_filled ? "spt-lost" : "spt-nonzero";
+}
+
 static inline void
 wlcm_guard_count(const struct wlcm *cm, uint32_t *rdp_gap, uint32_t *ring_gap, uint32_t *spt_lost, uint32_t *tail)
 {
@@ -4078,10 +4127,13 @@ wlcm_guard_count(const struct wlcm *cm, uint32_t *rdp_gap, uint32_t *ring_gap, u
 		for (unsigned k = 0; k < WLCM_NRING; k++) { if (i == cm->ring[k].id) { owned = true; break; } }
 		*rdp_gap += !owned && a[i] != 0;
 	}
-	for (uint32_t k = 0; k < WLRX_NBUF; k++) {
+	for (uint32_t k = 0; cm->spt_filled && k < WLRX_NBUF; k++) {
 		const uint32_t page = WLCM_RX_SPT_OFFSET + k / WLCM_SPT_ENTRIES, spt = k % WLCM_SPT_ENTRIES;
 		const volatile uint32_t *e = (const volatile uint32_t *)(const void *)(cm->spt + (size_t)page * WLCM_PAGE_BYTES + (size_t)spt * WLCM_SPT_ENTRY_BYTES);
 		if (e[0] == 0 && e[1] == 0) { (*spt_lost)++; }
+	}
+	for (uint32_t i = 0; !cm->spt_filled && i < WLCM_NSPT * WLCM_PAGE_BYTES / 4u; i++) {
+		*spt_lost += ((const volatile uint32_t *)(const void *)cm->spt)[i] != 0;
 	}
 	for (uint32_t off = WLCM_PAGE_BYTES + WLCM_NSPT * WLCM_PAGE_BYTES; off < WLCM_OFF_TAIL; off += 4u) {
 		bool inring = false;
