@@ -133,7 +133,8 @@ static bool wl_w15, wl_w12, wl_w11_ok, wl_w11_attempted, wl_mhi_valid;
 static uint32_t wl_bhi = 0x1000u;  /* C2e: BHIOFF as milestone 5 found it */
 static uint64_t wl_iova_next, wl_iova_base = 0xa0000000ull, wl_iova_end = 0xb0000000ull;
 static struct wl_dma wl_ce_arena, wl_msi_sink, wl_tables, wl_rxvectors, wl_rddm, wl_target[WL_TARGET_MAX];
-static struct wl_dma wl_rx_arena, wl_link_arena, wl_reo_arena, wl_mon_arena;  /* C2c, C2d, C2e */
+static struct wl_dma wl_rx_arena, wl_link_arena, wl_reo_arena, wl_mon_arena, wl_cm_arena;  /* C2c, C2d, C2e, C2f */
+static uint32_t wl_cmem_base; static bool wl_cmem_valid;  /* C2f: QMI dev_mem[0] CMEM region (set by the scenario) */
 static struct wl_dma wl14_regdb, wl14_bdf, wl14_m3, wl_ipcr, wl_contexts, wl_vectors, wl_amss, wl_image;
 static uint32_t wl_mrd(uint32_t off);
 static void wl_mwr(uint32_t off, uint32_t v);
@@ -4997,6 +4998,111 @@ dump_c2e(void)
 	free(ra); free(ma);
 }
 
+/* C2f pure checks: the wlcm header helpers build exactly the words L19 does, and
+ * the cc cookie math round-trips. Hardcoded expected values (l19_c2f proves them
+ * equal to the tree); a header value mutation diverges and aborts. */
+static void
+s_c2f_pure(void)
+{
+	static struct wlcm cm;
+	static struct wlrx rx;
+	uint8_t *ca = aligned_alloc(16384, WLCM_ARENA_BYTES), *ra = aligned_alloc(16384, RXA);
+	uint32_t regs[WLCM_RING_REGS_MAX][2], cc[WLCM_CC_REGS][2];
+	unsigned n = 0;
+	/* id, dir, entries, entry_dw, r0, r2 */
+	static const uint32_t exp[WLCM_NRING][6] = {
+		{ 121, 0, 64, 8, 0xa3437c, 0xa37010 }, { 24, 0, 512, 8, 0xa44900, 0xa46000 },
+		{ 128, 1, 32768, 8, 0xa34e08, 0xa370c8 }, { 25, 0, 512, 8, 0xa44978, 0xa46008 },
+		{ 130, 1, 32768, 8, 0xa34ef8, 0xa370d8 }, { 26, 0, 512, 8, 0xa449f0, 0xa46010 },
+		{ 132, 1, 32768, 8, 0xa34fe8, 0xa370e8 }, { 16, 0, 32, 8, 0xa38304, 0xa3b028 },
+		{ 20, 0, 256, 12, 0xa3828c, 0xa3b020 }, { 21, 1, 2048, 28, 0xa38a84, 0xa3b0a8 },
+	};
+	static const uint32_t ccexp[WLCM_CC_REGS][2] = {
+		{ 0xa38050, 0x113000 }, { 0xa38054, 0x1d1310 }, { 0xa34040, 0x113000 }, { 0xa34044, 0x51310 },
+		{ 0xa34090, 0xb }, { 0xa34094, 0x13a },
+	};
+	CHECK(ca && ra && !wlrx_layout(&rx, ra, 0xa1400000ull, RXA) && !wlcm_layout(&cm, ca, 0xa5000000ull, WLCM_ARENA_BYTES), "c2f layout");
+	cm.cmem_base = 0x113000u; cm.cmem_valid = true;
+	wlcm_cc_regs(&cm, 0u, 0u, cc);
+	for (unsigned k = 0; k < WLCM_CC_REGS; k++) { CHECK(cc[k][0] == ccexp[k][0] && cc[k][1] == ccexp[k][1], "c2f cc_config word"); }
+	CHECK(WLCM_REO_CC_CFG1_VAL == 0x1d1310u && WLCM_CC_CFG1_COMMON == 0x51310u && WLCM_WBM_CC_CFG2_OR == 0xbu &&
+	    WLCM_WBM_CC_CONVERT_OR == 0x13au, "c2f cc constants");
+	for (unsigned i = 0; i < WLCM_NRING; i++) {
+		const struct wlcm_ring *r = &cm.ring[i];
+		const uint32_t words = exp[i][2] * exp[i][3], msb = (words & 0xfffffu) << 8;
+		const uint32_t batch = exp[i][1] ? (exp[i][0] >= 128u ? 256u : 1u) : (exp[i][0] == 121u || exp[i][0] == 16u || exp[i][0] == 20u ? 1u : 1u);
+		const uint32_t timer = (exp[i][1] && exp[i][0] >= 128u) ? 1000u : 256u;
+		const uint32_t cons = ((timer >> 3) & 0xffffu) << 16 | ((batch * exp[i][3]) & 0x7fffu);
+		CHECK(r->id == exp[i][0] && r->dir == exp[i][1] && r->entries == exp[i][2] && r->entry_dw == exp[i][3], "c2f ring geometry");
+		CHECK(r->r0 == exp[i][4] && r->r2 == exp[i][5], "c2f ring r0/r2 base");
+		wlcm_ring_regs(&cm, i, regs, &n);
+		CHECK(n == (exp[i][1] ? 9u : 10u), "c2f ring write count");
+		CHECK(regs[0][0] == exp[i][4] + WLCE_R0_BASE_LSB && regs[0][1] == (uint32_t)r->iova, "c2f ring BASE_LSB");
+		CHECK(regs[1][0] == exp[i][4] + WLCE_R0_BASE_MSB && regs[1][1] == msb, "c2f ring BASE_MSB (size)");
+		if (exp[i][1] == 0) {
+			CHECK(regs[2][1] == exp[i][3], "c2f src ID entry size");
+			CHECK(regs[3][0] == exp[i][4] + WLCE_R0_CONS_IX0 && regs[3][1] == cons, "c2f src CONS_IX0");
+			CHECK(regs[n - 1][1] == (WLCE_MISC_LOOPCNT_DIS | WLCE_MISC_SRNG_ENABLE), "c2f src MISC");
+		} else {
+			CHECK(regs[2][1] == ((exp[i][0] & 0xffu) << 8 | exp[i][3]), "c2f dst ID");
+			CHECK(regs[3][0] == exp[i][4] + WLCE_R0_PROD_INT && regs[3][1] == cons, "c2f dst PROD_INT");
+			CHECK(regs[n - 1][1] == WLCE_MISC_SRNG_ENABLE, "c2f dst MISC");
+		}
+	}
+	CHECK(wlcm_buf_cookie(0) == 0x20000u && wlcm_buf_cookie(512u) == 0x20200u && wlcm_buf_cookie(WLRX_NBUF - 1u) == 0x20ffeu, "c2f cookie gen");
+	for (uint32_t k = 0; k < WLRX_NBUF; k += 777u) { CHECK(wlcm_cookie_slot(wlcm_buf_cookie(k)) == k, "c2f cookie round-trip"); }
+	CHECK(wlcm_cookie_slot(0u) == WLRX_SLOTS && wlcm_cookie_slot(0x1fffffu) == WLRX_SLOTS &&
+	    wlcm_cookie_slot(wlcm_buf_cookie(WLRX_NBUF - 1u) + 1u) == WLRX_SLOTS, "c2f foreign cookie refused");
+	CHECK(wlcm_ppt_addr(&cm, 7u) == 0x113000u + 4u * 7u && wlcm_ppt_val(&cm, 0u) == (uint32_t)((cm.spt_iova) >> 12), "c2f ppt");
+	{   /* the converted-return decode: a good cookie is held and queued; a foreign cookie is refused, not held */
+		static struct wlrd rd;
+		memset(&rd, 0, sizeof(rd));
+		wlrd_slots_init(&rd);
+		CHECK(wlrd_recycle_cc(&rd, &rx, wlcm_buf_cookie(5u)) == 0 && rd.returned == 1 && rd.cc_entries == 1 &&
+		    rd.slot[5] == WLRD_SLOT_HELD, "c2f converted return held");
+		CHECK(wlrd_recycle_cc(&rd, &rx, 0u) == 1 && rd.why, "c2f foreign converted cookie refused");
+	}
+	CHECK(WLWMI_PDEV_PARAM_PMF_QOS == 0x22u && WLWMI_PDEV_PARAM_DYNAMIC_BW == 0x0au && WLWMI_PDEV_PARAM_ARP_AC_OVERRIDE == 0x23u &&
+	    WLWMI_PDEV_PARAM_MESH_MCAST_ENABLE == 0x8fu && WLWMI_PDEV_PARAM_IDLE_PS_CONFIG == 0x2cu &&
+	    WLWMI_VDEV_PARAM_TX_ENCAP_TYPE == 0x30u && WLWMI_VDEV_PARAM_RX_DECAP_TYPE == 0x5bu &&
+	    WLWMI_CMD_DFS_PHYERR_OFFLOAD == 0xa005u && WLWMI_TAG_DFS_PHYERR_OFFLOAD_CMD == 0x250u &&
+	    WLWMI_CMD_LRO_CONFIG == 0x1d010u && WLWMI_TAG_LRO_INFO_CMD == 0x1aau &&
+	    WLHTT_H2T_PPDU_STATS_CFG == 0x11u && WLHTT_PPDU_STATS_DEFAULT == 0xe67u, "c2f WMI/HTT param values");
+	free(ca); free(ra);
+	puts("C2f pure: cc_config words and constants, the ten common rings' geometry/base/ID/threshold/MISC, the cc cookie "
+	     "round-trip and foreign-cookie refusal, the PPT math, and the mac-start/encap/PPDU param values");
+}
+
+static void
+dump_c2f(void)
+{
+	static struct wlcm cm;
+	static struct wlrx rx;
+	uint8_t *ca = aligned_alloc(16384, WLCM_ARENA_BYTES), *ra = aligned_alloc(16384, RXA);
+	uint32_t regs[WLCM_RING_REGS_MAX][2], cc[WLCM_CC_REGS][2];
+	unsigned n = 0;
+	CHECK(ca && ra && !wlrx_layout(&rx, ra, 0xa1400000ull, RXA) && !wlcm_layout(&cm, ca, 0xa5000000ull, WLCM_ARENA_BYTES), "dump layout");
+	cm.cmem_base = 0x113000u; cm.cmem_valid = true;
+	wlcm_cc_regs(&cm, 0u, 0u, cc);
+	for (unsigned k = 0; k < WLCM_CC_REGS; k++) { fprintf(stdout, "ccreg %u %u %u\n", k, cc[k][0], cc[k][1]); }
+	for (unsigned i = 0; i < WLCM_NRING; i++) {
+		wlcm_ring_regs(&cm, i, regs, &n);
+		fprintf(stdout, "ringn %u %u %u %u %u\n", cm.ring[i].id, cm.ring[i].dir, cm.ring[i].entries, cm.ring[i].entry_dw, n);
+		for (unsigned k = 0; k < n; k++) { fprintf(stdout, "ring %u %u %u %u\n", cm.ring[i].id, k, regs[k][0], regs[k][1]); }
+	}
+	for (unsigned i = 0; i < 2u * WLCM_NRING + 2u; i++) { fprintf(stdout, "cmpre %u %u\n", i, wlcm_pre_addr(&cm, i)); }
+	{
+		const uint32_t ks[4] = { 0u, 511u, 512u, WLRX_NBUF - 1u };
+		for (unsigned i = 0; i < 4; i++) { fprintf(stdout, "cookie %u %u %u\n", ks[i], wlcm_buf_cookie(ks[i]), wlcm_cookie_slot(wlcm_buf_cookie(ks[i]))); }
+	}
+	for (unsigned i = 0; i < WLCM_NSPT; i += (WLCM_NSPT - 1u) / 2u) { fprintf(stdout, "ppt %u %u %u\n", i, wlcm_ppt_addr(&cm, i), wlcm_ppt_val(&cm, i)); }
+	fprintf(stdout, "ccv %u %u %u %u\n", WLCM_REO_CC_CFG1_VAL, WLCM_CC_CFG1_COMMON, WLCM_WBM_CC_CFG2_OR, WLCM_WBM_CC_CONVERT_OR);
+	fprintf(stdout, "arena %u %u %u %u %u\n", WLCM_ARENA_BYTES, WLCM_OFF_TAIL, WLCM_NSPT, WLCM_NUM_RX_SPT_PAGES, WLCM_RX_SPT_OFFSET);
+	fprintf(stdout, "ppdu %u %u\n", WLHTT_H2T_PPDU_STATS_CFG, WLHTT_PPDU_STATS_DEFAULT);
+	fflush(stdout);
+	free(ca); free(ra);
+}
+
 static void
 dump_c2d(void)
 {
@@ -5076,6 +5182,7 @@ main(int argc, char **argv)
 	if (argc == 2 && !strcmp(argv[1], "dump-c2c")) { dump_c2c(); return 0; }
 	if (argc == 2 && !strcmp(argv[1], "dump-c2d")) { dump_c2d(); return 0; }
 	if (argc == 2 && !strcmp(argv[1], "dump-c2e")) { dump_c2e(); return 0; }
+	if (argc == 2 && !strcmp(argv[1], "dump-c2f")) { dump_c2f(); return 0; }
 	if (argc == 2 && !strcmp(argv[1], "c2e")) {  /* the C2e scenarios alone (the mutant runs of tools/test-fuxi-wlan-ce.py) */
 		s_c2e_pure(); s_c2e_happy(); s_c2e_rings_only(); s_c2e_crash(); s_c2e_full(); s_c2e_spill(); s_c2e_readings(); s_c2e_contain();
 		reset();
@@ -5086,6 +5193,12 @@ main(int argc, char **argv)
 		s_c2d_pure(); s_c2d_happy(); s_c2d_wedge(); s_c2d_exhaust(); s_c2d_entries(); s_c2d_contain(); s_c2d_failures(); s_c2d_widest();
 		reset();
 		puts("C2d model: all scenarios passed");
+		return 0;
+	}
+	if (argc == 2 && !strcmp(argv[1], "c2f")) {  /* the C2f scenarios alone (the mutant runs of tools/test-fuxi-wlan-ce.py) */
+		s_c2f_pure();
+		reset();
+		puts("C2f model: all scenarios passed");
 		return 0;
 	}
 	s_pure();
@@ -5138,6 +5251,7 @@ main(int argc, char **argv)
 	s_c2e_spill();
 	s_c2e_readings();
 	s_c2e_contain();
+	s_c2f_pure();
 	reset();
 	puts("W20 model: all scenarios passed");
 	return 0;

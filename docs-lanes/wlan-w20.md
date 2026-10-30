@@ -7,13 +7,16 @@ WBM idle link-descriptor list and the pdev chain masks, w20 0x100/0x200/0x400, a
 phone (r1c2c-all: the RX engine woke, nothing landed, the scan wedged); C2d (W27: RX ring selection and the
 REO/WBM buffer return path, w20 0x800/0x1000, default off) ran on the phone (r1c2d-l: everything programmed, nothing
 written, the scan wedged after 3 channels); C2e (W28: the RXDMA monitor status rings and a read-only crash line, w20
-0x2000, default off) is host-tested only (tools/test-fuxi-wlan-ce.py). Every line below that says what the target does is what
+0x2000, default off) is host-tested only (tools/test-fuxi-wlan-ce.py); C2f (W29: L19's dp_alloc order, cookie conversion
+and the common SRNGs L19 programs before any scan, w20 0x4000, default off) is host-tested only too. Every line below that
+says what the target does is what
 the model does, built from Linux ath12k v6.19. C2, C2b and C2c are described in their own sections below
 ([C2: W23/W24](#c2-w23w24-one-passive-scan-fuxiwlanqrtr7),
 [C2b](#c2b-chan_info-detail-and-the-pdev-stats-requests-fuxiwlanqrtr7-diagnostic),
 [C2c: W26](#c2c-w26-host-rx-rings-the-wbm-idle-list-and-the-chain-masks-fuxiwlanqrtr7-w20-0x100-0x200-0x400),
 [C2d: W27](#c2d-w27-rx-ring-selection-and-the-reowbm-buffer-return-path-fuxiwlanqrtr7-w20-0x800-0x1000),
-[C2e: W28](#c2e-w28-the-rxdma-monitor-status-rings-and-the-crash-line-fuxiwlanqrtr7-w20-0x2000)).
+[C2e: W28](#c2e-w28-the-rxdma-monitor-status-rings-and-the-crash-line-fuxiwlanqrtr7-w20-0x2000),
+[C2f: W29](#c2f-w29-l19s-dp_alloc-order-cookie-conversion-and-the-common-srngs-fuxiwlanqrtr7-w20-0x4000)).
 
 After this boot's W15 WLAN_MODE reply, the radio lane programs the host side of copy engines CE0..CE4 on
 SRNG rings, posts RX buffers, completes HTC (READY, HTT and WMI connect, SETUP_COMPLETE_EX) and WMI init
@@ -1325,7 +1328,7 @@ The EE and ERRCODE values in that block are the model's guesses; only the ERRDBG
 | all 38 channels, `written` > 0 on either ring, frames 0 | the crash is gone; status lands; nothing forwarded | r1c2e-r showed it alone: r1c2e; r1c2e: C3 management forwarding |
 | all 38 channels, `written` 0 on both rings | the firmware survives but never used the status rings | owner review (RXDMA status needs the monitor mode ring config?) |
 | `exhausted mon0` / `mon1` at a watch | RXDMA filled all 1023 status buffers (no reap, as L19 STA) | if the scan still ran on: fine; if it wedged right after: owner review (reaping the status rings is the next rung) |
-| the scan stops early again, `W28 crash ... syserr 1` | the firmware still crashes with the status rings in place | owner review: compare `taken`/`written` at the last watch, the REO cmd/status rings and cookie conversion are left |
+| the scan stops early again, `W28 crash ... syserr 1` | the firmware still crashes with the status rings in place | compare `taken`/`written` at the last watch; the REO cmd/status rings and cookie conversion are C2f (w20 0x4000) |
 | `W28 crash ... syserr 0`, state 0x2 at the timeout | the scan stalled without an MHI SYS_ERR | owner review |
 | `changed` > 0 or `foreign` > 0 | the device wrote a source ring entry | stop, owner review before any further kit |
 | `SPILL` on any guard line | a device write where no address was given | stop, owner review |
@@ -1358,6 +1361,163 @@ the commit body): the W15, W11 and W16 harness logs byte for byte; the init/conf
 0x2000 (salami and Fuxi builds, cmdline and ADT /defaults) byte for byte; a5a04bf's model with all its C1, C2, C2b, C2c
 and C2d scenarios equal byte for byte to the first part of the C2e model's log (every printed line, same
 instrumentation in both), the C2e scenarios only adding lines after them.
+
+## C2f: W29, L19's dp_alloc order, cookie conversion and the common SRNGs (`fuxiwlanqrtr=7`, w20 0x4000)
+
+Why: on the phone r1c2e (0x3b02: C2d's whole RX path + the monitor status rings) still wrote and reaped nothing and
+the firmware crashed (SYSERR, ERRDBG2 0x152ee53 / ERRDBG3 0x492). The C2c/C2d/C2e host-side MMIO ring programming already
+sits where L19's `ath12k_dp_alloc` puts it (`wl26_setup` runs inside `wl_w20_run`, after the CE rings and before the CE RX
+post, as core.c:1285 ce_init_pipes < 1291 dp_alloc < 1300 core_start), so no cross-HTC move is needed. What L19 still
+programs there, and at service ready, that C2c..C2e leave out is: cookie conversion (`ath12k_dp_cc_init` dp.c:1583-1667 and
+`ath12k_dp_cc_config` dp.c:1330-1380), the common SRNGs of `ath12k_dp_srng_common_setup` (dp.c:491-595: the SW2WBM release
+ring, three TCL data rings each with its WBM completion ring, the REO reinject ring, the REO command ring and the REO
+status ring), the mac-start pdev parameters (`ath12k_mac_start` mac.c:9363-9469, including the two HTT PPDU_STATS_CFG) and
+the vdev encap/decap params (`ath12k_mac_update_vif_offload` mac.c:9782-9827). C2f gives all of that behind one w20 bit, in
+L19's order, and nothing more; it adds no transmit and posts no TX descriptor.
+
+Code: the C2f section of `fuxi_wlan_ce.h` (`WLCM_*`, `struct wlcm`, `wlcm_layout`, `wlcm_buf_cookie`, `wlcm_cookie_slot`,
+`wlcm_spt_fill`, `wlcm_ppt_addr/val`, `wlcm_cc_regs`, `wlcm_ring_regs`, `wlcm_pre_addr`, `wlcm_rings_owned`, `wlcm_why`,
+`wlcm_reg_ok`, `wlcm_cmem_ok`, `wlcm_cmem_owned`, `wlcm_guard_count`; the cookie-converted decode added to `wlrd_entry` and
+`wlrd_recycle_cc`; `wlrx_fill_refill` / `wlrd_replenish` program cookie-converted cookies under `cc_on`) and the W29 part of
+the W20 block of `fuxi_wlan.c` (`wl29_reg`, `wl29_cmem`, `wl29_ring`, `wl29_cc_init`, `wl29_common_owned/pre/post`,
+`wl29_cc_config`, `wl29_ppdu_stats`, `wl29_macstart_pre/post`, `wl29_encap_decap`, `wl29_report`; the arena `wl_cm_arena` in
+`wl_owned_alias`, counted, zeroed and freed with the W26 arenas).
+
+### Gate and kits
+
+`WL23_BITS` gains 0x4000 L19ORDER; `WL20_BITS` (qrtr 6) does not, so qrtr 6 refuses it. It needs 0x1000 REORX (so 0x100 and
+0x02), because it layers on C2d's REO path and extends `wl27_setup`'s common setup. keep/stop22, 0x08, 0x20 and unknown bits
+stay refused. A valid boot with 0x4000 prints, after the W28 selected line: `W29 selected: L19 dp_alloc order, cookie
+conversion (CMEM from QMI), common rings sw2wbm/tcl+comp x3/reinject/reo-cmd/reo-status programmed never posted, mac-start
+pdev params and vdev encap/decap (w20 0x4000); nothing transmitted`.
+
+| Kit | w20 | Decimal | What it is |
+|---|---|---|---|
+| r1c2f | 0x7f02 | 32514 | everything: C2e's r1c2e (0x3b02) + ring selection (0x800) + L19's dp_alloc order, cookie conversion, the common SRNGs, the mac-start params and the vdev encap/decap |
+
+Route as C2c..C2e: r1c2's cmdline byte for byte (`fuxiwlan=28 fuxiwlanclk=1 fuxiwlanqrtr=7`, no w20) and
+`fuxiwlanw20=32514` in ADT /defaults (`--wlan-defaults`); `wl_arg` logs `salami fuxiwlanw20 from ADT /defaults`. The kits
+also carry `fuxiwlanmlo=4` (HOSTMEM) on the cmdline, so the firmware asks for its host memory on demand (QMI TLV 0x33) as
+r1c2c..r1c2e do; that is also what makes the QMI capability reply carry the CMEM region (`dev_mem[0]`) cookie conversion
+needs.
+
+### Sequence (L19 order)
+
+1. W20, inside `wl26_setup`, in `ath12k_dp_alloc`'s order (dp.c:1755-1813): the fifth arena (`wl_cm_arena`, 0x474000 bytes,
+   2 MiB aligned, Normal-NC, live SMMU readback) with the other four; the WBM idle list (C2c 0x200); then
+   `wl29_cc_init` (`ath12k_dp_cc_init`): the QMI CMEM region (`dev_mem[0]`, ATH12K_QMI_DEVMEM_CMEM_INDEX), 280 PPT entries
+   written into CMEM (one per SPT page, the page IOVA >> 12) through an allowlist with a pre-read of each (refuse if any is
+   non-zero), and the SPT pages filled (RX pages 0..7 hold the posted buffers' address pairs); then the common SRNGs inside
+   `wl27_setup` around C2d's rel/exc (`wl29_common_pre`: SW2WBM release 121, TCL data 24/25/26 each with its WBM completion
+   ring 128/130/132, REO reinject 16; then C2d's WBM2SW3 release 131 and REO2SW0 exception 0; then `wl29_common_post`: REO
+   command 20 with its command-number init and REO status 21; then `ath12k_hal_reo_hw_setup`); then the RX refill and
+   monitor status fills. With cookie conversion on the refill buffer cookies are the cookie-converted shape (ppt << 9 | spt).
+   No CMEM region: `W29 cookie conversion not programmed: ...; w20 0x4000 cc dropped for this boot`, the rings still run.
+2. W21, after `W21 wmi service ready complete` and before INIT (core.c:923 < 925): `wl29_cc_config` writes the REO and WBM
+   cookie configuration registers, then C2d's eight REO destination rings.
+3. W23: `wl29_macstart_pre` (PMF_QOS 1, DYNAMIC_BW 1, ARP_AC_OVERRIDE 0, the DFS phyerr offload, the two HTT PPDU_STATS_CFG,
+   MESH_MCAST 1) before the chain mask; `wl29_macstart_post` (LRO config with fixed zero seeds, idle-PS 1) after the channel
+   list; `wl29_encap_decap` (TX_ENCAP_TYPE then RX_DECAP_TYPE, ETHERNET when service 461 is set, else NATIVE_WIFI) right
+   after VDEV_CREATE and before NSS.
+4. Every poll pass reaps the REO/release rings as C2d does; with cookie conversion a WBM2SW RX release entry carries the
+   converted format (info0 CC_STATUS bit 16, RBM 12:9, cookie in word 7 27:8) and every returned cookie is mapped back
+   through the slot table (`wlcm_cookie_slot`) or the run stops, exactly as the by-address path refuses a foreign buffer.
+   The common rings are programmed and backed to full size but never posted and never reaped: a passive scan drives no TX
+   and sends no REO command, so the device never writes any of them.
+5. Containment: `wl26_contain` latches `wl_cm.stopping` (no common-ring, cc_config or CMEM access from then on); the arena
+   is recounted, zeroed and freed with the W26 arenas only in `wl5_abort`'s proven branch, else quarantined.
+
+Register and CMEM accesses, nothing else: the common-ring pre-reads and writes and the cc_config registers through
+`wl29_reg` (allowlist `wlcm_reg_ok`), the 280 PPT pre-reads and writes through `wl29_cmem` (allowlist `wlcm_cmem_ok`), both
+via the one `wl_win` window discipline and both refused after the latch; the mac-start, PPDU, encap/decap commands through
+`wl_ce_send` (WMI/HTT), as C2's own traffic. No interrupt, MSI, GIC, power or PMIC access, no REO command posted, no TCL or
+completion descriptor posted, nothing transmitted.
+
+### Wire, register and memory facts (all re-derived from L19 by the host test)
+
+Cookie conversion (dp.c:1330-1667; dp.h:237-281; hal.h:148-149, 266-287, 329-335; hw.c:1240-1241, 1290-1296). DEFAULT
+memory profile (the salami phone has 16 GB, so `ath12k_core_get_memory_mode` returns DEFAULT, core.c:1729-1741):
+rx_desc_count 12288, num_pool_tx_desc 32768, tx_comp_ring_size 32768. SPT page 4 KiB holds 512 entries of 8 bytes; 24 RX SPT
+pages + 256 TX SPT pages = 280, each with a 4-byte PPT entry = the page paddr >> 12. The RX buffer in slot k lives in RX
+SPT page k / 512 at entry k % 512; its cookie is ppt << 9 | spt with ppt = 256 (RX_SPT_PAGE_OFFSET) + page. cc_config:
+REO CFG0 (0x00a38050) = CMEM base; REO CFG1 (0x00a38054) = 0x1d1310 (CMEM_ADDR_MSB 0x10, PPT_MSB 19, SPT_MSB 8, ALIGN,
+ENABLE, GLOBAL_ENABLE); WBM CFG0 (0x00a34040) = CMEM base; WBM CFG1 (0x00a34044) = 0x51310 (no ENABLE/GLOBAL); WBM CFG2
+(0x00a34090) |= 0xb (RELEASE_PATH, ERR_PATH, CONV_IND); WBM CONVERT (0x00a34094) |= 0x13a (GLOBAL_EN, WBM2SW0/2/3/4).
+
+| Ring | id | dir | entries | entry words | R0 | R2 | batch/timer |
+|---|---|---|---|---|---|---|---|
+| SW2WBM release | 121 | SRC | 64 | 8 | 0x00a3437c | 0x00a37010 | 1 / 256 us |
+| TCL data 0/1/2 | 24/25/26 | SRC | 512 | 8 | 0x00a44900 + 0x78 n | 0x00a46000 + 8 n | 1 / 256 us |
+| WBM completion 0/2/4 | 128/130/132 | DST | 32768 | 8 | 0x00a34e08 + 0x78 n | 0x00a370c8 + 8 n | 256 / 1000 us |
+| REO reinject | 16 | SRC | 32 | 8 | 0x00a38304 | 0x00a3b028 | 1 / 256 us |
+| REO command | 20 | SRC | 256 | 12 | 0x00a3828c | 0x00a3b020 | 1 / 256 us |
+| REO status | 21 | DST | 2048 | 28 | 0x00a38a84 | 0x00a3b0a8 | 1 / 256 us |
+
+Each ring is set up with `ath12k_hal_srng_src_hw_init` / `dst_hw_init`'s writes without the MSI ones (hal.c:1664-1807):
+SRC: BASE_LSB, BASE_MSB (addr 39:32, size in words 27:8), ID (entry words), CONSR_INT_IX0 (timer >> 3, batch x entry words),
+CONSR_INT_IX1 0, TP_ADDR LSB/MSB (rdp + 4 x id), R2 HP 0, R2 TP 0, MISC (LOOPCNT_DISABLE | SRNG_ENABLE). DST: BASE_LSB,
+BASE_MSB, ID (ring id | entry words), PRODUCER_INT, HP_ADDR LSB/MSB, R2 HP 0, R2 TP 0, MISC (SRNG_ENABLE). The REO command
+ring's entries get `ath12k_hal_reo_init_cmd_ring`'s per-entry command number (hal_rx.c:871-894). Mac-start pdev params use
+PDEV_SET_PARAM (cmd 0x4003, tag 0x52): PMF_QOS 0x22, DYNAMIC_BW 0x0a, ARP_AC_OVERRIDE 0x23, MESH_MCAST_ENABLE 0x8f,
+IDLE_PS_CONFIG 0x2c; DFS phyerr offload (cmd 0xa005, tag 0x250); LRO config (cmd 0x1d010, tag 0x1aa, 19 content words, seeds
+fixed 0, lro_enable 0); the two PPDU_STATS_CFG (HTT message 0x11, pdev_mask 1 << i, tlv bitmask 0xe67) = 0x0e670211 and
+0x0e670411; encap/decap VDEV_SET_PARAM (cmd 0x5008, tag 0x5f) TX_ENCAP_TYPE 0x30 / RX_DECAP_TYPE 0x5b, value NATIVE_WIFI 1
+or ETHERNET 2.
+
+Arena (0x474000 bytes): a 4 KiB rdp page, 280 SPT pages (0x118000), the ten rings each page-aligned and backed to full size
+(the two completion rings are 0x100000 each, the bulk), a tail; the lane's device-writable total rises by this much when
+0x4000 is set. The rdp page but the ten rings' pointer words, the padding between rings, the RX SPT entries and the tail are
+guard-counted (`W29 guard`), again after containment; non-zero is a SPILL.
+
+### Lines
+
+```
+FUXI WLAN: W29 selected: L19 dp_alloc order, cookie conversion (CMEM from QMI), common rings ... (w20 0x4000); nothing transmitted   (at init)
+FUXI WLAN: W29 arena IOVA I bytes 0x474000 Normal-NC mapped; rdp I spt I
+FUXI WLAN: W29 cookie conversion cmem base X pages 280 (rx 24 tx 256) spt I ppt writes 280; cc on
+FUXI WLAN: W29 cookie conversion not programmed: REASON; w20 0x4000 cc dropped for this boot                 (no CMEM / owned)
+FUXI WLAN: W29 common before: rings 10 enabled N based N unreadable N; not owned|refused
+FUXI WLAN: W29 common rings not programmed: REASON; w20 0x4000 common rings dropped for this boot            (owned)
+FUXI WLAN: W29 common ring ID NAME entries N base B misc 0x42|0x40 readback ok                              (x10)
+FUXI WLAN: W29 reo cmd ring initialised 256 entries cmd-number 1..256
+FUXI WLAN: W29 cc_config reo-cfg1 0x1d1310 wbm-cfg1 0x51310 cfg2 X->X convert X->X; writes 6
+FUXI WLAN: W29 mac-start pdev params pmf-qos 1 dynamic-bw 1 arp-ac 0 dfs-offload mesh-mcast 1 ppdu-stats 2 pdev 0
+FUXI WLAN: W29 htt ppdu stats cfg pdev-mask 0x1|0x2 msg 0x0e670211|0x0e670411 sent                          (x2)
+FUXI WLAN: W29 mac-start lro cfg (seeds 0, lro-enable 0) idle-ps 1 pdev 0
+FUXI WLAN: W29 vdev 0 encap/decap native-wifi|ethernet (service 461 not set|set)
+FUXI WLAN: W29 common rings 10 of 10 programmed, writes N; cookie conversion on (cmem writes 280, returns decoded N)
+FUXI WLAN: W29 guard [SPILL ]nonzero dwords: rdp N, ring-gap N, spt-lost N, tail N[; stop; owner review before any further kit]
+FUXI WLAN: W29 guard after containment nonzero dwords: rdp N, ring-gap N, spt-lost N, tail N[; SPILL: ...]
+```
+
+### Deviations from L19, all deliberate
+
+- The common rings (TCL, completion, reinject, REO command and status) are programmed to L19's exact registers and backed
+  to their full programmed size, but never posted and never reaped: a passive scan drives no TX and sends no REO command.
+- The SPT holds the buffer's address pair, not a host descriptor VA (L19's `ath12k_rx_desc_info *`): every returned cookie
+  is mapped back arithmetically through the slot table (`wlcm_cookie_slot`), and anything that does not map is refused.
+- Cookie conversion is gated on the QMI CMEM region (`dev_mem[0]`); without it the converter is dropped for the boot (the
+  cc_config registers and the converted-entry decode go with it) and the rings still run, as the idle list and REO path drop.
+- The LRO seeds are fixed at 0 (L19 randomises them, but never sets `lro_enable`, so they shape nothing).
+- The chain masks stay C2c's 0x400 path (L19's `__ath12k_set_antenna` inside mac_start); W29 does not resend them.
+- No cookie-conversion is applied to the monitor status rings (L19's RXDMA_MONITOR_STATUS is not a WBM2SW ring).
+
+### What the host tests cover, and what only the device can answer
+
+Host-tested (model, L19 re-derivation, static checks, mutants): every cc_config word and address, the CMEM/PPT/SPT and
+cookie math, the ten common rings' ids, bases, sizes, entry words, thresholds and hw-init word encodings, the mac-start /
+encap / PPDU enum values, the cookie-converted decode (a good cookie held and queued, a foreign cookie refused), L19's
+dp_alloc order, the allowlists, the no-transmit rule, the latch and the zeroed free. Only the phone can say: whether cookie
+conversion and the full common-SRNG set are what the firmware was waiting for (whether it then stops crashing, moves frames
+through the RX pipeline and forwards MGMT_RX over WMI), whether it accepts the TCL/REO rings it is never given work on, and
+what the CMEM region's real base is.
+
+### Proof that boots without 0x4000 are unchanged
+
+The host suite rebuilds every prior scenario (C1, C2, C2b, C2c, C2d, C2e) from the C2f sources and compares byte for byte;
+every new line is reached only under `wl20_bits & WL20_L19ORDER`, so a boot without 0x4000 behaves as at 0f48029. The salami
+and Fuxi gate tests (`tools/test-fuxi-wlan-salami.py`) cover the qrtr-7 gate for 0x4000 (cmdline and ADT /defaults, refused
+with qrtr 6, keep/stop22, and without 0x1000).
 
 ## Host tests
 
@@ -1568,6 +1728,21 @@ entry struct, the alloc, fill and announcement order, the fill count, RBM and co
 the HTT ring id and type, thresholds, and the MSI, reap and status-selection facts the deviations rest on; the model's
 dump word by word. Mutants (`C2E_MUTANTS`, 31 rules broken once each) are all caught. test-fuxi-wlan-salami.py covers
 the gate for 0x2000 (salami and Fuxi builds, cmdline and ADT /defaults, the kit route with 15106 / 8962 in /defaults).
+
+C2f in the same model (`s_c2f_pure`, `dump-c2f`): the wlcm header helpers build exactly the words L19 does and the cc cookie
+round-trips. Pure checks: the six cc_config words and the four cc constants; the ten common rings' geometry, R0/R2 base, ID,
+threshold-encoded CONSR_INT/PRODUCER_INT and MISC; `wlcm_buf_cookie` / `wlcm_cookie_slot` round-trip and foreign-cookie
+refusal; the PPT math; the mac-start / encap / PPDU param values; and the converted-return decode (a good cookie held and
+queued, a foreign cookie refused by `wlrd_recycle_cc`). Static (`static_c2f`): the gate (0x4000 needs 0x1000, qrtr 6 refuses
+it), L19's dp_alloc order (cc_init after the idle list and before the common rings, the pre group before rel/exc and the post
+group after them, cc_config before the destination rings, mac-start params around the chain mask and channel list,
+encap/decap before NSS, the W29 report after W27), the two `wl_win` accessors (`wlcm_reg_ok`, `wlcm_cmem_ok`) refused after
+the latch, no transmit and no ring post, cc gated on the CMEM region, the latch and the single zeroed free. L19 (`l19_c2f`):
+cc_config addresses and values, the CMEM/PPT/SPT and cookie math (DEFAULT profile 24 rx + 256 tx pages, ppt << 9 | spt, page
+paddr >> 12), the ten common rings (ids, hal.h + hw.c R0/R2 bases, dp.h sizes with tx_comp 32768, hal_desc.h entry dwords
+8/8/8/12/28 by struct walk, dp.c TX vs other thresholds, the src/dst hw-init word encodings) and the mac-start / encap /
+PPDU enum values; the model's dump word by word. Mutants (`C2F_MUTANTS`, 24 rules broken once each) are all caught.
+test-fuxi-wlan-salami.py covers the gate for 0x4000 (cmdline and ADT /defaults, the kit route with 32514 in /defaults).
 
 What only the device can answer: whether the firmware fetches from the rings at all with zero interrupt
 thresholds, which pipe carries HTC READY (both are polled), the credit numbers, the real pdev id, whether

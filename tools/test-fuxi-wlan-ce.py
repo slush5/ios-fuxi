@@ -129,7 +129,7 @@ def static_checks():
     poll = between(DRIVER, 'static int\nwl_ce_poll(void)\n{', '\n}\n')
     assert 'if (wl_w11_events()) { wl23_guard_bad = true; return 1; }' in poll
     assert 'if (wl_w11_guard()) { wl23_guard_bad = true; return 1; }' in poll
-    assert '#define WL23_BITS (WL20_BITS | WL20_HTTVER | WL20_BAND24 | WL20_PDEVCAP | WL26_BITS | WL27_BITS | WL20_MONSTAT)' in DRIVER
+    assert '#define WL23_BITS (WL20_BITS | WL20_HTTVER | WL20_BAND24 | WL20_PDEVCAP | WL26_BITS | WL27_BITS | WL20_MONSTAT | WL20_L19ORDER)' in DRIVER
     assert '#define WL26_BITS (WL20_RXRING | WL20_IDLELINK | WL20_CHAINMASK)' in DRIVER
     assert '#define WL27_BITS (WL20_RXSEL | WL20_REORX)' in DRIVER
     bits23 = DRIVER.split('#define WL23_BITS', 1)[1].split('\n', 1)[0]
@@ -157,7 +157,7 @@ def static_checks():
     freed = abort.split('if (!bm_bad && !perst_bad && !seq_bad && !wl_smmu_undo()) {', 1)[1].split('} else {', 1)[0]
     assert 'wl_dma_free(&wl_ce_arena);' in freed and DRIVER.count('wl_dma_free(&wl_ce_arena)') == 1
     owned = between(DRIVER, 'wl_owned_alias(uint64_t pa, unsigned bytes, bool tables_only)\n{', '\n}\n')
-    assert '&wl14_m3, &wl_ce_arena, &wl_rx_arena, &wl_link_arena, &wl_reo_arena, &wl_mon_arena };' in owned
+    assert '&wl14_m3, &wl_ce_arena, &wl_rx_arena, &wl_link_arena, &wl_reo_arena, &wl_mon_arena, &wl_cm_arena };' in owned
     block = between(DRIVER, '/* ---- W20: CE/HTC/WMI to WMI READY (fuxiwlanqrtr=6, C1) ----', '/* ---- end W20 ---- */')
     # Hardware writes: the window helper (CE registers via wlce_reg_ok), the shadow writer, the
     # window restore and, with w20 0x04, the endpoint Device Control register. Nothing else.
@@ -186,6 +186,7 @@ def static_checks():
     static_c2c()
     static_c2d()
     static_c2e()
+    static_c2f()
 
 
 def c_calls(body, name):
@@ -415,7 +416,7 @@ def static_c2c():
     # wlrx_wbm_ok's and refuses after the latch; W26 never calls a raw accessor; the one BAR write is the HP publish to
     # the shadow register looked up for ring 120's R2 HP (index 19).
     block = between(DRIVER, '/* ---- W20: CE/HTC/WMI to WMI READY (fuxiwlanqrtr=6, C1) ----', '/* ---- end W20 ---- */')
-    assert strip_comments(block).count('wl_win(') == 4, 'wl_win: the definition and the three accessors only (CE, WBM, C2d REO)'
+    assert strip_comments(block).count('wl_win(') == 6, 'wl_win: the definition and the five accessors only (CE, WBM, C2d REO, C2f reg, C2f cmem)'
     assert 'if (fw_faults || wl_rx.stopping || !wlrx_wbm_ok(off, wr)) { return 1; }\n\treturn wl_win(off, wr, value);' in fns['wl26_wbm']
     w26code = strip_comments(region)
     for raw in ('wl_prd(', 'wl_pwr(', 'wl_mrd(', 'wl_mwr(', 'wl_contain_wr(', 'wl_ce_window(', 'wlce_wr(', 'wl_soc_write', 'rh_send',
@@ -444,7 +445,7 @@ def static_c2c():
     assert not re.search(r'wl_rx\.(?:rdp|wrp|base|bufs|link)\s*\[[^\]]*\]\s*[-+|&^]?=', code)
     assert not re.search(r'wl_rx\.(?:ring\[[^\]]*\]|idle)\.va\s*\[[^\]]*\]\s*[-+|&^]?=', code)
     assert not re.search(r'(?:memcpy|bzero|memset)\(\s*\(?[^,]*wl_rx\.', code)
-    assert re.findall(r'bzero\(\(void \*\)(wl_\w+_arena)\.va', code) == ['wl_rx_arena', 'wl_link_arena', 'wl_reo_arena', 'wl_mon_arena'] and \
+    assert re.findall(r'bzero\(\(void \*\)(wl_\w+_arena)\.va', code) == ['wl_rx_arena', 'wl_link_arena', 'wl_reo_arena', 'wl_mon_arena', 'wl_cm_arena'] and \
         all(f'bzero((void *)wl_{a}_arena.va' in fns['wl26_free'] for a in ('rx', 'link'))
     assert 'WLRX_PUBLISH(' in between(HEADER, 'static inline int\nwlrx_publish_refill(', '\n}\n') and \
         HEADER.count('WLRX_PUBLISH(') == 2  # the default macro and the one use
@@ -458,7 +459,7 @@ def static_c2c():
     assert cm.index('WLWMI_PDEV_PARAM_TX_CHAIN_MASK, tx }') < cm.index('WLWMI_PDEV_PARAM_RX_CHAIN_MASK, rx }')
     assert cm.index('wl23_words(WLWMI_CMD_PDEV_SET_PARAM, WLWMI_TAG_PDEV_SET_PARAM_CMD, t,') < \
         cm.index('wl23_words(WLWMI_CMD_PDEV_SET_PARAM, WLWMI_TAG_PDEV_SET_PARAM_CMD, r,')
-    assert re.findall(r'#define WLWMI_PDEV_PARAM_\w+', HEADER) == ['#define WLWMI_PDEV_PARAM_TX_CHAIN_MASK',
+    assert re.findall(r'#define WLWMI_PDEV_PARAM_\w+', HEADER.split('---- C2f', 1)[0]) == ['#define WLWMI_PDEV_PARAM_TX_CHAIN_MASK',
                                                                    '#define WLWMI_PDEV_PARAM_RX_CHAIN_MASK']
     assert 'if (!tx || !rx) {' in cm and cm.index('if (!tx || !rx) {') < cm.index('wl23_words(')
     # Containment: wl26_contain first in wl_ce_contain; wl26_free only in wl5_abort's proven branch, before the other
@@ -516,7 +517,7 @@ def c2c_line_bounds(fns, cfg, tag='W26', min_lines=28, extra=None):
     for name, body in re.findall(r'static const char \*const (\w+)\[\w*\] = \{(.*?)\};', DRIVER, re.S):
         tables[name] = max(len(s) for s in re.findall(r'"([^"]*)"', body))
     pure = {}
-    for name in ('wlrx_idle_why', 'wlrx_next', 'wlrd_why', 'wlrd_next', 'wlms_next'):
+    for name in ('wlrx_idle_why', 'wlrx_next', 'wlrd_why', 'wlrd_next', 'wlms_next', 'wlcm_why'):
         body = between(HEADER, f'static inline const char *\n{name}(', '\n}\n')
         pure[name] = max(len(''.join(x)) for x in re.findall(r'return [^;]*?"([^"]*)"(?:\s*"([^"]*)")?', body) +
                          re.findall(r'[:?]\s*"([^"]*)"(?:\s*"([^"]*)")?', body))
@@ -571,7 +572,7 @@ def c2c_line_bounds(fns, cfg, tag='W26', min_lines=28, extra=None):
             if name == 'wl26_list':
                 assert fmt == '%s\n', fmt
                 continue
-            assert fmt.startswith(('FUXI WLAN: W26 ', 'FUXI WLAN: W27 ', 'FUXI WLAN: W28 ', 'FUXI WLAN: W24 no beacon')) and \
+            assert fmt.startswith(('FUXI WLAN: W26 ', 'FUXI WLAN: W27 ', 'FUXI WLAN: W28 ', 'FUXI WLAN: W29 ', 'FUXI WLAN: W24 no beacon')) and \
                 fmt.endswith('\n'), fmt
             w = worst(fmt, a[1:], local, assigned)
             assert w <= 254, (name, w, fmt)
@@ -697,11 +698,11 @@ def static_c2e():
     code = strip_comments(drv)
     assert '#define WL20_MONSTAT 0x2000u' in drv and header_define('WLRX_W20_MONSTAT') == 0x2000
     cfg = between(drv, 'static void\nwl_probe_configure(void)\n{', '\n}\n')
-    assert '(((unsigned)w20 & WL20_MONSTAT) && !((unsigned)w20 & WL20_RXRING))) { wl_variant_invalid = true; }' in cfg
+    assert '(((unsigned)w20 & WL20_MONSTAT) && !((unsigned)w20 & WL20_RXRING)) ||' in cfg
     assert 'MONSTAT' not in drv.split('#define WL20_BITS', 1)[1].split('\n')[0]  # qrtr 6 refuses it
-    assert 'WL20_MONSTAT)' in drv.split('#define WL23_BITS', 1)[1].split('\n')[0]
+    assert 'WL20_MONSTAT' in drv.split('#define WL23_BITS', 1)[1].split('\n')[0]
     assert cfg.index('if (wl20_bits & WL20_MONSTAT) {') > cfg.index('if (wl20_bits & WL27_BITS) {')
-    region = between(drv, W28_START, 'static int\nwl_w23_run(void)')
+    region = between(drv, W28_START, '/* ---- C2f (fuxiwlanqrtr=7)')
     fns = c_functions(region)
     for name in ('wl28_rd', 'wl28_crash', 'wl28_sring', 'wl28_watch', 'wl28_report'):
         assert name in fns, name
@@ -768,11 +769,11 @@ def static_c2e():
     # Containment: wl_ms latched in wl26_contain before its early return; the arena recounted, zeroed and freed only in
     # wl26_free (the proven branch), owned for the SMMU walk.
     con = w26['wl26_contain']
-    assert con.index('wl_ms.stopping = true;') < con.index('if (!wl_rx_arena.va && !wl_link_arena.va) { return; }')
+    assert con.index('wl_ms.stopping = true;') < con.index('if (!wl_rx_arena.va && !wl_link_arena.va && !wl_cm_arena.va) { return; }')
     fr = w26['wl26_free']
     assert fr.index('wlms_guard_count(&wl_ms') < fr.index('bzero((void *)wl_mon_arena.va') < fr.index('wl_ce_wbarrier(NULL);') < \
         fr.index('wl_dma_free(&wl_mon_arena);')
-    assert drv.count('wl_dma_free(&wl_mon_arena)') == 1 and '&wl_reo_arena, &wl_mon_arena };' in drv
+    assert drv.count('wl_dma_free(&wl_mon_arena)') == 1 and '&wl_reo_arena, &wl_mon_arena, &wl_cm_arena };' in drv
     # Counts only: no print in the W28 glue (or W28's lines in wl26_setup / wl26_free) takes an arena word.
     arena = re.compile(r'\bwl_ms\.(?:base|bufs)\b|\.va\b|\bWLMS_LOAD\b|\bWLRX_LOAD\b|\bwl_rx\.(?:bufs|link|base|rdp|wrp)\b')
     nprint = 0
@@ -956,6 +957,200 @@ def l19_c2e(dump):
           'error ring and before the ring selection, batch 1, 500 us, low 128 entries in words, L19\'s MSI for them (ours 0), '
           'no reap and no status-ring selection in STA mode; the model\'s dump word by word (2 x 13 SRING_SETUP words: '
           '0x0101010b / 0x0101020b, 0x02020800, 0x003e0002, low 256; entries 0 and 1022)')
+
+
+def l19_c2f(dump):
+    """C2f: cookie conversion (dp.c cc_config/cc_init, dp.h CMEM/PPT/SPT constants, hal.h cookie cfg masks, hw.c wbm2sw
+    convert), the common SRNGs of ath12k_dp_srng_common_setup (hal.h/hw.c reg bases, dp.h ring sizes, hal_desc.h entry
+    sizes, dp.c thresholds, src/dst hw-init word encodings) and the mac-start / encap-decap enum values, re-derived from
+    L19 and compared with the model's dump word by word."""
+    if not (L19 / 'wmi.h').exists():
+        print(f'L19 re-derivation (C2f) SKIPPED: no Linux ath12k v6.19 tree at {L19} (set ATH12K_SRC)')
+        return
+    hal_h, hal_c, hw_c, dp_h, dp_c, desc, wmi_h, mac_c, dp_tx_c, core_c = (l19_text(n) for n in (
+        'hal.h', 'hal.c', 'hw.c', 'dp.h', 'dp.c', 'hal_desc.h', 'wmi.h', 'mac.c', 'dp_tx.c', 'core.c'))
+    H = hdefs()
+
+    def enum(text, name):
+        body = re.search(r'enum\s+' + name + r'\s*\{(.*?)\};', text, re.S)[1]
+        out, cur = {}, -1
+        for item in body.split(','):
+            item = re.sub(r'/\*.*?\*/', '', item, flags=re.S).strip()
+            if not item:
+                continue
+            if '=' in item:
+                k, v = (x.strip() for x in item.split('=', 1))
+                cur = out[v] if v in out else int(v, 0)
+            else:
+                k, cur = item, cur + 1
+            out[k] = cur
+        return out
+
+    def num(name, text):
+        return int(re.search(r'#define ' + name + r'\s+(0x[0-9a-fA-F]+|\d+)', text)[1], 0)
+
+    def field(name, text):
+        v = re.search(r'#define ' + name + r'\s+(.+?)\s*$', text, re.M)[1]
+        m = re.fullmatch(r'GENMASK\((\d+), (\d+)\)', v)
+        if m:
+            return int(m[2]), ((1 << (int(m[1]) - int(m[2]) + 1)) - 1)
+        return int(re.fullmatch(r'BIT\((\d+)\)', v)[1]), 1
+
+    def regval(name):   # a wcn7850_regs field, e.g. hal_reo1_ring_base_lsb
+        reg = hw_c.split('wcn7850_regs = {', 1)[1].split('\n};', 1)[0]
+        return int(re.search(r'\.' + name + r'\s*=\s*(0x[0-9a-fA-F]+)', reg)[1], 0)
+
+    def struct_dwords(name):
+        """sizeof(struct NAME) >> 2, by walking its fields (le32 1, le64 2, nested structs recurse, arrays multiply)."""
+        body = re.search(r'struct ' + name + r' \{(.*?)\n\} __packed;', desc, re.S)[1]
+        base = {'__le32': 1, '__le64': 2, 'u8': None}
+        total = 0
+        for line in body.split('\n'):
+            line = re.sub(r'/\*.*?\*/', '', line).strip().rstrip(';')
+            if not line:
+                continue
+            if re.match(r'\w+\s+\w+\[\]$', line):
+                continue  # flexible array member (TLV payload): size 0
+            mt = re.match(r'struct (\w+)\s+(\w+)(?:\[(\d+)\])?$', line)
+            if mt:
+                total += struct_dwords(mt[1]) * (int(mt[3]) if mt[3] else 1)
+                continue
+            m = re.match(r'(\w+)\s+(\w+)(?:\[(\d+)\])?$', line)
+            assert m and m[1] in base and base[m[1]], line
+            total += base[m[1]] * (int(m[3]) if m[3] else 1)
+        return total
+
+    words = {}
+    for line in dump.splitlines():
+        k, *v = line.split()
+        words.setdefault(k, []).append([int(x) for x in v])
+
+    REO, WBM, TCL = 0xa38000, 0xa34000, 0xa44000
+    assert num('HAL_SEQ_WCSS_UMAC_REO_REG', hal_h) == REO and num('HAL_SEQ_WCSS_UMAC_WBM_REG', hal_h) == WBM and \
+        num('HAL_SEQ_WCSS_UMAC_TCL_REG', hal_h) == TCL
+    # Cookie conversion cc_config values (dp.c:1330-1380; hal.h masks; dp.h constants; hw.c wbm2sw_cc_enable).
+    cmem_msb, ppt_msb, spt_msb = num('ATH12K_CMEM_ADDR_MSB', dp_h), num('ATH12K_CC_PPT_MSB', dp_h), num('ATH12K_CC_SPT_MSB', dp_h)
+    def enc(text, pfx, pairs):
+        v = 0
+        for name, x in pairs:
+            sh, mask = field(pfx + name, text)
+            v |= (x & mask) << sh
+        return v
+    reo_cfg1 = enc(hal_h, 'HAL_REO1_SW_COOKIE_CFG_', [('CMEM_BASE_ADDR_MSB', cmem_msb), ('COOKIE_PPT_MSB', ppt_msb),
+                   ('COOKIE_SPT_MSB', spt_msb), ('ALIGN', 1), ('ENABLE', 1), ('GLOBAL_ENABLE', 1)])
+    wbm_cfg1 = enc(hal_h, 'HAL_WBM_SW_COOKIE_CFG_', [('CMEM_BASE_ADDR_MSB', cmem_msb), ('COOKIE_PPT_MSB', ppt_msb),
+                   ('COOKIE_SPT_MSB', spt_msb), ('ALIGN', 1)])
+    cfg2_or = enc(hal_h, 'HAL_WBM_SW_COOKIE_CFG_', [('RELEASE_PATH_EN', 1), ('ERR_PATH_EN', 1), ('CONV_IND_EN', 1)])
+    conv_wcn = hw_c.split('ath12k_hw_hal_params_wcn7850 = {', 1)[1].split('};', 1)[0]
+    conv_bits = ['HAL_WBM_SW_COOKIE_CONV_CFG_GLOBAL_EN'] + re.findall(r'HAL_WBM_SW_COOKIE_CONV_CFG_WBM2SW\d_EN', conv_wcn)
+    conv_or = 0
+    for b in conv_bits:
+        sh, _ = field(b, hal_h)
+        conv_or |= 1 << sh
+    assert words['ccv'][0] == [reo_cfg1, wbm_cfg1, cfg2_or, conv_or] == [0x1d1310, 0x51310, 0xb, 0x13a], words['ccv'][0]
+    # cc_config register addresses: REO cookie cfg0/1 from wcn7850_regs, WBM ones from hal.h offsets.
+    reo_cfg0 = int(re.search(r'hal_reo1_sw_cookie_cfg0 = (0x[0-9a-f]+)', hw_c)[1], 0)
+    reo_cfg1a = int(re.search(r'hal_reo1_sw_cookie_cfg1 = (0x[0-9a-f]+)', hw_c)[1], 0)
+    cc_exp = [[REO + reo_cfg0, 0x113000], [REO + reo_cfg1a, reo_cfg1],
+              [WBM + num('HAL_WBM_SW_COOKIE_CFG0', hal_h), 0x113000], [WBM + num('HAL_WBM_SW_COOKIE_CFG1', hal_h), wbm_cfg1],
+              [WBM + num('HAL_WBM_SW_COOKIE_CFG2', hal_h), cfg2_or], [WBM + num('HAL_WBM_SW_COOKIE_CONVERT_CFG', hal_h), conv_or]]
+    assert [c[1:] for c in words['ccreg']] == cc_exp, (words['ccreg'], cc_exp)
+    # SPT / PPT / cookie math (dp.h); DEFAULT profile rx_desc 12288, pool_tx 32768 (core.c).
+    prof = core_c.split('ATH12K_QMI_MEMORY_MODE_DEFAULT] = {', 1)[1].split('},', 1)[0]
+    rx_desc = int(re.search(r'rx_desc_count = (\d+)', prof)[1])
+    pool_tx = int(re.search(r'num_pool_tx_desc = (\d+)', prof)[1])
+    spt_ent = num('ATH12K_MAX_SPT_ENTRIES', dp_h)
+    nrx, ntx = rx_desc // spt_ent, (pool_tx // spt_ent) * num('ATH12K_HW_MAX_QUEUES', l19_text('hw.h'))
+    assert words['arena'][0][2:] == [nrx + ntx, nrx, ntx] == [280, 24, 256], words['arena'][0]
+    ppt_shift = num('ATH12K_CC_PPT_SHIFT', dp_h)
+    for k, cookie, slot in words['cookie']:
+        page, spt = k // spt_ent, k % spt_ent
+        assert cookie == ((ntx + page) << ppt_shift | spt) and slot == k, (k, cookie, slot)
+    # PPT entry: cmem_base + 4*i, value = spt page paddr >> 12.
+    spt_iova = 0xa5000000 + H['WLCM_PAGE_BYTES']
+    for i, addr, v in words['ppt']:
+        assert addr == 0x113000 + 4 * i and v == (spt_iova + i * H['WLCM_PAGE_BYTES']) >> num('ATH12K_SPT_4K_ALIGN_OFFSET', dp_h)
+    # Common rings: ids, R0/R2 bases, sizes, entry dwords, thresholds, and the src/dst hw-init word encodings.
+    reo1_lsb, reo2_lsb = regval('hal_reo1_ring_base_lsb'), regval('hal_reo2_ring_base')
+    tcl1_lsb, tcl2_lsb = regval('hal_tcl1_ring_base_lsb'), regval('hal_tcl2_ring_base_lsb')
+    wbm0_lsb, wbm1_lsb = regval('hal_wbm0_release_ring_base_lsb'), regval('hal_wbm1_release_ring_base_lsb')
+    tcl_hp, tcl_hp2 = num('HAL_TCL1_RING_HP', hal_h), num('HAL_TCL2_RING_HP', hal_h)
+    wbm0_hp = num('HAL_WBM0_RELEASE_RING_HP', hal_h)
+    comp_nums = [int(x) for x in re.findall(r'\.wbm_ring_num = (\d+)', hal_c.split('ath12k_hal_wcn7850_tcl_to_wbm_rbm_map', 1)[1].split('};', 1)[0])]
+    assert comp_nums == [0, 2, 4], comp_nums
+    tx_comp = int(re.search(r'tx_comp_ring_size = (\d+)', prof)[1])
+    batch_tx, timer_tx = num('HAL_SRNG_INT_BATCH_THRESHOLD_TX', hal_h), num('HAL_SRNG_INT_TIMER_THRESHOLD_TX', hal_h)
+    batch_o, timer_o = num('HAL_SRNG_INT_BATCH_THRESHOLD_OTHER', hal_h), num('HAL_SRNG_INT_TIMER_THRESHOLD_OTHER', hal_h)
+    dw_tcl, dw_wbm = struct_dwords('hal_tcl_data_cmd'), struct_dwords('hal_wbm_release_ring')
+    dw_reinj = struct_dwords('hal_reo_entrance_ring')
+    dw_cmd = struct_dwords('hal_tlv_64_hdr') + struct_dwords('hal_reo_get_queue_stats')
+    dw_stat = struct_dwords('hal_tlv_64_hdr') + struct_dwords('hal_reo_get_queue_stats_status')
+    exp = {  # id: (dir, entries, entry_dw, r0, r2, batch, timer)
+        121: (0, num('DP_WBM_RELEASE_RING_SIZE', dp_h), dw_wbm, WBM + regval('hal_wbm_sw_release_ring_base_lsb'),
+              WBM + num('HAL_WBM_SW_RELEASE_RING_HP', hal_h), batch_o, timer_o),
+        16: (0, num('DP_REO_REINJECT_RING_SIZE', dp_h), dw_reinj, REO + regval('hal_sw2reo_ring_base'),
+             REO + num('HAL_SW2REO_RING_HP', hal_h), batch_o, timer_o),
+        20: (0, num('DP_REO_CMD_RING_SIZE', dp_h), dw_cmd, REO + regval('hal_reo_cmd_ring_base'),
+             REO + num('HAL_REO_CMD_HP', hal_h), batch_o, timer_o),
+        21: (1, num('DP_REO_STATUS_RING_SIZE', dp_h), dw_stat, REO + regval('hal_reo_status_ring_base'),
+             REO + num('HAL_REO_STATUS_HP', hal_h), batch_o, timer_o),
+    }
+    for i in range(3):
+        exp[24 + i] = (0, num('DP_TCL_DATA_RING_SIZE', dp_h), dw_tcl, TCL + tcl1_lsb + (tcl2_lsb - tcl1_lsb) * i,
+                       TCL + tcl_hp + (tcl_hp2 - tcl_hp) * i, batch_o, timer_o)
+        cn = comp_nums[i]
+        exp[128 + cn] = (1, tx_comp, dw_wbm, WBM + wbm0_lsb + (wbm1_lsb - wbm0_lsb) * cn,
+                         WBM + wbm0_hp + 8 * cn, batch_tx, timer_tx)
+    FL = {'BASE_LSB': 0x0, 'BASE_MSB': 0x4, 'ID': 0x8, 'MISC': 0x10, 'IX0': 0x30, 'IX1': 0x34, 'TP_LSB': 0x1c,
+          'TP_MSB': 0x20, 'PROD_INT': 0x24, 'HP_LSB': 0x14, 'HP_MSB': 0x18}
+    rdp = 0xa5000000
+    ringn = {r[0]: r[1:] for r in words['ringn']}
+    for rid, (d, ent, dw, r0, r2, batch, timer) in exp.items():
+        assert ringn[rid] == [d, ent, dw, 10 if d == 0 else 9], (rid, ringn[rid])
+        regs = {x[2]: x[3] for x in words['ring'] if x[0] == rid}
+        iova = regs[r0 + FL['BASE_LSB']]
+        msb = (iova >> 32 & 0xff) | (ent * dw & 0xfffff) << 8
+        cons = ((timer >> 3) & 0xffff) << 16 | (batch * dw & 0x7fff)
+        exp_regs = {r0 + FL['BASE_LSB']: iova, r0 + FL['BASE_MSB']: msb, r2: 0, r2 + 4: 0}
+        if d == 0:
+            exp_regs[r0 + FL['ID']] = dw
+            exp_regs[r0 + FL['IX0']] = cons
+            exp_regs[r0 + FL['IX1']] = 0
+            exp_regs[r0 + FL['TP_LSB']] = (rdp + 4 * rid) & 0xffffffff
+            exp_regs[r0 + FL['TP_MSB']] = (rdp + 4 * rid) >> 32
+            exp_regs[r0 + FL['MISC']] = (1 << 1) | (1 << 6)
+        else:
+            exp_regs[r0 + FL['ID']] = (rid & 0xff) << 8 | dw
+            exp_regs[r0 + FL['PROD_INT']] = cons
+            exp_regs[r0 + FL['HP_LSB']] = (rdp + 4 * rid) & 0xffffffff
+            exp_regs[r0 + FL['HP_MSB']] = (rdp + 4 * rid) >> 32
+            exp_regs[r0 + FL['MISC']] = 1 << 6
+        assert regs == exp_regs, (rid, regs, exp_regs)
+    # mac-start pdev params, encap/decap and PPDU stats enum values.
+    pdev = enum(wmi_h, 'wmi_tlv_pdev_param')
+    vdev = enum(wmi_h, 'wmi_tlv_vdev_param')
+    assert (pdev['WMI_PDEV_PARAM_PMF_QOS'], pdev['WMI_PDEV_PARAM_DYNAMIC_BW'], pdev['WMI_PDEV_PARAM_ARP_AC_OVERRIDE'],
+            pdev['WMI_PDEV_PARAM_MESH_MCAST_ENABLE'], pdev['WMI_PDEV_PARAM_IDLE_PS_CONFIG']) == \
+        (H['WLWMI_PDEV_PARAM_PMF_QOS'], H['WLWMI_PDEV_PARAM_DYNAMIC_BW'], H['WLWMI_PDEV_PARAM_ARP_AC_OVERRIDE'],
+         H['WLWMI_PDEV_PARAM_MESH_MCAST_ENABLE'], H['WLWMI_PDEV_PARAM_IDLE_PS_CONFIG'])
+    assert (vdev['WMI_VDEV_PARAM_TX_ENCAP_TYPE'], vdev['WMI_VDEV_PARAM_RX_DECAP_TYPE']) == \
+        (H['WLWMI_VDEV_PARAM_TX_ENCAP_TYPE'], H['WLWMI_VDEV_PARAM_RX_DECAP_TYPE'])
+    svc = enum(wmi_h, 'wmi_tlv_service')
+    assert svc['WMI_TLV_SERVICE_ETH_OFFLOAD'] == H['WLWMI_SVC_ETH_OFFLOAD'] == 461
+    txrx = enum(wmi_h, 'ath12k_hw_txrx_mode')
+    assert txrx['ATH12K_HW_TXRX_NATIVE_WIFI'] == H['WLWMI_TXRX_NATIVE_WIFI'] and txrx['ATH12K_HW_TXRX_ETHERNET'] == H['WLWMI_TXRX_ETHERNET']
+    ppdu_type = num('HTT_H2T_MSG_TYPE_PPDU_STATS_CFG', dp_h) if re.search(r'#define HTT_H2T_MSG_TYPE_PPDU_STATS_CFG', dp_h) else \
+        enum(dp_h, 'htt_h2t_msg_type')['HTT_H2T_MSG_TYPE_PPDU_STATS_CFG']
+    tag = enum(dp_h, 'htt_ppdu_stats_tag_type')
+    default_bits = 0
+    for b in re.findall(r'BIT\((HTT_PPDU_STATS_TAG_\w+)\)', dp_h.split('#define HTT_PPDU_STATS_TAG_DEFAULT', 1)[1].split('#define', 1)[0]):
+        default_bits |= 1 << tag[b]
+    assert words['ppdu'][0] == [ppdu_type, default_bits] == [0x11, 0xe67], words['ppdu'][0]
+    print('L19 re-derivation (C2f): cc_config addresses and values (REO/WBM cookie cfg0/1/2, convert; CMEM_ADDR_MSB, PPT/SPT '
+          'MSB, align/enable/global, wbm2sw0/2/3/4), the CMEM/PPT/SPT and cookie math (DEFAULT profile 24 rx + 256 tx pages, '
+          'ppt << 9 | spt, page paddr >> 12), the ten common rings (ids 121/24-26/128-132/16/20/21, hal.h+hw.c R0/R2 bases, '
+          'dp.h sizes with tx_comp 32768, hal_desc.h entry dwords 8/8/8/12/28, dp.c TX vs other thresholds, src/dst hw-init '
+          'word encodings), and the mac-start/encap/PPDU enum values; the model\'s dump word by word')
 
 
 def l19_c2d(define, dump):
@@ -1340,7 +1535,7 @@ C2E_MUTANTS = [
     ('h', '			if (a < s0 || (a - s0) % WLMS_SLOT_BYTES', '			if (a < s0 && (a - s0) % WLMS_SLOT_BYTES', 'foreign entries not counted'),
     ('d', '		if ((wl20_bits & WL20_MONSTAT) && (wl28_sring(0) || wl28_sring(1))) { return 1; }  /* C2e: dp_rx.c:4657-4670 */\n', '',
      'monitor status rings never announced'),
-    ('d', '(((unsigned)w20 & WL20_MONSTAT) && !((unsigned)w20 & WL20_RXRING))) { wl_variant_invalid = true; }', '0) { wl_variant_invalid = true; }',
+    ('d', '(((unsigned)w20 & WL20_MONSTAT) && !((unsigned)w20 & WL20_RXRING)) ||', '(0) ||',
      'gate: 0x2000 without 0x100'),
     ('d', '	wl28_crash("contain before MHI reset");  /* C2e: read-only; silent without w20 0x2000 */\n', '', 'no crash line before the MHI reset'),
     ('d', '		wl28_crash("scan COMPLETED timeout");  /* C2e: read-only, before anything else touches the device */\n', '',
@@ -1357,6 +1552,113 @@ C2E_MUTANTS = [
     ('d', '	wl28_report();  /* C2e; silent without 0x2000 */\n', '', 'never reported'),
     ('d', 'if (wlms_fill(&wl_ms, &wl_rx, m) || wlms_publish(&wl_ms, &wl_rx, &wl_ce_io, m))',
      'if (wlms_publish(&wl_ms, &wl_rx, &wl_ce_io, m) || wlms_fill(&wl_ms, &wl_rx, m))', 'HP published before the entries'),
+]
+
+
+def static_c2f():
+    """C2f: the gate (0x4000 needs 0x1000, qrtr 6 refuses it), L19's dp_alloc order (cc_init after the idle list and before
+    the common rings; the pre group before rel/exc and the post group after them; cc_config at service ready before the
+    destination rings; mac-start params around the chain mask and channel list; encap/decap before NSS; the W29 report after
+    W27's), the two allowlisted accessors through wl_win, no transmit, the latch and the free."""
+    drv, hdr = DRIVER, HEADER
+    code = strip_comments(drv)
+    cfg = between(drv, 'static void\nwl_probe_configure(void)\n{', '\n}\n')
+    assert '#define WL20_L19ORDER 0x4000u' in drv and header_define('WLRX_W20_L19ORDER') == 0x4000
+    assert 'WL20_L19ORDER' in drv.split('#define WL23_BITS', 1)[1].split('\n')[0]
+    assert 'L19ORDER' not in drv.split('#define WL20_BITS', 1)[1].split('\n')[0]  # qrtr 6 refuses it
+    assert '(((unsigned)w20 & WL20_L19ORDER) && !((unsigned)w20 & WL20_REORX))) { wl_variant_invalid = true; }' in cfg
+    region = between(drv, '/* ---- C2f (fuxiwlanqrtr=7)', '/* ---- end W20 ---- */')
+    fns = c_functions(region)
+    for name in ('wl29_reg', 'wl29_cmem', 'wl29_ring', 'wl29_cc_init', 'wl29_common_pre', 'wl29_common_post', 'wl29_cc_config',
+                 'wl29_macstart_pre', 'wl29_macstart_post', 'wl29_encap_decap', 'wl29_report', 'wl29_ppdu_stats'):
+        assert name in fns, name
+    w26 = c_functions(between(drv, W26_START, W27_START))
+    # dp_alloc order: cc_init after the idle list and before the common SRNGs (wl27_setup).
+    st = w26['wl26_setup']
+    assert st.index('wl26_idle()') < st.index('wl29_cc_init()') < st.index('wl27_setup()')
+    assert st.index('wl29_cc_init()') < st.index('wlrx_fill_refill(&wl_rx)')
+    assert 'wl26_alloc(&wl_cm_arena, WLCM_ARENA_BYTES' in st
+    # common setup: the pre group before rel/exc, the post group after exc and before reo_hw_setup (the GEN_ENABLE read).
+    su = between(drv, 'static int\nwl27_setup(void)\n{', '\n}\n')
+    assert su.index('wl29_common_pre()') < su.index('wl27_ring(WLRD_R_REL) || wl27_ring(WLRD_R_EXC)') < \
+        su.index('wl29_common_post()') < su.index('wl27_reo_rd(WLRD_REO_GEN_ENABLE)')
+    # cc_config at service ready, before the destination rings (core.c:923 < 925).
+    w21 = between(drv, 'static int\nwl_w21_run(void)\n{', '\n}\n')
+    assert w21.index('wl29_cc_config()') < w21.index('wl27_dest()')
+    # mac-start params: pre group before the chain mask; post group (lro, idle_ps) after the channel list and before vdev
+    # create; encap/decap after vdev create and before NSS.
+    assert w26['wl26_rings'].index('wl29_macstart_pre()') < w26['wl26_rings'].index('wl26_chainmask()')
+    w23 = between(drv, 'static int\nwl_w23_run(void)\n{', '\n}\n')
+    assert w23.index('W23 chan list %u passive') < w23.index('wl29_macstart_post()') < w23.index('WMI VDEV_CREATE') < \
+        w23.index('wl29_encap_decap()') < w23.index('WMI VDEV_SET_PARAM NSS')
+    assert w26['wl26_report'].index('wl27_report();') < w26['wl26_report'].index('wl29_report();')
+    # Containment latch and the free (zeroed, in the owned alias, freed once).
+    assert 'wl_cm.stopping = true;' in w26['wl26_contain']
+    fr = w26['wl26_free']
+    assert fr.index('wlcm_guard_count(&wl_cm') < fr.index('bzero((void *)wl_cm_arena.va') < fr.index('wl_dma_free(&wl_cm_arena);')
+    assert drv.count('wl_dma_free(&wl_cm_arena)') == 1
+    # Two allowlisted accessors only (wl29_reg via wlcm_reg_ok, wl29_cmem via wlcm_cmem_ok); both refused after the latch.
+    assert 'if (fw_faults || wl_cm.stopping || !wlcm_reg_ok(&wl_cm, off, wr)) { return 1; }' in fns['wl29_reg']
+    assert 'if (fw_faults || wl_cm.stopping || !wlcm_cmem_ok(&wl_cm, off)) { return 1; }' in fns['wl29_cmem']
+    w29 = strip_comments(region)
+    # No raw hardware access in the W29 glue except through wl_win (the two accessors) and wl_ce_send (HTT/WMI commands);
+    # nothing transmits (no TCL/completion post, no HP/TP publish of a common ring).
+    for raw in ('wl_pwr(', 'wl_mwr(', 'wl_prd(', 'wl_contain_wr(', 'wl_ce_window(', 'wl_ce_io_bar_wr(', 'wl26_wbm(', 'wl27_reo(',
+                'msi', 'MSI', 'gic', 'GIC', 'pmic', 'PMIC', 'irq', 'IRQ', 'WLRD_PUBLISH', 'WLRX_PUBLISH', 'WLMS_PUBLISH'):
+        assert raw not in w29, raw
+    assert w29.count('wl_win(') == 2  # wl29_reg, wl29_cmem
+    # cc is gated on the QMI CMEM region (dropped for the boot without it); on success all three decode flags are set so the
+    # refill cookies and the returned entries are decoded as cookie-converted.
+    assert 'if (!wl_cmem_valid) {' in fns['wl29_cc_init'] and 'cc dropped for this boot' in region
+    assert 'wl_cm.cc_on = wl_rx.cc_on = wl_rd.cc_on = true;' in fns['wl29_cc_init']
+    # The REO command ring's per-entry command numbers; never a TX descriptor posted.
+    assert 'c->va[i * c->entry_dw + 2u] = (i + 1u) & 0xffffu;' in fns['wl29_common_post']
+    print('C2f static: gate (0x4000 needs 0x1000, qrtr 6 refuses it), L19 dp_alloc order (cc_init after the idle list and '
+          'before the common rings, the pre group before rel/exc and the post group after them, cc_config before the '
+          'destination rings, mac-start params around the chain mask and channel list, encap/decap before NSS, W29 report '
+          'after W27), the two wl_win accessors (wlcm_reg_ok, wlcm_cmem_ok) refused after the latch, no transmit and no ring '
+          'post, cc gated on the CMEM region, the latch and the single zeroed free')
+
+
+# Each C2f rule broken in the production code must be caught by the C2f static checks or the model's C2f pure scenario.
+C2F_MUTANTS = [
+    ('h', '#define WLCM_REO_CC_CFG1_VAL (WLCM_CC_CFG1_COMMON | (1u << 19) | (1u << 20))',
+     '#define WLCM_REO_CC_CFG1_VAL (WLCM_CC_CFG1_COMMON | (1u << 20))', 'cc cfg1 without ENABLE'),
+    ('h', '#define WLCM_WBM_CC_CONVERT_OR ((1u << 8) | (1u << 1) | (1u << 3) | (1u << 4) | (1u << 5))',
+     '#define WLCM_WBM_CC_CONVERT_OR ((1u << 8) | (1u << 1) | (1u << 3) | (1u << 5))', 'wbm2sw3 conversion dropped'),
+    ('h', '#define WLCM_COMP_ENTRIES 32768u         /* tx_comp_ring_size, DEFAULT profile */',
+     '#define WLCM_COMP_ENTRIES 16384u         /* tx_comp_ring_size, DEFAULT profile */', 'completion ring size'),
+    ('h', '#define WLCM_RX_SPT_OFFSET WLCM_NUM_TX_SPT_PAGES   /* ATH12K_RX_SPT_PAGE_OFFSET (dp.h:256) */',
+     '#define WLCM_RX_SPT_OFFSET 0u   /* ATH12K_RX_SPT_PAGE_OFFSET (dp.h:256) */', 'rx spt offset'),
+    ('h', '#define WLCM_CC_SPT_SHIFT 9u             /* ATH12K_CC_PPT_SHIFT (dp.h:279) */',
+     '#define WLCM_CC_SPT_SHIFT 8u             /* ATH12K_CC_PPT_SHIFT (dp.h:279) */', 'cookie ppt shift'),
+    ('h', '#define WLCM_SW2WBM_R0 (WLCM_WBM_REG + 0x37cu)', '#define WLCM_SW2WBM_R0 (WLCM_WBM_REG + 0x380u)', 'sw2wbm base'),
+    ('h', '#define WLCM_REOCMD_DW 12u', '#define WLCM_REOCMD_DW 11u', 'reo cmd entry size'),
+    ('h', '#define WLCM_REOSTATUS_DW 28u            /* (sizeof(hal_tlv_64_hdr) 8 + sizeof(hal_reo_get_queue_stats_status) 104) >> 2 */',
+     '#define WLCM_REOSTATUS_DW 27u            /* (sizeof(hal_tlv_64_hdr) 8 + sizeof(hal_reo_get_queue_stats_status) 104) >> 2 */',
+     'reo status entry size'),
+    ('h', 'regs[k][0] = r->r0 + WLCE_R0_MISC; regs[k++][1] = WLCE_MISC_LOOPCNT_DIS | WLCE_MISC_SRNG_ENABLE;',
+     'regs[k][0] = r->r0 + WLCE_R0_MISC; regs[k++][1] = WLCE_MISC_SRNG_ENABLE;', 'src ring loopcnt bit'),
+    ('h', '#define WLWMI_PDEV_PARAM_PMF_QOS 0x22u', '#define WLWMI_PDEV_PARAM_PMF_QOS 0x23u', 'pmf-qos param id'),
+    ('h', '#define WLWMI_VDEV_PARAM_RX_DECAP_TYPE 0x5bu', '#define WLWMI_VDEV_PARAM_RX_DECAP_TYPE 0x5cu', 'rx decap param id'),
+    ('h', '#define WLHTT_PPDU_STATS_DEFAULT 0xe67u         /* HTT_PPDU_STATS_TAG_DEFAULT bits */',
+     '#define WLHTT_PPDU_STATS_DEFAULT 0xe66u         /* HTT_PPDU_STATS_TAG_DEFAULT bits */', 'ppdu stats default bits'),
+    ('h', 'if (slot >= WLRX_NBUF) { return wlrd_stop(rd, "W29 returned cookie is not one of our converted cookies"); }\n', '',
+     'foreign converted cookie accepted'),
+    ('h', 'page = ppt - WLCM_RX_SPT_OFFSET;\n\tk = page * WLCM_SPT_ENTRIES + spt;', 'page = ppt;\n\tk = page * WLCM_SPT_ENTRIES + spt;',
+     'cookie slot decode offset'),
+    ('d', 'if (wl29_cc_init()) { return 1; }   /* C2f: cookie converter', '(void)0; /* C2f: cookie converter', 'cc_init skipped'),
+    ('d', 'if (wl29_common_pre()) { return 1; }   /* C2f: SW2WBM release', '(void)0;   /* C2f: SW2WBM release', 'common pre skipped'),
+    ('d', 'if (wl29_common_post()) { return 1; }  /* C2f: REO command', '(void)0;  /* C2f: REO command', 'common post skipped'),
+    ('d', 'if (wl29_cc_config()) { return 1; }  /* C2f: ath12k_dp_cc_config', '(void)0;  /* C2f: ath12k_dp_cc_config', 'cc_config skipped'),
+    ('d', 'if (wl29_encap_decap()) { return 1; }   /* C2f: vdev encap/decap', '(void)0;   /* C2f: vdev encap/decap', 'encap/decap skipped'),
+    ('d', '(((unsigned)w20 & WL20_L19ORDER) && !((unsigned)w20 & WL20_REORX))) { wl_variant_invalid = true; }',
+     '(0)) { wl_variant_invalid = true; }', 'gate: 0x4000 without 0x1000'),
+    ('d', 'wl_cm.stopping = true;  /* C2f: no common-ring', '(void)0;  /* C2f: no common-ring', 'no latch'),
+    ('d', '	if (wl_cm_arena.va) { bzero((void *)wl_cm_arena.va, wl_cm_arena.size); bytes += (uint32_t)wl_cm_arena.size; }\n', '',
+     'cm arena not zeroed'),
+    ('d', '	wl_dma_free(&wl_cm_arena);\n', '', 'cm arena never freed'),
+    ('d', 'wl_cm.cc_on = wl_rx.cc_on = wl_rd.cc_on = true;', 'wl_cm.cc_on = wl_rx.cc_on = true;', 'reo decode cc flag not set'),
 ]
 
 
@@ -2355,12 +2657,16 @@ def main():
         c2cdump = subprocess.run([str(exe), 'dump-c2c'], check=True, capture_output=True, text=True).stdout
         c2ddump = subprocess.run([str(exe), 'dump-c2d'], check=True, capture_output=True, text=True).stdout
         c2edump = subprocess.run([str(exe), 'dump-c2e'], check=True, capture_output=True, text=True).stdout
+        c2fdump = subprocess.run([str(exe), 'dump-c2f'], check=True, capture_output=True, text=True).stdout
     l19_checks(dump, c2dump, c2cdump, c2ddump)
     l19_c2e(c2edump)
+    l19_c2f(c2fdump)
     mutants()
     mutants(C2E_MUTANTS, 'c2e')
+    mutants(C2F_MUTANTS, 'c2f')
     dash_check()
-    print('W20 (fuxiwlanqrtr=6) CE/HTC/WMI, W23 (fuxiwlanqrtr=7) passive scan, C2c (W26), C2d (W27) and C2e (W28) host tests passed')
+    print('W20 (fuxiwlanqrtr=6) CE/HTC/WMI, W23 (fuxiwlanqrtr=7) passive scan, C2c (W26), C2d (W27), C2e (W28) and C2f (W29) '
+          'host tests passed')
 
 
 if __name__ == '__main__':

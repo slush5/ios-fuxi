@@ -2244,6 +2244,15 @@ struct wlrx_content {
 	bool err_bad;
 	uint32_t link_written, link_unlisted, idle_changed;
 };
+/* C2f forward uses: the C2d entry parser (wlrd_entry, wlrd_recycle_cc) decodes
+ * cookie-converted returns with these; the full definitions are in the C2f
+ * section below (identical macro redefinitions there are allowed). */
+static inline uint32_t wlcm_buf_cookie(uint32_t k);
+static inline uint32_t wlcm_cookie_slot(uint32_t cookie);
+#define WLCM_WBM_REL_CC_STATUS (1u << 16)
+#define WLCM_WBM_REL_CC_RBM_SHIFT 9u
+#define WLCM_WBM_REL_CC_COOKIE_SHIFT 8u
+
 struct wlrx {
 	uint8_t *base; uint64_t iova; uint32_t bytes;                /* RX arena, 0x1040000 */
 	volatile uint32_t *rdp, *wrp; uint64_t rdp_iova, wrp_iova;   /* u32[207], u32[47] */
@@ -2261,6 +2270,7 @@ struct wlrx {
 	uint32_t htt_t2h[64], htt_t2h_other, sring_sent;
 	uint32_t tx_ci, ci_rx_frame_max, stats_answers, tx_stats[5];   /* D4 / D5 notes from the C2b readouts */
 	bool rx_on, idle_on, idle_tried, chain_on, stopping;
+	bool cc_on;             /* C2f: refill buffer cookies are cookie-converted */
 };
 
 static inline uint32_t
@@ -2328,7 +2338,8 @@ wlrx_fill_refill(struct wlrx *rx)
 	for (uint32_t k = 0; k < WLRX_NBUF; k++) {
 		volatile uint8_t *s = rx->bufs + (size_t)k * WLRX_SLOT_BYTES;
 		for (uint32_t j = 0; j < WLRX_SENTINEL_BYTES; j++) { s[j] = WLRX_SENTINEL; }
-		wlrx_addr_entry(&r->va[WLRX_BUF_DW * k], rx->bufs_iova + (uint64_t)k * WLRX_SLOT_BYTES, WLRX_RBM_SW1, k);
+		wlrx_addr_entry(&r->va[WLRX_BUF_DW * k], rx->bufs_iova + (uint64_t)k * WLRX_SLOT_BYTES, WLRX_RBM_SW1,
+		    rx->cc_on ? wlcm_buf_cookie(k) : k);   /* C2f: cookie-converted cookie when cc is on */
 	}
 	return 0;
 }
@@ -2916,6 +2927,8 @@ struct wlrd {
 	uint32_t reo_code[32], rxdma_code[32];
 	uint32_t sel_sent;
 	bool sel_on, reo_on, dst_on, stopping;
+	bool cc_on;                     /* C2f: cookie conversion active; returns carry cc cookies */
+	uint32_t cc_entries;            /* C2f: returns decoded through the cc cookie path */
 	const char *why;                /* the entry that stopped the run, a string literal */
 };
 
@@ -3111,6 +3124,31 @@ wlrd_recycle(struct wlrd *rd, struct wlrx *rx, uint32_t w0, uint32_t w1)
 	return 0;
 }
 
+/* C2f: a buffer the device handed back by cookie-converted cookie (not address):
+ * the cookie must decode to one of our posted RX slots that is out with the
+ * device; then the slot is held, its posted half cleared and re-sentinelled, and
+ * queued, exactly as the by-address path. Anything that does not decode is
+ * refused. Byte loops here, distinct from wlrd_recycle's word loops. */
+static inline int
+wlrd_recycle_cc(struct wlrd *rd, struct wlrx *rx, uint32_t cookie)
+{
+	uint32_t slot = wlcm_cookie_slot(cookie);
+	volatile uint8_t *buf;
+	if (rd->stopping || rx->stopping) { return wlrd_stop(rd, "W27 buffer return after the containment latch"); }
+	if (slot >= WLRX_NBUF) { return wlrd_stop(rd, "W29 returned cookie is not one of our converted cookies"); }
+	if (rd->slot[slot] != WLRD_SLOT_OUT) { return wlrd_stop(rd, "W29 converted buffer returned twice"); }
+	rd->slot[slot] = WLRD_SLOT_HELD;
+	buf = rx->bufs + (size_t)slot * WLRX_SLOT_BYTES;
+	for (uint32_t b = 0; b < WLRX_BUF_BYTES; b++) { buf[b] = 0; }
+	for (uint32_t b = 0; b < WLRX_SENTINEL_BYTES; b++) { buf[b] = WLRX_SENTINEL; }
+	rd->pend[(rd->pend_head + rd->pend_n) % WLRX_SLOTS] = (uint16_t)slot;
+	rd->pend_n++;
+	if (rd->pend_n > rd->pend_max) { rd->pend_max = rd->pend_n; }
+	rd->returned++;
+	rd->cc_entries++;
+	return 0;
+}
+
 /* A REO exception link descriptor: a listed slot of our link arena, its MSDUs
  * (zero address ends the list, at most 6) returned when the first one's RBM is
  * one L19 accepts; the descriptor itself is held (no SW2WBM ring here). Without
@@ -3151,9 +3189,15 @@ wlrd_entry(struct wlrd *rd, struct wlrx *rx, const struct wlce_io *io, const str
 {
 	if (r->kind == WLRD_R_REL) {
 		const uint32_t src = e[2] & 7u, type = (e[2] >> 6) & 7u;
+		const bool cc = rd->cc_on && (e[2] & WLCM_WBM_REL_CC_STATUS);   /* C2f: converted RX release format */
 		rd->rel_src[src == 1u ? 0 : src == 2u ? 1 : 2]++;
 		if (type) { rd->desc_other++; return 0; }
 		if (src != 1u && src != 2u) { return 0; }
+		if (cc) {
+			if (((e[2] >> WLCM_WBM_REL_CC_RBM_SHIFT) & 0xfu) != WLRD_RBM_SW3) { rd->rbm_other++; return 0; }
+			if (src == 2u) { rd->reo_code[(e[2] >> 26) & 0x1fu]++; } else { rd->rxdma_code[(e[2] >> 19) & 0x1fu]++; }
+			return wlrd_recycle_cc(rd, rx, (e[7] >> WLCM_WBM_REL_CC_COOKIE_SHIFT) & 0xfffffu);
+		}
 		if (((e[1] >> 8) & 0xfu) != WLRD_RBM_SW3) { rd->rbm_other++; return 0; }
 		if (src == 2u) { rd->reo_code[(e[2] >> 26) & 0x1fu]++; } else { rd->rxdma_code[(e[2] >> 19) & 0x1fu]++; }
 		return wlrd_recycle(rd, rx, e[0], e[1]);
@@ -3164,6 +3208,9 @@ wlrd_entry(struct wlrd *rd, struct wlrx *rx, const struct wlce_io *io, const str
 	rd->msdu++;
 	if (e[4] & (1u << 2)) { rd->cont++; }
 	if (((e[1] >> 8) & 0xfu) != WLRX_RBM_SW1) { rd->rbm_other++; }
+	/* C2f: a converted REO destination entry carries the cc cookie in word 1
+	 * bits 31:12; map it through the slot table instead of by address. */
+	if (rd->cc_on) { return wlrd_recycle_cc(rd, rx, (e[1] >> 12) & 0xfffffu); }
 	return wlrd_recycle(rd, rx, e[0], e[1]);
 }
 
@@ -3207,7 +3254,8 @@ wlrd_replenish(struct wlrd *rd, struct wlrx *rx, const struct wlce_io *io)
 	while (rd->pend_n && (tp + size - rd->refill_hp - WLRX_BUF_DW) % size >= WLRX_BUF_DW) {
 		const uint32_t k = rd->pend[rd->pend_head];
 		rd->pend_head = (rd->pend_head + 1u) % WLRX_SLOTS; rd->pend_n--;
-		wlrx_addr_entry(&f->va[rd->refill_hp], rx->bufs_iova + (uint64_t)k * WLRX_SLOT_BYTES, WLRX_RBM_SW1, k);
+		wlrx_addr_entry(&f->va[rd->refill_hp], rx->bufs_iova + (uint64_t)k * WLRX_SLOT_BYTES, WLRX_RBM_SW1,
+		    rx->cc_on ? wlcm_buf_cookie(k) : k);   /* C2f: cookie-converted cookie when cc is on */
 		rd->slot[k] = WLRD_SLOT_OUT;
 		rd->refill_hp = (rd->refill_hp + WLRX_BUF_DW) % size;
 		n++;
@@ -3538,6 +3586,466 @@ wlms_diag_ok(uint32_t off, uint32_t bhi)
 	if (bhi < 0x40u || bhi > 0x4000u - 0x40u || (bhi & 3u)) { return false; }
 	for (unsigned i = 0; i < WLMS_DIAG_N; i++) { if (off == wlms_diag_addr(i, bhi)) { return true; } }
 	return false;
+}
+
+/* ---- C2f (fuxiwlanqrtr=7): W29, L19's dp_alloc order, cookie conversion and
+ * the common SRNGs L19 programs before any scan ----
+ * Adapted from Linux ath12k dp.c, dp.h, hal.c, hal.h, hal_desc.h, hal_rx.c,
+ * hw.c, mac.c and wmi.c (BSD-3-Clause-Clear), v6.19. One more w20 bit, needing
+ * 0x100 (so 0x02 too): 0x4000 L19ORDER. The C2c/C2d/C2e host-side MMIO ring
+ * programming already sits where L19's ath12k_dp_alloc puts it (wl26_setup runs
+ * inside wl_w20_run, after the CE rings and before the CE RX post, as
+ * core.c:1285 ce_init_pipes < 1291 dp_alloc < 1300 core_start): 0x4000 adds the
+ * pieces L19 also programs there and at service ready that C2c..C2e leave out,
+ * in L19's order, and nothing more.
+ *
+ * At dp_alloc time (wl26_setup), in ath12k_dp_alloc's order (dp.c:1755-1813):
+ *   - the WBM idle list and its link descriptors (C2c 0x200, wl26_idle);
+ *   - cookie conversion (ath12k_dp_cc_init, dp.c:1583-1667): the SPT pages, the
+ *     PPT table in CMEM, the per-descriptor SPT entries. The CMEM base comes
+ *     from QMI dev_mem[0] (ATH12K_QMI_DEVMEM_CMEM_INDEX, qmi.c:2875-2884); with
+ *     no CMEM region the whole cookie converter is dropped for the boot (the
+ *     cc_config registers and the converted-entry decode go with it);
+ *   - the common SRNGs (ath12k_dp_srng_common_setup, dp.c:491-595): the SW2WBM
+ *     release ring, three TCL data rings each with its WBM completion ring, the
+ *     REO reinject ring (W29 pre group), then the WBM2SW3 release ring and the
+ *     REO2SW0 exception ring (C2d 0x1000, wl27 rel/exc), then the REO command
+ *     ring with its command-number init and the REO status ring (W29 post
+ *     group), then ath12k_hal_reo_hw_setup (C2d);
+ *   - the RX refill and monitor status fills (C2c/C2e).
+ * At service ready (core.c:923, just before the REO2SW1..8 destination rings of
+ * C2d): ath12k_dp_cc_config (dp.c:1330-1380) writes the REO and WBM cookie
+ * configuration registers.
+ * The TCL, completion, reinject, REO command and REO status rings are
+ * programmed to L19's exact registers and backed to their full programmed size,
+ * but NEVER posted to and NEVER reaped: a passive scan drives no TX and sends
+ * no REO command, so the device never writes any of them. Cookie conversion
+ * makes the RX buffer cookies the cookie-converted shape and the WBM2SW RX
+ * release entries the converted format (info0 CC_STATUS); every returned cookie
+ * is mapped back through the slot table (wlcm_cookie_slot) and anything that
+ * does not map is refused, exactly as the by-address path refuses a foreign
+ * buffer. All accesses go through allowlists with pre-reads and refuse an owner;
+ * device-writable memory lives in one SMMU-mapped arena with guards; nothing is
+ * freed until bus master off and PERST are proven. Nothing transmits. */
+#define WLRX_W20_L19ORDER 0x4000u
+
+/* Cookie conversion (dp.h:237-281, dp.c:1330-1667; hw.c:1283-1287, 1290-1296).
+ * DEFAULT memory profile (the salami phone has 16 GB, so total_ram >= 512 MiB and
+ * ath12k_core_get_memory_mode returns ATH12K_QMI_MEMORY_MODE_DEFAULT,
+ * core.c:1729-1741): rx_desc_count 12288, num_pool_tx_desc 32768,
+ * tx_comp_ring_size 32768 (core.c:41-52). SPT page 4 KiB holds 512 entries of
+ * 8 bytes; PPT holds one 4-byte entry per page (the page paddr >> 12). */
+#define WLCM_PAGE_BYTES 4096u
+#define WLCM_SPT_ENTRIES 512u            /* ATH12K_MAX_SPT_ENTRIES (dp.h:245) */
+#define WLCM_SPT_ENTRY_BYTES 8u
+#define WLCM_NUM_RX_SPT_PAGES 24u        /* 12288 / 512 (dp.h:247-248) */
+#define WLCM_NUM_TX_SPT_PAGES 256u       /* (32768 / 512) * 4 queues (dp.h:250-253) */
+#define WLCM_NSPT (WLCM_NUM_RX_SPT_PAGES + WLCM_NUM_TX_SPT_PAGES)   /* 280 (<= 1024, dp.h:242) */
+#define WLCM_RX_SPT_OFFSET WLCM_NUM_TX_SPT_PAGES   /* ATH12K_RX_SPT_PAGE_OFFSET (dp.h:256) */
+#define WLCM_CC_SPT_SHIFT 9u             /* ATH12K_CC_PPT_SHIFT (dp.h:279) */
+#define WLCM_CC_SPT_MASK 0x1ffu          /* ATH12K_DP_CC_COOKIE_SPT GENMASK(8,0) (dp.h:280) */
+#define WLCM_SPT_4K_SHIFT 12u            /* ATH12K_SPT_4K_ALIGN_OFFSET (dp.h:270) */
+#define WLCM_CMEM_ADDR_MSB 0x10u         /* ATH12K_CMEM_ADDR_MSB (dp.h:274) */
+#define WLCM_CC_PPT_MSB 19u              /* ATH12K_CC_PPT_MSB (dp.h:278) */
+#define WLCM_CC_SPT_MSB 8u               /* ATH12K_CC_SPT_MSB (dp.h:277) */
+/* The RX refill buffer in slot k lives in RX SPT page k / 512 at entry k % 512;
+ * its cookie-converted cookie is ppt << 9 | spt with ppt = RX_SPT_OFFSET + page
+ * (rx_ppt_base 0 for device 0, dp.c:1779). Only slots 0..WLRX_NBUF-1 are posted,
+ * so pages 0..7 of the RX SPT block carry buffer addresses; the rest are zero. */
+#define WLCM_RX_SPT_USED 8u              /* ceil(4095 / 512) */
+_Static_assert(WLCM_RX_SPT_USED * WLCM_SPT_ENTRIES >= WLRX_NBUF &&
+    ((WLCM_RX_SPT_OFFSET + WLCM_RX_SPT_USED - 1u) << WLCM_CC_SPT_SHIFT | WLCM_CC_SPT_MASK) <= 0xfffffu,
+    "W29 RX cookie fits 20 bits");
+
+/* cc_config register values (dp.c:1330-1380; hal.h:148-149, 266-287, 329-335;
+ * hw.c:1240-1241, 1290-1296). CFG0 = CMEM base; the field layouts are the same
+ * for REO and WBM but REO CFG1 also sets ENABLE and GLOBAL_ENABLE. CFG2 and the
+ * convert-config are read-modify-write. WCN7850 converts WBM2SW0/2/3/4. */
+#define WLCM_REO_REG 0x00a38000u
+#define WLCM_WBM_REG 0x00a34000u
+#define WLCM_TCL_REG 0x00a44000u
+#define WLCM_REO_CC_CFG0 (WLCM_REO_REG + 0x50u)
+#define WLCM_REO_CC_CFG1 (WLCM_REO_REG + 0x54u)
+#define WLCM_WBM_CC_CFG0 (WLCM_WBM_REG + 0x40u)
+#define WLCM_WBM_CC_CFG1 (WLCM_WBM_REG + 0x44u)
+#define WLCM_WBM_CC_CFG2 (WLCM_WBM_REG + 0x90u)
+#define WLCM_WBM_CC_CONVERT (WLCM_WBM_REG + 0x94u)
+#define WLCM_CC_CFG1_COMMON (WLCM_CMEM_ADDR_MSB | (WLCM_CC_PPT_MSB << 8) | (WLCM_CC_SPT_MSB << 13) | (1u << 18))
+#define WLCM_REO_CC_CFG1_VAL (WLCM_CC_CFG1_COMMON | (1u << 19) | (1u << 20))   /* + ENABLE + GLOBAL_ENABLE */
+#define WLCM_WBM_CC_CFG2_OR ((1u << 0) | (1u << 1) | (1u << 3))                 /* RELEASE_PATH | ERR_PATH | CONV_IND */
+#define WLCM_WBM_CC_CONVERT_OR ((1u << 8) | (1u << 1) | (1u << 3) | (1u << 4) | (1u << 5))  /* GLOBAL | WBM2SW0/2/3/4 */
+#define WLCM_CC_REGS 6u
+_Static_assert(WLCM_REO_CC_CFG1_VAL == 0x1d1310u && WLCM_CC_CFG1_COMMON == 0x51310u &&
+    WLCM_WBM_CC_CFG2_OR == 0xbu && WLCM_WBM_CC_CONVERT_OR == 0x13au, "W29 cc_config values");
+
+/* mac-start pdev parameters and the vdev encap/decap of ath12k_mac_start and
+ * ath12k_mac_update_vif_offload (mac.c:9363-9469, 9782-9827). WMI command ids
+ * (WMI_TLV_CMD grp encoding, wmi.h:63, 243-311), tags and enum values
+ * (re-derived; the test checks every one). PPDU stats is an HTT H2T message
+ * (dp_tx.c:1328-1361, dp.h:475, 711-755). */
+#define WLWMI_CMD_PDEV_SET_PARAM_C2F 0x4003u   /* == WLWMI_CMD_PDEV_SET_PARAM */
+#define WLWMI_CMD_DFS_PHYERR_OFFLOAD 0xa005u
+#define WLWMI_TAG_DFS_PHYERR_OFFLOAD_CMD 0x250u
+#define WLWMI_CMD_LRO_CONFIG 0x1d010u
+#define WLWMI_TAG_LRO_INFO_CMD 0x1aau
+#define WLWMI_PDEV_PARAM_PMF_QOS 0x22u
+#define WLWMI_PDEV_PARAM_DYNAMIC_BW 0x0au
+#define WLWMI_PDEV_PARAM_ARP_AC_OVERRIDE 0x23u
+#define WLWMI_PDEV_PARAM_MESH_MCAST_ENABLE 0x8fu
+#define WLWMI_PDEV_PARAM_IDLE_PS_CONFIG 0x2cu
+#define WLWMI_VDEV_PARAM_TX_ENCAP_TYPE 0x30u
+#define WLWMI_VDEV_PARAM_RX_DECAP_TYPE 0x5bu
+#define WLWMI_TXRX_NATIVE_WIFI 1u
+#define WLWMI_TXRX_ETHERNET 2u
+#define WLWMI_SVC_ETH_OFFLOAD 461u              /* WMI_TLV_SERVICE_ETH_OFFLOAD (wmi.h:2259) */
+#define WLHTT_H2T_PPDU_STATS_CFG 0x11u          /* HTT_H2T_MSG_TYPE_PPDU_STATS_CFG */
+#define WLHTT_PPDU_STATS_DEFAULT 0xe67u         /* HTT_PPDU_STATS_TAG_DEFAULT bits */
+#define WLCM_LRO_WORDS 19u                       /* lro_enable, res, th_4[5], th_6[11], pdev */
+#define WLCM_LRO_IPV4_SEEDS 5u
+#define WLCM_LRO_IPV6_SEEDS 11u
+
+/* The WBM2SW RX release entry when cookie conversion is on
+ * (struct hal_wbm_release_ring_cc_rx, hal_desc.h:1982-1991; hal_rx.c:386-404):
+ * word 0/1 the buffer VA (not an address we gave), word 2 info0 with CC_STATUS
+ * bit 16, RBM 12:9, word 7 info1 with the cookie 27:8. L19 requires RBM SW3. */
+#define WLCM_WBM_REL_CC_STATUS (1u << 16)
+#define WLCM_WBM_REL_CC_RBM_SHIFT 9u
+#define WLCM_WBM_REL_CC_COOKIE_SHIFT 8u
+
+/* The common rings of ath12k_dp_srng_common_setup, in L19's order (dp.c:491-595).
+ * ids and R0/R2 bases (hal.h, hw.c:1194-1296): SW2WBM_RELEASE 121
+ * (0x00a3437c / 0x00a37010, SRC, DP_WBM_RELEASE_RING_SIZE 64); TCL_DATA 24..26
+ * (0x00a44900 + 0x78 n / 0x00a46000 + 8 n, SRC, DP_TCL_DATA_RING_SIZE 512) each
+ * with its completion WBM2SW ring (tcl_to_wbm_rbm_map wbm_ring_num 0/2/4,
+ * hal.c:237-250: ids 128/130/132, 0x00a34e08 + 0x78 n / 0x00a370c8 + 8 n, DST,
+ * tx_comp_ring_size 32768); REO_REINJECT SW2REO 16 (0x00a38304 / 0x00a3b028,
+ * SRC, DP_REO_REINJECT_RING_SIZE 32); REO_CMD 20 (0x00a3828c / 0x00a3b020, SRC,
+ * DP_REO_CMD_RING_SIZE 256); REO_STATUS 21 (0x00a38a84 / 0x00a3b0a8, DST,
+ * DP_REO_STATUS_RING_SIZE 2048). The WBM2SW3 release ring (131) and the REO2SW0
+ * exception ring (0) are C2d's (wl27 rel/exc), programmed between the pre and
+ * post groups. Entry dwords (hal.c:13-132): TCL data 8, WBM release 8, REO
+ * entrance 8, REO cmd 12 (hal_tlv_64_hdr + hal_reo_get_queue_stats), REO status
+ * 29 (hal_tlv_64_hdr + hal_reo_get_queue_stats_status). Thresholds
+ * (ath12k_dp_srng_setup dp.c:270-320): a WCN7850 TX completion ring (0/2/4,
+ * hw.c:76-82) batch 256 timer 1000 us; everything else here batch 1 timer 256. */
+#define WLCM_TCL_R0(n) (WLCM_TCL_REG + 0x900u + 0x78u * (n))
+#define WLCM_TCL_R2(n) (WLCM_TCL_REG + 0x2000u + 8u * (n))
+#define WLCM_COMP_R0(n) (WLCM_WBM_REG + 0xe08u + 0x78u * (n))
+#define WLCM_COMP_R2(n) (WLCM_WBM_REG + 0x30c8u + 8u * (n))
+#define WLCM_SW2WBM_R0 (WLCM_WBM_REG + 0x37cu)
+#define WLCM_SW2WBM_R2 (WLCM_WBM_REG + 0x3010u)
+#define WLCM_REINJECT_R0 (WLCM_REO_REG + 0x304u)
+#define WLCM_REINJECT_R2 (WLCM_REO_REG + 0x3028u)
+#define WLCM_REOCMD_R0 (WLCM_REO_REG + 0x28cu)
+#define WLCM_REOCMD_R2 (WLCM_REO_REG + 0x3020u)
+#define WLCM_REOSTATUS_R0 (WLCM_REO_REG + 0xa84u)
+#define WLCM_REOSTATUS_R2 (WLCM_REO_REG + 0x30a8u)
+#define WLCM_TCL_ENTRIES 512u
+#define WLCM_COMP_ENTRIES 32768u         /* tx_comp_ring_size, DEFAULT profile */
+#define WLCM_SW2WBM_ENTRIES 64u
+#define WLCM_REINJECT_ENTRIES 32u
+#define WLCM_REOCMD_ENTRIES 256u
+#define WLCM_REOSTATUS_ENTRIES 2048u
+#define WLCM_REOCMD_DW 12u
+#define WLCM_REOSTATUS_DW 28u            /* (sizeof(hal_tlv_64_hdr) 8 + sizeof(hal_reo_get_queue_stats_status) 104) >> 2 */
+#define WLCM_REOCMD_HDR_CMD_NUMBER 0x3ffu  /* HAL_REO_CMD_HDR_INFO0_CMD_NUMBER GENMASK(15,0) low; set per entry */
+#define WLCM_BATCH_TX 256u
+#define WLCM_TIMER_TX_US 1000u
+#define WLCM_BATCH_OTHER 1u
+#define WLCM_TIMER_OTHER_US 256u
+#define WLCM_NRING 10u
+#define WLCM_RING_REGS_MAX 10u
+/* Arena (computed layout, DEFAULT profile): rdp page, 280 SPT pages, the ten
+ * rings each page-aligned and backed to full size, a 64 KiB tail. The two big
+ * completion rings (0x100000 each) dominate; the lane's device-writable total
+ * rises by this much when 0x4000 is set. */
+#define WLCM_OFF_TAIL 0x462000u
+#define WLCM_ARENA_BYTES 0x474000u          /* tail >= 64 KiB, rounded up to a 16 KiB (page-table) multiple */
+/* ring order: L19's common-setup order */
+enum { WLCM_R_SW2WBM, WLCM_R_TCL0, WLCM_R_COMP0, WLCM_R_TCL1, WLCM_R_COMP1, WLCM_R_TCL2, WLCM_R_COMP2,
+	WLCM_R_REINJECT, WLCM_R_REOCMD, WLCM_R_REOSTATUS };
+enum { WLCM_FREE, WLCM_SRNG, WLCM_BASE, WLCM_UNREADABLE, WLCM_NOCMEM, WLCM_CMEM_OWNED };
+
+struct wlcm_ring {
+	uint16_t id;
+	uint8_t dir;                 /* 0 SRC, 1 DST */
+	uint8_t entry_dw;
+	uint32_t entries, off, r0, r2, batch, timer_us;
+	volatile uint32_t *va;
+	uint64_t iova, ptr_iova;     /* rdp + 4 * id: SRC TP / DST HP remote word */
+	bool on;
+};
+struct wlcm {
+	uint8_t *base; uint64_t iova; uint32_t bytes;
+	volatile uint32_t *rdp; uint64_t rdp_iova;
+	uint8_t *spt; uint64_t spt_iova;                  /* 280 pages */
+	struct wlcm_ring ring[WLCM_NRING];
+	uint32_t cmem_base; bool cmem_valid;              /* QMI dev_mem[0].start */
+	uint32_t pre[2u * WLCM_NRING + 2u];               /* BASE_LSB, MISC of each ring; cfg2, convert */
+	unsigned own;
+	uint32_t ppt_pre[WLCM_NSPT];                      /* PPT pre-reads */
+	uint32_t writes, cmem_writes;
+	bool cc_on, rings_on, stopping;
+};
+
+/* The cookie-converted cookie of RX refill slot k (dp.c:1478, cc_cookie_gen). */
+static inline uint32_t
+wlcm_buf_cookie(uint32_t k)
+{
+	const uint32_t page = k / WLCM_SPT_ENTRIES, spt = k % WLCM_SPT_ENTRIES;
+	return ((WLCM_RX_SPT_OFFSET + page) << WLCM_CC_SPT_SHIFT) | spt;
+}
+
+/* Decode a cookie-converted cookie back to an RX refill slot; WLRX_SLOTS (out
+ * of range) when it is not one of ours (ath12k_dp_get_rx_desc bounds,
+ * dp.c:1394-1409). */
+static inline uint32_t
+wlcm_cookie_slot(uint32_t cookie)
+{
+	const uint32_t ppt = (cookie >> WLCM_CC_SPT_SHIFT), spt = cookie & WLCM_CC_SPT_MASK;
+	uint32_t page, k;
+	if (ppt < WLCM_RX_SPT_OFFSET || ppt >= WLCM_RX_SPT_OFFSET + WLCM_NUM_RX_SPT_PAGES || spt >= WLCM_SPT_ENTRIES) {
+		return WLRX_SLOTS;
+	}
+	page = ppt - WLCM_RX_SPT_OFFSET;
+	k = page * WLCM_SPT_ENTRIES + spt;
+	return k < WLRX_NBUF ? k : WLRX_SLOTS;
+}
+
+/* Lay out and zero the W29 arena: rdp page, 280 SPT pages, the ten rings backed
+ * to their full programmed size, a tail. */
+static inline int
+wlcm_layout(struct wlcm *cm, uint8_t *base, uint64_t iova, uint32_t bytes)
+{
+	static const struct { uint8_t slot, dir, dw; uint16_t id; uint32_t entries; uint32_t r0, r2; bool tx; } plan[WLCM_NRING] = {
+		{ WLCM_R_SW2WBM, 0, 8, 121, WLCM_SW2WBM_ENTRIES, WLCM_SW2WBM_R0, WLCM_SW2WBM_R2, false },
+		{ WLCM_R_TCL0, 0, 8, 24, WLCM_TCL_ENTRIES, 0, 0, false },
+		{ WLCM_R_COMP0, 1, 8, 128, WLCM_COMP_ENTRIES, 0, 0, true },
+		{ WLCM_R_TCL1, 0, 8, 25, WLCM_TCL_ENTRIES, 0, 0, false },
+		{ WLCM_R_COMP1, 1, 8, 130, WLCM_COMP_ENTRIES, 0, 0, true },
+		{ WLCM_R_TCL2, 0, 8, 26, WLCM_TCL_ENTRIES, 0, 0, false },
+		{ WLCM_R_COMP2, 1, 8, 132, WLCM_COMP_ENTRIES, 0, 0, true },
+		{ WLCM_R_REINJECT, 0, 8, 16, WLCM_REINJECT_ENTRIES, WLCM_REINJECT_R0, WLCM_REINJECT_R2, false },
+		{ WLCM_R_REOCMD, 0, WLCM_REOCMD_DW, 20, WLCM_REOCMD_ENTRIES, WLCM_REOCMD_R0, WLCM_REOCMD_R2, false },
+		{ WLCM_R_REOSTATUS, 1, WLCM_REOSTATUS_DW, 21, WLCM_REOSTATUS_ENTRIES, WLCM_REOSTATUS_R0, WLCM_REOSTATUS_R2, false },
+	};
+	uint64_t off;
+	if (!base || (iova & 0xfffu) || bytes < WLCM_ARENA_BYTES || iova + WLCM_ARENA_BYTES > (1ull << 32)) { return 1; }
+	cm->base = base; cm->iova = iova; cm->bytes = WLCM_ARENA_BYTES;
+	cm->rdp = (volatile uint32_t *)(void *)base; cm->rdp_iova = iova;
+	cm->spt = base + WLCM_PAGE_BYTES; cm->spt_iova = iova + WLCM_PAGE_BYTES;
+	off = (uint64_t)WLCM_PAGE_BYTES + (uint64_t)WLCM_NSPT * WLCM_PAGE_BYTES;
+	for (unsigned i = 0; i < WLCM_NRING; i++) {
+		struct wlcm_ring *r = &cm->ring[i];
+		const unsigned tn = i == WLCM_R_TCL0 ? 0 : i == WLCM_R_TCL1 ? 1 : 2;      /* TCL ring number */
+		const unsigned cn = i == WLCM_R_COMP0 ? 0 : i == WLCM_R_COMP1 ? 2 : 4;    /* completion WBM ring number */
+		r->id = plan[i].id; r->dir = plan[i].dir; r->entry_dw = plan[i].dw; r->entries = plan[i].entries;
+		r->r0 = plan[i].r0 ? plan[i].r0 : (i == WLCM_R_TCL0 || i == WLCM_R_TCL1 || i == WLCM_R_TCL2) ? WLCM_TCL_R0(tn) : WLCM_COMP_R0(cn);
+		r->r2 = plan[i].r2 ? plan[i].r2 : (i == WLCM_R_TCL0 || i == WLCM_R_TCL1 || i == WLCM_R_TCL2) ? WLCM_TCL_R2(tn) : WLCM_COMP_R2(cn);
+		r->batch = plan[i].tx ? WLCM_BATCH_TX : WLCM_BATCH_OTHER;
+		r->timer_us = plan[i].tx ? WLCM_TIMER_TX_US : WLCM_TIMER_OTHER_US;
+		off = (off + 0xfffu) & ~0xfffull;
+		r->off = (uint32_t)off; r->va = (volatile uint32_t *)(void *)(base + off); r->iova = iova + off;
+		r->ptr_iova = cm->rdp_iova + 4ull * r->id;
+		r->on = false;
+		off += (uint64_t)r->entries * r->entry_dw * 4u;
+	}
+	off = (off + 0xfffu) & ~0xfffull;
+	if (off != WLCM_OFF_TAIL || WLCM_OFF_TAIL + 0x10000u > WLCM_ARENA_BYTES) { return 1; }
+	for (uint32_t i = 0; i < WLCM_ARENA_BYTES / 4u; i++) { ((volatile uint32_t *)(void *)base)[i] = 0; }
+	return 0;
+}
+
+/* The SPT pages: RX pages 0..7 hold the posted buffers' address pairs (our own
+ * record; L19 stores a desc VA there, which we never read back), everything else
+ * zero. Written once at cc_init, never by the device. */
+static inline void
+wlcm_spt_fill(struct wlcm *cm, const struct wlrx *rx)
+{
+	for (uint32_t k = 0; k < WLRX_NBUF; k++) {
+		const uint32_t page = WLCM_RX_SPT_OFFSET + k / WLCM_SPT_ENTRIES, spt = k % WLCM_SPT_ENTRIES;
+		volatile uint32_t *e = (volatile uint32_t *)(void *)(cm->spt + (size_t)page * WLCM_PAGE_BYTES + (size_t)spt * WLCM_SPT_ENTRY_BYTES);
+		const uint64_t a = rx->bufs_iova + (uint64_t)k * WLRX_SLOT_BYTES;
+		e[0] = (uint32_t)a; e[1] = (uint32_t)(a >> 32) & 0xffu;
+	}
+}
+
+/* The PPT entry address (CMEM) and value for SPT page i: page paddr >> 12. */
+static inline uint32_t
+wlcm_ppt_addr(const struct wlcm *cm, unsigned i)
+{
+	return cm->cmem_base + 4u * i;   /* ATH12K_PPT_ADDR_OFFSET; rx_ppt_base 0 (dp.c:1548 adds 4*0) */
+}
+
+static inline uint32_t
+wlcm_ppt_val(const struct wlcm *cm, unsigned i)
+{
+	return (uint32_t)((cm->spt_iova + (uint64_t)i * WLCM_PAGE_BYTES) >> WLCM_SPT_4K_SHIFT);
+}
+
+/* The six cc_config register writes (dp.c:1330-1380). CFG2 and CONVERT are
+ * read-modify-write: the glue reads first and ORs in the bits. */
+static inline void
+wlcm_cc_regs(const struct wlcm *cm, uint32_t cfg2, uint32_t conv, uint32_t regs[WLCM_CC_REGS][2])
+{
+	const uint32_t v[WLCM_CC_REGS][2] = {
+		{ WLCM_REO_CC_CFG0, cm->cmem_base },
+		{ WLCM_REO_CC_CFG1, WLCM_REO_CC_CFG1_VAL },
+		{ WLCM_WBM_CC_CFG0, cm->cmem_base },
+		{ WLCM_WBM_CC_CFG1, WLCM_CC_CFG1_COMMON },
+		{ WLCM_WBM_CC_CFG2, cfg2 | WLCM_WBM_CC_CFG2_OR },
+		{ WLCM_WBM_CC_CONVERT, conv | WLCM_WBM_CC_CONVERT_OR },
+	};
+	for (unsigned k = 0; k < WLCM_CC_REGS; k++) { regs[k][0] = v[k][0]; regs[k][1] = v[k][1]; }
+}
+
+/* Ring I's register writes (ath12k_hal_srng_src_hw_init / dst_hw_init without
+ * the MSI writes, hal.c:1664-1706, 1714-1807). *N = the count. SRC: BASE_LSB,
+ * BASE_MSB, ID (entry size only), CONSR_INT_IX0, CONSR_INT_IX1 (0, no low
+ * threshold on these rings), TP_ADDR LSB/MSB, R2 HP 0, R2 TP 0, MISC
+ * (LOOPCNT_DISABLE | SRNG_ENABLE). DST: BASE_LSB, BASE_MSB, ID (ring id | entry
+ * size), PRODUCER_INT, HP_ADDR LSB/MSB, R2 HP 0, R2 TP 0, MISC (SRNG_ENABLE). */
+static inline void
+wlcm_ring_regs(const struct wlcm *cm, unsigned i, uint32_t regs[WLCM_RING_REGS_MAX][2], unsigned *n)
+{
+	const struct wlcm_ring *r = &cm->ring[i < WLCM_NRING ? i : 0];
+	const uint32_t words = r->entries * r->entry_dw;
+	const uint32_t msb = ((uint32_t)(r->iova >> 32) & 0xffu) | (words & 0xfffffu) << 8;
+	const uint32_t cons = ((r->timer_us >> 3) & 0xffffu) << 16 | ((r->batch * r->entry_dw) & 0x7fffu);
+	unsigned k = 0;
+	regs[k][0] = r->r0 + WLCE_R0_BASE_LSB; regs[k++][1] = (uint32_t)r->iova;
+	regs[k][0] = r->r0 + WLCE_R0_BASE_MSB; regs[k++][1] = msb;
+	if (r->dir == 0) {
+		regs[k][0] = r->r0 + WLCE_R0_ID; regs[k++][1] = r->entry_dw;
+		regs[k][0] = r->r0 + WLCE_R0_CONS_IX0; regs[k++][1] = cons;
+		regs[k][0] = r->r0 + WLCE_R0_CONS_IX1; regs[k++][1] = 0u;
+		regs[k][0] = r->r0 + WLCE_R0_TP_ADDR_LSB; regs[k++][1] = (uint32_t)r->ptr_iova;
+		regs[k][0] = r->r0 + WLCE_R0_TP_ADDR_MSB; regs[k++][1] = (uint32_t)(r->ptr_iova >> 32);
+		regs[k][0] = r->r2; regs[k++][1] = 0u;
+		regs[k][0] = r->r2 + 4u; regs[k++][1] = 0u;
+		regs[k][0] = r->r0 + WLCE_R0_MISC; regs[k++][1] = WLCE_MISC_LOOPCNT_DIS | WLCE_MISC_SRNG_ENABLE;
+	} else {
+		regs[k][0] = r->r0 + WLCE_R0_ID; regs[k++][1] = ((uint32_t)r->id & 0xffu) << 8 | r->entry_dw;
+		regs[k][0] = r->r0 + WLCE_R0_PROD_INT; regs[k++][1] = cons;
+		regs[k][0] = r->r0 + WLCE_R0_HP_ADDR_LSB; regs[k++][1] = (uint32_t)r->ptr_iova;
+		regs[k][0] = r->r0 + WLCE_R0_HP_ADDR_MSB; regs[k++][1] = (uint32_t)(r->ptr_iova >> 32);
+		regs[k][0] = r->r2; regs[k++][1] = 0u;
+		regs[k][0] = r->r2 + 4u; regs[k++][1] = 0u;
+		regs[k][0] = r->r0 + WLCE_R0_MISC; regs[k++][1] = WLCE_MISC_SRNG_ENABLE;
+	}
+	*n = k;
+}
+
+/* The pre-reads, in this order before any W29 write: BASE_LSB and MISC of each
+ * of the ten rings, then WBM CFG2 and the convert-config (read for the
+ * read-modify-writes and to show an owner). */
+static inline uint32_t
+wlcm_pre_addr(const struct wlcm *cm, unsigned i)
+{
+	if (i >= 2u * WLCM_NRING + 2u) { return 0u; }
+	if (i >= 2u * WLCM_NRING) { return i == 2u * WLCM_NRING ? WLCM_WBM_CC_CFG2 : WLCM_WBM_CC_CONVERT; }
+	return cm->ring[i / 2u].r0 + (i & 1u ? WLCE_R0_MISC : WLCE_R0_BASE_LSB);
+}
+
+/* Their reading: any ~0u unreadable; a ring with SRNG_ENABLE or a base already
+ * owned. Anything but FREE: no ring write at all. */
+static inline unsigned
+wlcm_rings_owned(const struct wlcm *cm)
+{
+	for (unsigned i = 0; i < 2u * WLCM_NRING; i++) { if (cm->pre[i] == ~0u) { return WLCM_UNREADABLE; } }
+	for (unsigned k = 0; k < WLCM_NRING; k++) { if (cm->pre[2u * k + 1u] & WLCE_MISC_SRNG_ENABLE) { return WLCM_SRNG; } }
+	for (unsigned k = 0; k < WLCM_NRING; k++) { if (cm->pre[2u * k]) { return WLCM_BASE; } }
+	return WLCM_FREE;
+}
+
+static inline const char *
+wlcm_why(unsigned own)
+{
+	switch (own) {
+	case WLCM_SRNG: return "a common ring has SRNG_ENABLE set (already owned)";
+	case WLCM_BASE: return "a common ring base is non-zero (already owned)";
+	case WLCM_UNREADABLE: return "a pre-read is ~0 (unreadable, ownership not established)";
+	case WLCM_NOCMEM: return "no QMI CMEM region (dev_mem[0]); cookie conversion needs it";
+	case WLCM_CMEM_OWNED: return "a CMEM PPT entry is already non-zero (cookie converter owned)";
+	default: return "free";
+	}
+}
+
+/* The W29 register allowlist: reads of the pre-read addresses (the cc_config
+ * read-modify-writes are among them); writes of the ten rings' registers, the
+ * six cc_config registers. Nothing else in the REO, WBM or TCL blocks; never a
+ * CE or C2c/C2d/C2e register. */
+static inline bool
+wlcm_reg_ok(const struct wlcm *cm, uint32_t off, bool wr)
+{
+	static const uint8_t src_f[9] = { WLCE_R0_BASE_LSB, WLCE_R0_BASE_MSB, WLCE_R0_ID, WLCE_R0_CONS_IX0, WLCE_R0_CONS_IX1,
+		WLCE_R0_TP_ADDR_LSB, WLCE_R0_TP_ADDR_MSB, WLCE_R0_MISC, 0xffu };
+	static const uint8_t dst_f[8] = { WLCE_R0_BASE_LSB, WLCE_R0_BASE_MSB, WLCE_R0_ID, WLCE_R0_PROD_INT, WLCE_R0_HP_ADDR_LSB,
+		WLCE_R0_HP_ADDR_MSB, WLCE_R0_MISC, 0xffu };
+	if (!wr) {
+		for (unsigned i = 0; i < 2u * WLCM_NRING + 2u; i++) { if (off == wlcm_pre_addr(cm, i)) { return true; } }
+		return false;
+	}
+	if (off == WLCM_REO_CC_CFG0 || off == WLCM_REO_CC_CFG1 || off == WLCM_WBM_CC_CFG0 || off == WLCM_WBM_CC_CFG1 ||
+	    off == WLCM_WBM_CC_CFG2 || off == WLCM_WBM_CC_CONVERT) { return true; }
+	for (unsigned k = 0; k < WLCM_NRING; k++) {
+		const struct wlcm_ring *r = &cm->ring[k];
+		if (off == r->r2 || off == r->r2 + 4u) { return true; }
+		if (r->dir == 0) { for (unsigned j = 0; src_f[j] != 0xffu; j++) { if (off == r->r0 + src_f[j]) { return true; } } }
+		else { for (unsigned j = 0; dst_f[j] != 0xffu; j++) { if (off == r->r0 + dst_f[j]) { return true; } } }
+	}
+	return false;
+}
+
+/* The CMEM allowlist: writes of the 280 PPT entries only; reads of the same for
+ * the ownership pre-reads. */
+static inline bool
+wlcm_cmem_ok(const struct wlcm *cm, uint32_t off)
+{
+	if (!cm->cmem_valid || off < cm->cmem_base || off >= cm->cmem_base + 4u * WLCM_NSPT || (off & 3u)) { return false; }
+	return true;
+}
+
+/* The PPT pre-reads' reading: all zero = free; any non-zero = owned; ~0u =
+ * unreadable (treated as owned: ownership not established). */
+static inline unsigned
+wlcm_cmem_owned(const struct wlcm *cm)
+{
+	for (unsigned i = 0; i < WLCM_NSPT; i++) { if (cm->ppt_pre[i]) { return WLCM_CMEM_OWNED; } }
+	return WLCM_FREE;
+}
+
+/* Non-zero dwords where the device was given no address (counts only). The
+ * device never writes this arena in a passive scan (no TX, no REO command), so
+ * every region here should stay as the host left it:
+ *  - rdp_gap: the rdp page except the ten rings' pointer words (all stay 0);
+ *  - ring_gap: the page-alignment padding between the rings (stays 0);
+ *  - spt_lost: RX SPT entries the host wrote (slots 0..NBUF-1) that no longer
+ *    hold a non-zero address (a device overwrite would clear or change them);
+ *  - tail: the 64 KiB tail. */
+static inline void
+wlcm_guard_count(const struct wlcm *cm, uint32_t *rdp_gap, uint32_t *ring_gap, uint32_t *spt_lost, uint32_t *tail)
+{
+	const volatile uint32_t *a = (const volatile uint32_t *)(const void *)cm->base;
+	*rdp_gap = *ring_gap = *spt_lost = *tail = 0;
+	for (uint32_t i = 0; i < WLCM_PAGE_BYTES / 4u; i++) {
+		bool owned = false;
+		for (unsigned k = 0; k < WLCM_NRING; k++) { if (i == cm->ring[k].id) { owned = true; break; } }
+		*rdp_gap += !owned && a[i] != 0;
+	}
+	for (uint32_t k = 0; k < WLRX_NBUF; k++) {
+		const uint32_t page = WLCM_RX_SPT_OFFSET + k / WLCM_SPT_ENTRIES, spt = k % WLCM_SPT_ENTRIES;
+		const volatile uint32_t *e = (const volatile uint32_t *)(const void *)(cm->spt + (size_t)page * WLCM_PAGE_BYTES + (size_t)spt * WLCM_SPT_ENTRY_BYTES);
+		if (e[0] == 0 && e[1] == 0) { (*spt_lost)++; }
+	}
+	for (uint32_t off = WLCM_PAGE_BYTES + WLCM_NSPT * WLCM_PAGE_BYTES; off < WLCM_OFF_TAIL; off += 4u) {
+		bool inring = false;
+		for (unsigned k = 0; k < WLCM_NRING; k++) {
+			if (off >= cm->ring[k].off && off < cm->ring[k].off + cm->ring[k].entries * cm->ring[k].entry_dw * 4u) { inring = true; break; }
+		}
+		if (!inring) { *ring_gap += a[off / 4u] != 0; }
+	}
+	for (uint32_t i = WLCM_OFF_TAIL / 4u; i < WLCM_ARENA_BYTES / 4u; i++) { *tail += a[i] != 0; }
 }
 
 #endif /* FUXI_WLAN_CE_H */
