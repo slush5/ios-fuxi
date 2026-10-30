@@ -9,7 +9,9 @@
  * (W27, w20 0x800/0x1000): HTT RX_RING_SELECTION_CFG for the two MAC rings,
  * and the UMAC RX path (REO destination and exception rings, the WBM release
  * ring for RX, the REO setup) with every returned buffer posted again to the
- * refill ring.
+ * refill ring. C2e (W28, w20 0x2000): the two RXDMA monitor status rings with
+ * host status buffers, watched and never reaped (as L19 in STA mode), and a
+ * read-only MHI/BHI crash line.
  * Pure C: no XNU or Linux includes. The includer provides uint8_t..uint64_t,
  * size_t, bool and memcpy (bsd/dev/fuxi_wlan.c in the kernel,
  * tools/fuxi-wlan-ce-model.c on the host).
@@ -2086,6 +2088,8 @@ wlstats_parse(struct wlstats *st, const uint8_t *p, uint32_t len)
 #define WLRX_RING_MAC0 161u              /* RXDMA_BUF ring_num 1, mac 0 (dp_rx.c:4699-4711; hal.c:1421-1423, 1830-1832) */
 #define WLRX_RING_MAC1 (WLRX_RING_MAC0 + WLRX_RINGS_PER_PMAC)
 #define WLRX_RING_ERR 186u               /* HAL_SRNG_RING_ID_WMAC1_RXDMA2SW0: RXDMA_DST ring_num 0, mac 0 */
+#define WLRX_RING_MON0 185u              /* C2e: HAL_SRNG_RING_ID_WMAC1_SW2RXDMA1_STATBUF = 184 + 1, mac 0 (hal.h:497-501) */
+#define WLRX_RING_MON1 (WLRX_RING_MON0 + WLRX_RINGS_PER_PMAC)
 #define WLRX_DMAC_START 160u             /* HAL_SRNG_RING_ID_DMAC_CMN_ID_START: wrp index = id - 160 (hal.c:2393, 2427) */
 #define WLRX_RDP_WORDS 207u              /* HAL_SRNG_RING_ID_MAX = 183 + 3 x 8 (hal.c:1564-1576) */
 #define WLRX_WRP_WORDS 47u               /* 3 x 8 + (183 - 160) (hal.c:1592-1604) */
@@ -2248,6 +2252,7 @@ struct wlrx {
 	uint8_t *link; uint64_t link_iova; uint32_t link_bytes;     /* link arena 0x440000 */
 	struct wlrx_ring idle; uint32_t ndesc;                      /* 32767 */
 	uint32_t refill_head;   /* host HP of ring 160 in words when C2d re-posts; 0 = the fixed 8190 of C2c */
+	bool mon_named;         /* C2e: rdp 185/193 and wrp 25/33 were named by SRING_SETUP (not gaps) */
 	uint32_t wbm_pre[WLRX_PRE_N];                               /* D1: seven pre-reads + the scattered base */
 	unsigned idle_own;                                          /* WLRX_IDLE_* of the pre-reads */
 	uint32_t chain_tx, chain_rx;                                /* sent values; 0 = not sent */
@@ -2345,9 +2350,8 @@ wlrx_publish_refill(struct wlrx *rx, const struct wlce_io *io)
  * an MSI group, dp.c:179-223); batch x entry words, timer >> 3; the low threshold
  * only with LOW_THRESH_INTR_EN; RESPONSE_REQUIRED never. */
 static inline void
-wlrx_sring_words(const struct wlrx *rx, unsigned i, uint32_t *w)
+wlrx_sring_ring(const struct wlrx_ring *r, uint32_t *w)
 {
-	const struct wlrx_ring *r = &rx->ring[i < WLRX_NRING ? i : 0];
 	uint32_t pdev = r->htt_type == WLRX_HTT_SW_TO_SW ? r->mac : r->mac + 1u;
 	for (uint32_t k = 0; k < WLRX_SRING_WORDS; k++) { w[k] = 0; }
 	w[0] = WLRX_HTT_SRING_SETUP | (pdev & 0xffu) << 8 | (r->htt_ring & 0xffu) << 16 | (r->htt_type & 0xffu) << 24;
@@ -2358,6 +2362,12 @@ wlrx_sring_words(const struct wlrx *rx, unsigned i, uint32_t *w)
 	w[6] = (uint32_t)r->tp_iova; w[7] = (uint32_t)(r->tp_iova >> 32);
 	w[11] = ((r->batch * r->entry_dw) & 0x7fffu) | ((r->timer_us >> 3) & 0xffffu) << 16;
 	w[12] = r->low ? ((r->entries >> 3) * r->entry_dw) & 0xffffu : 0u;
+}
+
+static inline void
+wlrx_sring_words(const struct wlrx *rx, unsigned i, uint32_t *w)
+{
+	wlrx_sring_ring(&rx->ring[i < WLRX_NRING ? i : 0], w);
 }
 
 /* Lay out and zero the link arena: ring 120 (a UMAC SRC ring, R2 pointers, no
@@ -2559,8 +2569,9 @@ wlrx_watch_derive(struct wlrx *rx, unsigned p)
 /* Guard words (B1): non-zero dwords in bytes 2048..4095 of slots 0..4094 (and
  * in how many slots), in slot 4095 and in the 128 KiB tail; and the gaps the
  * device was given no address in (2.7 "none"): the first 16 KiB except the
- * pointer words SRING_SETUP named (rdp 160/161/169/186, wrp 0/1/9/26), and the
- * 16 KiB after the error ring. Counts only. */
+ * pointer words SRING_SETUP named (rdp 160/161/169/186, wrp 0/1/9/26; with
+ * C2e also rdp 185/193, wrp 25/33), and the 16 KiB after the error ring. Counts
+ * only. */
 static inline void
 wlrx_guard_count(const struct wlrx *rx, uint32_t *upper, uint32_t *upper_slots, uint32_t *last, uint32_t *tail, uint32_t *gap)
 {
@@ -2571,7 +2582,9 @@ wlrx_guard_count(const struct wlrx *rx, uint32_t *upper, uint32_t *upper_slots, 
 		const bool named = i == WLRX_RING_REFILL || i == WLRX_RING_MAC0 || i == WLRX_RING_MAC1 || i == WLRX_RING_ERR ||
 		    (i >= WLRX_OFF_WRP / 4u && (k == WLRX_RING_REFILL - WLRX_DMAC_START || k == WLRX_RING_MAC0 - WLRX_DMAC_START ||
 		    k == WLRX_RING_MAC1 - WLRX_DMAC_START || k == WLRX_RING_ERR - WLRX_DMAC_START));
-		*gap += !named && a[i] != 0;
+		const bool mon = rx->mon_named && (i == WLRX_RING_MON0 || i == WLRX_RING_MON1 ||
+		    (i >= WLRX_OFF_WRP / 4u && (k == WLRX_RING_MON0 - WLRX_DMAC_START || k == WLRX_RING_MON1 - WLRX_DMAC_START)));
+		*gap += !named && !mon && a[i] != 0;
 	}
 	for (uint32_t i = (WLRX_OFF_ERR + 4u * WLRX_ERR_DW * WLRX_ERR_ENTRIES) / 4u; i < WLRX_OFF_BUFS / 4u; i++) { *gap += a[i] != 0; }
 	for (uint32_t k = 0; k < WLRX_SLOTS; k++) {
@@ -3237,6 +3250,294 @@ wlrd_next(const struct wlrd *rd, uint32_t bits, uint32_t frames_written)
 	if (frames_written) { return "owner review: buffers written, nothing returned on the REO/release rings"; }
 	return (bits & WLRX_W20_RXSEL) && (bits & WLRX_W20_REORX) ? "owner review: RXDMA wrote nothing (L19 also has the monitor status and REO cmd/status rings)" :
 	    "0x1902 (6402): ring selection and the REO path together";
+}
+
+/* ---- C2e (fuxiwlanqrtr=7): W28, the RXDMA monitor status rings and the crash line ----
+ * Adapted from Linux ath12k dp.c, dp.h, dp_mon.c, dp_rx.c, dp_tx.c, hal.c, hal.h,
+ * hal_desc.h, hal_rx.c and hw.c (BSD-3-Clause-Clear), v6.19. One more w20 bit,
+ * needing 0x100: 0x2000 MONSTAT, the two monitor status refill rings L19 sets
+ * up on WCN7850 before any scan (rxdma1_enable false, num_rxdma_per_pdev 2;
+ * hw.c:1433-1434). ath12k_dp_rx_alloc creates them after the RXDMA error ring
+ * (dp_rx.c:4733-4748; ids hal.h:497-501, 1024 entries dp.h:193, entries of
+ * struct hal_wbm_buffer_ring hal.c:157-164), ath12k_dp_rxdma_buf_setup fills
+ * them after the refill ring (dp_rx.c:450-517: 1024 asked, a fresh source ring
+ * takes 1023), each entry one status buffer inside the RX_MON_STATUS_BASE_BUF_SIZE
+ * budget of 2048 bytes, 128-aligned (dp.h:210-216, dp_mon.c:2697-2770), RBM
+ * rx_buf_rbm SW1 6 (hw.c:1291), cookie = the buffer's idr id from 0 in
+ * DP_RXDMA_BUF_COOKIE_BUF_ID 17:0, pdev bits 19:18 left 0 (dp.h:218-219), and
+ * ath12k_dp_rx_htt_setup announces them by HTT SRING_SETUP after the RXDMA
+ * error ring and before the ring selection (dp_rx.c:4657-4672):
+ * RXDMA_MONITOR_STATUS ring 1, SW_TO_HW, pdev mac + 1 (dp_tx.c:1140-1143,
+ * 1189-1196), batch 1, timer 500 us, low threshold entries >> 3 (dp.c:284-289).
+ * L19 gives them MSI (WCN7850 rx_mon_status ring mask, hw.c:898-903); nothing
+ * here has an interrupt, so the MSI words stay 0 as for every other ring. In STA
+ * mode L19 never reaps them (only with monitor_started, dp_mon.c:4421-4438) and
+ * sends them no ring selection (only the monitor mode config does,
+ * dp_tx.c:1655-1665): neither does this. The host only watches the device TP,
+ * the buffers whose sentinel changed, fill and exhaustion, ring entries that
+ * changed and the guards. The crash line reads the six MHI/BHI registers of the
+ * existing diagnostic (MHISTATUS, BHI EXECENV, ERRCODE, ERRDBG1..3) behind their
+ * own allowlist, read-only. Nothing read from a buffer is printed: counts only. */
+#define WLRX_W20_MONSTAT 0x2000u
+#define WLMS_HTT_RING_MON_STATUS 1u      /* HTT_RXDMA_MONITOR_STATUS_RING (dp.h:499-502) */
+#define WLMS_ENTRIES 1024u               /* DP_RXDMA_MON_STATUS_RING_SIZE (dp.h:193) */
+#define WLMS_NBUF 1023u                  /* a fresh source ring takes entries - 1 (dp_mon.c:2715-2720, hal.c:2039-2042) */
+#define WLMS_BUF_BYTES 2048u             /* RX_MON_STATUS_BASE_BUF_SIZE (dp.h:210): the posted half of a slot */
+#define WLMS_SLOT_BYTES 4096u            /* slot stride: the upper 2048 bytes are a guard, never posted */
+#define WLMS_SLOTS 1024u                 /* per ring: slots 0..1022 posted, slot 1023 never */
+#define WLMS_TIMER_US 500u               /* HAL_SRNG_INT_TIMER_THRESHOLD_RX (hal.h:768, dp.c:284-289) */
+#define WLMS_BATCH 1u
+/* Monitor status arena (0x2000): the two rings in a 64 KiB head (each followed by
+ * a gap of its own size), 2 x 1024 slots of 4 KiB (ring 0's, then ring 1's), a
+ * 64 KiB tail. The rings' HP/TP words are L19's: wrp[25]/rdp[185] and
+ * wrp[33]/rdp[193] in the W26 RX arena's first page. */
+#define WLMS_ARENA_BYTES 0x820000u
+#define WLMS_OFF_RING(m) (0x4000u * (m))
+#define WLMS_OFF_BUFS 0x10000u
+#define WLMS_OFF_TAIL 0x810000u
+_Static_assert(WLMS_OFF_RING(1) + 4u * WLRX_BUF_DW * WLMS_ENTRIES + 0x2000u <= WLMS_OFF_BUFS &&
+    4u * WLRX_BUF_DW * WLMS_ENTRIES == 0x2000u && WLMS_OFF_BUFS + 2u * WLMS_SLOTS * WLMS_SLOT_BYTES == WLMS_OFF_TAIL &&
+    WLMS_OFF_TAIL + 0x10000u == WLMS_ARENA_BYTES && WLMS_NBUF == WLMS_SLOTS - 1u && 2u * WLMS_BUF_BYTES == WLMS_SLOT_BYTES &&
+    WLRX_RING_MON1 == 193u && WLRX_RING_MON1 < WLRX_RDP_WORDS && WLRX_RING_MON1 - WLRX_DMAC_START < WLRX_WRP_WORDS &&
+    WLMS_NBUF - 1u <= 0x3ffffu, "W28 monitor status arena layout, 18-bit cookie");
+/* The crash line's six reads (MHI common.h, the same six as the W11/W15
+ * diagnostic): MHISTATUS 0x48 (SYSERR bit 2, MHI state 15:8), and at BHIOFF
+ * EXECENV 0x28, ERRCODE 0x30, ERRDBG1..3 0x34..0x3c. */
+#define WLMS_MHISTATUS 0x48u
+#define WLMS_BHI_EXECENV 0x28u
+#define WLMS_BHI_ERRCODE 0x30u
+#define WLMS_BHI_ERRDBG1 0x34u
+#define WLMS_DIAG_N 6u
+
+/* The device-written TP words of the two rings; the two HP publishes. The host
+ * model wraps both. */
+#ifndef WLMS_LOAD
+#define WLMS_LOAD(p) (*(p))
+#endif
+#ifndef WLMS_PUBLISH
+#define WLMS_PUBLISH(p, v) (*(p) = (v))
+#endif
+
+#define WLMS_F_MON0 0x01u
+#define WLMS_F_MON1 0x02u
+struct wlms_watch {             /* raw TP words in dwords; ~0u = unreadable */
+	uint32_t tp[2], taken[2], left[2], written[2];   /* taken / left in entries, written = sentinels changed */
+	uint8_t bad, unreadable, exhausted;              /* WLMS_F_* */
+	bool seen;
+};
+struct wlms {
+	uint8_t *base; uint64_t iova; uint32_t bytes;   /* monitor status arena, 0x820000 */
+	struct wlrx_ring ring[2];                        /* 185, 193 */
+	uint8_t *bufs; uint64_t bufs_iova;
+	uint32_t hp[2];                                  /* host HP in words as published; 0 = not yet */
+	struct wlms_watch w[WLRX_NPOINT];                /* the W26 watch points */
+	uint32_t written[2], changed[2], foreign[2];     /* after the scan */
+	uint32_t guard_upper, guard_upper_slots, guard_last, guard_tail, guard_gap;
+	uint32_t sring_sent;
+	bool on, stopping;
+};
+
+/* Lay out and zero the monitor status arena; the rings' remote pointer words in
+ * the RX arena's rdp/wrp (an L19 SRC ring: HP in wrp[id - 160], TP in rdp[id]). */
+static inline int
+wlms_layout(struct wlms *ms, struct wlrx *rx, uint8_t *base, uint64_t iova, uint32_t bytes)
+{
+	if (!base || !rx->base || (iova & 0xfffu) || bytes < WLMS_ARENA_BYTES || iova + WLMS_ARENA_BYTES > (1ull << 32)) { return 1; }
+	ms->base = base; ms->iova = iova; ms->bytes = WLMS_ARENA_BYTES;
+	ms->bufs = base + WLMS_OFF_BUFS; ms->bufs_iova = iova + WLMS_OFF_BUFS;
+	for (unsigned m = 0; m < 2; m++) {
+		struct wlrx_ring *r = &ms->ring[m];
+		r->id = (uint16_t)(m ? WLRX_RING_MON1 : WLRX_RING_MON0); r->src = 1; r->entry_dw = WLRX_BUF_DW;
+		r->entries = WLMS_ENTRIES; r->off = WLMS_OFF_RING(m); r->mac = m; r->htt_ring = WLMS_HTT_RING_MON_STATUS;
+		r->htt_type = WLRX_HTT_SW_TO_HW; r->batch = WLMS_BATCH; r->timer_us = WLMS_TIMER_US; r->low = true;
+		r->va = (volatile uint32_t *)(void *)(base + r->off); r->iova = iova + r->off;
+		r->hp_iova = rx->wrp_iova + 4ull * (r->id - WLRX_DMAC_START);
+		r->tp_iova = rx->rdp_iova + 4ull * r->id;
+		ms->hp[m] = 0;
+	}
+	for (uint32_t i = 0; i < WLMS_ARENA_BYTES / 4u; i++) { ((volatile uint32_t *)(void *)base)[i] = 0; }
+	rx->mon_named = true;
+	return 0;
+}
+
+static inline uint64_t
+wlms_slot_iova(const struct wlms *ms, unsigned m, uint32_t k)
+{
+	return ms->bufs_iova + ((uint64_t)m * WLMS_SLOTS + k) * WLMS_SLOT_BYTES;
+}
+
+/* Entry K of ring M as the host writes it (ath12k_hal_rx_buf_addr_info_set):
+ * slot K of the ring, RBM 6, cookie K; entry 1023 stays 0. */
+static inline void
+wlms_expect(const struct wlms *ms, unsigned m, uint32_t k, uint32_t *e)
+{
+	volatile uint32_t v[2] = { 0, 0 };
+	if (k < WLMS_NBUF) { wlrx_addr_entry(v, wlms_slot_iova(ms, m, k), WLRX_RBM_SW1, k); }
+	e[0] = v[0]; e[1] = v[1];
+}
+
+/* Host writes, at W20 after the refill fill and before any SRING_SETUP: the 0xa5
+ * sentinel over bytes 0..63 of slots 0..1022 of ring M and its 1023 entries. The
+ * HP follows with wlms_publish. */
+static inline int
+wlms_fill(struct wlms *ms, const struct wlrx *rx, unsigned m)
+{
+	struct wlrx_ring *r = &ms->ring[m < 2u ? m : 0u];
+	if (ms->stopping || rx->stopping || !ms->base || m >= 2u) { return 1; }
+	for (uint32_t k = 0; k < WLMS_NBUF; k++) {
+		volatile uint8_t *s = ms->bufs + ((size_t)m * WLMS_SLOTS + k) * WLMS_SLOT_BYTES;
+		uint32_t e[2];
+		for (uint32_t j = 0; j < WLRX_SENTINEL_BYTES; j++) { s[j] = WLRX_SENTINEL; }
+		wlms_expect(ms, m, k, e);
+		r->va[WLRX_BUF_DW * k] = e[0]; r->va[WLRX_BUF_DW * k + 1u] = e[1];
+	}
+	return 0;
+}
+
+/* L19 access_end for an LMAC source ring (hal.c:2173-2184): the write barrier,
+ * then wrp[id - 160] = 1023 entries in words. */
+static inline int
+wlms_publish(struct wlms *ms, struct wlrx *rx, const struct wlce_io *io, unsigned m)
+{
+	if (ms->stopping || rx->stopping || !ms->base || !rx->base || m >= 2u) { return 1; }
+	io->wbarrier(io->ctx);
+	WLMS_PUBLISH(&rx->wrp[ms->ring[m].id - WLRX_DMAC_START], WLMS_NBUF * WLRX_BUF_DW);
+	ms->hp[m] = WLMS_NBUF * WLRX_BUF_DW;
+	return 0;
+}
+
+static inline void
+wlms_sring_words(const struct wlms *ms, unsigned m, uint32_t *w)
+{
+	wlrx_sring_ring(&ms->ring[m < 2u ? m : 0u], w);
+}
+
+/* Posted slots of ring M whose bytes 0..63 are no longer all 0xa5. */
+static inline uint32_t
+wlms_written(const struct wlms *ms, unsigned m)
+{
+	uint32_t n = 0;
+	for (uint32_t k = 0; k < WLMS_NBUF && m < 2u; k++) {
+		const volatile uint8_t *s = ms->bufs + ((size_t)m * WLMS_SLOTS + k) * WLMS_SLOT_BYTES;
+		bool changed = false;
+		for (uint32_t j = 0; j < WLRX_SENTINEL_BYTES && !changed; j++) { changed = s[j] != WLRX_SENTINEL; }
+		n += changed;
+	}
+	return n;
+}
+
+/* A watch: each ring's device TP (rdp word, then the read barrier) and the
+ * buffers written; taken = tp / 2, left = ((hp - tp) mod 2048) / 2, exhausted at
+ * left 0 (the device holds all 1023: L19 STA mode never gives one back). */
+static inline void
+wlms_watch(struct wlms *ms, const struct wlrx *rx, const struct wlce_io *io, unsigned p)
+{
+	struct wlms_watch *w = &ms->w[p < WLRX_NPOINT ? p : 0];
+	const uint32_t size = WLMS_ENTRIES * WLRX_BUF_DW;
+	w->bad = w->unreadable = w->exhausted = 0;
+	for (unsigned m = 0; m < 2; m++) {
+		const uint8_t f = m ? WLMS_F_MON1 : WLMS_F_MON0;
+		unsigned k;
+		w->tp[m] = WLMS_LOAD(&rx->rdp[ms->ring[m].id]); io->rbarrier(io->ctx);
+		w->taken[m] = w->left[m] = 0;
+		k = wlrx_word(w->tp[m], size, WLRX_BUF_DW);
+		if (k == 2u) { w->unreadable |= f; }
+		else if (k) { w->bad |= f; }
+		else {
+			w->taken[m] = w->tp[m] / WLRX_BUF_DW;
+			w->left[m] = (ms->hp[m] + size - w->tp[m]) % size / WLRX_BUF_DW;
+			if (!w->left[m]) { w->exhausted |= f; }
+		}
+		w->written[m] = wlms_written(ms, m);
+	}
+	w->seen = true;
+}
+
+/* Non-zero dwords where the device was given no address (counts only): the
+ * gaps of the head, bytes 2048..4095 of each posted slot (and in how many
+ * slots), the two never-posted slots, the tail. */
+static inline void
+wlms_guard_count(const struct wlms *ms, uint32_t *upper, uint32_t *upper_slots, uint32_t *last, uint32_t *tail, uint32_t *gap)
+{
+	const volatile uint32_t *a = (const volatile uint32_t *)(const void *)ms->base;
+	*upper = *upper_slots = *last = *tail = *gap = 0;
+	for (uint32_t i = 0; i < WLMS_OFF_BUFS / 4u; i++) {
+		const uint32_t o = 4u * i;
+		const bool ring = o < WLMS_OFF_RING(0) + 0x2000u || (o >= WLMS_OFF_RING(1) && o < WLMS_OFF_RING(1) + 0x2000u);
+		*gap += !ring && a[i] != 0;
+	}
+	for (uint32_t s = 0; s < 2u * WLMS_SLOTS; s++) {
+		const volatile uint32_t *b = (const volatile uint32_t *)(const void *)(ms->bufs + (size_t)s * WLMS_SLOT_BYTES);
+		const bool posted = s % WLMS_SLOTS < WLMS_NBUF;
+		uint32_t n = 0;
+		for (uint32_t i = posted ? WLMS_BUF_BYTES / 4u : 0u; i < WLMS_SLOT_BYTES / 4u; i++) { n += b[i] != 0; }
+		if (posted) { *upper += n; *upper_slots += n != 0; } else { *last += n; }
+	}
+	for (uint32_t i = WLMS_OFF_TAIL / 4u; i < WLMS_ARENA_BYTES / 4u; i++) { *tail += a[i] != 0; }
+}
+
+/* After the scan: buffers written per ring, ring entries that differ from what
+ * the host wrote (the device only reads a source ring), and of those the ones
+ * whose address is not a posted slot start of that ring; the guards. */
+static inline void
+wlms_content(struct wlms *ms, const struct wlce_io *io)
+{
+	io->rbarrier(io->ctx);
+	for (unsigned m = 0; m < 2; m++) {
+		const struct wlrx_ring *r = &ms->ring[m];
+		ms->written[m] = wlms_written(ms, m);
+		ms->changed[m] = ms->foreign[m] = 0;
+		for (uint32_t k = 0; k < WLMS_ENTRIES; k++) {
+			const uint32_t w0 = r->va[WLRX_BUF_DW * k], w1 = r->va[WLRX_BUF_DW * k + 1u];
+			const uint64_t a = w0 | (uint64_t)(w1 & 0xffu) << 32, s0 = wlms_slot_iova(ms, m, 0);
+			uint32_t e[2];
+			wlms_expect(ms, m, k, e);
+			if (w0 == e[0] && w1 == e[1]) { continue; }
+			ms->changed[m]++;
+			if (a < s0 || (a - s0) % WLMS_SLOT_BYTES || (a - s0) / WLMS_SLOT_BYTES >= WLMS_NBUF) { ms->foreign[m]++; }
+		}
+	}
+	wlms_guard_count(ms, &ms->guard_upper, &ms->guard_upper_slots, &ms->guard_last, &ms->guard_tail, &ms->guard_gap);
+}
+
+/* D5 with 0x2000, for a scan that ran to COMPLETED and heard no beacon: a spill
+ * or a changed entry stops; an exhausted ring or one the device never wrote is
+ * named; without ring selection the next kit adds it and the REO path; else the
+ * C2c/C2d hint stands (PREV). */
+static inline const char *
+wlms_next(const struct wlms *ms, uint32_t bits, const char *prev)
+{
+	const struct wlms_watch *e = &ms->w[WLRX_P_COMPLETED];
+	if (!ms->on) { return "none: owner review (monitor status rings not announced)"; }
+	if (ms->guard_upper || ms->guard_last || ms->guard_tail || ms->guard_gap || ms->changed[0] || ms->changed[1]) {
+		return "none: stop, owner review before any further kit (monitor status guard spill or a changed ring entry)";
+	}
+	if (e->seen && e->exhausted) { return "owner review: a monitor status ring is exhausted (L19 STA mode reaps none either)"; }
+	if (!ms->written[0] && !ms->written[1]) {
+		return "owner review: RXDMA wrote no monitor status (L19 also has the REO cmd/status rings)";
+	}
+	if (!(bits & WLRX_W20_RXSEL) || !(bits & WLRX_W20_REORX)) {
+		return "0x3b02 (15106): the scan ran with the monitor status rings; add ring selection, the REO path and the idle list";
+	}
+	return prev;
+}
+
+/* The crash line's allowlist: the six reads, BHIOFF inside the mapped 16 KiB and
+ * word aligned (as milestone 5 reads it); no write anywhere. */
+static inline uint32_t
+wlms_diag_addr(unsigned i, uint32_t bhi)
+{
+	static const uint8_t o[WLMS_DIAG_N] = { 0, WLMS_BHI_EXECENV, WLMS_BHI_ERRCODE, WLMS_BHI_ERRDBG1, WLMS_BHI_ERRDBG1 + 4u,
+		WLMS_BHI_ERRDBG1 + 8u };
+	return i >= WLMS_DIAG_N ? 0u : i ? bhi + o[i] : WLMS_MHISTATUS;
+}
+
+static inline bool
+wlms_diag_ok(uint32_t off, uint32_t bhi)
+{
+	if (bhi < 0x40u || bhi > 0x4000u - 0x40u || (bhi & 3u)) { return false; }
+	for (unsigned i = 0; i < WLMS_DIAG_N; i++) { if (off == wlms_diag_addr(i, bhi)) { return true; } }
+	return false;
 }
 
 #endif /* FUXI_WLAN_CE_H */

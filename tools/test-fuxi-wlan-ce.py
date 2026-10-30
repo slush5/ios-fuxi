@@ -52,6 +52,22 @@ ring selection words (rx_desc.h compiled), ring ids, sizes, entry structs,
 registers, write orders, thresholds, the REO setup, compared word by word with
 the model's dump. Mutants: every C2d rule broken once in the production code
 is caught by the static checks or the model's C2d scenarios.
+C2e (W28, w20 0x2000 MONSTAT): the model adds the monitor status arena with
+per-region device permissions, the two HP publishes checked when they happen,
+the 5th and 6th SRING_SETUP, a fake RXDMA writing one status TLV per PPDU into
+the next status buffer (never given back), the six MHI/BHI registers of the
+crash line and, in the C2e scenarios only, the phone's crash (RX live without
+the monitor status rings: the scan stops after 15 channels, 3 with ring
+selection, MHI SYS_ERR with the phone's ERRDBG words). Static: the gate, W28's
+place in L19's order, the crash line's allowlist and its one read path (no
+register write), the fills and publishes only at W20 and refused after the
+latch, SRING_SETUP the only message, the crash line at the COMPLETED timeout
+and before the MHI reset, the free, counts-only lines within 254 bytes. L19:
+ring ids, sizes, entry struct (compiled), buffer budget and alignment, fill
+count, RBM and cookie, the HTT ring id and type, thresholds, the announcement
+and fill order, the MSI and reap facts the deviations rest on, compared word by
+word with the model's dump. Mutants: every C2e rule broken once in the
+production code is caught by the static checks or the model's C2e scenarios.
 No device, no network.
 """
 from pathlib import Path
@@ -113,7 +129,7 @@ def static_checks():
     poll = between(DRIVER, 'static int\nwl_ce_poll(void)\n{', '\n}\n')
     assert 'if (wl_w11_events()) { wl23_guard_bad = true; return 1; }' in poll
     assert 'if (wl_w11_guard()) { wl23_guard_bad = true; return 1; }' in poll
-    assert '#define WL23_BITS (WL20_BITS | WL20_HTTVER | WL20_BAND24 | WL20_PDEVCAP | WL26_BITS | WL27_BITS)' in DRIVER
+    assert '#define WL23_BITS (WL20_BITS | WL20_HTTVER | WL20_BAND24 | WL20_PDEVCAP | WL26_BITS | WL27_BITS | WL20_MONSTAT)' in DRIVER
     assert '#define WL26_BITS (WL20_RXRING | WL20_IDLELINK | WL20_CHAINMASK)' in DRIVER
     assert '#define WL27_BITS (WL20_RXSEL | WL20_REORX)' in DRIVER
     bits23 = DRIVER.split('#define WL23_BITS', 1)[1].split('\n', 1)[0]
@@ -141,7 +157,7 @@ def static_checks():
     freed = abort.split('if (!bm_bad && !perst_bad && !seq_bad && !wl_smmu_undo()) {', 1)[1].split('} else {', 1)[0]
     assert 'wl_dma_free(&wl_ce_arena);' in freed and DRIVER.count('wl_dma_free(&wl_ce_arena)') == 1
     owned = between(DRIVER, 'wl_owned_alias(uint64_t pa, unsigned bytes, bool tables_only)\n{', '\n}\n')
-    assert '&wl14_m3, &wl_ce_arena, &wl_rx_arena, &wl_link_arena, &wl_reo_arena };' in owned
+    assert '&wl14_m3, &wl_ce_arena, &wl_rx_arena, &wl_link_arena, &wl_reo_arena, &wl_mon_arena };' in owned
     block = between(DRIVER, '/* ---- W20: CE/HTC/WMI to WMI READY (fuxiwlanqrtr=6, C1) ----', '/* ---- end W20 ---- */')
     # Hardware writes: the window helper (CE registers via wlce_reg_ok), the shadow writer, the
     # window restore and, with w20 0x04, the endpoint Device Control register. Nothing else.
@@ -169,6 +185,7 @@ def static_checks():
     static_c2b()
     static_c2c()
     static_c2d()
+    static_c2e()
 
 
 def c_calls(body, name):
@@ -330,6 +347,8 @@ W26_START = '/* ---- C2c (fuxiwlanqrtr=7): W26, host RX rings, the WBM idle list
 H26_START = '/* ---- C2c (fuxiwlanqrtr=7): W26, host RX rings, the WBM idle list and the chain masks ----'
 W27_START = '/* ---- C2d (fuxiwlanqrtr=7): W27, RX ring selection and the REO/WBM buffer return path ----'
 H27_START = W27_START
+W28_START = '/* ---- C2e (fuxiwlanqrtr=7): W28, the RXDMA monitor status rings and the crash line ----'
+H28_START = W28_START
 
 
 def strip_comments(s):
@@ -425,7 +444,7 @@ def static_c2c():
     assert not re.search(r'wl_rx\.(?:rdp|wrp|base|bufs|link)\s*\[[^\]]*\]\s*[-+|&^]?=', code)
     assert not re.search(r'wl_rx\.(?:ring\[[^\]]*\]|idle)\.va\s*\[[^\]]*\]\s*[-+|&^]?=', code)
     assert not re.search(r'(?:memcpy|bzero|memset)\(\s*\(?[^,]*wl_rx\.', code)
-    assert re.findall(r'bzero\(\(void \*\)(wl_\w+_arena)\.va', code) == ['wl_rx_arena', 'wl_link_arena', 'wl_reo_arena'] and \
+    assert re.findall(r'bzero\(\(void \*\)(wl_\w+_arena)\.va', code) == ['wl_rx_arena', 'wl_link_arena', 'wl_reo_arena', 'wl_mon_arena'] and \
         all(f'bzero((void *)wl_{a}_arena.va' in fns['wl26_free'] for a in ('rx', 'link'))
     assert 'WLRX_PUBLISH(' in between(HEADER, 'static inline int\nwlrx_publish_refill(', '\n}\n') and \
         HEADER.count('WLRX_PUBLISH(') == 2  # the default macro and the one use
@@ -497,11 +516,12 @@ def c2c_line_bounds(fns, cfg, tag='W26', min_lines=28, extra=None):
     for name, body in re.findall(r'static const char \*const (\w+)\[\w*\] = \{(.*?)\};', DRIVER, re.S):
         tables[name] = max(len(s) for s in re.findall(r'"([^"]*)"', body))
     pure = {}
-    for name in ('wlrx_idle_why', 'wlrx_next', 'wlrd_why', 'wlrd_next'):
+    for name in ('wlrx_idle_why', 'wlrx_next', 'wlrd_why', 'wlrd_next', 'wlms_next'):
         body = between(HEADER, f'static inline const char *\n{name}(', '\n}\n')
         pure[name] = max(len(''.join(x)) for x in re.findall(r'return [^;]*?"([^"]*)"(?:\s*"([^"]*)")?', body) +
                          re.findall(r'[:?]\s*"([^"]*)"(?:\s*"([^"]*)")?', body))
-    bounded = {'tp %u taken %u left %u': [4, 4, 4], 'hp %u tp %u avail %u': [5, 5, 5], 'hp %u fill %u': [4, 4]}
+    bounded = {'tp %u taken %u left %u': [4, 4, 4], 'hp %u tp %u avail %u': [5, 5, 5], 'hp %u fill %u': [4, 4],
+               'hp %u tp %u taken %u left %u written %u': [4, 4, 4, 4, 4], 'hp %u tp %u %s written %u': [4, 10, 0, 4]}
 
     def fmt_of(arg):
         return ''.join(re.findall(r'"((?:[^"\\]|\\.)*)"', arg)).replace('\\n', '\n')
@@ -551,7 +571,8 @@ def c2c_line_bounds(fns, cfg, tag='W26', min_lines=28, extra=None):
             if name == 'wl26_list':
                 assert fmt == '%s\n', fmt
                 continue
-            assert fmt.startswith(('FUXI WLAN: W26 ', 'FUXI WLAN: W27 ', 'FUXI WLAN: W24 no beacon')) and fmt.endswith('\n'), fmt
+            assert fmt.startswith(('FUXI WLAN: W26 ', 'FUXI WLAN: W27 ', 'FUXI WLAN: W28 ', 'FUXI WLAN: W24 no beacon')) and \
+                fmt.endswith('\n'), fmt
             w = worst(fmt, a[1:], local, assigned)
             assert w <= 254, (name, w, fmt)
             longest = max(longest, w)
@@ -575,10 +596,10 @@ def static_c2d():
     for k, v in (('WL20_RXSEL', '0x800u'), ('WL20_REORX', '0x1000u')):
         assert f'#define {k} {v}' in drv, k
     cfg = between(drv, 'static void\nwl_probe_configure(void)\n{', '\n}\n')
-    assert '(((unsigned)w20 & WL27_BITS) && !((unsigned)w20 & WL20_RXRING))) { wl_variant_invalid = true; }' in cfg
+    assert '(((unsigned)w20 & WL27_BITS) && !((unsigned)w20 & WL20_RXRING)) ||\n' in cfg
     assert 'WL27' not in drv.split('#define WL20_BITS', 1)[1].split('\n')[0]  # qrtr 6 refuses both
     assert cfg.index('if (wl20_bits & WL27_BITS) {') > cfg.index('if (wl20_bits & WL26_BITS) {')
-    region = between(drv, W27_START, 'static int\nwl_w23_run(void)')
+    region = between(drv, W27_START, W28_START)
     fns = c_functions(region)
     for name in ('wl27_reo', 'wl27_reo_rd', 'wl27_shadow', 'wl27_tp', 'wl27_ring', 'wl27_setup', 'wl27_dest', 'wl27_sel', 'wl27_poll',
                  'wl27_watch', 'wl27_report'):
@@ -667,6 +688,274 @@ def static_c2d():
           'or after a refusal, RX_RING_SELECTION_CFG the only new message, returns refused after the latch and zeroed before '
           f'their sentinel, one barriered publish, the REO arena freed only after its recount and zeroing, no arena word in '
           f'any of the {nprint} W27 print calls; W27 lines at most {longest} of 254 bytes')
+
+
+def static_c2e():
+    """C2e: the gate, W28's place in L19's order, the crash line's allowlist and its one read path, no register write, the
+    fills and publishes only at W20 and refused after the latch, SRING_SETUP the only message, the free, counts-only lines."""
+    drv, hdr = DRIVER, HEADER
+    code = strip_comments(drv)
+    assert '#define WL20_MONSTAT 0x2000u' in drv and header_define('WLRX_W20_MONSTAT') == 0x2000
+    cfg = between(drv, 'static void\nwl_probe_configure(void)\n{', '\n}\n')
+    assert '(((unsigned)w20 & WL20_MONSTAT) && !((unsigned)w20 & WL20_RXRING))) { wl_variant_invalid = true; }' in cfg
+    assert 'MONSTAT' not in drv.split('#define WL20_BITS', 1)[1].split('\n')[0]  # qrtr 6 refuses it
+    assert 'WL20_MONSTAT)' in drv.split('#define WL23_BITS', 1)[1].split('\n')[0]
+    assert cfg.index('if (wl20_bits & WL20_MONSTAT) {') > cfg.index('if (wl20_bits & WL27_BITS) {')
+    region = between(drv, W28_START, 'static int\nwl_w23_run(void)')
+    fns = c_functions(region)
+    for name in ('wl28_rd', 'wl28_crash', 'wl28_sring', 'wl28_watch', 'wl28_report'):
+        assert name in fns, name
+    w26 = c_functions(between(drv, W26_START, W27_START))
+    # L19's order: the fourth arena after the REO arena and before any WBM write; its fill and HP publishes after the
+    # refill ring (ath12k_dp_rxdma_buf_setup); its two SRING_SETUP after the four C2c ones and before the ring selection
+    # (ath12k_dp_rx_htt_setup); its watch after W27's, its report after W27's and before the hint.
+    st = w26['wl26_setup']
+    assert st.index('wl26_alloc(&wl_reo_arena') < st.index('wl26_alloc(&wl_mon_arena') < st.index('wl26_idle()') < \
+        st.index('wlrx_fill_refill(&wl_rx)') < st.index('wlrx_publish_refill(') < st.index('wlms_fill(&wl_ms, &wl_rx, m)') < \
+        st.index('wlms_publish(&wl_ms, &wl_rx, &wl_ce_io, m)') < st.index('return wl_w11_guard();')
+    rings = w26['wl26_rings']
+    assert rings.index('if (wl26_sring(i)) { return 1; }') < rings.index('(wl28_sring(0) || wl28_sring(1))') < \
+        rings.index('(wl27_sel(0) || wl27_sel(1))') < rings.index('wl23_poll_for(WL20_W_NONE, 100, &took)')
+    assert w26['wl26_watch'].index('wl27_watch(lb);') < w26['wl26_watch'].index('wl28_watch(p, lb);')
+    rep = w26['wl26_report']
+    assert rep.index('wl27_report();') < rep.index('wl28_report();') < rep.index('if (wl26_heard_none) {') < rep.index('wlms_next(')
+    assert code.count('wl28_sring(') == 4 and code.count('wl28_watch(') == 3 and code.count('wl28_report();') == 1  # decl, def, uses; one report call
+    # The crash line: one read path through the allowlist (the six reads of the W11/W15 diagnostic), no write; silent
+    # without 0x2000; exactly two places: the COMPLETED timeout and wl5_abort right before the MHI reset write.
+    assert 'if (!wlms_diag_ok(off, wl_bhi)) { return ~0u; }\n\treturn wl_mrd(off);' in fns['wl28_rd']
+    w28code = strip_comments(region)
+    assert w28code.count('wl_mrd(') == 1
+    for raw in ('wl_prd(', 'wl_pwr(', 'wl_mwr(', 'wl_contain_wr(', 'wl_win(', 'wl_ce_window(', 'wl_ce_io_bar_wr(', 'wlce_wr(',
+                'wl_soc_', 'rh_send', 'wl_m6o_', 'wl17_', 'wl26_wbm(', 'wl27_reo(', 'msi', 'MSI', 'gic', 'GIC', 'pmic', 'PMIC',
+                'wl_rails', 'irq', 'IRQ', 'wl23_words(', 'WLWMI_CMD', 'wlwmi_encode'):
+        assert raw not in w28code, raw
+    cr = fns['wl28_crash']
+    assert cr.index('if (!(wl20_bits & WL20_MONSTAT)) { return; }') < cr.index('wl28_rd(wlms_diag_addr(i, wl_bhi))')
+    diag = [hdr.split('static const uint8_t o[WLMS_DIAG_N] = {', 1)[1].split('};', 1)[0]]
+    assert ' '.join(diag[0].split()) == '0, WLMS_BHI_EXECENV, WLMS_BHI_ERRCODE, WLMS_BHI_ERRDBG1, WLMS_BHI_ERRDBG1 + 4u, WLMS_BHI_ERRDBG1 + 8u'
+    assert (header_define('WLMS_MHISTATUS'), header_define('WLMS_BHI_EXECENV'), header_define('WLMS_BHI_ERRCODE'),
+            header_define('WLMS_BHI_ERRDBG1'), header_define('WLMS_DIAG_N')) == (0x48, 0x28, 0x30, 0x34, 6)
+    # the same six offsets the existing W11/W15 diagnostic reads (wl_wlfw_diagnostics)
+    wd = between(drv, 'static void\nwl_wlfw_diagnostics(const char *label)\n{', '\n}\n')
+    assert sorted(re.findall(r'wl_mrd\(([^)]*)\)', wd)) == sorted(['wl_bhi+0x28', '0x48', 'wl_bhi+0x30', 'wl_bhi+0x34', 'wl_bhi+0x38',
+                                                                    'wl_bhi+0x3c'])
+    assert code.count('wl28_crash(') == 4  # the declaration, the definition, the timeout, wl5_abort
+    w23 = between(drv, 'static int\nwl_w23_run(void)\n{', '\n}\n')
+    assert 'printf("FUXI WLAN: W23 timeout scan COMPLETED (%u ms); report, contain, no retry\\n", took);\n\t\twl28_crash("scan COMPLETED timeout");' in w23
+    abort = between(drv, 'static void\nwl5_abort(unsigned step)\n{', '\n}\n')
+    assert abort.index('wl_ce_contain(step);') < abort.index('wl28_crash("contain before MHI reset");') < \
+        abort.index('reset_bad = wl_contain_wr((uint64_t)WL_BAR0 + 0x38, 2);')
+    # HTT: the one message is SRING_SETUP through wl_ce_send on the HTT endpoint (the C2c encoder), no reply asked.
+    assert w28code.count('wl_ce_send(') == 1 and 'wl_ce_send(eid, msg, sizeof(msg), "HTT SRING_SETUP")' in fns['wl28_sring']
+    assert 'wlrx_sring_ring(&ms->ring[m < 2u ? m : 0u], w);' in hdr and 'wlrx_sring_ring(&rx->ring[i < WLRX_NRING ? i : 0], w);' in hdr
+    # Host writes into the arena only through wlms_layout (zeroing), wlms_fill and wlms_publish, each called once from
+    # wl26_setup and refused after the latch; the glue stores into neither the arena nor rdp/wrp.
+    for fn in ('wlms_fill(', 'wlms_publish(', 'wlms_layout('):
+        assert code.count(fn) == 1 and fn in st, fn
+    for fn in ('wlms_fill(', 'wlms_publish('):
+        assert 'if (ms->stopping || rx->stopping' in between(hdr, 'static inline int\n' + fn, '\n}\n'), fn
+    assert not re.search(r'wl_ms\.(?:base|bufs)\s*\[[^\]]*\]\s*[-+|&^]?=', code)
+    assert not re.search(r'wl_ms\.ring\[[^\]]*\]\.va\s*\[[^\]]*\]\s*[-+|&^]?=', code)
+    pub = between(hdr, 'static inline int\nwlms_publish(', '\n}\n')
+    assert pub.index('io->wbarrier(io->ctx);') < pub.index('WLMS_PUBLISH(&rx->wrp[ms->ring[m].id - WLRX_DMAC_START], WLMS_NBUF * WLRX_BUF_DW);')
+    assert hdr.count('WLMS_PUBLISH(') == 2 and hdr.count('WLMS_LOAD(') == 2
+    wa = between(hdr, 'static inline void\nwlms_watch(', '\n}\n')
+    assert 'w->tp[m] = WLMS_LOAD(&rx->rdp[ms->ring[m].id]); io->rbarrier(io->ctx);' in wa
+    # Never reaped: no TP or HP write after W20 (no WLMS_PUBLISH outside wlms_publish, no wrp/rdp store in the glue).
+    h28 = strip_comments(between(hdr, H28_START, '#endif /* FUXI_WLAN_CE_H */'))
+    assert 'wlms_publish' not in strip_comments(region) and not re.search(r'(?:rdp|wrp)\[[^\]]*\]\s*[-+|&^]?=', h28) and \
+        h28.count('ms->hp[m] =') == 2 and 'WLRX_PUBLISH' not in h28 and 'WLRD_PUBLISH' not in h28
+    # Containment: wl_ms latched in wl26_contain before its early return; the arena recounted, zeroed and freed only in
+    # wl26_free (the proven branch), owned for the SMMU walk.
+    con = w26['wl26_contain']
+    assert con.index('wl_ms.stopping = true;') < con.index('if (!wl_rx_arena.va && !wl_link_arena.va) { return; }')
+    fr = w26['wl26_free']
+    assert fr.index('wlms_guard_count(&wl_ms') < fr.index('bzero((void *)wl_mon_arena.va') < fr.index('wl_ce_wbarrier(NULL);') < \
+        fr.index('wl_dma_free(&wl_mon_arena);')
+    assert drv.count('wl_dma_free(&wl_mon_arena)') == 1 and '&wl_reo_arena, &wl_mon_arena };' in drv
+    # Counts only: no print in the W28 glue (or W28's lines in wl26_setup / wl26_free) takes an arena word.
+    arena = re.compile(r'\bwl_ms\.(?:base|bufs)\b|\.va\b|\bWLMS_LOAD\b|\bWLRX_LOAD\b|\bwl_rx\.(?:bufs|link|base|rdp|wrp)\b')
+    nprint = 0
+    for name, body in list(fns.items()) + [('wl26_setup', st), ('wl26_free', fr)]:
+        for fn in ('printf', 'snprintf'):
+            for call in c_calls(strip_comments(body), fn):
+                if name in ('wl26_setup', 'wl26_free') and 'W28' not in call:
+                    continue
+                for arg in c_args(call)[1:]:
+                    assert not arena.search(arg), (name, arg)
+                nprint += 1
+    assert nprint >= 10, nprint
+    longest = c2c_line_bounds(fns, cfg, tag='W28', min_lines=8, extra={'point': 27, 'where': len('contain before MHI reset')})
+    print('C2e static: gate (0x2000 needs 0x100, qrtr 6 refuses it), W28 in L19\'s order (the arena after the REO arena and '
+          'before any WBM write, fill and HP publishes after the refill ring, the two SRING_SETUP after the four C2c ones and '
+          'before the ring selection, watch and report after W27\'s), the crash line\'s six reads through its allowlist (the '
+          'W11/W15 diagnostic\'s offsets) and one read path, no register write, at the COMPLETED timeout and before the MHI '
+          'reset only, SRING_SETUP the only message, arena writes only at W20 and refused after the latch, never reaped, '
+          f'freed only after its recount and zeroing, no arena word in any of the {nprint} W28 print calls; W28 lines at most '
+          f'{longest} of 254 bytes')
+
+
+def l19_c2e(dump):
+    """C2e: the monitor status rings (hal.h ids, hal.c config, dp.h sizes, dp_rx.c alloc / fill / announcement order,
+    dp_mon.c replenish: count, cookie, RBM and buffer budget, dp_tx.c HTT mapping, dp.c thresholds), the MSI and reap facts
+    the deviations rest on (hw.c, dp_mon.c, dp_tx.c, mac.c), against the header, then every word of the model's dump."""
+    if not (L19 / 'wmi.h').exists():
+        print(f'L19 re-derivation (C2e) SKIPPED: no Linux ath12k v6.19 tree at {L19} (set ATH12K_SRC)')
+        return
+    hal_h, hal_c, hw_c, dp_h, dp_c, dp_tx_c, dp_rx_c, dp_mon_c, desc, mac_c = (l19_text(n) for n in (
+        'hal.h', 'hal.c', 'hw.c', 'dp.h', 'dp.c', 'dp_tx.c', 'dp_rx.c', 'dp_mon.c', 'hal_desc.h', 'mac.c'))
+    H = hdefs()
+    flat = lambda t: ' '.join(t.replace('\\\n', ' ').split())  # noqa: E731
+
+    def enum(text, name):
+        body = re.search(r'enum\s+' + name + r'\s*\{(.*?)\};', text, re.S)[1]
+        out, cur = {}, -1
+        for item in body.split(','):
+            item = item.strip()
+            if not item:
+                continue
+            if '=' in item:
+                k, v = (x.strip() for x in item.split('=', 1))
+                cur = out[v] if v in out else int(v, 0)
+            else:
+                k, cur = item, cur + 1
+            out[k] = cur
+        return out
+
+    def num(name, text):
+        return int(re.search(r'#define ' + name + r'\s+(\d+)\s*$', text, re.M)[1])
+
+    def field(name, text):
+        v = re.search(r'#define ' + name + r'\s+(.+?)\s*$', text, re.M)[1]
+        m = re.fullmatch(r'GENMASK\((\d+), (\d+)\)', v)
+        if m:
+            return int(m[2]), ((1 << (int(m[1]) - int(m[2]) + 1)) - 1)
+        return int(re.fullmatch(r'BIT\((\d+)\)', v)[1]), 1
+    # Ring ids: the STATBUF ring of each PMAC, ring_num 0 (hal.h enum, hal.c config and ring-id arithmetic).
+    ring = enum(hal_h, 'hal_srng_ring_id')
+    pp = ring['HAL_SRNG_RING_ID_PMAC1_ID_END'] - ring['HAL_SRNG_RING_ID_PMAC1_ID_START']
+    d0 = ring['HAL_SRNG_RING_ID_DMAC_CMN_ID_START']
+    fc = flat(hal_c)
+    cfgs = {t: dict(re.findall(r'\.(\w+) = ([^,]+)', b)) for t, b in re.findall(r'\[(HAL_\w+)\] = \{(.*?)\},', fc)}
+    ms = cfgs['HAL_RXDMA_MONITOR_STATUS']
+    assert (ms['start_ring_id'], ms['entry_size'], ms['mac_type'], ms['ring_dir'], ms['max_rings']) == \
+        ('HAL_SRNG_RING_ID_WMAC1_SW2RXDMA1_STATBUF', 'sizeof(struct hal_wbm_buffer_ring) >> 2', 'ATH12K_HAL_SRNG_PMAC',
+         'HAL_SRNG_DIR_SRC', '1'), ms
+    assert 'HAL_RXDMA_MONITOR_STATUS' not in fn_body(hal_c, 'static int ath12k_hal_srng_create_config_wcn7850(')
+    ids = [ring['HAL_SRNG_RING_ID_WMAC1_SW2RXDMA1_STATBUF'] + 0 + m * pp for m in (0, 1)]
+    assert ids == [H['WLRX_RING_MON0'], H['WLRX_RING_MON1']] == [185, 193], ids
+    # WCN7850: no rxdma1 (so the status rings, not the monitor buffer ring), two per pdev, RBM SW1, MSI for them.
+    wcn = hw_c.split('.name = "wcn7850 hw2.0"', 1)[1].split('.name =', 1)[0]
+    for fact in ('.rxdma1_enable = false', '.num_rxdma_per_pdev = 2', '.ring_mask = &ath12k_hw_ring_mask_wcn7850',
+                 '.hal_params = &ath12k_hw_hal_params_wcn7850'):
+        assert fact in wcn, fact
+    rbm = enum(hal_h, 'hal_rx_buf_return_buf_manager')
+    assert re.search(r'ath12k_hw_hal_params_wcn7850 = \{\s+\.rx_buf_rbm = HAL_RX_BUF_RBM_SW1_BM,', hw_c) and \
+        rbm['HAL_RX_BUF_RBM_SW1_BM'] == H['WLRX_RBM_SW1'] == 6
+    mask = hw_c.split('ath12k_hw_ring_mask_wcn7850 = {', 1)[1].split('};', 1)[0]
+    assert 'ATH12K_RX_MON_STATUS_RING_MASK_0' in mask.split('.rx_mon_status = {', 1)[1].split('}', 1)[0]  # L19: MSI; ours: none
+    # Allocation (dp_rx.c ath12k_dp_rx_alloc): after the error ring, before the buffer setup, in the !rxdma1 branch.
+    al = flat(fn_body(dp_rx_c, 'int ath12k_dp_rx_alloc('))
+    st = 'ath12k_dp_srng_setup(ab, srng, HAL_RXDMA_MONITOR_STATUS, 0, i, DP_RXDMA_MON_STATUS_RING_SIZE);'
+    assert al.index('HAL_RXDMA_DST, 0, i, DP_RXDMA_ERR_DST_RING_SIZE);') < al.index('} else {') < al.index(st) < \
+        al.index('ret = ath12k_dp_rxdma_buf_setup(ab);')
+    assert num('DP_RXDMA_MON_STATUS_RING_SIZE', dp_h) == H['WLMS_ENTRIES'] == 1024
+    # Fill (ath12k_dp_rxdma_buf_setup): the refill ring first, then each status ring with size / entry size = 1024 asked
+    # (dp.c pads the ring by HAL_RING_BASE_ALIGN - 1 bytes, which the division drops); the replenish takes min(asked,
+    # bufs_max, num_free) and a fresh source ring has entries - 1 free: 1023.
+    bs = flat(fn_body(dp_rx_c, 'static int ath12k_dp_rxdma_buf_setup('))
+    assert bs.index('ath12k_dp_rxdma_ring_buf_setup(ab, &dp->rx_refill_buf_ring);') < \
+        bs.index('ret = ath12k_dp_rxdma_mon_ring_buf_setup(ab, mon_ring, HAL_RXDMA_MONITOR_STATUS);')
+    mb = flat(fn_body(dp_rx_c, 'static int ath12k_dp_rxdma_mon_ring_buf_setup('))
+    assert 'num_entries = rx_ring->refill_buf_ring.size / ath12k_hal_srng_get_entrysize(ab, ringtype); rx_ring->bufs_max = num_entries;' \
+        in mb and 'ath12k_dp_mon_status_bufs_replenish(ab, rx_ring, num_entries);' in mb
+    assert 'ring->size = (num_entries * entry_sz) + HAL_RING_BASE_ALIGN - 1;' in dp_c and num('HAL_RING_BASE_ALIGN', hal_h) == 8
+    rp = flat(fn_body(dp_mon_c, 'int ath12k_dp_mon_status_bufs_replenish('))
+    for fact in ('enum hal_rx_buf_return_buf_manager mgr = ab->hw_params->hal_params->rx_buf_rbm;',
+                 'req_entries = min(req_entries, rx_ring->bufs_max);', 'num_free = ath12k_hal_srng_src_num_free(ab, srng, true);',
+                 'req_entries = min(num_free, req_entries);', 'skb = dev_alloc_skb(RX_MON_STATUS_BUF_SIZE);',
+                 'if (!IS_ALIGNED((unsigned long)skb->data, RX_MON_STATUS_BUF_ALIGN)) {',
+                 'buf_id = idr_alloc(&rx_ring->bufs_idr, skb, 0, rx_ring->bufs_max * 3, GFP_ATOMIC);',
+                 'cookie = u32_encode_bits(buf_id, DP_RXDMA_BUF_COOKIE_BUF_ID);',
+                 'ath12k_hal_rx_buf_addr_info_set(desc, paddr, cookie, mgr);', 'ath12k_hal_srng_access_end(ab, srng);'):
+        assert fact in rp, fact
+    assert 'return ((srng->ring_size - hp + tp) / srng->entry_size) - 1;' in hal_c
+    entry_dw = 2  # hal_wbm_buffer_ring: one ath12k_buffer_addr (two __le32, compiled in l19_c2c)
+    assert re.search(r'struct hal_wbm_buffer_ring \{\s+struct ath12k_buffer_addr buf_addr_info;\s+\}', desc) and \
+        re.search(r'struct ath12k_buffer_addr \{\s+__le32 info0;\s+__le32 info1;\s+\}', desc)
+    asked = (1024 * entry_dw * 4 + num('HAL_RING_BASE_ALIGN', hal_h) - 1) // (entry_dw * 4)
+    bufs_max, num_free = asked, (1024 * entry_dw) // entry_dw - 1  # a fresh ring: hp = tp = 0, ring_size in words
+    nbuf = min(min(asked, bufs_max), num_free)
+    assert (asked, nbuf) == (1024, H['WLMS_NBUF']) == (1024, 1023), (asked, nbuf)
+    ck = field('DP_RXDMA_BUF_COOKIE_BUF_ID', dp_h)
+    assert ck == (0, (1 << 18) - 1) and nbuf - 1 <= ck[1] and field('DP_RXDMA_BUF_COOKIE_PDEV_ID', dp_h) == (18, 3)
+    # The buffer: dev_alloc_skb(RX_MON_STATUS_BUF_SIZE), 128-aligned, inside the RX_MON_STATUS_BASE_BUF_SIZE budget of
+    # 2048 bytes (what is left after the reservation, the alignment and the skb tail); we post the whole budget.
+    assert re.search(r'#define RX_MON_STATUS_BUF_SIZE\s+\(RX_MON_STATUS_BASE_BUF_SIZE - \\\s+\(RX_MON_STATUS_BUF_RESERVATION \+ \\\s+'
+                     r'RX_MON_STATUS_BUF_ALIGN \+ \\\s+SKB_DATA_ALIGN\(sizeof\(struct skb_shared_info\)\)\)\)', dp_h)
+    assert num('RX_MON_STATUS_BASE_BUF_SIZE', dp_h) == H['WLMS_BUF_BYTES'] == 2048 and num('RX_MON_STATUS_BUF_ALIGN', dp_h) == 128
+    assert H['WLMS_SLOT_BYTES'] % 128 == 0 and H['WLMS_OFF_BUFS'] % 128 == 0 and H['WLMS_SLOT_BYTES'] == 2 * H['WLMS_BUF_BYTES']
+    # HTT: RXDMA_MONITOR_STATUS ring id and type, the announcement order (ath12k_dp_rx_htt_setup).
+    rid, rtype = enum(dp_h, 'htt_srng_ring_id'), enum(dp_h, 'htt_srng_ring_type')
+    assert rid['HTT_RXDMA_MONITOR_STATUS_RING'] == H['WLMS_HTT_RING_MON_STATUS'] == 1
+    typ = flat(fn_body(dp_tx_c, 'ath12k_dp_tx_get_ring_id_type('))
+    assert 'case HAL_RXDMA_MONITOR_STATUS: *htt_ring_id = HTT_RXDMA_MONITOR_STATUS_RING; *htt_ring_type = HTT_SW_TO_HW_RING; break;' in typ
+    hs = flat(fn_body(dp_rx_c, 'int ath12k_dp_rx_htt_setup('))
+    mon = 'ret = ath12k_dp_tx_htt_srng_setup(ab, ring_id, i, HAL_RXDMA_MONITOR_STATUS);'
+    assert hs.index('ath12k_dp_tx_htt_srng_setup(ab, ring_id, i, HAL_RXDMA_DST);') < hs.index('if (ab->hw_params->rxdma1_enable) {') < \
+        hs.index('} else {') < hs.index(mon) < hs.index('rxdma_ring_sel_config(ab)')
+    assert 'ring_id = dp->rx_mon_status_refill_ring[i].refill_buf_ring.ring_id;' in hs
+    # Thresholds (dp.c ath12k_dp_srng_setup): low = entries >> 3 with LOW_THRESH_INTR_EN, batch 1, timer RX (500 us);
+    # the low threshold in words (hal.c).
+    th = flat(fn_body(dp_c, 'int ath12k_dp_srng_setup('))
+    assert 'case HAL_RXDMA_MONITOR_STATUS: params.low_threshold = num_entries >> 3; params.flags |= HAL_SRNG_FLAGS_LOW_THRESH_INTR_EN; ' \
+        'params.intr_batch_cntr_thres_entries = 1; params.intr_timer_thres_us = HAL_SRNG_INT_TIMER_THRESHOLD_RX; break;' in th
+    timer = num('HAL_SRNG_INT_TIMER_THRESHOLD_RX', hal_h)
+    assert (timer, 1) == (H['WLMS_TIMER_US'], H['WLMS_BATCH']) == (500, 1)
+    assert 'srng->u.src_ring.low_threshold = params->low_threshold * srng->entry_size;' in fc
+    # L19 STA mode: no reap without a monitor vdev, no ring selection for the status rings outside monitor mode.
+    pr = flat(fn_body(dp_mon_c, 'int ath12k_dp_mon_process_ring('))
+    assert '} else { if (ar->monitor_started) num_buffs_reaped = __ath12k_dp_mon_process_ring(ar, mac_id, napi, &budget); }' in pr
+    assert flat(dp_tx_c).count('HAL_RXDMA_MONITOR_STATUS, RX_MON_STATUS_BUF_SIZE,') == 1 and \
+        'HAL_RXDMA_MONITOR_STATUS, RX_MON_STATUS_BUF_SIZE,' in flat(fn_body(dp_tx_c, 'int ath12k_dp_tx_htt_rx_monitor_mode_ring_config('))
+    assert 'if (!ab->hw_params->rxdma1_enable) return ret;' in flat(fn_body(mac_c, 'static int ath12k_mac_config_mon_status_default('))
+    # Every word of the model's dump (RX arena at A = 0xa1400000, monitor status arena at M = 0xa2e00000).
+    words = {}
+    for line in dump.splitlines():
+        k, *v = line.split()
+        words.setdefault(k, []).append([int(x) for x in v])
+    A, M = 0xa1400000, 0xa2e00000
+    assert '#define WLMS_OFF_RING(m) (0x4000u * (m))' in HEADER
+    f = {k: field('HTT_SRNG_SETUP_CMD_' + k, dp_h) for k in ('INFO0_MSG_TYPE', 'INFO0_PDEV_ID', 'INFO0_RING_ID', 'INFO0_RING_TYPE',
+                                                           'INFO1_RING_SIZE', 'INFO1_RING_ENTRY_SIZE', 'INFO1_RING_LOOP_CNT_DIS',
+                                                           'INTR_INFO_BATCH_COUNTER_THRESH', 'INTR_INFO_INTR_TIMER_THRESH',
+                                                           'INFO2_INTR_LOW_THRESH')}
+    enc = lambda k, v: (v & f[k][1]) << f[k][0]  # noqa: E731
+    sw1 = rbm['HAL_RX_BUF_RBM_SW1_BM']
+    for m in (0, 1):
+        rid_ = ids[m]
+        want = [enc('INFO0_MSG_TYPE', enum(dp_h, 'htt_h2t_msg_type')['HTT_H2T_MSG_TYPE_SRING_SETUP']) |
+                enc('INFO0_PDEV_ID', m + 1) | enc('INFO0_RING_ID', rid['HTT_RXDMA_MONITOR_STATUS_RING']) |
+                enc('INFO0_RING_TYPE', rtype['HTT_SW_TO_HW_RING']),
+                M + 0x4000 * m, 0,
+                enc('INFO1_RING_ENTRY_SIZE', entry_dw) | enc('INFO1_RING_SIZE', 1024 * entry_dw) | enc('INFO1_RING_LOOP_CNT_DIS', 1),
+                A + H['WLRX_OFF_WRP'] + 4 * (rid_ - d0), 0, A + H['WLRX_OFF_RDP'] + 4 * rid_, 0,
+                0, 0, 0,  # MSI address and data: L19's MSI, none here
+                enc('INTR_INFO_BATCH_COUNTER_THRESH', 1 * entry_dw) | enc('INTR_INFO_INTR_TIMER_THRESH', timer >> 3),
+                enc('INFO2_INTR_LOW_THRESH', (1024 >> 3) * entry_dw)]
+        got = [v for _, v in sorted((k, v) for k, v in words[f'msring{m}'])]
+        assert got == want, (m, [(i, hex(a), hex(b)) for i, (a, b) in enumerate(zip(got, want)) if a != b])
+        b = M + H['WLMS_OFF_BUFS'] + 1024 * 4096 * m
+        assert words[f'mentry{m}'] == [[0, b, sw1 << 8], [1022, b + 1022 * 4096, sw1 << 8 | 1022 << 12]], words[f'mentry{m}']
+        assert words[f'mring{m}'] == [[rid_, 1024, entry_dw]]
+    assert words['mnbuf'] == [[nbuf]] and words['mbufbytes'] == [[2048]] and words['marena'] == [[H['WLMS_ARENA_BYTES']]]
+    print('L19 re-derivation (C2e): monitor status ring ids 185/193 (STATBUF + PMAC stride), 1024 entries of '
+          'hal_wbm_buffer_ring (2 words), source rings, allocated after the error ring and filled after the refill ring with '
+          '1023 buffers each (size / entry size, min with num_free), RBM SW1 6, cookie = idr id from 0 in 17:0, the 2048-byte '
+          'RX_MON_STATUS_BASE_BUF_SIZE budget at 128 alignment, HTT RXDMA_MONITOR_STATUS 1 / SW_TO_HW, announced after the '
+          'error ring and before the ring selection, batch 1, 500 us, low 128 entries in words, L19\'s MSI for them (ours 0), '
+          'no reap and no status-ring selection in STA mode; the model\'s dump word by word (2 x 13 SRING_SETUP words: '
+          '0x0101010b / 0x0101020b, 0x02020800, 0x003e0002, low 256; entries 0 and 1022)')
 
 
 def l19_c2d(define, dump):
@@ -1010,16 +1299,70 @@ C2D_MUTANTS = [
     ('d', '	wl_rd.stopping = true;  /* C2d: no reap', '	(void)0;  /* C2d: no reap', 'no latch'),
     ('d', '		if ((wl20_bits & WL20_RXSEL) && (wl27_sel(0) || wl27_sel(1))) { return 1; }', '', 'no ring selection'),
     ('d', '	if (wl_rd.reo_on && wl27_poll()) { return 1; }  /* C2d', '	/* C2d', 'never polled'),
-    ('d', '(((unsigned)w20 & WL27_BITS) && !((unsigned)w20 & WL20_RXRING))) { wl_variant_invalid = true; }', '0) { wl_variant_invalid = true; }',
+    ('d', '(((unsigned)w20 & WL27_BITS) && !((unsigned)w20 & WL20_RXRING)) ||', '0 ||',
      'gate without 0x100'),
     ('d', '	if (wl_reo_arena.va) { bzero((void *)wl_reo_arena.va, wl_reo_arena.size); bytes += (uint32_t)wl_reo_arena.size; }\n', '',
      'REO arena not zeroed'),
     ('d', '		if (moved && wl27_tp(&wl_rd.ring[i])) {', '		if (0 && wl27_tp(&wl_rd.ring[i])) {', 'TP never published'),
 ]
 
+# Each C2e rule broken in the production code (driver or header) must be caught by the C2e static checks or the
+# model's C2e scenarios.
+C2E_MUTANTS = [
+    ('h', '#define WLMS_HTT_RING_MON_STATUS 1u', '#define WLMS_HTT_RING_MON_STATUS 2u', 'monitor status HTT ring id'),
+    ('h', 'r->htt_ring = WLMS_HTT_RING_MON_STATUS;\n		r->htt_type = WLRX_HTT_SW_TO_HW;',
+     'r->htt_ring = WLMS_HTT_RING_MON_STATUS;\n		r->htt_type = WLRX_HTT_SW_TO_SW;', 'monitor status ring type SW_TO_SW'),
+    ('h', 'r->batch = WLMS_BATCH; r->timer_us = WLMS_TIMER_US; r->low = true;', 'r->batch = WLMS_BATCH; r->timer_us = WLMS_TIMER_US; r->low = false;',
+     'no low threshold'),
+    ('h', '#define WLMS_TIMER_US 500u', '#define WLMS_TIMER_US 256u', 'monitor status timer threshold'),
+    ('h', '#define WLMS_BATCH 1u', '#define WLMS_BATCH 0u', 'monitor status batch threshold'),
+    ('h', 'r->id = (uint16_t)(m ? WLRX_RING_MON1 : WLRX_RING_MON0);', 'r->id = (uint16_t)(m ? WLRX_RING_MON0 : WLRX_RING_MON1);',
+     'ring ids swapped'),
+    ('h', '		r->hp_iova = rx->wrp_iova + 4ull * (r->id - WLRX_DMAC_START);\n		r->tp_iova = rx->rdp_iova + 4ull * r->id;',
+     '		r->tp_iova = rx->wrp_iova + 4ull * (r->id - WLRX_DMAC_START);\n		r->hp_iova = rx->rdp_iova + 4ull * r->id;', 'HP/TP words swapped'),
+    ('h', 'wlrx_addr_entry(v, wlms_slot_iova(ms, m, k), WLRX_RBM_SW1, k);', 'wlrx_addr_entry(v, wlms_slot_iova(ms, m, k), WLRX_RBM_SW1, k + 1u);',
+     'cookie off by one'),
+    ('h', 'wlrx_addr_entry(v, wlms_slot_iova(ms, m, k), WLRX_RBM_SW1, k);', 'wlrx_addr_entry(v, wlms_slot_iova(ms, m, k), WLRX_RBM_IDLE_DESC, k);',
+     'wrong RBM'),
+    ('h', '	if (k < WLMS_NBUF) { wlrx_addr_entry(v,', '	if (k <= WLMS_NBUF) { wlrx_addr_entry(v,', 'entry 1023 listed'),
+    ('h', '	io->wbarrier(io->ctx);\n	WLMS_PUBLISH(', '	WLMS_PUBLISH(', 'HP publish without the barrier'),
+    ('h', '		w->tp[m] = WLMS_LOAD(&rx->rdp[ms->ring[m].id]); io->rbarrier(io->ctx);', '		w->tp[m] = WLMS_LOAD(&rx->rdp[ms->ring[m].id]);',
+     'TP without the read barrier'),
+    ('h', '	if (ms->stopping || rx->stopping || !ms->base || m >= 2u) { return 1; }\n	for (uint32_t k = 0;',
+     '	if (!ms->base || m >= 2u) { return 1; }\n	for (uint32_t k = 0;', 'fill after the latch'),
+    ('h', '		*gap += !ring && a[i] != 0;', '		(void)ring;', 'head gaps not counted'),
+    ('h', '		if (posted) { *upper += n; *upper_slots += n != 0; } else { *last += n; }', '		if (posted) { *upper += n; *upper_slots += n != 0; }',
+     'unposted slots not counted'),
+    ('h', '	rx->mon_named = true;\n', '', 'W26 gap count does not name the monitor status words'),
+    ('h', '	return i >= WLMS_DIAG_N ? 0u : i ? bhi + o[i] : WLMS_MHISTATUS;', '	return i >= WLMS_DIAG_N ? 0u : i ? bhi + o[i] : 0x38u;',
+     'crash line reads MHICTRL'),
+    ('h', '			if (!w->left[m]) { w->exhausted |= f; }', '', 'exhaustion never flagged'),
+    ('h', '			if (a < s0 || (a - s0) % WLMS_SLOT_BYTES', '			if (a < s0 && (a - s0) % WLMS_SLOT_BYTES', 'foreign entries not counted'),
+    ('d', '		if ((wl20_bits & WL20_MONSTAT) && (wl28_sring(0) || wl28_sring(1))) { return 1; }  /* C2e: dp_rx.c:4657-4670 */\n', '',
+     'monitor status rings never announced'),
+    ('d', '(((unsigned)w20 & WL20_MONSTAT) && !((unsigned)w20 & WL20_RXRING))) { wl_variant_invalid = true; }', '0) { wl_variant_invalid = true; }',
+     'gate: 0x2000 without 0x100'),
+    ('d', '	wl28_crash("contain before MHI reset");  /* C2e: read-only; silent without w20 0x2000 */\n', '', 'no crash line before the MHI reset'),
+    ('d', '		wl28_crash("scan COMPLETED timeout");  /* C2e: read-only, before anything else touches the device */\n', '',
+     'no crash line at the timeout'),
+    ('d', '	if (!wlms_diag_ok(off, wl_bhi)) { return ~0u; }\n', '', 'crash read without the allowlist'),
+    ('d', '	wl_ms.stopping = true;  /* C2e: no host write', '	(void)0;  /* C2e: no host write', 'no latch'),
+    ('d', '	if (wl_mon_arena.va) { bzero((void *)wl_mon_arena.va, wl_mon_arena.size); bytes += (uint32_t)wl_mon_arena.size; }\n', '',
+     'arena not zeroed'),
+    ('d', '	wl_dma_free(&wl_mon_arena);\n', '', 'arena never freed'),
+    ('d', '	for (unsigned m = 0; (wl20_bits & WL20_MONSTAT) && m < 2u; m++) {', '	for (unsigned m = 0; (wl20_bits & WL20_MONSTAT) && m < 1u; m++) {',
+     'ring 193 never filled'),
+    ('d', '	if (!wl_ms.on || wl_ms.stopping || p >= WLRX_NPOINT) { return; }\n	wlms_watch(', '	if (1) { return; }\n	wlms_watch(',
+     'never watched'),
+    ('d', '	wl28_report();  /* C2e; silent without 0x2000 */\n', '', 'never reported'),
+    ('d', 'if (wlms_fill(&wl_ms, &wl_rx, m) || wlms_publish(&wl_ms, &wl_rx, &wl_ce_io, m))',
+     'if (wlms_publish(&wl_ms, &wl_rx, &wl_ce_io, m) || wlms_fill(&wl_ms, &wl_rx, m))', 'HP published before the entries'),
+]
 
-def mutants():
-    """Every C2d mutant is caught (static check or model C2d run); run in parallel."""
+
+def mutants(table=None, mode='c2d'):
+    """Every C2d (C2e) mutant is caught (static check or the model's C2d (C2e) scenarios); run in parallel."""
+    table = C2D_MUTANTS if table is None else table
     import concurrent.futures
     global DRIVER, HEADER
     orig = (DRIVER, HEADER)
@@ -1034,9 +1377,9 @@ def mutants():
             assert hdr.count(old) == 1, what
             hdr = hdr.replace(old, new)
         return what, drv, hdr
-    jobs = [one(m) for m in C2D_MUTANTS]
+    jobs = [one(m) for m in table]
     built = []
-    with tempfile.TemporaryDirectory(prefix='fuxi-c2d-mut-') as tmp:
+    with tempfile.TemporaryDirectory(prefix=f'fuxi-{mode}-mut-') as tmp:
         for n, (what, drv, hdr) in enumerate(jobs):
             DRIVER, HEADER = drv, hdr
             caught = False
@@ -1058,14 +1401,15 @@ def mutants():
             b = subprocess.run(CC + ['-I', str(d), str(MODEL), '-o', str(d / 'model')], capture_output=True, text=True)
             if b.returncode:
                 return what, True
-            r = subprocess.run([str(d / 'model'), 'c2d'], capture_output=True, text=True, timeout=600)
+            r = subprocess.run([str(d / 'model'), mode], capture_output=True, text=True, timeout=600)
             return what, r.returncode != 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 2) as ex:
             res = list(ex.map(run, built))
     missed = [w for w, c in res if not c]
-    assert not missed, f'C2d mutants not caught: {missed}'
-    print(f'C2d mutants: all {len(C2D_MUTANTS)} caught ({len(C2D_MUTANTS) - len(built)} by the static checks, {len(built)} by the '
-          'model\'s C2d scenarios)')
+    tag = 'C2' + mode[2:]
+    assert not missed, f'{tag} mutants not caught: {missed}'
+    print(f'{tag} mutants: all {len(table)} caught ({len(table) - len(built)} by the static checks, {len(built)} by the '
+          f'model\'s {tag} scenarios)')
 
 
 def header_define(name):
@@ -2010,10 +2354,13 @@ def main():
         c2dump = subprocess.run([str(exe), 'dump-c2'], check=True, capture_output=True, text=True).stdout
         c2cdump = subprocess.run([str(exe), 'dump-c2c'], check=True, capture_output=True, text=True).stdout
         c2ddump = subprocess.run([str(exe), 'dump-c2d'], check=True, capture_output=True, text=True).stdout
+        c2edump = subprocess.run([str(exe), 'dump-c2e'], check=True, capture_output=True, text=True).stdout
     l19_checks(dump, c2dump, c2cdump, c2ddump)
+    l19_c2e(c2edump)
     mutants()
+    mutants(C2E_MUTANTS, 'c2e')
     dash_check()
-    print('W20 (fuxiwlanqrtr=6) CE/HTC/WMI, W23 (fuxiwlanqrtr=7) passive scan and C2c (W26) host tests passed')
+    print('W20 (fuxiwlanqrtr=6) CE/HTC/WMI, W23 (fuxiwlanqrtr=7) passive scan, C2c (W26), C2d (W27) and C2e (W28) host tests passed')
 
 
 if __name__ == '__main__':
