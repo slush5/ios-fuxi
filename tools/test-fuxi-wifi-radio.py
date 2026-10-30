@@ -25,7 +25,13 @@ salami build. Each scenario is a process of its own (the radio state is one word
   T6 static       the leaf lock rule, the producer never sleeps, no wl_ symbol on the iOS side, and any
                   fuxi_wlan.c prototype of the producer API equals the header (none yet: 0099 hooks deferred)
   T9 mutants      17 source mutations, each must fail a scenario or a static rule
+  T10 study       docs-lanes/wifi-ios-join-result.md: trace1/trace4 script a Settings session (scan, the pre-join
+                  GETs, refused and open joins, DISASSOCIATE) and print every request's error, value and bytes and
+                  every event; built from the pre-study sources (STUDY_BASE) and from these, without the knobs, the
+                  output must be byte-identical. study / study-loopback / study-range: fuxiwifijoin=1..8 and
+                  fuxiwifiprejoin=1/2/3 do what they say, success is untouched, out-of-range is off; 6 study mutants
 """
+import difflib
 import importlib.util
 import os
 from pathlib import Path
@@ -43,7 +49,8 @@ FLAGS = ['-std=gnu11', '-g', '-O1', '-Wall', '-Wextra', '-Werror', '-Wno-unused-
          '-pthread']
 SAN = ['-fsanitize=address,undefined', '-fno-sanitize-recover=all']
 SCENARIOS = ('parse', 'fuzz', 'table', 'radio', 'stop', 'cancel', 'early', 'silent-scan', 'silent-state', 'backstop',
-             'rearm', 'nochannel', 'canned', 'default')
+             'rearm', 'nochannel', 'canned', 'default', 'trace1', 'trace4', 'study', 'study-loopback', 'study-range',
+             'study-timing')
 RESULTS = []
 
 spec = importlib.util.spec_from_file_location('test_wifi_ios', ROOT / 'tools/test-fuxi-wifi-ios.py')
@@ -54,7 +61,8 @@ TEST = r'''
 extern unsigned int alarm(unsigned int seconds);   /* (not <unistd.h>: its link() would meet fuxi_wifi_ios.c's) */
 /* ---- what every scenario uses ---------------------------------------------------------------------- */
 bool fuxi_wifi_net_attach(const struct fuxi_wifi_net_link *p) {
- assert(p->wireless && !p->up && p->address[0]==2 && !strcmp(p->name,"radio-scan")); attached++; return true;
+ assert(p->wireless && !p->up && p->address[0]==2 && !strcmp(p->name,opt==1?"synthetic-loopback":"radio-scan")); attached++;
+ return true;
 }
 static void settle(void) {
  struct timespec pause = { .tv_nsec=1000000 };
@@ -819,8 +827,196 @@ static void scenario_default(void) {
  puts("default: PASS");
 }
 
+/* ---- T10: the join study (docs-lanes/wifi-ios-join-result.md) ------------------------------------------
+   trace: one scripted Settings session, every request's error, value and bytes and every event as posted,
+   printed; python runs it on the sources before the knobs and on these, both without the knobs, and wants
+   the same bytes. study: what each knob value does. */
+static unsigned ev_said;
+static void trace_events(void) {
+ pthread_mutex_lock(&ev_lock);
+ for (; ev_said<ev_count && ev_said<512; ev_said++)
+  fprintf(stdout,"TRACE event %u, %u bytes %02x%02x%02x%02x\n",ev_trace[ev_said].code,ev_trace[ev_said].length,
+   ev_trace[ev_said].head[0],ev_trace[ev_said].head[1],ev_trace[ev_said].head[2],ev_trace[ev_said].head[3]);
+ pthread_mutex_unlock(&ev_lock);
+}
+static uint8_t trace_buf[8192];
+static int trace_req(bool set,int type,int value,const void *in,unsigned n) {
+ int v=0,e;
+ memset(trace_buf,0xa5,sizeof(trace_buf));
+ if (in) memcpy(trace_buf,in,n);
+ e=request_with(set,type,value,n?trace_buf:NULL,n,&v); settle(); other_settle();
+ fflush(stdout);
+ fprintf(stdout,"TRACE %s %d: error %d, value %d, ",set?"set":"get",type,e,v);
+ for (unsigned i=0;i<n && !set;i++) fprintf(stdout,"%02x",trace_buf[i]);
+ fputc('\n',stdout); trace_events(); fflush(stdout);
+ return e;
+}
+static const int PREJOIN[]={ 16,4,2,9,17,57,8,14,13,103,1 };
+static void trace_prejoin(void) {
+ for (unsigned i=0;i<sizeof(PREJOIN)/sizeof(PREJOIN[0]);i++) trace_req(false,PREJOIN[i],0,NULL,PREJOIN[i]==103?1164:64);
+}
+static void trace_scan(const char *name) {
+ struct apple80211_scan_request *q=calloc(1,sizeof(*q)); struct apple80211_scan_result *r=calloc(1,sizeof(*r));
+ q->version=1; q->scan_type=3; q->channel_count=1; q->channels[0]=(struct apple80211_channel){ 1, 0, 0 };
+ if (name) { q->ssid_length=(uint32_t)strlen(name); memcpy(q->ssid,name,strlen(name)); }
+ trace_req(true,10,0,q,sizeof(*q));
+ for (unsigned i=0;i<8;i++) { r->elements_length=1024; if (trace_req(false,11,0,r,sizeof(*r))) break; }
+ free(q); free(r);
+}
+static int trace_join(const char *name,const char *key) {
+ struct apple80211_assoc *j=calloc(1,sizeof(*j)); int e;
+ j->version=1; j->ssid_length=(uint32_t)strlen(name); memcpy(j->ssid,name,strlen(name));
+ if (key) { j->auth_lower=1; j->auth_upper=8; j->key_cipher=CIPHER_PASSPHRASE; j->key_length=(uint32_t)strlen(key); memcpy(j->key,key,strlen(key)); }
+ e=trace_req(true,20,0,j,sizeof(*j));
+ trace_req(false,21,0,NULL,0); trace_req(false,103,0,NULL,1164); trace_req(false,13,0,NULL,0);
+ trace_req(true,22,0,NULL,0); trace_req(false,21,0,NULL,0);
+ free(j); return e;
+}
+static void scenario_trace(int backend,int join,int prejoin) {
+ const char *locked=backend==4?"Fuxi Canned WPA2":"Fuxi Loopback", *open=backend==4?"Fuxi Canned Open":"Fuxi Loopback";
+ if (backend==4) fuxi_wifi_radio_stopped(FUXI_WIFI_RADIO_NOT_REQUESTED);
+ opt_join=join; opt_prejoin=prejoin; opt=backend; fuxi_wifi_ios_init(); assert(attached==1);
+ if (backend==4) wait_said("FUXI WIFI IOS: radio: canned producer ready");
+ other_settle(); trace_events();
+ trace_req(false,19,0,NULL,24); trace_req(false,13,0,NULL,0); trace_req(false,12,0,NULL,13); trace_req(false,43,0,NULL,256);
+ trace_scan(NULL); trace_prejoin();
+ trace_scan(open); trace_prejoin();
+ for (unsigned i=0;i<3;i++) trace_join(locked,"fuxitest1");
+ trace_join(open,NULL);
+ trace_prejoin();
+ for (unsigned i=0;i<6;i++) trace_join(locked,"fuxitest1");
+ other_settle(); trace_events(); clean_log();
+ fflush(stdout); puts(backend==4?"trace4: PASS":"trace1: PASS");
+}
+static unsigned ev_mark(void) { pthread_mutex_lock(&ev_lock); unsigned n=ev_count; pthread_mutex_unlock(&ev_lock); return n; }
+/* the codes posted since `mark`, as a string of letters: P power, S ssid, B bssid, L link, J join (event 9) */
+static const char *ev_since(unsigned mark,unsigned *payload) {
+ static char out[64]; unsigned k=0;
+ pthread_mutex_lock(&ev_lock);
+ for (unsigned i=mark;i<ev_count && k<63;i++) {
+  unsigned c=ev_trace[i].code; out[k++]=c==1?'P':c==2?'S':c==3?'B':c==4?'L':c==9?'J':c==10?'C':'?';
+  if (c==9 && payload) { *payload=ev_trace[i].length==4?(unsigned)ev_trace[i].head[0]|ev_trace[i].head[1]<<8:~0u; }
+  if (c==4) assert(ev_trace[i].head[0]==0 || ev_trace[i].head[0]==1);
+ }
+ out[k]=0; pthread_mutex_unlock(&ev_lock); return out;
+}
+static void study_wpa2(const char *name,int *set_error,int *result,const char **seq,unsigned *payload) {
+ struct apple80211_assoc join={.version=1}; unsigned mark=ev_mark();
+ join.ssid_length=(uint32_t)strlen(name); memcpy(join.ssid,name,strlen(name));
+ join.key_cipher=CIPHER_PASSPHRASE; join.key_length=9; memcpy(join.key,"fuxitest1",9);
+ *payload=~0u - 1;
+ *set_error=request(true,20,&join,sizeof(join),NULL); settle();
+ assert(!request(false,21,NULL,0,result)); *seq=ev_since(mark,payload);
+}
+static void scenario_study(void) {
+ int e,v; const char *seq; unsigned pay; struct fuxi_wifi_sta_bss *b=calloc(1,sizeof(*b));
+ fuxi_wifi_radio_stopped(FUXI_WIFI_RADIO_NOT_REQUESTED);
+ opt_join=8; opt_prejoin=2; opt=4; fuxi_wifi_ios_init();
+ assert(said_times("FUXI WIFI IOS: study: fuxiwifijoin=8 (each in turn), fuxiwifiprejoin=2 (RSSI, CHANNEL, BSSID, AUTH_TYPE from the last scan)\n")==1);
+ wait_said("FUXI WIFI IOS: radio: canned producer ready"); other_settle();
+ /* pre-join: nothing heard yet, still ENXIO */
+ uint8_t bssid[6]; struct { uint32_t version; struct apple80211_channel channel; } ch;
+ struct { uint32_t version,radios,unit; int32_t each[4],all,each_ext[4],all_ext; } rssi;
+ struct { uint32_t version,lower,upper,extended; } auth;
+ assert(request(false,16,&rssi,sizeof(rssi),NULL)==ENXIO && request(false,9,bssid,6,NULL)==ENXIO);
+ /* an unnamed scan: the strongest, Fuxi Canned WPA2 (-48, channel 6, RSN) */
+ assert(!scan_ask(3,0,0)); settle(); other_settle();
+ assert(!request(false,16,&rssi,sizeof(rssi),NULL) && rssi.all==-48 && rssi.each[0]==-48 && rssi.radios==1);
+ assert(!request(false,4,&ch,sizeof(ch),NULL) && ch.channel.channel==6);
+ assert(!request(false,9,bssid,6,NULL) && !memcmp(bssid,"\x02\x46\x55\x58\x4a\x01",6));
+ assert(!request(false,2,&auth,sizeof(auth),NULL) && auth.lower==1 && auth.upper==8);
+ assert(said("fixture gets 16 (RSSI), value 0, 52 bytes (study: not joined, from the last scan): answered [+0 ms]\n"));
+ /* the rest stays as it was: not joined */
+ assert(request(false,103,b,1164,NULL)==ENXIO && request(false,1,b,32,NULL)==ENXIO && request(false,8,NULL,0,NULL)==ENXIO);
+ assert(request(false,17,NULL,0,NULL)==EOPNOTSUPP && request(false,57,NULL,0,NULL)==EOPNOTSUPP);
+ assert(!request(false,13,NULL,0,&v) && v==0);
+ /* a scan for a name: that network although weaker (Fuxi Canned Open, -61, channel 36, open) */
+ memset(&scan_req,0,sizeof(scan_req)); scan_req.version=1; scan_req.scan_type=3; scan_req.channel_count=1;
+ scan_req.channels[0]=(struct apple80211_channel){ 1, 0, 0 }; scan_req.ssid_length=16; memcpy(scan_req.ssid,"Fuxi Canned Open",16);
+ assert(!request(true,10,&scan_req,sizeof(scan_req),NULL)); settle(); other_settle();
+ assert(!request(false,16,&rssi,sizeof(rssi),NULL) && rssi.all==-61);
+ assert(!request(false,4,&ch,sizeof(ch),NULL) && ch.channel.channel==36);
+ assert(!request(false,9,bssid,6,NULL) && bssid[5]==2);
+ assert(!request(false,2,&auth,sizeof(auth),NULL) && auth.upper==0);
+ /* a later unnamed scan keeps the name asked for last */
+ assert(!scan_ask(3,0,0)); settle(); other_settle();
+ assert(!request(false,9,bssid,6,NULL) && bssid[5]==2);
+ /* fuxiwifijoin=8: C1..C7 in turn, then C1 again */
+ study_wpa2("Fuxi Canned WPA2",&e,&v,&seq,&pay); assert(!e && v==9 && !strcmp(seq,"J") && pay==~0u);
+ assert(said("[study C1: result 9 (timeout) if it fails]: answered [+0 ms]\n"));
+ assert(said("FUXI WIFI IOS: apple80211: study C1: the join failed ("));
+ study_wpa2("Fuxi Canned WPA2",&e,&v,&seq,&pay); assert(!e && v==2 && !strcmp(seq,"JSBL"));
+ study_wpa2("Fuxi Canned WPA2",&e,&v,&seq,&pay); assert(!e && v==2 && !strcmp(seq,"SBLJ"));
+ study_wpa2("Fuxi Canned WPA2",&e,&v,&seq,&pay); assert(!e && v==2 && !strcmp(seq,"J") && pay==2);
+ unsigned refused=said_times("join refused (scan-only backend)");
+ study_wpa2("Fuxi Canned WPA2",&e,&v,&seq,&pay); assert(e==EOPNOTSUPP && v==2 && !strcmp(seq,""));
+ assert(said_times("join refused (scan-only backend)")==refused);     /* the station was never asked */
+ study_wpa2("Fuxi Canned WPA2",&e,&v,&seq,&pay); assert(!e && v==21 && !strcmp(seq,"J"));
+ study_wpa2("Fuxi Canned WPA2",&e,&v,&seq,&pay); assert(!e && v==0 && !strcmp(seq,""));
+ assert(said("FUXI WIFI IOS: apple80211: study C7: the join failed ("));
+ unsigned mark=ev_mark(); assert(!request(true,22,NULL,0,NULL)); settle(); assert(!strcmp(ev_since(mark,NULL),"SBL"));
+ assert(!request(false,21,NULL,0,&v) && v==0);
+ study_wpa2("Fuxi Canned WPA2",&e,&v,&seq,&pay); assert(!e && v==9 && !strcmp(seq,"J"));
+ assert(!link_up && !atomic_load(&received));
+ other_settle(); clean_log(); free(b);
+ puts("study: PASS");
+}
+static void scenario_study_loopback(void) {
+ int e,v; const char *seq; unsigned pay;
+ opt_join=5; opt_prejoin=1; opt=1; fuxi_wifi_ios_init(); assert(attached==1);
+ assert(said("FUXI WIFI IOS: study: fuxiwifijoin=5 (SET ASSOCIATE refused), fuxiwifiprejoin=1 (RSSI, CHANNEL, BSSID from the last scan)\n"));
+ /* =1 can join: C5 is not applied, the refused WPA2 join goes on as without the knob */
+ study_wpa2("Fuxi Loopback",&e,&v,&seq,&pay); assert(!e && v==2 && !strcmp(seq,"J"));
+ assert(!said("[study C"));
+ /* the open join still succeeds as before; the pre-join answers then are the joined network's own */
+ struct apple80211_assoc join={.version=1,.ssid_length=13}; memcpy(join.ssid,"Fuxi Loopback",13);
+ unsigned mark=ev_mark(); assert(!request(true,20,&join,sizeof(join),NULL)); settle();
+ assert(!request(false,21,NULL,0,&v) && v==1 && link_up && !strcmp(ev_since(mark,NULL),"JSBL"));
+ struct { uint32_t version,lower,upper,extended; } auth;
+ assert(!request(false,2,&auth,sizeof(auth),NULL) && auth.upper==0);
+ assert(!said("(study: not joined"));
+ assert(!request(true,22,NULL,0,NULL)); settle(); assert(!link_up);
+ /* nothing heard yet (no scan): still ENXIO; with prejoin=1, AUTH_TYPE stays ENXIO */
+ uint8_t bssid[6]; assert(request(false,9,bssid,6,NULL)==ENXIO);
+ assert(!scan_ask(3,0,0)); settle();
+ assert(!request(false,9,bssid,6,NULL) && !memcmp(bssid,"\x02\x46\x55\x58\x49\x02",6));
+ assert(request(false,2,&auth,sizeof(auth),NULL)==ENXIO);
+ /* out-of-range values: off, and said */
+ clean_log();
+ puts("study-loopback: PASS");
+}
+static void scenario_study_range(void) {
+ opt_join=9; opt_prejoin=4; opt=4; fuxi_wifi_ios_init();
+ assert(said("FUXI WIFI IOS: study: fuxiwifijoin=9 (off), fuxiwifiprejoin=4 (off)\n"));
+ wait_said("FUXI WIFI IOS: radio: canned producer ready"); other_settle();
+ int e,v; const char *seq; unsigned pay;
+ study_wpa2("Fuxi Canned WPA2",&e,&v,&seq,&pay); assert(!e && v==2 && !strcmp(seq,"J") && pay==~0u);
+ assert(!scan_ask(3,0,0)); settle(); other_settle();
+ uint8_t bssid[6]; assert(request(false,9,bssid,6,NULL)==ENXIO);
+ assert(!said("[study C") && !said("study C"));
+ other_settle(); clean_log();
+ puts("study-range: PASS");
+}
+
+/* fuxiwifiprejoin=3: every answer as without it, each line says the time since the request before */
+static void scenario_study_timing(void) {
+ int e,v; const char *seq; unsigned pay; uint8_t bssid[6];
+ now_abs=5*NSEC_PER_SEC;   /* (the kernel's uptime is never 0: a request at 0 counts as the first) */
+ opt_join=0; opt_prejoin=3; opt=4; fuxi_wifi_ios_init();
+ assert(said("FUXI WIFI IOS: study: fuxiwifijoin=0 (off), fuxiwifiprejoin=3 (timing only)\n"));
+ wait_said("FUXI WIFI IOS: radio: canned producer ready"); other_settle();
+ assert(!scan_ask(3,0,0)); settle(); other_settle();
+ now_abs+=1500*1000000ull; assert(request(false,9,bssid,6,NULL)==ENXIO);
+ assert(said("fixture gets 9 (BSSID), value 0, 6 bytes: error 6 [+1500 ms]\n"));
+ now_abs+=40*1000000ull; assert(request(false,16,bssid,6,NULL)==ENXIO);
+ assert(said("fixture gets 16 (RSSI), value 0, 6 bytes: error 6 [+40 ms]\n"));
+ study_wpa2("Fuxi Canned WPA2",&e,&v,&seq,&pay); assert(!e && v==2 && !strcmp(seq,"J") && pay==~0u && !said("[study C"));
+ other_settle(); clean_log();
+ puts("study-timing: PASS");
+}
+
 int main(int argc,char **argv) {
- assert(argc==2); alarm(40);
+ assert(argc>=2); alarm(40);
  const char *s=argv[1];
  if (!strcmp(s,"parse")) scenario_parse();
  else if (!strcmp(s,"fuzz")) scenario_fuzz();
@@ -836,6 +1032,12 @@ int main(int argc,char **argv) {
  else if (!strcmp(s,"nochannel")) scenario_nochannel();
  else if (!strcmp(s,"canned")) scenario_canned();
  else if (!strcmp(s,"default")) scenario_default();
+ else if (!strcmp(s,"trace1") || !strcmp(s,"trace4"))
+  scenario_trace(s[5]-'0',argc>2?atoi(argv[2]):0,argc>3?atoi(argv[3]):0);
+ else if (!strcmp(s,"study")) scenario_study();
+ else if (!strcmp(s,"study-loopback")) scenario_study_loopback();
+ else if (!strcmp(s,"study-range")) scenario_study_range();
+ else if (!strcmp(s,"study-timing")) scenario_study_timing();
  else return 2;
  return 0;
 }
@@ -1023,6 +1225,97 @@ def mutant_suite(tmp):
     check(f'T9 mutants: {len(killed)} of {len(MUTANTS)} source mutations caught', not survived, survived)
 
 
+# ---- T10: the join study is off by default, byte for byte ----------------------------------------------
+# The files the study changed, as they were before it (salami 7caf3ed, K2 + C2b); the rest of the unit is today's.
+# A later change to one of them on purpose moves STUDY_BASE to that change once its trace diff is understood.
+STUDY_BASE = '7caf3ed6b1e42190b551c0a3bc40ab6a0c340381'
+STUDY_FILES = ('fuxi_wifi_apple80211.c', 'fuxi_wifi_ios.c', 'fuxi_wifi_sta.h')
+STUDY_MUTANTS = [
+    ('a refusal candidate without the knob', 'fuxi_wifi_apple80211.c',
+     'STUDY_EACH - 1) : study_join;', 'STUDY_EACH - 1) : STUDY_PAYLOAD;'),
+    ('pre-join answers without the knob', 'fuxi_wifi_apple80211.c',
+     '(study_prejoin == 1 || study_prejoin == 2) && state->phase != FUXI_WIFI_STA_JOINED',
+     'state->phase != FUXI_WIFI_STA_JOINED'),
+    ('SET ASSOCIATE refused where a join can succeed', 'fuxi_wifi_apple80211.c',
+     'candidate == STUDY_REFUSE_SET && !study_joins_refused', 'false'),
+    ('timing without the knobs', 'fuxi_wifi_apple80211.c', 'if (study_join != 0 || study_prejoin != 0) {    /*',
+     'if (true) {    /*'),
+    ('timing only answers from the scan', 'fuxi_wifi_apple80211.c', 'if ((study_prejoin == 1 || study_prejoin == 2) &&',
+     'if (study_prejoin != 0 &&'),
+    ('the strongest wins over the name asked for', 'fuxi_wifi_apple80211.c',
+     'match ? !named || each->rssi > out->rssi :', 'match ? !found || each->rssi > out->rssi :'),
+]
+
+
+def steps(text):
+    """The trace in its order; the log lines of each step (the station's thread and the ioctl's may say theirs in
+    either order within one request) as a sorted block, each line still compared byte for byte."""
+    out, block = [], []
+    for line in text.splitlines(True):
+        if line.startswith('TRACE '):
+            out += sorted(block) + [line]
+            block = []
+        else:
+            block.append(line)
+    return ''.join(out + sorted(block))
+
+
+def trace_outputs(exe, runs=(('trace1',), ('trace4',))):
+    out = {}
+    for args in runs:
+        p = subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=60)
+        out[' '.join(args)] = (p.returncode, steps(p.stdout + p.stderr))
+    return out
+
+
+def study_suite(tmp):
+    base = tmp / 'study-base'
+    shutil.copytree(SRC, base)
+    for name in STUDY_FILES:
+        p = subprocess.run(['git', '-C', str(ROOT), 'show', f'{STUDY_BASE}:xnu/fuxi-wifi-ios/{name}'], capture_output=True,
+                           text=True)
+        if not check(f'T10 base: {name} at {STUDY_BASE[:7]} is in this clone', p.returncode == 0, p.stderr):
+            return
+        (base / name).write_text(p.stdout)
+    for label, defs in (('fuxi', ()), ('salami', ('-DFUXI_SALAMI=1',))):
+        before, now = build(tmp, 'study-base-' + label, base, defs), build(tmp, 'study-now-' + label, defs=defs)
+        if not check(f'T10 {label}: the pre-study and the study sources build with the trace scenarios',
+                     not isinstance(before, str) and not isinstance(now, str),
+                     before if isinstance(before, str) else now):
+            continue
+        a, b, again = trace_outputs(before), trace_outputs(now), trace_outputs(now)
+        for run_name in a:
+            lines = b[run_name][1].count('\nTRACE ')
+            same = a[run_name] == b[run_name] == again[run_name] and a[run_name][0] == 0 and lines > 100
+            diff = '' if same else ''.join(list(difflib.unified_diff(a[run_name][1].splitlines(True),
+                                                                     b[run_name][1].splitlines(True), 'before', 'now'))[:40])
+            check(f'T10 {label} {run_name}: without fuxiwifijoin/fuxiwifiprejoin every request, value, byte, event and '
+                  f'line is as before the study ({lines} traced, {len(b[run_name][1])} bytes)', same, diff)
+        on = trace_outputs(now, (('trace4', '8', '2'), ('trace4', '0', '0')))
+        check(f'T10 {label}: the knobs do change the trace (trace4 8 2), and 0 0 is the default',
+              on['trace4 8 2'][0] == 0 and on['trace4 8 2'][1] != b['trace4'][1] and on['trace4 0 0'] == b['trace4'])
+    caught, missed = [], []
+    for name, file, old, new in STUDY_MUTANTS:
+        text = (SRC / file).read_text()
+        if text.count(old) != 1:
+            missed.append(f'{name}: pattern found {text.count(old)} times')
+            continue
+        mdir = tmp / ('study-mut-' + re.sub(r'\W+', '-', name))
+        shutil.copytree(SRC, mdir)
+        (mdir / file).write_text(text.replace(old, new))
+        exe = build(tmp, 'study-m-' + re.sub(r'\W+', '-', name), mdir, sanitize=False)
+        if isinstance(exe, str):
+            missed.append(f'{name}: does not compile')
+            continue
+        by = next((s for s in ('study', 'study-loopback', 'study-range', 'study-timing') if not run(exe, s)[0]), None)
+        if by is None:
+            mine = trace_outputs(exe)
+            by = 'the trace' if mine != trace_outputs(build(tmp, 'study-base-fuxi', base)) else None
+        (caught if by else missed).append(name)
+        print(f'    study mutant "{name}": ' + (f'caught by {by}' if by else 'SURVIVED'), flush=True)
+    check(f'T10 mutants: {len(caught)} of {len(STUDY_MUTANTS)} study mutations caught', not missed, missed)
+
+
 def main():
     subprocess.run(['python3', str(ROOT / 'tools/sync-fuxi-wifi-ios.py'), '--check'], check=True)
     problems = static_rules()
@@ -1039,6 +1332,7 @@ def main():
                 ok, out = run(exe, s)
                 check(f'{label} {s}', ok, out)
         mutant_suite(tmp)
+        study_suite(tmp)
     bad = [n for n, ok in RESULTS if not ok]
     print(f'wifi radio tests: {len(RESULTS) - len(bad)} PASS, {len(bad)} FAIL', flush=True)
     sys.exit(1 if bad else 0)

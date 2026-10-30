@@ -214,14 +214,29 @@ static void *current_proc(void) { return NULL; }
 static int proc_suser(void *p) { (void)p; return !superuser; }
 struct kev_msg { unsigned vendor_code,kev_class,kev_subclass,event_code;
  struct { unsigned data_length; void *data_ptr; } dv[2]; };
+/* (study) every event in the order posted: its code, its data's length and first 4 bytes */
+static pthread_mutex_t ev_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct { unsigned code,length; uint8_t head[4]; } ev_trace[512];
+static unsigned ev_count;
 static int kev_post_msg(struct kev_msg *m) {
  assert(m->kev_class==6 && m->kev_subclass==1 && m->dv[0].data_length==16);
  assert(!strcmp(m->dv[0].data_ptr,"en0"));
  if (m->event_code==4) assert(m->dv[1].data_length==32);
+ pthread_mutex_lock(&ev_lock);
+ if (ev_count<512) {
+  ev_trace[ev_count].code=m->event_code; ev_trace[ev_count].length=m->dv[1].data_length;
+  memset(ev_trace[ev_count].head,0,4);
+  if (m->dv[1].data_length) memcpy(ev_trace[ev_count].head,m->dv[1].data_ptr,m->dv[1].data_length<4?m->dv[1].data_length:4);
+ }
+ ev_count++;
+ pthread_mutex_unlock(&ev_lock);
  atomic_fetch_add(&events[m->event_code],1); return 0;
 }
+/* fuxiwifiios, and (study) fuxiwifijoin and fuxiwifiprejoin: 0 is "not given" */
+static int opt_join, opt_prejoin;
 static int PE_parse_boot_argn(const char *key,void *p,int n) {
- assert(!strcmp(key,"fuxiwifiios") && n==4); memcpy(p,&opt,4); return opt!=0;
+ const int *v=!strcmp(key,"fuxiwifiios")?&opt:!strcmp(key,"fuxiwifijoin")?&opt_join:!strcmp(key,"fuxiwifiprejoin")?&opt_prejoin:NULL;
+ assert(v && n==4); memcpy(p,v,4); return *v!=0;
 }
 static int mbuf_copydata(mbuf_t p,size_t off,size_t n,void *out) { memcpy(out,(const char *)p+off,n);return 0; }
 static void FuxiNetworkStackStart(void) { registry++; }

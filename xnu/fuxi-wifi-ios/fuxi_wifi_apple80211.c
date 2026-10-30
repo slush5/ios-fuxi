@@ -6,6 +6,8 @@
  * Fuxi, 2026-10-30 (K2): a scan's result carries the noise figure when there is one and its channel's
  * own flags (passive, radar); with the radio backends (fuxiwifiios=3/4) the elements are kept whole
  * within the room wifid gives, and GET 43/44 say which backend answers.
+ * Fuxi, 2026-10-30 (study): two default-off experiments, the answer to a refused join (fuxiwifijoin) and
+ * the GETs wifid makes before a join (fuxiwifiprejoin); see docs-lanes/wifi-ios-join-result.md.
  * Original file commentary is retained below. See LICENSE.HackiOS.
  */
 /*
@@ -130,6 +132,62 @@ fuxi_wifi_apple80211_backend(const char *name, bool whole)
 	bzero(driver_name, sizeof(driver_name));
 	snprintf(driver_name, sizeof(driver_name), "%s", name);
 	whole_elements = whole;
+}
+
+/*
+ * (Fuxi, study) Why a refused join shows no "Unable to join" alert, and why the password sheet waits:
+ * docs-lanes/wifi-ios-join-result.md. Both are off unless their boot-arg says otherwise, and off means
+ * every answer, event and line is as before.
+ *
+ * fuxiwifijoin: how a join that failed is told (a join that succeeded is never touched):
+ *   1 ASSOCIATE_RESULT 9 (a timeout) instead of 2
+ *   2 2, then the link down (involuntary) after event 9
+ *   3 2, the link down first, then event 9
+ *   4 2, and event 9 carries the result (4 bytes)
+ *   5 SET ASSOCIATE itself refused (EOPNOTSUPP), the station never asked; only where every join is refused
+ *     (the radio backends); elsewhere the join goes on as with 0
+ *   6 21 (a wrong passphrase): a control, it blames the password, never a default
+ *   7 nothing: no event 9, GET 21 stays 0 (running) until wifid gives up by itself
+ *   8 each of 1..7 in turn, one a join, so several are seen in one boot
+ * fuxiwifiprejoin: while nothing is joined, GET RSSI, CHANNEL and BSSID (and with 2 AUTH_TYPE too) are
+ *   answered from what the last scan heard: the network it asked for by name, else the strongest; 3 answers
+ *   nothing new.
+ * Either of them not 0: each request's line also says how long after the one before it came ("[+N ms]"),
+ * which is how the wait before the password sheet is placed.
+ */
+enum { STUDY_TIMEOUT = 1, STUDY_LINK_AFTER, STUDY_LINK_BEFORE, STUDY_PAYLOAD, STUDY_REFUSE_SET, STUDY_PMK, STUDY_SILENT,
+       STUDY_EACH };
+static unsigned study_join, study_prejoin;      /* (set once at init) */
+static bool study_joins_refused;                /* the backend refuses every join */
+static unsigned study_joins;                    /* joins asked for with fuxiwifijoin=8 */
+static unsigned join_candidate;                 /* of the join in flight: 0, or what fuxiwifijoin does if it fails */
+static uint8_t prejoin_name[32], prejoin_name_length;   /* what the last scan asked for by name */
+static uint64_t study_last;                     /* when the last request came (absolute time) */
+
+static const char *
+study_said(unsigned candidate)
+{
+	static const char *const said[] = { "", "result 9 (timeout)", "result 2, link down after event 9",
+		                            "result 2, link down before event 9", "result 2, event 9 carries it",
+		                            "SET ASSOCIATE refused", "result 21 (invalid PMK, a control)",
+		                            "no event 9, result stays 0" };
+
+	return candidate < sizeof(said) / sizeof(said[0]) ? said[candidate] : "?";
+}
+
+void
+fuxi_wifi_apple80211_study(int join, int prejoin, bool joins_refused)
+{
+	if (join == 0 && prejoin == 0) {
+		return;
+	}
+	study_join = join >= 1 && join <= STUDY_EACH ? (unsigned)join : 0;
+	study_prejoin = prejoin >= 1 && prejoin <= 3 ? (unsigned)prejoin : 0;
+	study_joins_refused = joins_refused;
+	printf("FUXI WIFI IOS: study: fuxiwifijoin=%d (%s), fuxiwifiprejoin=%d (%s)\n", join, study_join == 0 ? "off" :
+	    study_join == STUDY_EACH ? "each in turn" : study_said(study_join), prejoin, study_prejoin == 0 ? "off" :
+	    study_prejoin == 1 ? "RSSI, CHANNEL, BSSID from the last scan" : study_prejoin == 2 ?
+	    "RSSI, CHANNEL, BSSID, AUTH_TYPE from the last scan" : "timing only");
 }
 
 /* ---- channels ---------------------------------------------------------------------------------------- */
@@ -286,6 +344,50 @@ give_network(const struct apple80211req *request, const struct fuxi_wifi_sta_bss
 	return error;
 }
 
+/*
+ * (Fuxi, study) fuxiwifiprejoin: the network the GETs before a join are answered from, into `out`: the one the
+ * last scan asked for by name if it heard it (the strongest of that name), else the strongest it heard.
+ */
+static bool
+prejoin_bss(struct fuxi_wifi_sta_bss *out)
+{
+	struct fuxi_wifi_sta_bss *each;
+	uint8_t name[32];
+	unsigned name_length;
+	bool found = false, named = false;
+
+	if ((each = kalloc_data(sizeof(*each), Z_WAITOK)) == NULL) {
+		return false;
+	}
+	lck_mtx_lock(&apple80211_lock);
+	name_length = prejoin_name_length;
+	memcpy(name, prejoin_name, sizeof(name));
+	lck_mtx_unlock(&apple80211_lock);
+	for (unsigned i = 0; fuxi_wifi_sta_heard(i, each); i++) {
+		bool match = name_length != 0 && each->ssid_length == name_length && memcmp(each->ssid, name, name_length) == 0;
+
+		if (match ? !named || each->rssi > out->rssi : !named && (!found || each->rssi > out->rssi)) {
+			*out = *each;
+			found = true;
+			named = match;
+		}
+	}
+	kfree_data(each, sizeof(*each));
+	return found;
+}
+
+static bool
+bss_has_rsn(const struct fuxi_wifi_sta_bss *bss)
+{
+	for (unsigned at = 0; at + 2 <= bss->elements_length && at + 2 + bss->elements[at + 1] <= bss->elements_length;
+	    at += 2 + bss->elements[at + 1]) {
+		if (bss->elements[at] == 48) {
+			return true;
+		}
+	}
+	return false;
+}
+
 /* ---- get ---------------------------------------------------------------------------------------------- */
 
 static int
@@ -429,6 +531,13 @@ get(struct apple80211req *request, char *said, size_t said_size)
 		return ENOMEM;
 	}
 	fuxi_wifi_sta_state(state);
+	/* (study) fuxiwifiprejoin: not joined, these few are answered as if joined to what the last scan heard */
+	if ((study_prejoin == 1 || study_prejoin == 2) && state->phase != FUXI_WIFI_STA_JOINED && (request->req_type == 16 || request->req_type == 4 ||
+	    request->req_type == 9 || (study_prejoin == 2 && request->req_type == 2)) && prejoin_bss(&state->bss)) {
+		state->phase = FUXI_WIFI_STA_JOINED;
+		state->security = bss_has_rsn(&state->bss) ? FUXI_WIFI_STA_WPA2_PSK : FUXI_WIFI_STA_OPEN;
+		snprintf(said, said_size, " (study: not joined, from the last scan)");
+	}
 	switch (request->req_type) {
 	case 13:                                /* the state: APPLE80211_S_INIT 0, _SCAN 1, _AUTH 2, _ASSOC 3, _RUN 4 */
 		request->req_val = state->phase == FUXI_WIFI_STA_JOINED ? 4 : state->phase == FUXI_WIFI_STA_JOINING ? 2 :
@@ -571,6 +680,10 @@ set_scan(const struct apple80211req *request, char *said, size_t said_size)
 	} else {
 		lck_mtx_lock(&apple80211_lock);
 		result_next = 0;
+		if (what->ssid_length != 0) {   /* (study: the network a join may follow; never said) */
+			prejoin_name_length = what->ssid_length;
+			memcpy(prejoin_name, what->ssid, sizeof(prejoin_name));
+		}
 		lck_mtx_unlock(&apple80211_lock);
 		error = fuxi_wifi_sta_ask_scan(what);
 	}
@@ -589,6 +702,7 @@ set_join(const struct apple80211req *request, char *said, size_t said_size)
 {
 	struct apple80211_assoc *asked;
 	struct fuxi_wifi_sta_join *what;
+	unsigned candidate;
 	int error;
 
 	if (request->req_len != sizeof(struct apple80211_assoc)) {
@@ -625,9 +739,19 @@ set_join(const struct apple80211req *request, char *said, size_t said_size)
 		goto out;
 	}
 	lck_mtx_lock(&apple80211_lock);
-	join_result = 0;
+	candidate = study_join == STUDY_EACH ? 1 + study_joins++ % (STUDY_EACH - 1) : study_join;
+	if (candidate == STUDY_REFUSE_SET && !study_joins_refused) {
+		candidate = 0;
+	}
+	join_candidate = candidate;
+	join_result = candidate == STUDY_REFUSE_SET ? 2 : 0;
 	lck_mtx_unlock(&apple80211_lock);
-	error = fuxi_wifi_sta_ask_join(what);
+	if (candidate != 0) {
+		size_t at = strlen(said);
+
+		snprintf(said + at, said_size - at, " [study C%u: %s if it fails]", candidate, study_said(candidate));
+	}
+	error = candidate == STUDY_REFUSE_SET ? EOPNOTSUPP : fuxi_wifi_sta_ask_join(what);
 out:
 	if (asked != NULL) {
 		memset_s(asked, sizeof(*asked), 0, sizeof(*asked));
@@ -772,6 +896,24 @@ post(uint32_t code, const void *data, uint32_t length)
 	kev_post_msg(&message);
 }
 
+/* The link: 1 a network is joined, 0 it was left when asked, an errno: lost (fuxi_wifi_sta_event's FUXI_WIFI_STA_LINK). */
+static void
+post_link(int status)
+{
+	struct apple80211_link_changed link = { .down = status != 1, .involuntary = status != 1 && status != 0,
+		                                .reason = status != 1 && status != 0 ? 4 : 0 };      /* (4: gone, not asked) */
+	struct fuxi_wifi_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
+
+	if (state != NULL) {
+		fuxi_wifi_sta_state(state);
+		link.rssi = status == 1 ? state->bss.rssi : 0;
+		kfree_data(state, sizeof(*state));
+	}
+	post(EVENT_SSID_CHANGED, NULL, 0);
+	post(EVENT_BSSID_CHANGED, NULL, 0);
+	post(EVENT_LINK_CHANGED, &link, sizeof(link));
+}
+
 /* What the station side says has happened (bsd/dev/fuxi_wifi_sta.c calls this, on its thread or the station's). */
 void
 fuxi_wifi_apple80211_event(enum fuxi_wifi_sta_event event, int status)
@@ -793,27 +935,37 @@ fuxi_wifi_apple80211_event(enum fuxi_wifi_sta_event event, int status)
 		lck_mtx_unlock(&apple80211_lock);
 		post(EVENT_SCAN_DONE, NULL, 0);
 		break;
-	case FUXI_WIFI_STA_JOIN_DONE:
-		lck_mtx_lock(&apple80211_lock);
-		join_result = status == 0 ? 1 : status == EAUTH ? 21 : status == ETIMEDOUT ? 9 : 2;
-		lck_mtx_unlock(&apple80211_lock);
-		post(EVENT_ASSOC_DONE, NULL, 0);
-		break;
-	case FUXI_WIFI_STA_LINK: {
-		struct apple80211_link_changed link = { .down = status != 1, .involuntary = status != 1 && status != 0,
-			                                .reason = status != 1 && status != 0 ? 4 : 0 };      /* (4: gone, not asked) */
-		struct fuxi_wifi_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
+	case FUXI_WIFI_STA_JOIN_DONE: {
+		unsigned candidate;
+		uint32_t result;
 
-		if (state != NULL) {
-			fuxi_wifi_sta_state(state);
-			link.rssi = status == 1 ? state->bss.rssi : 0;
-			kfree_data(state, sizeof(*state));
+		lck_mtx_lock(&apple80211_lock);
+		candidate = status != 0 ? join_candidate : 0;
+		join_candidate = 0;
+		join_result = status == 0 ? 1 : status == EAUTH ? 21 : status == ETIMEDOUT ? 9 : 2;
+		join_result = candidate == STUDY_TIMEOUT ? 9 : candidate == STUDY_PMK ? 21 : candidate == STUDY_SILENT ? 0 : join_result;
+		result = join_result;
+		lck_mtx_unlock(&apple80211_lock);
+		if (candidate == 0) {
+			post(EVENT_ASSOC_DONE, NULL, 0);
+			break;
 		}
-		post(EVENT_SSID_CHANGED, NULL, 0);
-		post(EVENT_BSSID_CHANGED, NULL, 0);
-		post(EVENT_LINK_CHANGED, &link, sizeof(link));
+		printf("FUXI WIFI IOS: apple80211: study C%u: the join failed (%d), told as: %s\n", candidate, status,
+		    study_said(candidate));
+		if (candidate == STUDY_LINK_BEFORE) {
+			post_link(ECONNREFUSED);
+		}
+		if (candidate != STUDY_SILENT) {
+			post(EVENT_ASSOC_DONE, candidate == STUDY_PAYLOAD ? &result : NULL, candidate == STUDY_PAYLOAD ? sizeof(result) : 0);
+		}
+		if (candidate == STUDY_LINK_AFTER) {
+			post_link(ECONNREFUSED);
+		}
 		break;
 	}
+	case FUXI_WIFI_STA_LINK:
+		post_link(status);
+		break;
 	}
 }
 
@@ -1004,7 +1156,7 @@ fuxi_wifi_apple80211_ioctl(u_long command, void *data)
 {
 	static unsigned said;
 	struct apple80211req *request = data;
-	char who[32] = "?", what[200] = "", outcome[24];
+	char who[32] = "?", what[200] = "", outcome[24], gap[32] = "";
 	bool is_set = command == SIOCSA80211;
 	unsigned times;
 	int error;
@@ -1022,6 +1174,14 @@ fuxi_wifi_apple80211_ioctl(u_long command, void *data)
 	error = is_set ? set(request, what, sizeof(what)) : get(request, what, sizeof(what));
 	times = note(request, is_set, error);
 	summary_start();
+	if (study_join != 0 || study_prejoin != 0) {    /* (study: how long after the request before it) */
+		uint64_t now, before, ns;
+
+		clock_get_uptime(&now);
+		before = __atomic_exchange_n(&study_last, now, __ATOMIC_RELAXED);
+		absolutetime_to_nanoseconds(before != 0 && now > before ? now - before : 0, &ns);
+		snprintf(gap, sizeof(gap), " [+%llu ms]", (unsigned long long)(ns / 1000000));
+	}
 	/* (each kind is said the first few times and then every hundredth: a request that is repeated for ever is not said for ever) */
 	if ((times <= 24 || times % 100 == 0) && said < 4000) {
 		said++;
@@ -1030,8 +1190,8 @@ fuxi_wifi_apple80211_ioctl(u_long command, void *data)
 		} else {
 			snprintf(outcome, sizeof(outcome), "error %d", error);
 		}
-		printf("FUXI WIFI IOS: apple80211: %s %s %d (%s), value %d, %u bytes%s: %s\n", who, is_set ? "sets" : "gets", request->req_type,
-		    type_name(request->req_type), request->req_val, request->req_len, what, outcome);
+		printf("FUXI WIFI IOS: apple80211: %s %s %d (%s), value %d, %u bytes%s: %s%s\n", who, is_set ? "sets" : "gets",
+		    request->req_type, type_name(request->req_type), request->req_val, request->req_len, what, outcome, gap);
 	}
 	return error;
 }

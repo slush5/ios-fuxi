@@ -380,6 +380,10 @@ never sees MMIO or DMA. The tables (about 140 KB) are allocated only with
 - `fuxiwifiios=1` and `=2` are unchanged: the same lines and the same GET 11
   bytes (no noise figure, an active channel `0x8a`, a room of 0 still gives no
   elements).
+- A refused join is silent on the phone (no "Unable to join" alert) and the
+  password sheet stalls: docs-lanes/wifi-ios-join-result.md maps every join
+  path and adds two default-off boot-args to try candidates on the phone,
+  `fuxiwifijoin=1..8` and `fuxiwifiprejoin=1..3`.
 - `tools/fuxi-wifi-ios-test.c --scan-only` lists what one scan heard (band,
   channel, RSSI, privacy, RSN, the name's length) and refuses any join on these
   backends. `scan PASS` (exit 0) only when a network was heard; none is

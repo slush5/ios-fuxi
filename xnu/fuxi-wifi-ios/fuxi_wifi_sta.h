@@ -129,6 +129,8 @@ void     fuxi_wifi_apple80211_summary(void);                              /* wha
                                                                          * (a timer says it every minute while requests come) */
 /* init only, the radio backends: their name (GET 43/44), and a scan's records carry real elements, kept whole */
 void     fuxi_wifi_apple80211_backend(const char *name, bool whole_elements);
+/* init only, the boot-args fuxiwifijoin and fuxiwifiprejoin (0 and 0: nothing changes, nothing is said) */
+void     fuxi_wifi_apple80211_study(int join, int prejoin, bool joins_refused);
 #endif
 
 #endif

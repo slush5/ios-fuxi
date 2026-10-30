@@ -466,12 +466,16 @@ fuxi_wifi_ios_init(void)
 {
 	const struct fuxi_wifi_backend *ops = &fake_backend;
 	thread_t thread;
-	int on = 0;
+	int on = 0, join = 0, prejoin = 0;
 	PE_parse_boot_argn("fuxiwifiios", &on, sizeof(on));
 	if (on < 1 || on > 4 || enabled) {
 		return;
 	}
 	enabled = true;
+	/* default-off experiments (docs-lanes/wifi-ios-join-result.md); the radio backends refuse every join */
+	PE_parse_boot_argn("fuxiwifijoin", &join, sizeof(join));
+	PE_parse_boot_argn("fuxiwifiprejoin", &prejoin, sizeof(prejoin));
+	fuxi_wifi_apple80211_study(join, prejoin, on >= 3);
 	if (on >= 3) {
 		rscan_init(on == 4);
 		return;
