@@ -100,6 +100,7 @@ void     fuxi_wifi_radio_starting(void);
 void     fuxi_wifi_radio_ready(const uint16_t *freqs, unsigned count);         /* the channels the firmware may use */
 bool     fuxi_wifi_radio_take(struct fuxi_wifi_radio_request *out);            /* a new request, copied */
 bool     fuxi_wifi_radio_cancelled(uint32_t seq);                              /* stop scanning for it */
+bool     fuxi_wifi_radio_wanted(void);          /* false once STOPPED (terminal): no request comes this boot */
 int      fuxi_wifi_radio_frame(uint32_t seq, const uint8_t *frame, size_t length, uint16_t rx_mhz, int16_t rssi_dbm,
     int16_t noise_dbm);                                                        /* parsed and copied during the call */
 int      fuxi_wifi_radio_bss(uint32_t seq, const struct fuxi_wifi_sta_bss *bss);       /* a record parsed elsewhere */

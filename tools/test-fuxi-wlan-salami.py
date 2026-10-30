@@ -27,11 +27,18 @@ Host-only, synthetic cmd-db and RSC registers, fake boot-args and a fake ADT
     the exact bytes each property adds;
   - the Fuxi build (no FUXI_SALAMI) keeps its defaults, ignores /defaults and
     starts as before;
-  - W20 (fuxiwlanqrtr=6) and W23 (fuxiwlanqrtr=7, C2) start only with all 28
-    steps; qrtr outside 0..7, keep/stop22 with qrtr 6/7, fuxiwlanw20 without
-    qrtr 6/7, w20 bits outside the set of the selected stage (0x08 ACTIVE in
-    none) and 0x01 with 0x02 are refused before any access; the init lines
-    print the real qrtr.
+  - W20 (fuxiwlanqrtr=6), W23 (fuxiwlanqrtr=7, C2) and W25 (fuxiwlanqrtr=8,
+    C3) start only with all 28 steps; qrtr outside 0..8, keep/stop22 with qrtr
+    6/7/8, fuxiwlanw20 without qrtr 6/7/8, w20 bits outside the set of the
+    selected stage (0x08 ACTIVE in none) and 0x01 with 0x02 are refused before
+    any access; the init lines print the real qrtr;
+  - C3: fuxi_wlan_init tells the iOS scan handoff (patch 0104) once why there
+    is no radio (not requested 0x10000, refused 0x20001/0x20002, no thread
+    0x30000 after STARTING) or STARTING just before the thread starts, and
+    prints nothing for it; fuxiwlansalami=2 is the gate of =1 plus the
+    profile defaults fuxiwlanclk=1, fuxiwlanprobe=civac and the S4 fuxiwlanseq
+    set, each overridden by an explicit boot-arg or ADT /defaults knob, and the
+    M2 recipe runs with the knobs of the r1c1 recipe.
 """
 from pathlib import Path
 import importlib.util
@@ -403,9 +410,20 @@ static bool PE_get_default(const char *name, void *out, unsigned int max) {
     return false;
 }
 static unsigned starts, start_limit;
+/* C3: the scan handoff's producer calls (patch 0104 fuxi_wifi_radio.c) and the thread start, in order. */
+static char radio_trace[512];
+static size_t radio_len;
+static void radio_note(const char *what, unsigned code) {
+    int n=snprintf(radio_trace+radio_len,sizeof(radio_trace)-radio_len,code?" %s:%#x":" %s",what,code);
+    assert(n>0 && (size_t)n<sizeof(radio_trace)-radio_len); radio_len+=(size_t)n;
+}
+void fuxi_wifi_radio_starting(void) { radio_note("starting",0); }
+void fuxi_wifi_radio_stopped(unsigned code) { radio_note("stopped",code); }
 static void fw_thread(void *arg, wait_result_t r) { (void)arg; (void)r; }
 static int kernel_thread_start(void (*fn)(void *, wait_result_t), void *arg, thread_t *t) {
-    (void)fn; *t=NULL; starts++; start_limit=(unsigned)(uintptr_t)arg; return KERN_SUCCESS;
+    (void)fn; *t=NULL;
+    if(strstr(bootargs,"gate_no_thread")) { radio_note("no-thread",0); return 1; }   /* a test switch, not a knob */
+    starts++; start_limit=(unsigned)(uintptr_t)arg; radio_note("thread",0); return KERN_SUCCESS;
 }
 static void thread_deallocate(thread_t t) { (void)t; }
 '''
@@ -416,6 +434,12 @@ int main(int argc, char **argv) {
     bootargs=argv[1]; adt=argv[2];
     fuxi_wlan_init();
     printf("RESULT starts=%u limit=%u adt=%u\n", starts, start_limit, adt_reads);
+    printf("RADIO%s\n", radio_trace);
+#if defined(FUXI_SALAMI)
+    if(strstr(bootargs,"gate_read_clk")) {   /* a harness switch: fuxiwlanclk is read by M6h, after the thread starts */
+        int c=-1; bool got=PE_parse_boot_argn("fuxiwlanclk",&c,sizeof(c)); printf("CLK %d %d\n",got,c);
+    }
+#endif
 #if defined(FUXI_SALAMI)
     printf("NAMES bdf=%s regdb=%s m3=%s amss=%s\n", wl14_bdf_name, wl14_regdb_name, wl14_m3_name, wl_amss_path);
 #else
@@ -475,8 +499,35 @@ def gate_suite(tmp, mk):
         ('fuxiwlan=0 fuxiwlansalami=1', 0, 0, None),
         ('fuxiwlan=11', 0, 0, 'refused on salami (fuxiwlan=11 needs fuxiwlansalami=1)'),
         ('fuxiwlan=11 fuxiwlansalami=0', 0, 0, 'needs fuxiwlansalami=1'),
-        ('fuxiwlan=11 fuxiwlansalami=2', 0, 0, 'needs fuxiwlansalami=1'),
+        ('fuxiwlan=11 fuxiwlansalami=3', 0, 0, 'needs fuxiwlansalami=1'),
+        ('fuxiwlan=11 fuxiwlansalami=-2', 0, 0, 'needs fuxiwlansalami=1'),
         ('fuxiwlan=11 fuxiwlansalami=yes', 0, 0, 'needs fuxiwlansalami=1'),
+        # C3: fuxiwlansalami=2 = the same gate plus the profile defaults (clk, probe, seq).
+        ('fuxiwlan=11 fuxiwlansalami=2', 1, 11, 'salami K-W1 gate open (fuxiwlansalami=2, fuxiwlanrails 0)'),
+        ('fuxiwlan=11 fuxiwlansalami=2', 1, 11, 'M6o seq mask 0xff valid=1'),
+        ('fuxiwlan=11 fuxiwlansalami=2', 1, 11, 'M6k probe=civac'),
+        ('fuxiwlan=28 fuxiwlansalami=2 fuxiwlanqrtr=8', 1, 28,
+         'W20 selected qrtr=8 (CE/HTC/WMI init, then the W25 scan service for iOS) w20 0 valid 1'),
+        ('fuxiwlan=28 fuxiwlansalami=2 fuxiwlanqrtr=8', 1, 28, 'W25 selected scan service for iOS (fuxiwifiios=3): passive '
+         'only, nothing transmitted; 1800 s, or 3 failed scans in a row, then contain; first scan W24 lines, then one W25 '
+         'line a scan'),
+        ('fuxiwlan=28 fuxiwlansalami=2 fuxiwlanqrtr=8', 1, 28, 'W23 selected passive scan of 38 channels'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=8', 1, 28, 'W12 selected qrtr=8 target memory cap'),
+        ('fuxiwlan=1 fuxiwlansalami=2 fuxiwlanqrtr=8 fuxiwlanw20=0x92', 1, 28, 'w20 0x92 valid 1'),
+        ('fuxiwlan=28 fuxiwlansalami=2 fuxiwlanqrtr=8 fuxiwlanw20=0x10', 1, 28,
+         'W23 selected passive scan of 13 channels (2.4 GHz only)'),
+        ('fuxiwlan=27 fuxiwlansalami=2 fuxiwlanqrtr=8', 0, 0, 'W20 fuxiwlanqrtr=8 needs all 28 steps (fuxiwlan=1 or 28), limit 27; refused'),
+        ('fuxiwlan=28 fuxiwlansalami=2 fuxiwlanqrtr=8 fuxiwlanw20=8', 0, 0, 'w20 0x8 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=2 fuxiwlanqrtr=8 fuxiwlanw20=0x20', 0, 0, 'w20 0x20 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=2 fuxiwlanqrtr=8 fuxiwlanw20=3', 0, 0, 'w20 0x3 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=2 fuxiwlanqrtr=8 fuxiwlankeep=1', 0, 0, 'w20 0 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=2 fuxiwlanqrtr=8 fuxiwlanstop22=1', 0, 0, 'w20 0 valid 0'),
+        # an explicit knob wins over the profile: probe off, another seq set, clock knob read later (M6h)
+        ('fuxiwlan=11 fuxiwlansalami=2 fuxiwlanprobe=off fuxiwlanseq=cycle', 1, 11, 'M6o seq mask 0x1 valid=1'),
+        ('fuxiwlan=11 fuxiwlansalami=2 fuxiwlanprobe=off', 1, 11, 'M6k probe=off'),
+        # the profile never makes an invalid selector valid
+        ('fuxiwlan=11 fuxiwlansalami=2 fuxiwlanseq=cyclerails', 0, 0, 'invalid selector 0, cyclerails 1'),
+        ('fuxiwlan=11 fuxiwlansalami=2 fuxiwlanprobe=bogus', 0, 0, 'invalid selector 1'),
         ('fuxiwlan=11 fuxiwlansalami=1', 1, 11, 'salami K-W1 gate open (fuxiwlansalami=1, fuxiwlanrails 0)'),
         ('fuxiwlan=12 fuxiwlansalami=1', 1, 12, 'enabled (fuxiwlan=12'),
         ('fuxiwlan=16 fuxiwlansalami=1', 1, 16, None),
@@ -531,9 +582,12 @@ def gate_suite(tmp, mk):
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=-1', 0, 0, 'w20 0xffffffff valid 0'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlankeep=1', 0, 0, 'w20 0 valid 0'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanstop22=1', 0, 0, 'w20 0 valid 0'),
-        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=8', 0, 0, 'W20 fuxiwlanqrtr=8 is not 0..7 in this build; refused'),
-        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=9', 0, 0, 'W20 fuxiwlanqrtr=9 is not 0..7'),
-        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=-1', 0, 0, 'W20 fuxiwlanqrtr=-1 is not 0..7'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=9', 0, 0, 'W20 fuxiwlanqrtr=9 is not 0..8 in this build; refused'),
+        ('fuxiwlan=28 fuxiwlansalami=2 fuxiwlanqrtr=9', 0, 0, 'W20 fuxiwlanqrtr=9 is not 0..8'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=99', 0, 0, 'W20 fuxiwlanqrtr=99 is not 0..8'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=-1', 0, 0, 'W20 fuxiwlanqrtr=-1 is not 0..8'),
+        # C3 hooks: no thread -> STOPPED NO_THREAD after STARTING (gate_no_thread is a harness switch)
+        ('fuxiwlan=11 fuxiwlansalami=1 gate_no_thread', 0, 0, 'FUXI WLAN: kernel_thread_start failed'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlankeep=1', 0, 0, 'w20 0 valid 0'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanstop22=1', 0, 0, 'w20 0 valid 0'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw20=8', 0, 0, 'w20 0x8 valid 0'),
@@ -548,12 +602,35 @@ def gate_suite(tmp, mk):
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=5 fuxiwlanw20=0', 1, 28, None),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=5', 1, 28, 'W12 selected qrtr=5 target memory cap'),
     ]
+    def radio_want(args, starts, out):
+        """C3: what fuxi_wlan_init tells the iOS scan handoff (ios_scan_plan.md 2.5), once, at its exits."""
+        if starts:
+            return ' starting thread'
+        if 'gate_no_thread' in args:
+            return ' starting no-thread stopped:0x30000'
+        if 'needs fuxiwlansalami=1' in out:
+            return ' stopped:0x20001'
+        if 'refused on salami before any access' in out:
+            return ' stopped:0x20002'
+        return ' stopped:0x10000'
+
     for args, starts, limit, text in cases:
         s, lim, names, out, reads = run(salami, args)
         assert (s, lim) == (starts, limit), (args, s, lim, out)
         assert reads == 0 and 'from ADT /defaults' not in out, (args, out)   # empty /defaults: never read
         if text:
             assert text in out, (args, out)
+        radio = re.search(r'RADIO(.*)', out)[1]
+        assert radio == radio_want(args, s, out), (args, radio, out)
+        # the hooks print nothing: every line but RESULT/RADIO/NAMES is the radio lane's own
+        assert 'radio' not in '\n'.join(l for l in out.splitlines() if not l.startswith(('RADIO', 'RESULT', 'NAMES'))), out
+        # fuxiwlansalami=2: the three profile knobs, each said once when the boot gives none of them
+        prof = re.findall(r'salami (fuxiwlan\w+) from the fuxiwlansalami=2 profile', out)
+        if 'fuxiwlansalami=2' in args and 'M6g IOVA' in out:   # (the knobs are read once the salami gate passed)
+            given = {t.split('=', 1)[0] for t in args.split()}
+            assert prof == [k for k in ('fuxiwlanseq', 'fuxiwlanprobe') if k not in given], (args, prof, out)
+        else:
+            assert not prof, (args, out)
         if not args.startswith('fuxiwlan=') or 'fuxiwlan=0' in args:
             assert 'FUXI WLAN' not in out, (args, out)  # absent args: nothing at all
         if not starts and 'needs fuxiwlansalami' in (text or ''):
@@ -580,6 +657,31 @@ def gate_suite(tmp, mk):
         assert s == 0 and 'refused on salami before any access (invalid selector 1' in out, (bad, out)
     s, _, names, _, _ = run(salami, f'fuxiwlan=1 fuxiwlansalami=1 {W14} fuxiwlanm3={"b" * 63}')
     assert s == 1 and names['m3'] == 'b' * 63
+
+    # C3 profile (decision 7): fuxiwlansalami=2 = S4 + clk as defaults. The clock knob (read by M6h) from the
+    # profile, an explicit boot-arg or ADT value winning over it, and nothing of it with =1.
+    def clk(out):
+        return re.search(r'CLK (\d) (-?\d+)', out).groups()
+    _, _, _, out, _ = run(salami, 'fuxiwlan=11 fuxiwlansalami=2 gate_read_clk')
+    assert clk(out) == ('1', '1') and 'salami fuxiwlanclk from the fuxiwlansalami=2 profile' in out, out
+    _, _, _, out, _ = run(salami, 'fuxiwlan=11 fuxiwlansalami=2 fuxiwlanclk=0 gate_read_clk')
+    assert clk(out) == ('1', '0') and 'fuxiwlanclk from the' not in out, out
+    _, _, _, out, _ = run(salami, 'fuxiwlan=11 fuxiwlansalami=2 gate_read_clk', enc('fuxiwlanclk=0 fuxiwlanprobe=off'))
+    assert clk(out) == ('1', '0') and 'M6k probe=off' in out and 'from the fuxiwlansalami=2 profile' in out, out
+    assert 'fuxiwlanclk from the' not in out and 'fuxiwlanprobe from the' not in out, out
+    _, _, _, out, _ = run(salami, 'fuxiwlan=11 fuxiwlansalami=1 gate_read_clk')
+    assert clk(out) == ('0', '-1') and 'profile' not in out, out
+    # The M2 recipe (cmdline fuxiwlan=28 fuxiwlanqrtr=8, ADT /defaults fuxiwlansalami=2) runs with exactly the
+    # knobs of the r1c1 recipe (S4 in ADT /defaults + fuxiwlanclk=1 on the cmdline) at qrtr 8.
+    m2 = run(salami, 'fuxiwlan=28 fuxiwlanqrtr=8 gate_read_clk', enc('fuxiwlansalami=2'))
+    r1 = run(salami, 'fuxiwlan=28 fuxiwlanclk=1 fuxiwlanqrtr=8 gate_read_clk',
+             enc('fuxiwlansalami=1 fuxiwlanprobe=civac fuxiwlanseq=cycle,parf,dbi,eq,hostirq,msi,por,prefix'))
+
+    def knob_view(out):
+        return [l.replace('fuxiwlansalami=2,', 'fuxiwlansalami=1,') for l in out.splitlines()
+                if 'from ADT /defaults' not in l and 'fuxiwlansalami=2 profile' not in l and not l.startswith('RESULT ')]
+    assert m2[:3] == r1[:3] and m2[0] == 1 and knob_view(m2[3]) == knob_view(r1[3]), (m2[3], r1[3])
+    assert clk(m2[3]) == clk(r1[3]) == ('1', '1') and 'M6o seq mask 0xff valid=1' in m2[3] and 'M6k probe=civac' in m2[3]
 
     # K-W1b /defaults fallback. (a) The same knobs from ADT /defaults alone (mkadt encoding) give the same
     # result and the same log as from the boot-args, less one "from ADT /defaults" line per read.
@@ -668,8 +770,16 @@ def gate_suite(tmp, mk):
     assert (s, lim) == (1, 28) and 'W20 selected qrtr=6 (CE/HTC/WMI init to READY) w20 0x40 valid 1' in out, out
     s, lim, _, out, _ = run(fuxi, 'fuxiwlan=28 fuxiwlanqrtr=7 fuxiwlanw20=0x10')
     assert (s, lim) == (1, 28) and 'W20 selected qrtr=7 (CE/HTC/WMI init, then W23 passive scan) w20 0x10 valid 1' in out, out
-    s, _, _, out, _ = run(fuxi, 'fuxiwlan=28 fuxiwlanqrtr=8')
-    assert s == 1 and 'W20 fuxiwlanqrtr=8 is not 0..7 in this build; refused' in out, out
+    s, lim, _, out, _ = run(fuxi, 'fuxiwlan=28 fuxiwlanqrtr=8')
+    assert (s, lim) == (1, 28) and 'W20 selected qrtr=8 (CE/HTC/WMI init, then the W25 scan service for iOS) w20 0 valid 1' in out, out
+    s, _, _, out, _ = run(fuxi, 'fuxiwlan=28 fuxiwlanqrtr=9')
+    assert s == 1 and 'W20 fuxiwlanqrtr=9 is not 0..8 in this build; refused' in out, out
+    # C3 hooks on the Fuxi build too: not requested, or STARTING before the thread; fuxiwlansalami means nothing there
+    for args, want in (('', ' stopped:0x10000'), ('fuxiwlan=0', ' stopped:0x10000'), ('fuxiwlan=11', ' starting thread'),
+                       ('fuxiwlan=11 fuxiwlansalami=2', ' starting thread'),
+                       ('fuxiwlan=11 gate_no_thread', ' starting no-thread stopped:0x30000')):
+        out = run(fuxi, args)[3]
+        assert re.search(r'RADIO(.*)', out)[1] == want and 'profile' not in out, (args, out)
     print(f'K-W1 gate: {len(cases)} salami boot-arg cases, firmware names/overrides/refusals, Fuxi control passed')
     print(f'K-W1b /defaults: {len(equal)} knob sets equal from ADT alone and split cmdline/ADT; boot-arg wins; '
           'absent from both is off; oversize/unterminated properties; Fuxi ignores /defaults')

@@ -22,6 +22,7 @@ PREAMBLE = r'''
 #include <assert.h>
 #include <sys/types.h>
 #include <stdarg.h>
+#include <errno.h>
 static char logbuf[131072];
 static size_t loglen;
 static void test_printf(const char *fmt, ...) {
@@ -275,6 +276,15 @@ static int vnode_close(vnode_t v, int mode, vfs_context_t c) { return 0; }
 # W20: the block calls the pure CE/HTC/WMI header fuxi_wlan.c includes (bsd/dev/fuxi_wlan_ce.h).
 PREAMBLE += (ROOT / 'xnu/fuxi-wlan/fuxi_wlan_ce.h').read_text()
 TESTS = r'''
+/* C3: the W20 block names the scan handoff of patch 0104 (fuxi_wifi_radio.c, not in these harnesses). Only
+ * the W25 service (fuxiwlanqrtr=8, tools/test-fuxi-wlan-ce.py) calls it, so any call here is a failure. */
+void fuxi_wifi_radio_ready(const uint16_t *freqs, unsigned count) { (void)freqs; (void)count; assert(!"handoff"); }
+bool fuxi_wifi_radio_take(struct fuxi_wifi_radio_request *out) { (void)out; assert(!"handoff"); return false; }
+bool fuxi_wifi_radio_cancelled(uint32_t seq) { (void)seq; assert(!"handoff"); return true; }
+bool fuxi_wifi_radio_wanted(void) { assert(!"handoff"); return false; }
+int fuxi_wifi_radio_frame(uint32_t seq, const uint8_t *frame, size_t length, uint16_t rx_mhz, int16_t rssi_dbm,
+    int16_t noise_dbm) { (void)seq; (void)frame; (void)length; (void)rx_mhz; (void)rssi_dbm; (void)noise_dbm; assert(!"handoff"); return 1; }
+void fuxi_wifi_radio_done(uint32_t seq, int status) { (void)seq; (void)status; assert(!"handoff"); }
 static void init(void) {
     nr=ne=sleeps=frees=allocations=0; random_value=0x12345; next_pa=0x8c0000000ull;
     progress=true; fail_bm=fail_perst=no_root=false;
