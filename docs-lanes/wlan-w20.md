@@ -10,7 +10,8 @@ written, the scan wedged after 3 channels); C2e (W28: the RXDMA monitor status r
 0x2000, default off) is host-tested only (tools/test-fuxi-wlan-ce.py); C2f (W29: L19's dp_alloc order, cookie conversion
 and the common SRNGs L19 programs before any scan, w20 0x4000, default off) is host-tested only too; C2g (where the per-MAC
 RXDMA ring pointers live, read-only pointer-word lines, the relaxed cookie-conversion gate and the `fuxiwlanw29` default
-0x9f) is host-tested only. Every line below that
+0x9f) is host-tested only; C2h (W30: the vendor's kiwi RX extras behind `fuxiwlanvrx`, default off, after the
+management-RX study `docs-lanes/wlan-mgmt-rx-study.md`) is host-tested only. Every line below that
 says what the target does is what
 the model does, built from Linux ath12k v6.19. C2, C2b and C2c are described in their own sections below
 ([C2: W23/W24](#c2-w23w24-one-passive-scan-fuxiwlanqrtr7),
@@ -19,7 +20,8 @@ the model does, built from Linux ath12k v6.19. C2, C2b and C2c are described in 
 [C2d: W27](#c2d-w27-rx-ring-selection-and-the-reowbm-buffer-return-path-fuxiwlanqrtr7-w20-0x800-0x1000),
 [C2e: W28](#c2e-w28-the-rxdma-monitor-status-rings-and-the-crash-line-fuxiwlanqrtr7-w20-0x2000),
 [C2f: W29](#c2f-w29-l19s-dp_alloc-order-cookie-conversion-and-the-common-srngs-fuxiwlanqrtr7-w20-0x4000),
-[C2g](#c2g-the-per-mac-ring-pointers-the-cc-gate-and-the-w29-default)).
+[C2g](#c2g-the-per-mac-ring-pointers-the-cc-gate-and-the-w29-default),
+[C2h: W30](#c2h-w30-the-vendors-kiwi-rx-extras-fuxiwlanvrx)).
 
 After this boot's W15 WLAN_MODE reply, the radio lane programs the host side of copy engines CE0..CE4 on
 SRNG rings, posts RX buffers, completes HTC (READY, HTT and WMI connect, SETUP_COMPLETE_EX) and WMI init
@@ -43,6 +45,8 @@ file:line below is into that tree. UniXNU-sheng was not used for any line of cod
 | `fuxiwlanqrtr=7` | | C2: all of `=6`, then W23/W24 (one passive scan). Same gate and refusals as `=6`; on salami also `fuxiwlansalami=1`. |
 | `fuxiwlanqrtr` outside 0..7 | 8 (C3), negative, 9+ | refused (`W20 fuxiwlanqrtr=N is not 0..7 in this build; refused`). Before C1 these ran silently with no QRTR. |
 | `fuxiwlanw20=N` | 0 default | With qrtr 6 or 7: 0x01 NOHTT (no HTT connect; WMI then gets the next endpoint), 0x04 MRRS128 (endpoint PCIe Device Control max read request 128 bytes before CE init, low half only), 0x40 NOHWMODE (no PDEV_SET_HW_MODE). With qrtr 7 only: 0x02 HTTVER (HTT version request after HW mode), 0x10 BAND24 (the 13 2.4 GHz channels only), 0x80 PDEVCAP (the EXT MAC/PHY pdev id instead of 0), and C2c's 0x100 RXRING (host RX rings with 4095 buffers and their 4 HTT SRING_SETUP; only with 0x02), 0x200 IDLELINK (the WBM idle link-descriptor list), 0x400 CHAINMASK (PDEV_SET_PARAM TX/RX chain mask), and C2d's 0x800 RXSEL (RX_RING_SELECTION_CFG per MAC ring) and 0x1000 REORX (REO/release rings, buffers back to ring 160), each only with 0x100, and C2e's 0x2000 MONSTAT (the monitor status rings 185/193 and the crash line), only with 0x100. Refused: 0x08 ACTIVE (would transmit probe requests) and 0x20 FULLBSSID (would log whole BSSIDs; the owner masks every BSSID) at every qrtr, the qrtr-7 bits with qrtr 6, 0x01 together with 0x02, 0x100 without 0x02, 0x800, 0x1000 or 0x2000 without 0x100, any other bit. |
+
+| `fuxiwlanvrx=N` | absent or 0 default | C2h, only with qrtr 7 and a valid w20 0x4000: 0x01 MGMTREO (read-only management-RX counts), 0x02 CCSTALE (cookie conversion over a stale PPT; needs `fuxiwlanw29` 0x02, in the 0x9f default), 0x04 IPADIS (WMI INIT flag1 IPA_DISABLE), 0x08 FSE (HTT RX_FSE_SETUP_CFG and RX_FISA_CFG; needs w20 0x800). Refused: negative, any other bit, without a valid 0x4000 or qrtr 7. See [C2h](#c2h-w30-the-vendors-kiwi-rx-extras-fuxiwlanvrx). |
 
 Refusals set `wl_variant_invalid`; salami refuses at init before any access, the Fuxi build at step 17.
 Every boot without `fuxiwlanqrtr=6` or `7` logs and behaves as before C1, and every boot with qrtr absent
@@ -1733,6 +1737,102 @@ commit body):
 
 So boots without 0x100 print nothing new, and boots without 0x4000 are unchanged apart from the read-only lines.
 
+## C2h: W30, the vendor's kiwi RX extras (`fuxiwlanvrx`)
+
+Code and host tests only; nothing ran on the phone. Why: Study K (branch `study/kiwi-rx`) showed the RX-ring readings
+are vendor-normal; the faults are (a) no WMI MGMT_RX and (b) the scan stalling once the RX engine runs. The management-RX
+study (`docs-lanes/wlan-mgmt-rx-study.md`) tested the leading hypothesis, MLO management-RX reordering held by the
+firmware, against the vendor driver and L19 and found it contradicted: MGMT RX REO is host-side reordering, the phone's
+own vendor build does not compile it and still receives beacons, nothing in WMI INIT or QMI switches it, and L19 ignores
+it. Four pieces come out of the study and Study K, each behind one bit of a new knob; default 0 changes nothing.
+
+Code: the C2h section of `fuxi_wlan_ce.h` (`WLVRX_*`, `struct wlvrx_reo`, `wlvrx_note`, `struct wlvrx_ppt`,
+`wlvrx_ppt_rest_ok`, `wlvrx_ppt_count`, `wlvrx_flag1_ipa`, `wlvrx_fst_region_ok`, `wlvrx_fst_rd_ok`, `wlvrx_fse_words`,
+`wlvrx_fisa_words`) and the C2h section of the W20 block of `fuxi_wlan.c` (`wl30_cmem_rd`, `wl30_ccstale`, `wl30_htt`,
+`wl30_fse`), with one hook per piece in `wl_ce_wmi_rx`, `wl26_rings`, `wl29_cc_init`, `wl_w21_run`, `wl_w22_run` and
+`wl_w23_run`, each under its bit.
+
+### Gate and kits
+
+`fuxiwlanvrx` is an int read like every fuxiwlan* knob (boot-arg, else ADT /defaults; `--wlan-defaults fuxiwlanvrx=N`).
+Absent or 0: `wl30_mask` stays 0, no W30 line, the boot exactly as at c398819 (proof below). Given non-zero it needs qrtr 7
+and a valid w20 0x4000; bits outside 0xf, 0x02 without `fuxiwlanw29` 0x02 and 0x08 without w20 0x800 are refused before
+any access (`W20 fuxiwlanvrx 0xN refused: ...` or `... needs fuxiwlanqrtr=7 with w20 0x4000; refused`, the run invalid).
+A valid boot prints after the W29 selected line:
+`W30 selected: vendor kiwi rx, fuxiwlanvrx 0xN: mgmt-reo counts yes|no, stale ppt overwrite yes|no, init ipa-disable
+yes|no, fse/fisa cfg yes|no; nothing transmitted`.
+
+| Bit | Piece | Where | What it does |
+|---|---|---|---|
+| 0x01 | MGMTREO | `wl_ce_wmi_rx` (counts), `wl_w21_run`, `wl_w23_run` | nothing sent or written: service 299 at service ready; counts of MGMT_RX, its REO params TLV (counter valid), FW_CONSUMED (beacon / probe response), SRNG_REAP after the scan |
+| 0x02 | CCSTALE | `wl29_cc_init` | a non-zero PPT among our 280 no longer refuses cc: the 280 are written as C2f writes them, the vendor's other 744 read (read-only allowlist) and counted, never written; C2f's cc_config follows at service ready; a ~0 entry still refuses |
+| 0x04 | IPADIS | `wl_w22_run` | WMI INIT flag1 bit 30 = !ipa-enabled = 1 (0x40020 -> 0x40040020) |
+| 0x08 | FSE | `wl26_rings`, after the two RX_RING_SELECTION_CFG | the 128 flow-table VALID words pre-read (read-only allowlist), no CMEM write; HTT RX_FSE_SETUP_CFG (CMEM base + 0x1000, hi 0x10, 128 records, depth 16, prefix 2, the vendor's key) and RX_FISA_CFG (0x1f, 0xffffffff), no reply |
+
+Suggested kits, all w20 0x7f02 (32514) with the W29 default (no `fuxiwlanw29`, so 0x9f), the r1c2 cmdline byte for
+byte (`fuxiwlan=28 fuxiwlanclk=1 fuxiwlanqrtr=7`) plus `fuxiwlanmlo=4` as r1c2f..r1c2g, and `fuxiwlanw20=32514` and
+`fuxiwlanvrx` in ADT /defaults (`wl_arg` logs `salami fuxiwlanvrx from ADT /defaults`). In the study's ranking, each
+piece alone first:
+
+| Kit | fuxiwlanvrx | Decimal | Question |
+|---|---|---|---|
+| r1c2i-08 | 0x08 | 8 | FSE/FISA alone: does the scan still stall once the RX engine runs (rank 1)? |
+| r1c2i-02 | 0x02 | 2 | the stale PPT overwritten, cc programmed: does REO's state matter (rank 2)? |
+| r1c2i-04 | 0x04 | 4 | IPA_DISABLE alone (rank 3) |
+| r1c2i-01 | 0x01 | 1 | read only: does the firmware consume beacons (fw-consumed), tag MGMT_RX with REO params, or neither (rank 4; changes nothing) |
+| r1c2i-0a | 0x0a | 10 | FSE + stale PPT |
+| r1c2i-0e | 0x0e | 14 | FSE + stale PPT + IPA_DISABLE |
+| r1c2i-0f | 0x0f | 15 | everything, with the counts |
+
+0x01 changes nothing that is sent, so it can be ORed into any kit (9, 3, 5) when a boot's counts are wanted too.
+
+### Lines
+
+```
+FUXI WLAN: W30 selected: vendor kiwi rx, fuxiwlanvrx 0xN: mgmt-reo counts yes|no, stale ppt overwrite yes|no, init ipa-disable yes|no, fse/fisa cfg yes|no; nothing transmitted   (init)
+FUXI WLAN: W30 ccstale: ppt stale N of 280 (first I last L) to be overwritten; rest read N non-zero N (first I|-1) all-ones N, left as found (fuxiwlanvrx 0x02)
+FUXI WLAN: W30 ccstale: ppt clean (non-zero 0 of 280); rest read N non-zero N all-ones N, left as found (fuxiwlanvrx 0x02)
+FUXI WLAN: W30 ccstale refused: ppt non-zero N of 280, all-ones N (unreadable); rest read N non-zero N all-ones N; nothing written (fuxiwlanvrx 0x02)
+FUXI WLAN: W30 ccstale not applied: REASON (fuxiwlanvrx 0x02)                          (a C2f gate refused first; its own line follows)
+FUXI WLAN: W30 fse setup sent base B/H records 128 depth 16 prefix 2 key da565a6d..fa01acbe; table valid N unreadable N; fisa cfg sent 0x1f/0xffffffff; no cmem write (fuxiwlanvrx 0x08)
+FUXI WLAN: W30 fse/fisa cfg not sent: REASON (fuxiwlanvrx 0x08)
+FUXI WLAN: W30 mgmtreo: nothing sent (...); service 299 set|not set; counting fw-consumed, srng-reap, reo-params (fuxiwlanvrx 0x01)   (service ready)
+FUXI WLAN: W30 ipadis: wmi init flag1 X -> X (IPA_DISABLE bit 30 = !ipa-enabled; no IPA on this host) (fuxiwlanvrx 0x04)
+FUXI WLAN: W30 mgmtreo counts: mgmt-rx N (reo-params N, ctr-valid N), fw-consumed N (beacon N, probe-resp N, no hdr N), srng-reap N   (after the W24 report)
+```
+
+The widest W30 line is 250 bytes by the static bound (the FSE line); the model checks every printed line.
+
+### Reading the next boot
+
+- 0x08: the FSE line with `table valid 0` on a fresh table (the vendor writes none at setup); then whether SCAN_STARTED
+  comes, how many channels pass, and whether MGMT_RX or the W27 counts move. A scan completing with 0x08 and stalling
+  without it names the flow table.
+- 0x02: the stale count (Study K expects the Android driver's TX pages: runs from 0 and 128) and `cc_config ... writes 6`.
+- 0x01: `fw-consumed` with beacons and `mgmt-rx 0` = the firmware takes the beacons itself (a scan or filter question);
+  everything 0 = beacons never reach its management path; `reo-params` > 0 = it runs the REO tagging (harmless for us).
+
+### Safety
+
+Unchanged: allowlists, pre-reads and refusals (two new read-only CMEM allowlists; the only CMEM writes stay C2f's 280
+through `wlcm_cmem_ok`; one C2h accessor, `wl30_cmem_rd`, reads through `wl_win` and is refused after `wl26_contain`);
+device-writable memory only in the arenas (C2h allocates nothing); frees only after bus master off and PERST; no IRQ or
+MSI; no PMIC or voltage write; nothing transmits (PASSIVE forced, no probe request, no TX descriptor; the two HTT
+messages are configuration); every console line within 254 bytes.
+
+### Proof that boots without `fuxiwlanvrx` are unchanged
+
+Two differentials against c398819, each tree built from its own sources (scripts in this session's scratchpad,
+recorded in the commit body):
+
+- D1: c398819's model with all its scenarios, instrumented to dump every log, linked against c398819's and this
+  change's production code (each tree's `production()` extraction): 266 logs, 2661715 bytes, byte for byte.
+- D2: the salami and Fuxi init/configure gate (`test-fuxi-wlan-salami.py`'s build) over 1536 boot-arg sets without
+  `fuxiwlanvrx` (fuxiwlan 28/1/11, qrtr absent/5/6/7, eight w20 values, four fuxiwlanw29 values, keep, mlo), cmdline and
+  ADT /defaults: 6144 runs, byte for byte.
+
+Every new line and access is reached only under a `wl30_mask` bit, and `wl30_mask` is 0 unless the knob is given valid.
+
 ## Host tests
 
 `CC=cc python3 tools/test-fuxi-wlan-ce.py` (also in tools/ci/build.sh): the model in
@@ -1963,6 +2063,24 @@ alone not; the CMEM region absent, too small, below 0x80000, at or past 0x200000
 no CMEM access, the two boundaries accepted; the CMEM allowlist inside start..start+size; `wl_win` refusing an offset past
 its field without touching the window register). Mutants (`C2F_MUTANTS`, 41 rules broken once each) are all caught.
 test-fuxi-wlan-salami.py covers the gate for 0x4000 (cmdline and ADT /defaults, the kit route with 32514 in /defaults).
+
+C2h in the same model (`s_c2h_*`, the `c2h` mode for mutants): pure checks of the counts (FW_CONSUMED beacon and probe
+response subtypes, a short and an overrunning TLV, SRNG_REAP, other ids, the REO params TLV with and without its valid
+counter), the IPA flag, the FSE/FISA words against the vendor's written down again (the key against its 40 bytes),
+the region and read allowlists; `s_c2h_ccstale` against the W29 register file / CMEM of the C2f gate with a seeded
+Android-like PPT (our 280 overwritten and nothing past them written, the other 744 read and left, cc_config follows;
+a smaller region, a clean table, a ~0 entry refused with nothing written, a configured cc register or no region with
+no CMEM access, and without the bit the C2f refusal unchanged); `s_c2h_ipadis` (the firmware's INIT check wants bit 30);
+`s_c2h_fse` in a 0x902 scan (both messages word by word after the ring selection and before the channel list, exactly
+the 128 VALID reads, no CMEM write; too small a region or none: not sent, no CMEM access); `s_c2h_mgmtreo` (the WMI
+command stream and the BSS table as without the bit, every count); `s_c2h_all`. Static (`static_c2h`): the gate, each
+hook under its bit and in the vendor's place, one read-only accessor, no C2h write, the 280 writes unchanged, the two
+HTT messages the only sends, every W30 line within 254 bytes. Vendor (`vendor_c2h`, with the ISC vendor tree at
+`$KIWI_VENDOR_SRC`, else SKIPPED): every C2h constant re-derived (flag1 bit 30 and its vendor rule, service 299, event
+ids 0x700d/0x700e from the MGMT group order, TLV tags 0x3d2/0x3d3 from the tag enum, the FW_CONSUMED and REO params
+layouts, the kiwi Kbuild without MGMT RX REO, the PPT and flow table geometry, the FSE/FISA types, fields, defaults,
+key, address rule and order, the FSE entry); each file's ISC notice checked first. Mutants (`C2H_MUTANTS`, 28) are all
+caught. `tools/test-fuxi-wlan-salami.py` covers the parse, the refusals and the /defaults route (six kit values).
 
 What only the device can answer: whether the firmware fetches from the rings at all with zero interrupt
 thresholds, which pipe carries HTC READY (both are polled), the credit numbers, the real pdev id, whether

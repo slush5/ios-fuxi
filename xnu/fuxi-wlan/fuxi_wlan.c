@@ -49,6 +49,11 @@
  *                 absent = 0x9f (all but LRO and IDLE_PS, which stall WMI on this polled,
  *                 interrupt-less host; sent only when selected); 0, unknown bits or any
  *                 other use refused
+ *   fuxiwlanvrx=N  C2h, only with qrtr=7 and a valid w20 0x4000: the vendor's kiwi RX pieces
+ *                 (0x01 mgmt-reo counts, read only; 0x02 cookie conversion over a stale PPT, needs
+ *                 fuxiwlanw29 0x02; 0x04 WMI INIT flag1 IPA_DISABLE; 0x08 HTT FSE_SETUP/FISA_CFG,
+ *                 needs w20 0x800); absent or 0 = none; unknown bits or any other use refused
+ *                 (docs-lanes/wlan-mgmt-rx-study.md)
  * Salami (FUXI_SALAMI, OnePlus 11, K-W1): the driver runs only when
  * fuxiwlansalami=1 is present as well; its absence or any other value refuses
  * before the thread starts, as do fuxiwlanseq with cyclerails and any invalid
@@ -921,6 +926,17 @@ static bool wl16_large, wl16_redrive;
 #define WL29_ALL 0xffu
 #define WL29_DEFAULT (WL29_ALL & ~(WL29_LRO | WL29_IDLEPS))   /* 0x9f */
 static unsigned wl29_mask = WL29_DEFAULT;
+/* C2h (fuxiwlanvrx, only with a valid qrtr 7 w20 0x4000): the vendor's kiwi RX
+ * extras, one bit each (docs-lanes/wlan-mgmt-rx-study.md). Absent or 0 = none,
+ * the boot exactly as without the knob; given non-zero, bits inside WL30_ALL,
+ * 0x02 only with fuxiwlanw29 0x02 and 0x08 only with w20 0x800, else the run is
+ * refused before any access. */
+#define WL30_MGMTREO 0x01u    /* read only: MGMT RX REO has no host part on kiwi; FW_CONSUMED / SRNG_REAP / REO TLV counts */
+#define WL30_CCSTALE 0x02u    /* cookie conversion overwrites a stale PPT (our 280 entries), the rest read and counted */
+#define WL30_IPADIS 0x04u     /* WMI INIT flag1 bit 30 IPA_DISABLE = !ipa-enabled */
+#define WL30_FSE 0x08u        /* HTT RX_FSE_SETUP_CFG (table in CMEM) and RX_FISA_CFG after the ring selection */
+#define WL30_ALL 0x0fu
+static unsigned wl30_mask;
 static bool wl_w20, wl_w23;
 static unsigned wl20_bits;
 static unsigned wl20_qrtr; /* 6 or 7 when wl_w20, for the init lines */
@@ -1220,7 +1236,7 @@ wl_probe_configure(void)
 		printf("FUXI WLAN: rails variant %d (1 early before WLAN_EN, 2 late before WLAN_MODE) valid %u\n",
 		    rails, !wl_variant_invalid);
 	}
-	int stop22 = 0, keep = 0, qrtr = 0, w20 = 0, w29 = 0;
+	int stop22 = 0, keep = 0, qrtr = 0, w20 = 0, w29 = 0, vrx = 0;
 	(void)PE_parse_boot_argn("fuxiwlanstop22", &stop22, sizeof(stop22));
 	(void)PE_parse_boot_argn("fuxiwlankeep", &keep, sizeof(keep));
 	(void)PE_parse_boot_argn("fuxiwlanqrtr", &qrtr, sizeof(qrtr));
@@ -1282,6 +1298,8 @@ wl_probe_configure(void)
 	bool w20_given = PE_parse_boot_argn("fuxiwlanw20", &w20, sizeof(w20));
 	wl29_mask = WL29_DEFAULT;
 	bool w29_given = PE_parse_boot_argn("fuxiwlanw29", &w29, sizeof(w29));
+	wl30_mask = 0;
+	bool vrx_given = PE_parse_boot_argn("fuxiwlanvrx", &vrx, sizeof(vrx));
 	if (qrtr < 0 || qrtr > WL20_QRTR_MAX) {
 		wl_variant_invalid = true;
 		printf("FUXI WLAN: W20 fuxiwlanqrtr=%d is not 0..%d in this build; refused\n", qrtr, WL20_QRTR_MAX);
@@ -1302,6 +1320,14 @@ wl_probe_configure(void)
 			printf("FUXI WLAN: W20 fuxiwlanw29 %#x refused: needs a valid w20 0x4000, non-zero, bits 0xff only, 0x02 only with 0x01\n",
 			    (unsigned)w29);
 		} else if (w29_given) { wl29_mask = (unsigned)w29; }
+		/* C2h: fuxiwlanvrx only with a valid 0x4000, known bits, 0x02 with the cc piece, 0x08 with the ring selection */
+		if (vrx_given && vrx && (!(wl20_bits & WL20_L19ORDER) || vrx < 0 || ((unsigned)vrx & ~WL30_ALL) ||
+		    (((unsigned)vrx & WL30_CCSTALE) && !(wl29_mask & WL29_CC)) || (((unsigned)vrx & WL30_FSE) && !(wl20_bits & WL20_RXSEL)))) {
+			wl_variant_invalid = true;
+			wl20_bits = 0;
+			printf("FUXI WLAN: W20 fuxiwlanvrx %#x refused: needs a valid w20 0x4000, bits 0xf only, 0x02 only with fuxiwlanw29 0x02, "
+			    "0x08 only with w20 0x800\n", (unsigned)vrx);
+		} else if (vrx_given) { wl30_mask = (unsigned)vrx; }
 		printf("FUXI WLAN: W20 selected qrtr=%d (%s) w20 %#x valid %u\n", qrtr,
 		    wl_w23 ? "CE/HTC/WMI init, then W23 passive scan" : "CE/HTC/WMI init to READY", (unsigned)w20, !wl_variant_invalid);
 		if (wl_w23) {
@@ -1332,6 +1358,12 @@ wl_probe_configure(void)
 			    m & WL29_RINGS ? "yes" : "no", m & WL29_CC ? "yes" : "no", m & WL29_PDEV ? "yes" : "no", m & WL29_DFS ? "yes" : "no",
 			    m & WL29_PPDU ? "yes" : "no", m & WL29_LRO ? "yes" : "no", m & WL29_IDLEPS ? "yes" : "no", m & WL29_ENCAP ? "yes" : "no");
 		}
+		if (wl30_mask && (wl20_bits & WL20_L19ORDER)) {   /* C2h: the vendor pieces fuxiwlanvrx selects */
+			const unsigned m = wl30_mask;
+			printf("FUXI WLAN: W30 selected: vendor kiwi rx, fuxiwlanvrx %#x: mgmt-reo counts %s, stale ppt overwrite %s, init ipa-disable %s, "
+			    "fse/fisa cfg %s; nothing transmitted\n", m, m & WL30_MGMTREO ? "yes" : "no", m & WL30_CCSTALE ? "yes" : "no",
+			    m & WL30_IPADIS ? "yes" : "no", m & WL30_FSE ? "yes" : "no");
+		}
 	} else if (w20_given && w20) {
 		wl_variant_invalid = true;
 		printf("FUXI WLAN: W20 fuxiwlanw20 %#x needs fuxiwlanqrtr=6; refused\n", (unsigned)w20);
@@ -1339,6 +1371,10 @@ wl_probe_configure(void)
 	if (!wl_w20 && w29_given) {   /* C2f bisect: fuxiwlanw29 without qrtr 7 and w20 0x4000 */
 		wl_variant_invalid = true;
 		printf("FUXI WLAN: W20 fuxiwlanw29 %#x needs fuxiwlanqrtr=7 with w20 0x4000; refused\n", (unsigned)w29);
+	}
+	if (!wl_w20 && vrx_given && vrx) {   /* C2h: fuxiwlanvrx without qrtr 7 and w20 0x4000 */
+		wl_variant_invalid = true;
+		printf("FUXI WLAN: W20 fuxiwlanvrx %#x needs fuxiwlanqrtr=7 with w20 0x4000; refused\n", (unsigned)vrx);
 	}
 	wl_stop22 = stop22 == 1; wl_keep = keep == 1;
 	if (wl_w14) {
@@ -4906,6 +4942,9 @@ static int wl29_macstart_pre(void);
 static int wl29_macstart_post(void);
 static int wl29_encap_decap(void);
 static void wl29_report(void);
+static struct wlvrx_reo wl30_reo;   /* C2h fuxiwlanvrx 0x01: counts only */
+static unsigned wl30_ccstale(unsigned own);
+static int wl30_fse(void);
 
 /* One register access through the dynamic window: the wl_soc_write
  * discipline without its per-access log line (pci.c:163-182, 1201-1285;
@@ -5123,6 +5162,7 @@ wl_ce_wmi_rx(void *ctx, const uint8_t *msg, uint32_t len)
 	uint32_t id = 0, foreign = wl_scan.foreign, ci = wl_scan.ci_seen;
 	(void)ctx;
 	if (wlwmi_rx(&wl_wmi, msg, len, &id)) { return 1; }
+	if (wl30_mask & WL30_MGMTREO) { wlvrx_note(&wl30_reo, id, msg + 4, len - 4); }  /* C2h: counts only */
 	if (wl_wmi.scan && wlscan_known(id)) {
 		if (wl_scan.foreign != foreign && wl23_lines++ < 64) { printf("FUXI WLAN: W23 scan foreign freq %u\n", wl_scan.ev_freq); }
 		if (wl_scan.ci_seen != ci) { wlrx_note_ci(&wl_rx, wl_scan.ci); wl23_ci_line(); }  /* C2c: D4/D5 notes, no line */
@@ -5710,7 +5750,10 @@ wl26_rings(void)
 		for (unsigned i = 0; i < WLRX_NRING; i++) { if (wl26_sring(i)) { return 1; } }
 		if ((wl20_bits & WL20_MONSTAT) && (wl28_sring(0) || wl28_sring(1))) { return 1; }  /* C2e: dp_rx.c:4657-4670 */
 		if ((wl20_bits & WL20_RXSEL) && (wl27_sel(0) || wl27_sel(1))) { return 1; }  /* C2d: dp_rx.c:4672 */
+		if ((wl30_mask & WL30_FSE) && wl30_fse()) { return 1; }  /* C2h: the vendor's FSE_SETUP and FISA_CFG after the selection */
 		if (wl23_poll_for(WL20_W_NONE, 100, &took) == 1) { return 1; }
+	} else if (wl30_mask & WL30_FSE) {
+		printf("FUXI WLAN: W30 fse/fisa cfg not sent: the rx rings are not set up (fuxiwlanvrx 0x08)\n");
 	}
 	wl26_watch(WLRX_P_SETUP);
 	if (wl29_macstart_pre()) { return 1; }   /* C2f: mac-start pdev params before the chain mask (mac.c:9372-9415) */
@@ -6454,6 +6497,9 @@ wl29_cc_init(void)
 	if (own == WLCM_FREE) {
 		for (unsigned i = 0; i < WLCM_NSPT; i++) { wl_cm.ppt_pre[i] = wl29_cmem_rd(wlcm_ppt_addr(&wl_cm, i)); }
 		own = wlcm_cmem_owned(&wl_cm);
+		if (wl30_mask & WL30_CCSTALE) { own = wl30_ccstale(own); }   /* C2h: a stale PPT is overwritten, as the vendor does */
+	} else if (wl30_mask & WL30_CCSTALE) {
+		printf("FUXI WLAN: W30 ccstale not applied: %s (fuxiwlanvrx 0x02)\n", wlcm_why(own));
 	}
 	if (own != WLCM_FREE) {
 		printf("FUXI WLAN: W29 cookie conversion not programmed: %s; w20 0x4000 cc dropped for this boot\n", wlcm_why(own));
@@ -6671,6 +6717,104 @@ wl29_report(void)
 	}
 }
 
+/* ---- C2h (fuxiwlanqrtr=7, w20 0x4000, fuxiwlanvrx): the vendor's kiwi RX extras ----
+ * Default off; each piece behind its fuxiwlanvrx bit (docs-lanes/wlan-mgmt-rx-study.md;
+ * the pure parts, constants and allowlists are the C2h section of fuxi_wlan_ce.h).
+ * 0x01 (MGMTREO) sends and writes nothing: one line at service ready, the counts
+ * after the scan. 0x02 (CCSTALE) lets wl29_cc_init overwrite a stale PPT: our 280
+ * entries are written exactly as C2f writes them, the vendor's other 744 are read
+ * through their own read allowlist and counted, never written; every other C2f
+ * gate (REO and common rings ours, the CMEM region, the six cc registers) stands,
+ * and an unreadable (~0) entry still refuses. 0x04 (IPADIS) sets WMI INIT flag1
+ * bit 30 in wl_w22_run. 0x08 (FSE) sends the two HTT messages after the ring
+ * selection, the table's valid words pre-read through their read allowlist and
+ * nothing written to CMEM. CMEM reads go through wl_win and are refused after
+ * wl26_contain; no MSI, interrupt, power or PMIC access; nothing transmitted. */
+
+/* A C2h CMEM read: OK says whether the address is on that piece's read allowlist. */
+static uint32_t
+wl30_cmem_rd(uint32_t off, bool ok)
+{
+	uint32_t v = ~0u;
+	if (fw_faults || wl_cm.stopping || wl_rx.stopping || !ok) { return ~0u; }
+	return wl_win(off, false, &v) ? ~0u : v;
+}
+
+/* wl29_cc_init with 0x02, after the 280 PPT pre-reads (OWN = their C2f reading):
+ * the line, then FREE (cc goes on, the 280 entries are overwritten) or the C2f
+ * refusal. The rest of the vendor's PPT is read and counted either way. */
+static unsigned
+wl30_ccstale(unsigned own)
+{
+	struct wlvrx_ppt s;
+	wlvrx_ppt_count(&wl_cm, &s);
+	s.rest_read = s.rest_nonzero = s.rest_ones = 0; s.rest_first = ~0u;
+	for (uint32_t i = WLCM_NSPT; i < WLVRX_PPT_ENTRIES; i++) {
+		const uint32_t off = wl_cm.cmem_base + 4u * i;
+		if (!wlvrx_ppt_rest_ok(&wl_cm, off)) { break; }   /* the region ends: read no further */
+		const uint32_t v = wl30_cmem_rd(off, wlvrx_ppt_rest_ok(&wl_cm, off));
+		s.rest_read++;
+		if (v == ~0u) { s.rest_ones++; } else if (v) { s.rest_nonzero++; if (s.rest_first == ~0u) { s.rest_first = i; } }
+	}
+	if (s.ones) {
+		printf("FUXI WLAN: W30 ccstale refused: ppt non-zero %u of %u, all-ones %u (unreadable); rest read %u non-zero %u all-ones %u; "
+		    "nothing written (fuxiwlanvrx 0x02)\n", s.stale, WLCM_NSPT, s.ones, s.rest_read, s.rest_nonzero, s.rest_ones);
+		return own;
+	}
+	if (own == WLCM_FREE) {
+		printf("FUXI WLAN: W30 ccstale: ppt clean (non-zero 0 of %u); rest read %u non-zero %u all-ones %u, left as found "
+		    "(fuxiwlanvrx 0x02)\n", WLCM_NSPT, s.rest_read, s.rest_nonzero, s.rest_ones);
+		return own;
+	}
+	printf("FUXI WLAN: W30 ccstale: ppt stale %u of %u (first %u last %u) to be overwritten; rest read %u non-zero %u (first %d) "
+	    "all-ones %u, left as found (fuxiwlanvrx 0x02)\n", s.stale, WLCM_NSPT, s.first, s.last, s.rest_read, s.rest_nonzero,
+	    s.rest_first == ~0u ? -1 : (int)s.rest_first, s.rest_ones);
+	return WLCM_FREE;
+}
+
+/* One C2h HTT message through wl_ce_send on the HTT endpoint (CE4), no reply
+ * (the vendor asks none). */
+static int
+wl30_htt(const uint32_t *w, unsigned n, const char *what)
+{
+	uint8_t msg[4u * WLVRX_FSE_WORDS];
+	for (unsigned k = 0; k < n; k++) { wlce_put32(msg + 4u * k, w[k]); }
+	return wl_ce_send(wl_htc.htt_eid, msg, 4u * n, what);
+}
+
+/* With 0x08, in wl26_rings right after the two RX_RING_SELECTION_CFG (the vendor's
+ * dp_soc_attach_target order): the flow table's 128 valid words pre-read (read
+ * only), then RX_FSE_SETUP_CFG and RX_FISA_CFG. Not sending is not fatal (the
+ * vendor's own failure there is not either); a send fault is. */
+static int
+wl30_fse(void)
+{
+	uint32_t w[WLVRX_FSE_WORDS], f[WLVRX_FISA_WORDS], valid = 0, unread = 0;
+	const uint32_t eid = wl_htc.htt_eid;
+	const struct wlce_pipe *p = &wl_ce.pipe[wl_htc.ep[eid].ul_pipe];
+	const char *why = !wl_cmem_valid ? "no QMI CMEM region (dev_mem[0])" :
+	    !wlvrx_fst_region_ok(wl_cmem_base, wl_cmem_size) ? "the QMI CMEM region cannot hold the 4 KiB PPT and the 16 KiB flow table" :
+	    !eid || !wl_htc.ep[eid].used ? "no HTT endpoint" : wl_rx.stopping ? "stopping" :
+	    p->posted - p->reaped >= p->nslots ? "CE4 slots all in flight" : NULL;
+	if (why) {
+		printf("FUXI WLAN: W30 fse/fisa cfg not sent: %s (fuxiwlanvrx 0x08)\n", why);
+		return 0;
+	}
+	for (uint32_t i = 0; i < WLVRX_FST_ENTRIES; i++) {
+		const uint32_t off = (uint32_t)wl_cmem_base + WLVRX_FST_OFF + WLVRX_FSE_BYTES * i + WLVRX_FSE_VALID_OFF;
+		const uint32_t v = wl30_cmem_rd(off, wlvrx_fst_rd_ok(wl_cmem_base, wl_cmem_size, off));
+		if (v == ~0u) { unread++; } else { valid += (v & WLVRX_FSE_VALID) != 0; }
+	}
+	wlvrx_fse_words(wl_cmem_base, w);
+	wlvrx_fisa_words(f);
+	if (wl30_htt(w, WLVRX_FSE_WORDS, "HTT RX_FSE_SETUP_CFG") || wl30_htt(f, WLVRX_FISA_WORDS, "HTT RX_FISA_CFG")) { return 1; }
+	printf("FUXI WLAN: W30 fse setup sent base %#x/%#x records %u depth %u prefix %u key %08x..%08x; table valid %u unreadable %u; "
+	    "fisa cfg sent %#x/%#x; no cmem write (fuxiwlanvrx 0x08)\n", w[2], w[3], w[1] & 0xfffffu, (w[1] >> 20) & 0xffu, w[1] >> 28,
+	    w[4], w[13], valid, unread, f[1], f[2]);
+	return 0;
+}
+/* ---- end C2h ---- */
+
 static int
 wl_w23_run(void)
 {
@@ -6762,6 +6906,11 @@ wl_w23_run(void)
 	}
 	wl26_watch(WLRX_P_COMPLETED);  /* C2c: as soon as the wait returned, before the W24 lines */
 	wl24_report();
+	if (wl30_mask & WL30_MGMTREO) {   /* C2h: counts only */
+		printf("FUXI WLAN: W30 mgmtreo counts: mgmt-rx %u (reo-params %u, ctr-valid %u), fw-consumed %u (beacon %u, probe-resp %u, "
+		    "no hdr %u), srng-reap %u\n", wl30_reo.mgmt_rx, wl30_reo.reo_tlv, wl30_reo.reo_valid, wl30_reo.consumed,
+		    wl30_reo.consumed_bcn, wl30_reo.consumed_prsp, wl30_reo.consumed_bad, wl30_reo.srng_reap);
+	}
 	if (w == 2) {
 		wl23_ci_flush();
 		wl26_report();  /* C2c */
@@ -6834,6 +6983,13 @@ wl_w22_run(void)
 	uint32_t len = 0;
 	wl12_stage = WL22_WMI;
 	if (wlwmi_encode_init(&wl_wmi, cmd, sizeof(cmd), &len)) { return wl_w11_fail("W22 INIT encode bounds"); }
+	if (wl30_mask & WL30_IPADIS) {   /* C2h: the vendor's flag1 IPA_DISABLE = !ipa-enabled; this host has no IPA */
+		uint8_t *f1 = cmd + 4 + WLWMI_INIT_BYTES + 4u * WLWMI_RC_FLAG1;
+		const uint32_t was = wlce_get32(f1);
+		wlce_put32(f1, wlvrx_flag1_ipa(was, false));
+		printf("FUXI WLAN: W30 ipadis: wmi init flag1 %#x -> %#x (IPA_DISABLE bit 30 = !ipa-enabled; no IPA on this host) "
+		    "(fuxiwlanvrx 0x04)\n", was, wlce_get32(f1));
+	}
 	if (wl_ce_send(wl_htc.wmi_eid, cmd, len, "WMI INIT")) { return 1; }
 	printf("FUXI WLAN: W22 wmi init sent bytes %u (vdevs %u peers %u chains %#x flag1 %#x flags2 %#x host-svc %#x mem-chunks 0)\n",
 	    len, wlce_get32(rc + 4 * WLWMI_RC_NUM_VDEVS), wlce_get32(rc + 4 * WLWMI_RC_NUM_PEERS),
@@ -6893,6 +7049,11 @@ wl_w21_run(void)
 		printf("FUXI WLAN: W21 wmi service ready ext2 bytes %u\n", wl_wmi.ext2_bytes);
 	}
 	printf("FUXI WLAN: W21 wmi service ready complete\n");
+	if (wl30_mask & WL30_MGMTREO) {   /* C2h: nothing to send (study); the service bit and what is counted */
+		printf("FUXI WLAN: W30 mgmtreo: nothing sent (mgmt rx reo is host-side reordering, absent from the vendor kiwi build and "
+		    "L19); service 299 %s; counting fw-consumed, srng-reap, reo-params (fuxiwlanvrx 0x01)\n",
+		    wlwmi_svc(&wl_wmi, WLVRX_SVC_MGMT_RX_REO) ? "set" : "not set");
+	}
 	if (wl29_cc_config()) { return 1; }  /* C2f: ath12k_dp_cc_config at core.c:923, before the REO destination rings; silent without cc */
 	if (wl27_dest()) { return 1; }  /* C2d: REO2SW1..8 after service ready, before INIT (core.c:925); silent without REO */
 	return wl_w22_run();
@@ -6905,7 +7066,7 @@ wl_w20_run(void)
 {
 	wl12_stage = WL20_CE;
 	wl_ce_started = true; wl_ce_waited = wl_ce_logged = 0;
-	bzero(&wl_htc, sizeof(wl_htc)); bzero(&wl_wmi, sizeof(wl_wmi));
+	bzero(&wl_htc, sizeof(wl_htc)); bzero(&wl_wmi, sizeof(wl_wmi)); bzero(&wl30_reo, sizeof(wl30_reo));
 	wl23_scan_sent = wl23_guard_bad = false; /* C2: no STOP_SCAN in containment unless W23 sent START_SCAN */
 	wl23_rssi_conv = 0;
 	if ((wl20_bits & WL20_MRRS128) && wl_ce_mrrs128()) { return 1; }

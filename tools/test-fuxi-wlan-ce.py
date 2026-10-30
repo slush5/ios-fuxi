@@ -79,6 +79,11 @@ counts REO CFG1 alone as an owner (the phone's values program cc), the
 fuxiwlanw29 default 0x9f (no LRO, no IDLE_PS); L19 (l19_c2g): LMAC rings have no
 register or shadow, their HP/TP only in wrp/rdp, and L19 never touches the
 pointers of rings 161/169 after SRING_SETUP; mutants.
+C2h (fuxiwlanvrx, W30): the vendor's kiwi RX extras after docs-lanes/wlan-mgmt-rx-study.md, each behind one bit:
+0x01 read-only management-RX counts (FW_CONSUMED, SRNG_REAP, the REO params TLV), 0x02 cookie conversion over a
+stale PPT (our 280 written, the rest read only), 0x04 WMI INIT flag1 IPA_DISABLE, 0x08 HTT RX_FSE_SETUP_CFG /
+RX_FISA_CFG (model s_c2h_*; static_c2h; vendor_c2h re-derives every constant from the ISC vendor tree at
+$KIWI_VENDOR_SRC, else skipped; mutants).
 No device, no network.
 """
 from pathlib import Path
@@ -198,6 +203,7 @@ def static_checks():
     static_c2d()
     static_c2e()
     static_c2f()
+    static_c2h()
 
 
 def c_calls(body, name):
@@ -427,7 +433,10 @@ def static_c2c():
     # wlrx_wbm_ok's and refuses after the latch; W26 never calls a raw accessor; the one BAR write is the HP publish to
     # the shadow register looked up for ring 120's R2 HP (index 19).
     block = between(DRIVER, '/* ---- W20: CE/HTC/WMI to WMI READY (fuxiwlanqrtr=6, C1) ----', '/* ---- end W20 ---- */')
-    assert strip_comments(block).count('wl_win(') == 6, 'wl_win: the definition and the five accessors only (CE, WBM, C2d REO, C2f reg, C2f cmem)'
+    assert strip_comments(block).count('wl_win(') == 7, \
+        'wl_win: the definition and the six accessors only (CE, WBM, C2d REO, C2f reg, C2f cmem, C2h cmem read)'
+    # C2h: the one C2h CMEM accessor reads only, through the caller's allowlist answer, refused after the latch.
+    assert 'if (fw_faults || wl_cm.stopping || wl_rx.stopping || !ok) { return ~0u; }\n\treturn wl_win(off, false, &v) ? ~0u : v;' in block
     assert 'if (fw_faults || wl_rx.stopping || !wlrx_wbm_ok(off, wr)) { return 1; }\n\treturn wl_win(off, wr, value);' in fns['wl26_wbm']
     w26code = strip_comments(region)
     for raw in ('wl_prd(', 'wl_pwr(', 'wl_mrd(', 'wl_mwr(', 'wl_contain_wr(', 'wl_ce_window(', 'wlce_wr(', 'wl_soc_write', 'rh_send',
@@ -552,7 +561,7 @@ def c2c_line_bounds(fns, cfg, tag='W26', min_lines=28, extra=None):
                 if fmt in bounded:
                     w += bounded[fmt][i]
                 else:
-                    w += {'%u': 10, '%#x': 10, '%#010x': 10, '%x': 8, '%d': 11, '%#llx': 18}[spec]
+                    w += {'%u': 10, '%#x': 10, '%#010x': 10, '%x': 8, '%08x': 8, '%d': 11, '%#llx': 18}[spec]
                 continue
             cand = [len(s.encode().decode('unicode_escape')) for s in re.findall(r'"((?:[^"\\]|\\.)*)"', arg)]
             cand += [local[n] for n in re.findall(r'\b(\w+)(?:\[\w+\])?', arg) if n in local]
@@ -590,7 +599,8 @@ def c2c_line_bounds(fns, cfg, tag='W26', min_lines=28, extra=None):
             if name == 'wl26_list':
                 assert fmt == '%s\n', fmt
                 continue
-            assert fmt.startswith(('FUXI WLAN: W26 ', 'FUXI WLAN: W27 ', 'FUXI WLAN: W28 ', 'FUXI WLAN: W29 ', 'FUXI WLAN: W24 no beacon')) and \
+            assert fmt.startswith(('FUXI WLAN: W26 ', 'FUXI WLAN: W27 ', 'FUXI WLAN: W28 ', 'FUXI WLAN: W29 ', 'FUXI WLAN: W30 ',
+                                   'FUXI WLAN: W24 no beacon')) and \
                 fmt.endswith('\n'), fmt
             w = worst(fmt, a[1:], local, assigned)
             assert w <= 254, (name, w, fmt)
@@ -1652,6 +1662,7 @@ def static_c2f():
     assert 'L19ORDER' not in drv.split('#define WL20_BITS', 1)[1].split('\n')[0]  # qrtr 6 refuses it
     assert '(((unsigned)w20 & WL20_L19ORDER) && !((unsigned)w20 & WL20_REORX))) { wl_variant_invalid = true; }' in cfg
     region = between(drv, '/* ---- C2f (fuxiwlanqrtr=7)', '/* ---- end W20 ---- */')
+    region = region.replace(between(region, '/* ---- C2h (fuxiwlanqrtr=7', '/* ---- end C2h ---- */', True), '')  # static_c2h's
     fns = c_functions(region)
     for name in ('wl29_reg', 'wl29_cmem', 'wl29_ring', 'wl29_cc_init', 'wl29_common_pre', 'wl29_common_post', 'wl29_cc_config',
                  'wl29_macstart_pre', 'wl29_macstart_post', 'wl29_encap_decap', 'wl29_report', 'wl29_ppdu_stats'):
@@ -1715,6 +1726,193 @@ def static_c2f():
           'destination rings, mac-start params around the chain mask and channel list, encap/decap before NSS, W29 report '
           'after W27), the two wl_win accessors (wlcm_reg_ok, wlcm_cmem_ok) refused after the latch, no transmit and no ring '
           'post, cc gated on the CMEM region, the latch and the single zeroed free')
+
+
+VENDOR = Path(os.environ.get('KIWI_VENDOR_SRC', Path.home() / 'op11-ios/src/sm8550-modules/qcom/opensource/wlan'))
+
+
+def vendor_c2h():
+    """C2h: the vendor constants re-derived from the ISC vendor host driver for kiwi (qca-wifi-host-cmn, qcacld-3.0,
+    fw-api; LineageOS/android_kernel_oneplus_sm8550-modules @ 9c16bd2) when it is on disk ($KIWI_VENDOR_SRC = its
+    qcom/opensource/wlan); every file read is checked for the ISC notice first. Skipped without the tree."""
+    if not (VENDOR / 'fw-api/fw/htt.h').exists():
+        print(f'vendor re-derivation (C2h) SKIPPED: no vendor wlan tree at {VENDOR} (set KIWI_VENDOR_SRC)')
+        return
+    files = {}
+    for rel in ('fw-api/fw/htt.h', 'fw-api/fw/wmi_unified.h', 'fw-api/fw/wmi_services.h', 'fw-api/fw/wmi_tlv_defs.h',
+                'fw-api/hw/kiwi/v2/rx_flow_search_entry.h', 'qca-wifi-host-cmn/dp/wifi3.0/be/dp_be.h',
+                'qca-wifi-host-cmn/dp/wifi3.0/dp_main.c', 'qca-wifi-host-cmn/dp/wifi3.0/dp_htt.c',
+                'qca-wifi-host-cmn/wlan_cfg/wlan_cfg.c', 'qca-wifi-host-cmn/wlan_cfg/wlan_cfg.h',
+                'qca-wifi-host-cmn/wlan_cfg/cfg_dp.h', 'qca-wifi-host-cmn/wmi/src/wmi_unified_tlv.c',
+                'qcacld-3.0/components/dp/core/src/wlan_dp_rx_fst.c', 'qcacld-3.0/core/wma/src/wma_main.c'):
+        t = (VENDOR / rel).read_text(errors='replace')
+        head = ' '.join(t[:3000].replace('*', ' ').split())
+        assert 'Permission to use, copy, modify, and/or distribute this software for any purpose with or without fee is ' \
+            'hereby granted' in head, rel   # ISC
+        assert 'GNU General Public' not in t[:3000] and 'SPDX-License-Identifier: GPL' not in t[:3000], rel
+        files[rel.split('/')[-1]] = t
+    kbuild = (VENDOR / 'qcacld-3.0/Kbuild').read_text()   # a make fragment (no licence header): flags only
+    htt, wmi, svc, be, cfgc = files['htt.h'], files['wmi_unified.h'], files['wmi_services.h'], files['dp_be.h'], files['wlan_cfg.c']
+
+    def d(text, name):
+        return int(re.search(r'#define ' + name + r'\s+\(?(0x[0-9a-fA-F]+|\d+)', text)[1], 0)
+    # 0x04: flag1 IPA_DISABLE bit 30, set to !ucfg_ipa_is_enabled() by the vendor every boot (a clearing SET)
+    assert d(wmi, 'WMI_RSRC_CFG_FLAG_IPA_DISABLE_S') == 30 and d(wmi, 'WMI_RSRC_CFG_FLAG_IPA_DISABLE_M') == header_define('WLVRX_FLAG1_IPA_DISABLE')
+    assert 'tgt_cfg->ipa_disable = ucfg_ipa_is_enabled() ? false : true;' in files['wma_main.c']
+    assert 'WMI_RSRC_CFG_FLAG_IPA_DISABLE_SET(resource_cfg->flag1,\n\t\t\t\t\t  tgt_res_cfg->ipa_disable);' in files['wmi_unified_tlv.c']
+    assert '(word32) &= ~WMI_RSRC_CFG_FLAG_ ## flag ## _M;' in wmi
+    # 0x01: service 299, the MGMT group's event order (13 = FW_CONSUMED, 14 = SRNG_REAP), the two TLV tags
+    assert int(re.search(r'WMI_SERVICE_MGMT_RX_REO_SUPPORTED = (\d+)', svc)[1]) == header_define('WLVRX_SVC_MGMT_RX_REO')
+    grp = strip_comments(wmi).split('WMI_MGMT_RX_EVENTID = WMI_EVT_GRP_START_ID(WMI_GRP_MGMT),', 1)[1]
+    ev = re.findall(r'\b(WMI_\w+_EVENTID)\s*,', grp.split('WMI_EVT_GRP_START_ID', 1)[0])
+    assert 0x7001 + 1 + ev.index('WMI_MGMT_RX_FW_CONSUMED_EVENTID') == header_define('WLVRX_EV_MGMT_RX_FW_CONSUMED')
+    assert 0x7001 + 1 + ev.index('WMI_MGMT_SRNG_REAP_EVENTID') == header_define('WLVRX_EV_MGMT_SRNG_REAP')
+    with tempfile.TemporaryDirectory(prefix='fuxi-c2h-vendor-') as tmp:
+        (Path(tmp) / 't.c').write_text('#include "wmi_tlv_defs.h"\n')
+        pre = subprocess.run([CC[0], '-E', '-P', '-I', str(VENDOR / 'fw-api/fw'), str(Path(tmp) / 't.c')],
+                             capture_output=True, text=True).stdout
+    i = pre.index('WMITLV_TAG_STRUC_wmi_mgmt_rx_hdr,')
+    body = pre[pre.index('{', pre.rindex('typedef enum', 0, i)) + 1:pre.index('}', i)]
+    tags, v = {}, -1
+    for item in (x.strip() for x in body.split(',') if x.strip()):
+        name, _, val = (a.strip() for a in item.partition('='))
+        v = (tags[val] if val in tags else int(val, 0)) if val else v + 1
+        tags[name] = v
+    assert tags['WMITLV_TAG_STRUC_wmi_mgmt_rx_hdr'] == 0x2c and tags['WMITLV_TAG_STRUC_wmi_init_cmd_fixed_param'] == 0x4a
+    assert tags['WMITLV_TAG_STRUC_wmi_mgmt_rx_reo_params'] == header_define('WLVRX_TAG_MGMT_RX_REO_PARAMS')
+    assert tags['WMITLV_TAG_STRUC_wmi_mgmt_rx_fw_consumed_hdr'] == header_define('WLVRX_TAG_FW_CONSUMED_HDR')
+    assert 'A_UINT32 peer_info_subtype;' in wmi and '[31:28]: subtype' in wmi and 'WMI_GET_BITS(mgmt_pkt_ctr_link_info, 15, 1)' in wmi
+    fc = re.search(r'typedef struct \{\s*A_UINT32 tlv_header; /\* WMITLV_TAG_STRUCT_wmi_mgmt_rx_fw_consumed_hdr \*/(.*?)\} '
+                   r'wmi_mgmt_rx_fw_consumed_hdr;', wmi, re.S)[1]
+    fields = re.findall(r'A_UINT32 (\w+)\s*;', fc)
+    assert fields.index('peer_info_subtype') * 4 == 12 and len(fields) * 4 == header_define('WLVRX_FW_CONSUMED_BYTES'), fields
+    rp = re.search(r'A_UINT32 tlv_header; /\*TLV WMITLV_TAG_STRUC_wmi_mgmt_rx_reo_params\*/(.*?)\} wmi_mgmt_rx_reo_params;', wmi, re.S)[1]
+    rf = re.findall(r'A_UINT32 (\w+)\s*;', rp)
+    assert rf.index('mgmt_pkt_ctr_link_info') == 1 and len(rf) * 4 == header_define('WLVRX_REO_PARAMS_BYTES'), rf
+    # the phone's vendor build has no MGMT RX REO: no rx_reo object, no WLAN_MGMT_RX_REO_SUPPORT define
+    assert not re.search(r'mgmt_txrx_rx_reo|rx_reo_\w*\.o|MGMT_RX_REO|MLO_GLOBAL_SHMEM', kbuild)   # ol_rx_reorder is data RX
+    objs = kbuild.split('UMAC_MGMT_TXRX_OBJS := ', 1)[1].split('\n\n', 1)[0]
+    assert re.findall(r'(\w+)\.o', objs) == ['wlan_mgmt_txrx_main', 'wlan_mgmt_txrx_utils_api', 'wlan_mgmt_txrx_tgt_api'], objs
+    # 0x02: the PPT is 1024 entries (4 KiB) at the CMEM base, the flow table after it, 16 KiB
+    assert d(be, 'DP_CC_PPT_MAX_ENTRIES') == header_define('WLVRX_PPT_ENTRIES') and d(be, 'DP_CC_PPT_MEM_SIZE') == 4096
+    assert d(be, 'DP_CMEM_FST_SIZE') == header_define('WLVRX_FST_BYTES') == 0x4000 and \
+        '(DP_CC_MEM_OFFSET_IN_CMEM + DP_CC_PPT_MEM_SIZE)' in be and header_define('WLVRX_FST_OFF') == 4096
+    # 0x08: message types, field layout, defaults, the key, the address rule and the FISA words
+    assert d(htt, 'HTT_RX_FSE_SETUP_NUM_REC_S') == 0 and d(htt, 'HTT_RX_FSE_SETUP_MAX_SEARCH_S') == 20 and \
+        d(htt, 'HTT_RX_FSE_SETUP_IP_DA_SA_PREFIX_S') == 28 and d(htt, 'HTT_RX_FSE_SETUP_PDEV_ID_S') == 8
+    assert re.search(r'HTT_H2T_MSG_TYPE_RX_FSE_SETUP_CFG\s+= 0x12,', htt) and re.search(r'HTT_H2T_MSG_TYPE_RX_FISA_CFG\s+= 0x15,', htt)
+    assert re.findall(r'HTT_RX_(\w+),', htt.split('enum htt_ip_da_sa_prefix {', 1)[1].split('}', 1)[0]).index(
+        'IPV4_COMPATIBLE_IPV6') == header_define('WLVRX_FST_PREFIX')
+    fst = files['wlan_dp_rx_fst.c']
+    assert '(soc->fst_cmem_base >> 32) | 0x10;' in fst and 'fisa_hw_fst_setup_cmd.ip_da_sa_prefix =\tHTT_RX_IPV4_COMPATIBLE_IPV6;' in fst
+    assert 'fisa_hw_fst_setup_cmd.pdev_id = 0;' in fst and header_define('WLVRX_FST_ADDR_HI') == 0x10
+    assert d(files['cfg_dp.h'], 'WLAN_CFG_RX_FLOW_SEARCH_TABLE_SIZE_DEFAULT') == header_define('WLVRX_FST_ENTRIES')
+    assert '#ifdef CONFIG_BERYLLIUM\n#define WLAN_CFG_RX_FST_MAX_SEARCH 16' in files['wlan_cfg.h'] and header_define('WLVRX_FST_SEARCH') == 16
+    key = bytes(int(x, 16) for x in re.findall(r'0x([0-9a-f]{2})', cfgc.split('rx_fst_toeplitz_key[WLAN_CFG_RX_FST_TOEPLITZ_KEYLEN] = {', 1)[1].split('};', 1)[0]))
+    hk = [int(x, 16) for x in re.findall(r'0x([0-9a-f]{8})u', between(HEADER, 'wlvrx_fse_words(uint64_t cmem_base', '\n}\n'))]
+    assert len(key) == 40 and hk == [int.from_bytes(key[4 * i:4 * i + 4], 'little') for i in range(10)], hk
+    hs = files['dp_htt.c']
+    assert 'fse_setup->toeplitz314_288 = *key;' in hs and 'HTT_RX_FSE_SETUP_HASH_314_288_SET(*msg_word,\n\t\t\t\t\t  fse_setup->toeplitz314_288);' in hs
+    assert '((_var) |= ((_val) << HTT_RX_FSE_SETUP_HASH_314_288_S));' in htt   # ORed whole: the check only asserts
+    assert 'HTT_RX_FISA_CONFIG_FISA_V2_ENABLE_SET(*msg_word, 1);' in hs and 'HTT_RX_FISA_CONFIG_FISA_V2_AGGR_LIMIT_SET(*msg_word, 0xf);' in hs
+    assert (1 << d(htt, 'HTT_RX_FISA_CONFIG_FISA_V2_ENABLE_S')) | (0xf << d(htt, 'HTT_RX_FISA_CONFIG_FISA_V2_AGGR_LIMIT_S')) == 0x1f
+    mn = files['dp_main.c']
+    assert '#define FISA_MAX_TIMEOUT 0xffffffff' in mn and 'fisa_config.fisa_timeout = FISA_MAX_TIMEOUT;' in mn
+    assert mn.index('dp_rxdma_ring_sel_cfg(soc)') < mn.index('status = dp_rx_target_fst_config(soc);') < mn.index('status = dp_rx_fisa_config(soc);')
+    fse = files['rx_flow_search_entry.h']
+    assert d(fse, 'NUM_OF_DWORDS_RX_FLOW_SEARCH_ENTRY') * 4 == header_define('WLVRX_FSE_BYTES') and \
+        d(fse, 'RX_FLOW_SEARCH_ENTRY_VALID_OFFSET') == header_define('WLVRX_FSE_VALID_OFF') and d(fse, 'RX_FLOW_SEARCH_ENTRY_VALID_LSB') == 8
+    print('vendor re-derivation (C2h): flag1 IPA_DISABLE bit 30 set to !ipa-enabled, service 299, FW_CONSUMED 0x700d / '
+          'SRNG_REAP 0x700e, TLV tags 0x3d2 / 0x3d3 and the subtype word, no MGMT RX REO in the kiwi Kbuild, the PPT 1024 x 4 '
+          'and the 16 KiB flow table after it, FSE/FISA types, fields, defaults (128, search 16, prefix 2), the key, hi | 0x10, '
+          'FISA 0x1f / 0xffffffff after the ring selection, the 64-byte FSE with VALID at 0x24 bit 8; 14 files ISC-checked')
+
+
+def static_c2h():
+    """C2h (fuxiwlanvrx): the gate (only with a valid 0x4000, bits 0xf, 0x02 with fuxiwlanw29 0x02, 0x08 with 0x800; absent
+    or 0 = nothing), each piece reached only under its bit and in the vendor's place, the one read-only CMEM accessor
+    (allowlist answer from the caller, refused after the latch), no CMEM write and no register write in C2h, the 280 PPT
+    writes unchanged, the two HTT messages the only sends, no transmit, every W30 line within 254 bytes."""
+    drv = DRIVER
+    code = strip_comments(drv)
+    cfg = between(drv, 'static void\nwl_probe_configure(void)\n{', '\n}\n')
+    for name, v in (('WL30_MGMTREO', 0x01), ('WL30_CCSTALE', 0x02), ('WL30_IPADIS', 0x04), ('WL30_FSE', 0x08), ('WL30_ALL', 0x0f)):
+        assert re.search(r'#define ' + name + f' 0x{v:02x}u' + r'\b', drv), name
+    # the knob: read like every fuxiwlan* knob (boot-arg, then ADT /defaults), 0 unless given valid, refused otherwise
+    assert cfg.count('PE_parse_boot_argn("fuxiwlanvrx", &vrx, sizeof(vrx))') == 1 and 'wl30_mask = 0;' in cfg
+    assert code.count('wl30_mask = ') == 2 and 'else if (vrx_given) { wl30_mask = (unsigned)vrx; }' in cfg
+    assert ('if (vrx_given && vrx && (!(wl20_bits & WL20_L19ORDER) || vrx < 0 || ((unsigned)vrx & ~WL30_ALL) ||\n'
+            '\t\t    (((unsigned)vrx & WL30_CCSTALE) && !(wl29_mask & WL29_CC)) || (((unsigned)vrx & WL30_FSE) && '
+            '!(wl20_bits & WL20_RXSEL)))) {') in cfg
+    assert cfg.index('wl29_mask = (unsigned)w29;') < cfg.index('wl30_mask = (unsigned)vrx;') < cfg.index('W20 selected qrtr=%d')
+    assert 'if (!wl_w20 && vrx_given && vrx) {' in cfg and 'if (wl30_mask && (wl20_bits & WL20_L19ORDER)) {' in cfg
+    # every hook under its bit, in the vendor's place
+    w20 = between(drv, '/* ---- W20: CE/HTC/WMI to WMI READY (fuxiwlanqrtr=6, C1) ----', '/* ---- end W20 ---- */')
+    hooks = {
+        'if (wl30_mask & WL30_MGMTREO) { wlvrx_note(&wl30_reo, id, msg + 4, len - 4); }': 1,
+        'if ((wl30_mask & WL30_FSE) && wl30_fse()) { return 1; }': 1,
+        'if (wl30_mask & WL30_CCSTALE) { own = wl30_ccstale(own); }': 1,
+        'if (wl30_mask & WL30_IPADIS) {': 1,
+        'if (wl30_mask & WL30_MGMTREO) {': 3,  # the note, the service-ready line, the counts line
+        '} else if (wl30_mask & WL30_CCSTALE) {': 1,
+        '} else if (wl30_mask & WL30_FSE) {': 1,
+    }
+    for h, n in hooks.items():
+        assert w20.count(h) == n, h
+    assert strip_comments(w20).count('wl30_fse()') == 1 and strip_comments(w20).count('wl30_ccstale(own)') == 1
+    assert strip_comments(w20).count('wlvrx_note(') == 1 and strip_comments(w20).count('wlvrx_flag1_ipa(') == 1
+    wmi_rx = between(drv, 'static int\nwl_ce_wmi_rx(void *ctx, const uint8_t *msg, uint32_t len)\n{', '\n}\n')
+    assert wmi_rx.index('if (wlwmi_rx(&wl_wmi, msg, len, &id)) { return 1; }') < wmi_rx.index('wlvrx_note(')
+    rings = between(drv, 'static int\nwl26_rings(void)\n{', '\n}\n')
+    assert rings.index('wl27_sel(0) || wl27_sel(1)') < rings.index('wl30_fse()') < rings.index('wl23_poll_for(WL20_W_NONE, 100')
+    ccin = between(drv, 'static int\nwl29_cc_init(void)\n{', '\n}\n')
+    assert ccin.index('wl_cm.ppt_pre[i] = wl29_cmem_rd(') < ccin.index('own = wl30_ccstale(own);') < \
+        ccin.index('if (own != WLCM_FREE) {') < ccin.index('wl29_cmem(wlcm_ppt_addr(&wl_cm, i), true, &v)')
+    assert ccin.count('for (unsigned i = 0; i < WLCM_NSPT; i++) {') == 2 and strip_comments(ccin).count('wl29_cmem(') == 1
+    w22 = between(drv, 'static int\nwl_w22_run(void)\n{', '\n}\n')
+    assert w22.index('wlwmi_encode_init(&wl_wmi, cmd') < w22.index('wlvrx_flag1_ipa(was, false)') < w22.index('"WMI INIT")')
+    w21 = between(drv, 'static int\nwl_w21_run(void)\n{', '\n}\n')
+    assert w21.index('W21 wmi service ready complete') < w21.index('W30 mgmtreo: nothing sent') < w21.index('wl29_cc_config()')
+    w23 = between(drv, 'static int\nwl_w23_run(void)\n{', '\n}\n')
+    assert w23.index('wl24_report();') < w23.index('W30 mgmtreo counts:') < w23.index('if (w == 2) {')
+    # the C2h section: one read-only accessor through wl_win, its allowlist answered by the caller, refused after the latch;
+    # no write anywhere; the two HTT messages through wl_ce_send; nothing raw, no MSI/IRQ/PMIC, no transmit
+    region = between(drv, '/* ---- C2h (fuxiwlanqrtr=7', '/* ---- end C2h ---- */')
+    fns = c_functions(region)
+    for name in ('wl30_cmem_rd', 'wl30_ccstale', 'wl30_htt', 'wl30_fse'):
+        assert name in fns, name
+    c2h = strip_comments(region)
+    assert c2h.count('wl_win(') == 1 and 'return wl_win(off, false, &v) ? ~0u : v;' in fns['wl30_cmem_rd']
+    assert 'if (fw_faults || wl_cm.stopping || wl_rx.stopping || !ok) { return ~0u; }' in fns['wl30_cmem_rd']
+    assert 'wl30_cmem_rd(off, wlvrx_ppt_rest_ok(&wl_cm, off))' in fns['wl30_ccstale']
+    assert 'wl30_cmem_rd(off, wlvrx_fst_rd_ok(wl_cmem_base, wl_cmem_size, off))' in fns['wl30_fse']
+    assert c2h.count('wl_ce_send(') == 1 and 'return wl_ce_send(wl_htc.htt_eid, msg, 4u * n, what);' in fns['wl30_htt']
+    assert 'wl30_htt(w, WLVRX_FSE_WORDS, "HTT RX_FSE_SETUP_CFG") || wl30_htt(f, WLVRX_FISA_WORDS, "HTT RX_FISA_CFG")' in fns['wl30_fse']
+    for raw in ('wl_pwr(', 'wl_mwr(', 'wl_prd(', 'wl_contain_wr(', 'wl_ce_window(', 'wl_ce_io_bar_wr(', 'wl26_wbm(', 'wl27_reo(',
+                'wl29_reg(', 'wl29_cmem(', 'true, &', 'msi', 'MSI', 'gic', 'GIC', 'pmic', 'PMIC', 'irq', 'IRQ', 'PUBLISH',
+                'wlcm_ppt_val', 'WMI START_SCAN', 'probe'):
+        assert raw not in c2h, raw
+    # the ~0 refusal stands (the C2f reading returned unchanged), a stale table overwritten only by the C2f writes
+    cs = fns['wl30_ccstale']
+    assert cs.index('if (s.ones) {') < cs.index('return own;') < cs.index('return WLCM_FREE;')
+    # the header: the read allowlists never cover a write and stay inside the region
+    hdr = HEADER
+    assert 'return (uint64_t)off + 4u <= (uint64_t)cm->cmem_base + cm->cmem_size;' in \
+        between(hdr, 'static inline bool\nwlvrx_ppt_rest_ok(', '\n}\n')
+    assert 'return (off - lo) % WLVRX_FSE_BYTES == WLVRX_FSE_VALID_OFF;' in between(hdr, 'static inline bool\nwlvrx_fst_rd_ok(', '\n}\n')
+    # the lines
+    lfns = dict(fns)
+    for name, body in (('wl_w21_run', w21), ('wl_w22_run', w22), ('wl_w23_run', w23), ('wl29_cc_init', ccin), ('wl26_rings', rings)):
+        calls = [c for c in c_calls(body, 'printf') if '"FUXI WLAN: W30 ' in c]
+        assert calls, name
+        lfns[name] = ''.join(f'printf({c});\n' for c in calls)
+    nl = sum(len([c for c in c_calls(b, 'printf') if 'W30' in c]) for b in lfns.values())
+    longest = c2c_line_bounds(lfns, cfg, tag='W30', min_lines=10)
+    print(f'C2h static: the gate (valid 0x4000, bits 0xf, 0x02 with fuxiwlanw29 0x02, 0x08 with 0x800; absent or 0 = nothing), '
+          f'each piece under its bit in the vendor\'s place (fse after the ring selection, ccstale between the PPT pre-reads '
+          f'and the C2f refusal, ipadis between the INIT encode and its send, mgmtreo after wlwmi_rx and at service ready / '
+          f'after the W24 report), one read-only CMEM accessor (caller\'s allowlist, refused after the latch), no C2h write, '
+          f'the 280 PPT writes unchanged, the two HTT messages the only sends; {nl} W30 lines at most {longest} of 254 bytes')
 
 
 # Each C2f rule broken in the production code must be caught by the C2f static checks or the model's C2f scenarios
@@ -1816,6 +2014,50 @@ C2F_MUTANTS = [
     ('h', 'p->n = mon ? WLRX_NPTR : 4u;', 'p->n = 4u;', 'pointer words: 185/193 left out with 0x2000'),
     ('h', 'if (!p->valid[m]) { p->first[m] = i; }', 'p->first[m] = i;', 'valid span: first index not the first'),
     ('h', '\t\t\tp->last[m] = i;\n', '', 'valid span: last index not kept'),
+]
+
+
+# Each C2h rule broken in the production code must be caught by the C2h static checks or the model's C2h scenarios.
+C2H_MUTANTS = [
+    ('h', '#define WLVRX_FLAG1_IPA_DISABLE (1u << 30)', '#define WLVRX_FLAG1_IPA_DISABLE (1u << 29)', 'IPA_DISABLE bit 29'),
+    ('d', 'wlce_put32(f1, wlvrx_flag1_ipa(was, false));', 'wlce_put32(f1, wlvrx_flag1_ipa(was, true));', 'ipa taken as enabled'),
+    ('h', '#define WLVRX_FST_SEARCH 16u', '#define WLVRX_FST_SEARCH 2u', 'FSE search depth 2 (pre-Beryllium)'),
+    ('h', '#define WLVRX_FST_OFF 0x1000u', '#define WLVRX_FST_OFF 0x0u', 'flow table over the PPT'),
+    ('h', '#define WLVRX_FST_ADDR_HI 0x10u', '#define WLVRX_FST_ADDR_HI 0x0u', 'flow table address taken as DDR'),
+    ('h', '0x3bb7426au, 0xfa01acbeu };', '0x3bb7426au, 0x0201acbeu };', 'key word 13 masked to 27 bits'),
+    ('h', '#define WLVRX_FISA_CTRL (1u | 0xfu << 1)', '#define WLVRX_FISA_CTRL (1u)', 'FISA without the aggregation limit'),
+    ('h', '#define WLVRX_FISA_TIMEOUT 0xffffffffu', '#define WLVRX_FISA_TIMEOUT 0u', 'FISA timeout disabled'),
+    ('h', '#define WLVRX_FST_ENTRIES 128u', '#define WLVRX_FST_ENTRIES 256u', 'FSE 256 records'),
+    ('h', 'return (off - lo) % WLVRX_FSE_BYTES == WLVRX_FSE_VALID_OFF;', 'return true;', 'flow table reads beyond the valid words'),
+    ('h', '\treturn wlcm_cmem_region_ok(start, size) && size >= WLVRX_FST_OFF + WLVRX_FST_BYTES &&',
+     '\treturn wlcm_cmem_region_ok(start, size) && size >= WLVRX_FST_OFF &&', 'flow table in too small a region'),
+    ('h', '\treturn (uint64_t)off + 4u <= (uint64_t)cm->cmem_base + cm->cmem_size;\n}\n\n/* Our 280',
+     '\treturn true;\n}\n\n/* Our 280', 'PPT rest read past the region'),
+    ('h', 'const uint32_t sub = wlce_get32(it.v + 12) >> 28;', 'const uint32_t sub = wlce_get32(it.v + 8) >> 28;',
+     'fw-consumed subtype from the pdev word'),
+    ('h', '#define WLVRX_REO_CTR_VALID (1u << 15)', '#define WLVRX_REO_CTR_VALID (1u << 14)', 'reo counter valid bit 14'),
+    ('h', '#define WLVRX_FW_CONSUMED_BYTES 36u', '#define WLVRX_FW_CONSUMED_BYTES 40u', 'fw-consumed struct one word long'),
+    ('h', '#define WLVRX_EV_MGMT_RX_FW_CONSUMED 0x700du', '#define WLVRX_EV_MGMT_RX_FW_CONSUMED 0x700cu', 'fw-consumed id'),
+    ('d', 'if ((wl30_mask & WL30_FSE) && wl30_fse()) { return 1; }', 'if (wl30_fse()) { return 1; }', 'fse without its bit'),
+    ('d', 'if (wl30_mask & WL30_CCSTALE) { own = wl30_ccstale(own); }', '{ own = wl30_ccstale(own); }', 'ccstale without its bit'),
+    ('d', 'if (wl30_mask & WL30_MGMTREO) { wlvrx_note(&wl30_reo, id, msg + 4, len - 4); }',
+     'wlvrx_note(&wl30_reo, id, msg + 4, len - 4);', 'mgmtreo counts without the bit'),
+    ('d', '\tif (s.ones) {\n', '\tif (0 && s.ones) {\n', 'an unreadable PPT entry overwritten'),
+    ('d', 'for (unsigned i = 0; i < WLCM_NSPT; i++) {\n\t\tuint32_t v = wlcm_ppt_val(&wl_cm, i);',
+     'for (unsigned i = 0; i < WLCM_NSPT + 1u; i++) {\n\t\tuint32_t v = wlcm_ppt_val(&wl_cm, i);', 'a PPT write past our 280'),
+    ('d', 'if (fw_faults || wl_cm.stopping || wl_rx.stopping || !ok) { return ~0u; }',
+     'if (fw_faults || wl_rx.stopping || !ok) { return ~0u; }', 'CMEM read after the cc latch'),
+    ('d', 'return wl_win(off, false, &v) ? ~0u : v;', 'return wl_win(off, true, &v) ? ~0u : v;', 'the C2h CMEM access a write'),
+    ('d', '(fuxiwlanvrx 0x08)\\n", why);\n\t\treturn 0;', '(fuxiwlanvrx 0x08)\\n", why);\n\t\treturn 1;',
+     'fse refusal fatal'),
+    ('d', 'wl30_reo.consumed_bcn, wl30_reo.consumed_prsp, wl30_reo.consumed_bad', 'wl30_reo.consumed_prsp, wl30_reo.consumed_bcn, wl30_reo.consumed_bad',
+     'beacon and probe-resp counts swapped'),
+    ('d', 'wlwmi_svc(&wl_wmi, WLVRX_SVC_MGMT_RX_REO) ? "set" : "not set"', 'wlwmi_svc(&wl_wmi, 298u) ? "set" : "not set"',
+     'service 298 for 299'),
+    ('d', 'const uint32_t v = wl30_cmem_rd(off, wlvrx_ppt_rest_ok(&wl_cm, off));\n\t\ts.rest_read++;\n\t\tif (v == ~0u) { s.rest_ones++; } else if (v) {',
+     'const uint32_t v = wl30_cmem_rd(off, wlvrx_ppt_rest_ok(&wl_cm, off));\n\t\ts.rest_read++;\n\t\tif (v == ~0u) { s.rest_ones++; } else if (!v) {',
+     'rest count inverted'),
+    ('d', 'if (wl30_mask & WL30_IPADIS) {', 'if (wl30_mask & WL30_FSE) {', 'ipadis on the fse bit'),
 ]
 
 
@@ -2788,7 +3030,8 @@ def l19_c2c(vals, define, struct_fields, size, word_names, tlv, wmi_h, wmi_c, ma
 def dash_check():
     files = ['xnu/fuxi-wlan/fuxi_wlan.c', 'xnu/fuxi-wlan/fuxi_wlan_ce.h', 'xnu/patches/0099-fuxi-wlan.patch',
              'tools/fuxi-wlan-ce-model.c', 'tools/test-fuxi-wlan-ce.py', 'tools/test-fuxi-wlan-salami.py',
-             'tools/mkadt-salami.py', 'tools/ci/build.sh', 'docs-lanes/wlan-w20.md', 'tools/test-fuxi-wlan-m6.py',
+             'tools/mkadt-salami.py', 'tools/ci/build.sh', 'docs-lanes/wlan-w20.md', 'docs-lanes/wlan-mgmt-rx-study.md',
+             'tools/test-fuxi-wlan-m6.py',
              'tools/test-fuxi-wlan-w11.py', 'tools/test-fuxi-wlan-w15.py', 'tools/test-fuxi-wlan-w16.py']
     for f in files:
         text = (ROOT / f).read_text()
@@ -2819,12 +3062,14 @@ def main():
     l19_c2e(c2edump)
     l19_c2f(c2fdump)
     l19_c2g()
+    vendor_c2h()
     mutants()
     mutants(C2E_MUTANTS, 'c2e')
     mutants(C2F_MUTANTS, 'c2f')
+    mutants(C2H_MUTANTS, 'c2h')
     dash_check()
-    print('W20 (fuxiwlanqrtr=6) CE/HTC/WMI, W23 (fuxiwlanqrtr=7) passive scan, C2c (W26), C2d (W27), C2e (W28) and C2f (W29) '
-          'host tests passed')
+    print('W20 (fuxiwlanqrtr=6) CE/HTC/WMI, W23 (fuxiwlanqrtr=7) passive scan, C2c (W26), C2d (W27), C2e (W28), C2f (W29) and '
+          'C2h (W30) host tests passed')
 
 
 if __name__ == '__main__':
