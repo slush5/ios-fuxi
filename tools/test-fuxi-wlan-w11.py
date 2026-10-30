@@ -305,8 +305,8 @@ int main(void) {
         if(kind==5)((struct wl_context *)(wl_contexts.va+0x1800))->len=0;
         assert(finish_step() && !starts);contain();
     }
-    /* 6 is W20 and 7 W23 now (test-fuxi-wlan-ce.py); a value past the stages is refused, never a silent no-QRTR run. */
-    dev_on=false;setup(NULL);qrtr_arg=8;wl_probe_configure();assert(!wl_qrtr && wl_variant_invalid);
+    /* 6 is W20, 7 W23 and 8 W25 now (test-fuxi-wlan-ce.py); a value past the stages is refused, never a silent no-QRTR run. */
+    dev_on=false;setup(NULL);qrtr_arg=9;wl_probe_configure();assert(!wl_qrtr && wl_variant_invalid);
     setup(NULL);stop22_arg=0;qrtr_arg=1;wl_probe_configure();cache_drop=true;assert(run(20)==20);cache_drop=false;cleanup(20);
     setup(NULL);stop22_arg=0;qrtr_arg=1;wl_probe_configure();fail_nth_alloc=4;assert(run(20)==20);fail_nth_alloc=0;cleanup(20);
     start(0,true);wl_finish(27);assert(frees==allocations && !starts);dev_on=false;

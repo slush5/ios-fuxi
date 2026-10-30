@@ -1,14 +1,16 @@
-# W20-W24: copy engines, HTC and WMI init to WMI READY (WCN7850, `fuxiwlanqrtr=6`, C1), one passive scan (`fuxiwlanqrtr=7`, C2)
+# W20-W25: copy engines, HTC and WMI init to WMI READY (WCN7850, `fuxiwlanqrtr=6`, C1), one passive scan (`fuxiwlanqrtr=7`, C2), a passive scan service for iOS (`fuxiwlanqrtr=8`, C3)
 
 Status: C1 (c742af3) passed on the phone; C2 (39c80e5) ran clean on the phone (kit r1c2: 38 channels
 tuned, CHAN_INFO on all of them, no MGMT_RX at all); C2b (7caf3ed: CHAN_INFO detail and a pdev stats
-request per PHY pdev on top of C2) is committed, its readout boot is next; C2c (W26: host RX rings, the
-WBM idle link-descriptor list and the pdev chain masks, w20 0x100/0x200/0x400, all default off) is
-host-tested only (tools/test-fuxi-wlan-ce.py). Every line below that says what the target does is what
-the model does, built from Linux ath12k v6.19. C2, C2b and C2c are described in their own sections below
-([C2: W23/W24](#c2-w23w24-one-passive-scan-fuxiwlanqrtr7),
+request per PHY pdev on top of C2) is committed; C2c (c18f99d, W26: host RX rings, the WBM idle
+link-descriptor list and the pdev chain masks, w20 0x100/0x200/0x400, all default off) made the PHY report
+real busy time. C3 (W25, the scan service for iOS, rebased onto C2c, which it carries under qrtr 8 as
+under qrtr 7) is host-tested only (tools/test-fuxi-wlan-ce.py). Every line below that says what the target
+does is what the model does, built from Linux ath12k v6.19. C2, C2b, C2c and C3 are described in their own
+sections below ([C2: W23/W24](#c2-w23w24-one-passive-scan-fuxiwlanqrtr7),
 [C2b](#c2b-chan_info-detail-and-the-pdev-stats-requests-fuxiwlanqrtr7-diagnostic),
-[C2c: W26](#c2c-w26-host-rx-rings-the-wbm-idle-list-and-the-chain-masks-fuxiwlanqrtr7-w20-0x100-0x200-0x400)).
+[C2c: W26](#c2c-w26-host-rx-rings-the-wbm-idle-list-and-the-chain-masks-fuxiwlanqrtr7-and-8-w20-0x100-0x200-0x400),
+[C3: W25](#c3-w25-a-passive-scan-service-for-ios-fuxiwlanqrtr8)).
 
 After this boot's W15 WLAN_MODE reply, the radio lane programs the host side of copy engines CE0..CE4 on
 SRNG rings, posts RX buffers, completes HTC (READY, HTT and WMI connect, SETUP_COMPLETE_EX) and WMI init
@@ -29,13 +31,16 @@ file:line below is into that tree. UniXNU-sheng was not used for any line of cod
 | Knob | Values | Effect |
 |---|---|---|
 | `fuxiwlanqrtr=6` | | W11..W15 as `=5`, then W20..W22. Needs all 28 steps (`fuxiwlan=1` or `28`); refused with `fuxiwlankeep=1` or `fuxiwlanstop22=1`. The W15 knobs (`fuxiwlanw15`, `fuxiwlanw16`) apply. |
-| `fuxiwlanqrtr=7` | | C2: all of `=6`, then W23/W24 (one passive scan). Same gate and refusals as `=6`; on salami also `fuxiwlansalami=1`. |
-| `fuxiwlanqrtr` outside 0..7 | 8 (C3), negative, 9+ | refused (`W20 fuxiwlanqrtr=N is not 0..7 in this build; refused`). Before C1 these ran silently with no QRTR. |
-| `fuxiwlanw20=N` | 0 default | With qrtr 6 or 7: 0x01 NOHTT (no HTT connect; WMI then gets the next endpoint), 0x04 MRRS128 (endpoint PCIe Device Control max read request 128 bytes before CE init, low half only), 0x40 NOHWMODE (no PDEV_SET_HW_MODE). With qrtr 7 only: 0x02 HTTVER (HTT version request after HW mode), 0x10 BAND24 (the 13 2.4 GHz channels only), 0x80 PDEVCAP (the EXT MAC/PHY pdev id instead of 0), and C2c's 0x100 RXRING (host RX rings with 4095 buffers and their 4 HTT SRING_SETUP; only with 0x02), 0x200 IDLELINK (the WBM idle link-descriptor list), 0x400 CHAINMASK (PDEV_SET_PARAM TX/RX chain mask). Refused: 0x08 ACTIVE (would transmit probe requests) and 0x20 FULLBSSID (would log whole BSSIDs; the owner masks every BSSID) at every qrtr, the qrtr-7 bits with qrtr 6, 0x01 together with 0x02, 0x100 without 0x02, any other bit. |
+| `fuxiwlanqrtr=7` | | C2: all of `=6`, then W23/W24 (one passive scan). Same gate and refusals as `=6`; on salami also `fuxiwlansalami=1` (or `2`, C3). |
+| `fuxiwlanqrtr=8` | | C3: all of `=7` up to the station vdev (with the C2c W26 setup when a W26 bit is given), then W25 (the scan service for iOS, `fuxiwifiios=3`). Same gate and refusals as `=7`. |
+| `fuxiwlanqrtr` outside 0..8 | negative, 9+ | refused (`W20 fuxiwlanqrtr=N is not 0..8 in this build; refused`). Before C1 these ran silently with no QRTR. |
+| `fuxiwlanw20=N` | 0 default | With qrtr 6, 7 or 8: 0x01 NOHTT (no HTT connect; WMI then gets the next endpoint), 0x04 MRRS128 (endpoint PCIe Device Control max read request 128 bytes before CE init, low half only), 0x40 NOHWMODE (no PDEV_SET_HW_MODE). With qrtr 7 or 8 only: 0x02 HTTVER (HTT version request after HW mode), 0x10 BAND24 (the 13 2.4 GHz channels only; with qrtr 8 iOS then gets only those 13), 0x80 PDEVCAP (the EXT MAC/PHY pdev id instead of 0), and C2c's 0x100 RXRING (host RX rings with 4095 buffers and their 4 HTT SRING_SETUP; only with 0x02), 0x200 IDLELINK (the WBM idle link-descriptor list), 0x400 CHAINMASK (PDEV_SET_PARAM TX/RX chain mask). Refused: 0x08 ACTIVE (would transmit probe requests) and 0x20 FULLBSSID (would log whole BSSIDs; the owner masks every BSSID) at every qrtr, the qrtr-7 bits with qrtr 6, 0x01 together with 0x02, 0x100 without 0x02, any other bit. |
+| `fuxiwlansalami=2` | salami only | C3 profile (owner decision 7, to be confirmed): the gate of `=1`, plus the defaults `fuxiwlanclk=1`, `fuxiwlanprobe=civac`, `fuxiwlanseq=cycle,parf,dbi,eq,hostirq,msi,por,prefix` (the S4 set and the clock votes of the passing r1c1 kit). A boot-arg or ADT `/defaults` value of the same knob always wins; each default used prints `salami <knob> from the fuxiwlansalami=2 profile`. No `fuxiwlanmlo` default; never CLKON, cyclerails or `fuxiwlancnss=pdc`. Any value but 1 or 2 is refused as before (the refusal line still names `=1`, unchanged). |
 
 Refusals set `wl_variant_invalid`; salami refuses at init before any access, the Fuxi build at step 17.
-Every boot without `fuxiwlanqrtr=6` or `7` logs and behaves as before C1, and every boot with qrtr absent
-or 0..6 logs and behaves as before C2 (three differentials, see the C2 section).
+Every boot without `fuxiwlanqrtr=6`, `7` or `8` logs and behaves as before C1, every boot with qrtr absent
+or 0..6 as before C2, and every boot with qrtr absent or 0..7 as before C3 (three differentials each, see
+the C2 and C3 sections).
 
 ## Sequence (L19 core.c:1274-1300, 868-960)
 
@@ -558,7 +563,7 @@ starting with `W23 chan-info ` or `W23 stats `, except that in the 9 that reach 
 each, one per DBS PHY pdev) the containment line's counters move by exactly the sum of those exchanges'
 `ce tx X rx Y`.
 
-## C2c: W26, host RX rings, the WBM idle list and the chain masks (`fuxiwlanqrtr=7`, w20 0x100, 0x200, 0x400)
+## C2c: W26, host RX rings, the WBM idle list and the chain masks (`fuxiwlanqrtr=7` and `8`, w20 0x100, 0x200, 0x400)
 
 Why: C2 (r1c2) tuned all 38 channels and heard zero MGMT_RX, and r1c2b (w20 0x02) got VERSION_CONF 3.112
 and still zero. L19 never scans without two host resources C2 does not give: the WBM idle list of MSDU
@@ -582,7 +587,8 @@ accessors share). The arenas are `wl_rx_arena` and `wl_link_arena`, both in `wl_
 ### Gate and kits
 
 `WL23_BITS` gains 0x100 RXRING, 0x200 IDLELINK and 0x400 CHAINMASK; `WL20_BITS` (qrtr 6) does not, so
-qrtr 6 refuses all three. 0x100 needs 0x02 (L19 asks the HTT version before any ring announcement,
+qrtr 6 refuses all three. qrtr 8 (C3) takes `WL23_BITS` too, so the three bits, their rules and the W26
+setup are the same there (see C3, [With C2b and C2c](#with-c2b-and-c2c-the-rebase-onto-c18f99d)). 0x100 needs 0x02 (L19 asks the HTT version before any ring announcement,
 core.c:955 then 1143); with 0x01 the existing 0x01 + 0x02 rule refuses it too. 0x200 and 0x400 need no
 other bit. keep/stop22, 0x08, 0x20 and unknown bits stay refused. A valid qrtr 7 boot with a W26 bit
 prints, after the W23 selected line:
@@ -836,6 +842,307 @@ absent or 0..8 and w20 values without a W26 bit (the r1c2 and r1c2b kit sets inc
 the Fuxi build, byte for byte; 7caf3ed's model with all its C1, C2 and C2b scenarios (88 logs) against
 7caf3ed's and C2c's production code, byte for byte; and C2c's model + code against 7caf3ed's model + code:
 the 88 shared scenario logs byte for byte, C2c only adds scenarios after them.
+
+## C3: W25, a passive scan service for iOS (`fuxiwlanqrtr=8`)
+
+Code: the `/* ---- W25: the scan service for iOS ... ---- */` part of the W20 block of `fuxi_wlan.c`
+(`wl_w25_run`, `wl25_scan`, `wl25_stop`, `wl25_heard`, `wl25_end`), the copy of the 0104 handoff
+declarations in the W20 knob region (`/* ---- the scan handoff of patch 0104 ... ---- */`), the hooks in
+`fuxi_wlan_init` and `fw_thread`, and in `fuxi_wlan_ce.h` `wlwmi_encode_start_scan_list`, `wlscan_listed`,
+the scan-id filter (`wlscan.want_id`) and the MGMT_RX hook (`wlscan.heard`). The iOS side of the handoff is
+`bsd/dev/fuxi_wifi_radio.c` (patch 0104, K2; [wifi-ios.md](wifi-ios.md)). Plan:
+`op11-tools/salami-port/wlan/r1/ios_scan_plan.md` 2.2-2.5 and `overnight_plan.md` 3.2-3.4.
+
+Owner decisions applied as for C2 (passive only, nothing transmitted, K-W2 MAC, SSIDs in clear only in the
+W24 proof lines, every BSSID OUI-only, no data path, peer, key or join, the 38 channels, no 6 GHz), plus
+two the shop took for C3, to be confirmed by the owner and kept easy to change: decision 7, the
+`fuxiwlansalami=2` profile (one table, `wl_salami_defaults`), and decision 8, a 30-minute service
+(`WL25_LIFETIME_MS`), then containment and Wi-Fi off in iOS.
+
+C3 was written on C2 (39c80e5) and is rebased onto C2c (c18f99d, on C2b 7caf3ed). Log prefixes stay
+distinct: W23/W24 are C2's lines, `W23 chan-info` and `W23 stats` C2b's, W25 C3's, W26 C2c's.
+
+### With C2b and C2c (the rebase onto c18f99d)
+
+- C2c runs under qrtr 8 exactly as under qrtr 7. Its bits are `WL23_BITS` (0x100 only with 0x02; 0x08,
+  0x20 and every other bit still refused; keep/stop22 still refused), read in W20 init with the same
+  `W26 selected` line, which a qrtr 8 boot prints before its `W25 selected` line. The W26 setup sits in the
+  path both stages share: at W20 the arenas, the idle list and the refill ring (`wl26_setup`), at W23
+  right after VERSION_CONF the four SRING_SETUP, the setup watch and the chain masks before the channel
+  list (`wl26_rings`), all before the W25 hook after the vdev lines. So a C3 boot can carry the w20
+  combination that made the PHY report real busy time and frames arrive (r1c2c, see C2c), with the same
+  register allowlists, the same containment (`wl26_contain` first, after the W25 summary) and the same
+  free (only in wl5_abort's proven branch after bus master off and PERST).
+- The C2c watches and the W26 report follow the first W25 scan only: `started` at the first poll pass
+  that sees STARTED, `mid` at the first pass with foreign >= (n + 1) / 2 (n = that request's channels),
+  `completed` as soon as that scan ended (whatever its end), before its W24 lines; then, after the first
+  scan's W25 line, the C2b flush and the W26 content, guard, error-ring, link, counter, D4 and D5 lines
+  (the D5 hint only when that scan completed with no frame). Why only the first: the four watch slots are
+  one-shot (`wl_rx.w[].taken`) and are what the r1c2c readout compares, a W26 report is about ten lines,
+  and 30 minutes of scans would bury the W25 lines; the containment recount (D3, `W26 rx guard after
+  containment`) still covers the whole service. The CHAN_INFO notes behind D4 (`wlrx_note_ci`) keep
+  counting in every scan, but are printed only in that first report.
+- C2b's post-scan stats belong to the one-shot qrtr 7 run only: the W25 service never calls `wl23_stats`
+  (no REQUEST_STATS in any scan, checked by the model and statically). C2b's `W23 chan-info` lines print in
+  the first W25 scan only (`wl25_ci_off`, the cap of 128 still applies), like C2's foreign-channel lines.
+- Not resolved by the host: C2c posts its 4095 refill buffers once and never reaps the MAC rings (a
+  diagnostic rung). If the firmware turns out to need host RX buffers to hand MGMT_RX on, a long service
+  could use them up; the first scan's watches and the containment recount show how fast they go, and a
+  later rung would have to reap and repost them. The model lands RXDMA frames in the first W25 scan only.
+- C2b's rule that no line passes 254 bytes is now checked for C3 too: the service end is two lines
+  (`W25 service end: ...;` and `W25 service end rings: rx CE1 ... credits N`).
+
+### Hooks (every boot, every qrtr)
+
+`fuxi_wlan_init` tells the handoff why there is no radio, once, at the exit it takes:
+`fuxi_wifi_radio_stopped(NOT_REQUESTED)` (no `fuxiwlan`, code 0x10000), `REFUSED | 1` (salami without
+`fuxiwlansalami=1/2`, 0x20001), `REFUSED | 2` (salami invalid selector or cyclerails, 0x20002), or
+`fuxi_wifi_radio_starting()` just before `kernel_thread_start` and `NO_THREAD` (0x30000) if that fails.
+`fw_thread` calls `fuxi_wifi_radio_stopped(EXITED | detail)` once, after `thread exit`, on every exit: after
+fw_run (detail = its step << 8 | reason, 0 when every step passed; fw_run has run wl5_abort on every path
+that touched the device) or after a window mapping failure (detail 0xffff, nothing ran). The calls print
+nothing; without `fuxiwifiios=3` they only store the state word in fuxi_wifi_radio.c, so every radio-lane
+line is unchanged. 0099 does not include the 0104 header: the eight prototypes (the seven producer calls it
+uses plus `fuxi_wifi_radio_wanted`, below), the request struct and five
+`FUXI_WIFI_RADIO_*` defines are copied into fuxi_wlan.c, and two tests check them against the header word
+for word (tools/test-fuxi-wlan-ce.py, tools/test-fuxi-wifi-radio.py T6). The host harnesses that compile the
+W20 block without the handoff get link stubs that fail if called (tools/test-fuxi-wlan-m6.py, the salami
+gate harness records the calls).
+
+### Sequence (after the W23 vdev lines)
+
+1. `fuxi_wifi_radio_ready(freqs, n)` with the channels W23 gave the firmware: the 38 (or 13 with w20
+   0x10). C2 records no regulatory channel event to intersect with (`0x3a003` is logged only), so the list
+   is the one SCAN_CHAN_LIST sent; a channel the firmware cannot use shows as START_FAILED or nothing heard.
+2. Idle: every 10 ms a poll pass (`wl_ce_poll`: W11 events and guard, RX on CE2/CE1 with each buffer posted
+   again as it is consumed, TX completions, HTC credit reports), the lifetime check, `fuxi_wifi_radio_take`;
+   when that gives nothing, `fuxi_wifi_radio_wanted()`, false once the iOS side is STOPPED for the boot (its
+   own 3 timeouts in a row, no usable channel; terminal, so no request can come): the service ends there.
+   With `fuxiwifiios=3` absent, or with the user's Wi-Fi switch off, it stays true (the radio idles to its
+   lifetime, as before).
+3. One request: not passive -> `done(seq, EINVAL)`, nothing sent; its channels kept only where the W23 list
+   has them, each once, in its order; none left -> `done(seq, EINVAL)`, nothing sent. Else one START_SCAN
+   (`wlwmi_encode_start_scan_list`: the C2 command with only the scan id, the passive dwell and the channel
+   array changed; PASSIVE | CHAN_STAT_EVENT forced, no SSID, IE or probe), dwell = the request's when
+   50..200 ms (the iOS side's own rule, so both sides compute the same number), else 150; max_scan_time
+   n x dwell x 3/2 (the iOS side waits 1000 ms more); scan id 0xa001..0xafff in turn (ATH12K_SCAN_ID's block
+   with a 12-bit counter; SCAN_EVENTs of another id are counted in `wrong_id` and ignored, so a late event of
+   a stopped scan never ends the next one; they are said: `W25 ignored scan event` lines, 8 in the service,
+   the count and the last such id on each W25 line, the total in the service end, the count in a snapshot).
+4. While it runs, a poll pass every 1 ms. Every beacon or probe response the MGMT_RX parser keeps goes to
+   `fuxi_wifi_radio_frame(seq, frame, len, rx MHz, snr + noise floor, noise floor)` inside the call that has
+   its RX buffer, before the buffer is posted again (the iOS side parses and copies during the call).
+5. The end: COMPLETED -> `done(seq, 0)`; START_FAILED or DEQUEUED -> `done(seq, EIO)`;
+   `fuxi_wifi_radio_cancelled(seq)` -> STOP_SCAN (ath12k_scan_stop's values with this scan's id), at most
+   300 ms for its COMPLETED or DEQUEUED, `done(seq, ECANCELED)`; no STARTED in 1000 ms (L19 mac.c:5046-5053)
+   or no end by max_scan_time + 200 ms (mac.c:5385-5388), whichever comes first -> the same STOP_SCAN,
+   `done(seq, ETIMEDOUT)`. A STOP_SCAN not confirmed in 300 ms: `done()` all the same (that keeps the iOS
+   side's 1000 ms margin), then, before the next `take()`, poll passes every 1 ms for that scan's COMPLETED or
+   DEQUEUED until 3 s after the STOP_SCAN (L19 waits 3 s, mac.c:4902), so the next START_SCAN never meets an
+   abort still under way. A failed scan = START_FAILED, DEQUEUED, a timeout, or a cancel whose STOP_SCAN is
+   never confirmed in those 3 s; a completed scan resets the count; a cancel confirmed (in time or late) and a
+   refused request change nothing.
+6. The service ends after 1800 s (`W25 complete: lifetime over (1800 s); stop/contain`, then the normal
+   step 28 end into wl5_abort), when the iOS side has stopped (`W25 complete: the iOS side stopped;
+   stop/contain`, the same normal end), after 3 failed scans in a row (`W25 failure: W25 3 failed scans in a
+   row; contain, no retry`), or at the first failure of the transport, the guard, a credit wait (3000 ms) or
+   an encoder (the usual `W25 failure: ...` and snapshot). `wl_ce_contain` prints the W25 summary, then C2's
+   containment STOP_SCAN rule applies to the scan in flight (its id), then the latch. `fw_thread` reports
+   EXITED and iOS turns Wi-Fi off. Elapsed times come from mach_absolute_time, not from counted sleeps, so
+   the 1 ms and 10 ms polls taking longer than asked cannot stretch the bounds.
+
+Long runs: RX buffers are posted again one for one as they are consumed (`wlce_reap_rx`), so 62 stay out on
+each pipe whatever the number of scans; every send waits for its TX completion; credits come back in the
+firmware's trailer reports and an endpoint's count stops at 0xffff (`WLHTC_CREDITS_MOST`; L19 adds without
+a bound); every counter a decision uses is either reset per scan (the scan table, the failure run) or a
+difference of 64-bit milliseconds; the rest are only printed.
+
+### Logs
+
+```
+FUXI WLAN: W25 selected scan service for iOS (fuxiwifiios=3): passive only, nothing transmitted; 1800 s, or 3 failed scans in a row, then contain; first scan W24 lines, then one W25 line a scan   (at init)
+  ... W15, W20..W22 and the W23 chan list / vdev lines as for qrtr 7 ...
+FUXI WLAN: W25 service ready: 38 channels passive to iOS (2.4 GHz 13, 5 GHz 25), lifetime 1800 s
+FUXI WLAN: W23 scan foreign freq F                                         (the first scan sent only)
+FUXI WLAN: W23 chan-info freq F flags START ...                            (C2b, the first scan sent only)
+FUXI WLAN: W26 rx watch started ... / W26 idle watch started ...           (C2c with a W26 bit, the first scan only; mid likewise)
+FUXI WLAN: W26 rx watch completed ... / W26 idle watch completed ...       (the first scan only, before its W24 lines)
+FUXI WLAN: W24 bss aa:bb:cc:xx:xx:xx ch C freq F dBm S privacy P rsn R beacon frames N ssid "NAME"   (the first completed scan only)
+FUXI WLAN: W24 scan summary frames N bss M ssids K
+FUXI WLAN: W24 scan detail mgmt-rx N ...
+FUXI WLAN: W25 scan K seq S id 0xa001: 38 channels passive dwell 150 ms, completed after T ms, reason 0, status 0; frames N bss M, to iOS N kept K; scan events E, of another id 0 (last 0)   (scans 1..24, every 100th, the first 24 failed ones)
+FUXI WLAN: W26 rx content ... / rx guard ... / rxdma err ... / link content ... / counters ...   (C2c, after the first scan's W25 line only)
+FUXI WLAN: W25 scan K seq S: not passive, refused, nothing sent, status 22      (or "no listed channel, refused")
+FUXI WLAN: W25 complete: lifetime over (1800 s); stop/contain                  (or "the iOS side stopped")
+FUXI WLAN: W25 service end: lifetime over after 1800 s; scans N (completed A, failed F, cancelled C, refused R), frames to iOS N kept K; stops confirmed late L, scan events of another id W, credit waits H;
+FUXI WLAN: W25 service end rings: rx CE1 P/R CE2 P/R tx CE3 P/R credits N
+FUXI WLAN: W26 rx contain: host writes off; arenas held until bus master off, PERST and SMMU undo   (with a W26 arena)
+FUXI WLAN: W23 contain: scan over, no STOP_SCAN
+```
+
+Other ends of a W25 line: `start failed`, `dequeued`, `cancelled`, `no STARTED`, `no end by max + 200 ms`,
+the last three followed by `, stop confirmed`, `, stop confirmed late` or `, stop not confirmed` (Darwin
+errno: EIO 5, EINVAL 22, ETIMEDOUT 60, ECANCELED 89); `reason` is the firmware's, from COMPLETED,
+START_FAILED or DEQUEUED (0 when none came). An ignored SCAN_EVENT of another id prints
+`W25 ignored scan event 0xT of id 0xI (in flight 0xF)` (8 in the service); a snapshot taken while a W25 scan
+is in flight adds `W20 snapshot scan id 0xF: events of another id W (last 0xI), of another vdev V`. In the
+service an HTC credit wait (`W25 WMI START_SCAN waits for ...`) is said the first 16 times and every 100th,
+all of them counted in the service end. The W25 lines and the summary carry counts, reasons and scan ids
+only, never an SSID or a BSSID; the iOS side logs none either.
+
+### Host tests (C3)
+
+In tools/test-fuxi-wlan-ce.py, on the model's simulated clock (wl_sleep moves it, mach_absolute_time reads
+it), behind a fake iOS side that queues requests and records ready(), frames and done(): six requests in a
+row (the 38-channel type-3 scan, dwell 0 -> 150, a mixed list with 2484 MHz and 6 GHz dropped and a repeat,
+a non-passive one and an unlisted one refused with nothing sent, a DFS channel at 200 ms, a stale COMPLETED
+of the previous id ignored, every frame checked to be handed over inside the CE1/CE2 RX buffers); a cancel
+400 ms into a 38-channel scan (STOP_SCAN with its id, the target's leftovers dropped); START_FAILED, a reset by
+a good scan, an overrun (STOP_SCAN at max + 200 = 650 ms), DEQUEUED, no STARTED (STOP_SCAN at 1000 ms), the
+third failure in a row contained; an unanswered STOP_SCAN (300 ms, a failure, the next START_SCAN 3 s after
+it); 3 x START_FAILED; three unanswered STOP_SCANs in a row (contained with the third scan in flight on a
+healthy transport: containment's STOP_SCAN goes out and names that scan, 0xa003); an overrun at the
+request's dwell (200 ms: STOP_SCAN at 600 + 200 = 800 ms); a cancel whose STOP_SCAN is never answered
+(ECANCELED to iOS, a failed scan) and one answered 1 s late (a cancel, `stop confirmed late`, the next
+START_SCAN right after the late end); a guard failure after a START_SCAN (no STOP_SCAN, no doorbell);
+credit starvation (a START_SCAN waits 3000 ms, then containment, STOP_SCAN skipped); 30 idle minutes
+(180000 polls of 10 ms, the end at 1800 s); w20 0x10 (13 channels to iOS); 4100 scans in a row (62 RX
+buffers out on each pipe after 36900+ messages, every TX reaped, every credit back, ids wrapping after
+0xafff, W25 lines 1..24 and every 100th); the iOS side stopping after 2 scans (the idle service ends at its
+next poll, not at 1800 s); a target answering every SCAN_EVENT with 0xa000 (8 `ignored scan event` lines,
+the per-scan count and last id, the total; 3 timeouts contain); a target returning each START_SCAN credit
+only after its COMPLETED (247 waits in 250 scans, 18 wait lines, all counted; the START_FAILED 30th scan
+still gets its line); pure checks of the list encoder (equal to C2's but for id, dwell, channels; every
+refusal), the id filter and the credit bound. The model also fails any C3 run in which a due RX message
+finds no posted buffer for 1 s.
+
+END TO END: the real `xnu/fuxi-wifi-ios/fuxi_wifi_radio.c` (one unit, as tools/test-fuxi-wifi-radio.py
+builds it) linked with the radio lane model (another unit, `-DFUXI_WLAN_E2E`): the consumer asks
+`fuxi_wifi_radio_scan({2437, 5180}, passive, 150 ms)`; the firmware must see one START_SCAN of exactly those
+channels, PASSIVE, dwell 150, max 450; the two networks it beacons there come back through
+`fuxi_wifi_radio_results` with SSID, BSSID, frequency (the DS / HT operation channel), RSSI (SNR + floor),
+noise -95; `stopped(EXITED)` turns Wi-Fi off (`code 0x40000`); the iOS log names no SSID or BSSID.
+
+Mutants (16, each must fail for its own reason): the passive check dropped (the firmware sees a non-passive
+request), the NOT_REQUESTED stop dropped (salami gate suite), the EXITED stop dropped (static), no RX
+re-post (RX ring starved), the lifetime bound broken (ran past 1800 s), the scan-id filter dropped, no
+STOP_SCAN on a cancel, 3 failures never contain, containment's STOP_SCAN back to C2's 0xa000, the overrun
+deadline from the 150 ms dwell, an unconfirmed cancel not a failure, no wait for the end of an unconfirmed
+stop, the iOS side's stop never ending the service, the ignored-id lines dropped, the credit-wait line
+uncapped, failed scans past 24 not said. tools/test-fuxi-wifi-radio.py checks `fuxi_wifi_radio_wanted`
+(true while READY, with the user's Wi-Fi off, without a consumer and with `=4`; false after the 3 timeouts
+and after a stop; T9 mutant: always true). tools/test-fuxi-wlan-salami.py covers the qrtr 8 gate and
+the profile (defaults, explicit knobs winning on the cmdline and in ADT /defaults, the M2 recipe running
+with exactly the r1c1 knobs) and the hooks' order and codes; test-fuxi-wlan-w11/w15/w16.py the selector
+lattice up to 9.
+
+With C2b and C2c: `s_svc_c2c` runs the service behind a firmware that hands MGMT_RX on only with host
+buffers and links (C2c's `rx_rule` 2): without a W26 bit no frame reaches iOS and no W26 line or C2b stats
+line appears (C2b's 76 chan-info lines do); with w20 0x702 the W26 setup comes out as under qrtr 7 (link
+and RX arenas, ring 120, 4095 refill buffers, the four SRING_SETUP after VERSION_CONF, the chain masks before
+the channel list), the frames reach iOS in both of two 38-channel scans (24), the four watches and the W26
+report appear once, after the first scan, the chan-info and foreign lines in the first scan only, no
+REQUEST_STATS is sent, and containment prints the W25 summary, `W26 rx contain`, zeroes and frees both
+arenas. Static checks: `WL23_BITS` holds the W26 bits, `wl26_rings` runs before the W25 hook, each watch and
+`wl26_report` appears once in the service, behind `first`, and the service has no stats call. Every line
+of every C3 scenario is held to 254 bytes (C2b's `model_line`). tools/test-fuxi-wlan-salami.py: qrtr 8
+with each W26 kit value (and the refusals: 0x100, 0x301, 0x708, 0x720, 0xf02, keep), the same from ADT
+/defaults alone and split, and the C3 kit route below for the 9 kit values.
+
+### Proof that qrtr 0..7 are unchanged
+
+Before the rebase (C3 on C2): scripts in op11-tools/salami-port/wlan/r1/impl/c3-verify (verify.sh), run
+again after the review fixes from impl/c3-fix: the W15 harness log (qrtr 5, keep 0 and 1) of 39c80e5 and
+C3, byte for byte; the init/configure logs of 763 boot-arg sets on the salami and the Fuxi build, both
+through 39c80e5's own gate harness; 39c80e5's C1+C2 host model (65 scenario logs) built against 39c80e5's
+and C3's production code, byte for byte.
+
+After the rebase, against salami c18f99d (C2c), three differentials, each tree built from its own sources
+(a worktree of c18f99d next to the rebased tree; the driver's own cut functions, no copied code):
+
+1. Model, each tree its own: in each tree, `production()` of that tree's tools/test-fuxi-wlan-ce.py cuts
+   that tree's fuxi_wlan.c, and that tree's tools/fuxi-wlan-ce-model.c is built against it and that tree's
+   fuxi_wlan_ce.h with the test's own flags (ASan/UBSan, -Werror), with one hook added in a copy of the
+   model: at every `reset()` the scenario log so far (`logbuf`) is written to a numbered file. Both models
+   run all their scenarios. Result: the 151 scenario logs of c18f99d's model (1563024 bytes) equal the first 151 of the rebased model byte for byte (it adds 19 after them, the C3 scenarios), and its 34 summary lines are the rebased model's first 34.
+2. Model, crossed: c18f99d's model (with the same hook) built against the rebased tree's cut and header;
+   the W25 entry points it has no use for (`fuxi_wifi_radio_*`, `mach_absolute_time`,
+   `absolutetime_to_nanoseconds`) are stubs that abort if called. Result: its 151 scenario logs equal those of c18f99d's model on c18f99d's code, byte for byte, and no stub was called.
+3. Gate: in each tree, the salami and the Fuxi init harness assembled exactly as that tree's
+   tools/test-fuxi-wlan-salami.py `gate_suite` does (its `GATE_PRE`, the K-W1b knob source, the milestone
+   5 region, `fuxi_wlan_init`, its `GATE_MAIN`), run over every combination of `fuxiwlan` absent/0/1/11/27/28,
+   `fuxiwlansalami` absent/0/1/3, `fuxiwlanqrtr` absent or 0..7, 27 `fuxiwlanw20` values (absent, the C1
+   and C2 bits, 0x08, 0x20, -1, every C2c kit value, 0x100 without 0x02, 0x708, 0x720, 0xf02, 0x1000) and five
+   extras (none, keep, stop22, `fuxiwlanw15=1 fuxiwlanw16=3`, `fuxiwlanclk=1 fuxiwlanmlo=0x2d`), on the
+   cmdline, and every seventh set again split (the first knob on the cmdline, the rest in ADT /defaults as
+   mkadt-salami.py encodes them). The whole output (every console line, RESULT, NAMES) is compared byte for
+   byte, less the harness's `RADIO` line, which only the C3 harness has (it records what `fuxi_wlan_init`
+   tells patch 0104; the calls print nothing). Result: 66642 runs (salami and Fuxi builds), byte for byte equal.
+
+Left out by design, because C3 changes them: `fuxiwlanqrtr` 8, and -1 or 9 and beyond (the refusal line now
+says `not 0..8`), and `fuxiwlansalami=2` (refused before C3, the C3 profile now). The scripts
+(c3diff.py, cross.py) were run from the session's scratch space and are not part of the tree; the method
+above is what they do.
+
+### Kit (M2)
+
+The r1c1/r1c2 recipe with the C3 kernel: KIT_BASE `fuxitouch=1 fuxitclk=1000 fuxitouch_poll_us=2000
+fuxitouch_idle_us=4000 fuxicpuload=10`, cmdline extra `fuxicores=0x7c sweetfb_tegate=1 sweetfb_teguard=0
+fuxiwlan=28 fuxiwlanqrtr=8 fuxiwifiios=3`, KIT_ADT_EXTRA `--wlan-node --wlan-defaults fuxiwlansalami=2`,
+KIT_RO=0 (op11-tools/salami-port/wlan/r1/impl/c3-kit/build_c3_kit.sh). Computed the way
+logo-boot/build_kit_rel.sh and s31_build.sh build it (c3-kit/budget.sh, which reproduces the r1c1 and k2m1
+numbers): cmdline 526 characters (592 of 607 with the loader's 66, 15 free), ADT 16348 bytes (36 of 16384
+free). Without the profile (S4 + the wlan node) the ADT would be 16472 bytes and mkadt-salami.py refuses it.
+`sweetiolog=Preferences` does not fit on this KIT_BASE (615 of 607); dropping `fuxicpuload=10` (owner
+decision 4) would make it fit (600).
+
+Run M2 with `SESSION_SECONDS=3000 bash run_first_boot.sh --yes` (after `--local-only` and `--check-only`).
+The 1800 s lifetime starts at `W25 service ready`, minutes after the handoff, while the kit runner monitors
+1800 s from the handoff by default and renews the loader reset (15 min) only while it runs: with the default,
+the service end, its containment and the iOS `Wi-Fi reported off` line come after the monitor stopped, and
+the reset (2100 to 2700 s after the handoff) can come before them. With 3000 s the end is captured when W25
+is ready within 20 min of the handoff, and the reset comes at 3300 s or later.
+
+### Kit (M2c: C3 with the C2c rung)
+
+The same kernel, with the w20 combination of the C2c kit whose readout made frames arrive (r1c2c ladder;
+`<n>` in decimal, 1794 = 0x702 for all three W26 parts; 0x100 needs 0x02). The cmdline is full, so w20
+goes through ADT /defaults (`--wlan-defaults fuxiwlanw20=<n>`, a 4-byte int, 40 bytes of ADT), as for the
+C2c kits; `wl_arg` logs `salami fuxiwlanw20 from ADT /defaults`. Budget (the M2 numbers above plus the
+40-byte property; c3-kit/budget.sh has to confirm them before a build):
+
+- On M2's KIT_BASE as is, `--wlan-node --wlan-defaults "fuxiwlansalami=2 fuxiwlanw20=<n>"` makes the ADT
+  16388 bytes, 4 over the 16384 cap: mkadt-salami.py refuses it, and `fuxiwlansalami=2` (17 characters
+  with its space) does not fit the cmdline's 15 free either.
+- Recipe: drop `fuxicpuload=10` from KIT_BASE (owner decision 4, 15 characters with its space) and move
+  the profile to the cmdline. KIT_BASE `fuxitouch=1 fuxitclk=1000 fuxitouch_poll_us=2000
+  fuxitouch_idle_us=4000`, cmdline extra `fuxicores=0x7c sweetfb_tegate=1 sweetfb_teguard=0 fuxiwlan=28
+  fuxiwlanqrtr=8 fuxiwifiios=3 fuxiwlansalami=2` (528 characters, 594 of 607 with the loader's 66),
+  KIT_ADT_EXTRA `--wlan-node --wlan-defaults fuxiwlanw20=<n>` (16348 bytes: one number property in place of
+  the profile's), KIT_RO=0. The gate reads both the same way as the M2 shape (tools/test-fuxi-wlan-salami.py,
+  C3 kit route, for the 9 C2c kit values: profile defaults used, `w20 0x... valid 1`, `W26 selected`,
+  `W25 selected`).
+- Without owner decision 4 there is no fit on this KIT_BASE; the C2c kits' own route (r1c2's cmdline with
+  w20 in /defaults) stays the way to read the rung itself at qrtr 7.
+
+Expected, on top of M2's lines: `W26 selected: ...` after `W20 selected qrtr=8 ... w20 0x... valid 1`, the
+W26 W20/W23 setup lines as in r1c2c before `W25 service ready`, the watches and the W26 report around the
+first scan only, then the W25 lines; `W26 rx contain` after the W25 summary, and `W26 arenas zeroed` before
+`abort buffers freed`. Run it as M2 (`SESSION_SECONDS=3000`).
+
+### What only the device can answer (C3)
+
+Whether the firmware takes scan ids other than 0xa000 (L19 always sends 0xa000; the vendor host driver is
+believed to number its scans the same way, a 12-bit counter under the 0xa000 prefix, but that is from
+memory, not checked here). If every W25 scan gets START_FAILED while C2's scan started, the id is the first
+suspect: a build with `WLSCAN_ID_LAST` equal to `WLSCAN_ID_FIRST` = 0xa000 tests it (the id filter then
+cannot tell scans apart; the STOP_SCAN waits still bound that). If the target answers with an id of its own,
+the filter drops even START_FAILED, and every scan reads `no STARTED`: the log then shows `W25 ignored scan
+event ... of id 0xI` lines and `of another id N (last 0xI)` > 0 on the W25 lines with no STARTED. Ladder:
+0xI = 0xa000 -> the next build sets `WLSCAN_ID_FIRST` = `WLSCAN_ID_LAST` = 0xa000; any other fixed 0xI ->
+those two set to 0xI; an id that changes -> a build that sets no `want_id`. Also: how often wifid scans with
+Settings open and whether it cancels, the real time a 38-channel scan takes, and whether Settings lists
+what GET 11 returns (ios_scan_plan.md M2).
 
 ## Host tests
 

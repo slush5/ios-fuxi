@@ -336,13 +336,19 @@ lock; requests and records are copied, no pointer crosses, and the iOS side
 never sees MMIO or DMA. The tables (about 140 KB) are allocated only with
 `fuxiwifiios=3/4`.
 
-- `fuxiwifiios=3`: the producer is the radio lane (patch 0099). Its
-  STARTING/STOPPED calls are a later 0099 change, so in this build nothing
-  reports and the backend turns Wi-Fi off when iOS first asks for a scan or the
-  state, or 30 s after attach: `radio: no radio lane reported before iOS first
-  asked (code 0x50001); Wi-Fi reported off, no retry this boot` (or `within 30 s
-  of attach`, `0x50002`). With the hooks, a boot without `fuxiwlan` says
-  `radio: the radio lane stopped (code 0x10000); ...` instead.
+- `fuxiwifiios=3`: the producer is the radio lane (patch 0099). Since C3,
+  `fuxi_wlan_init` reports on every boot, before launchd: STARTING just before
+  its thread starts, or STOPPED with why not (`0x10000` no `fuxiwlan`,
+  `0x20001`/`0x20002` salami refusals, `0x30000` no thread); its thread reports
+  STOPPED `0x4XXXX` after its containment, on every exit (XXXX = the failing
+  step << 8 | reason, 0 when every step passed). With `fuxiwlanqrtr=8` the
+  thread's W25 service says READY with its channel list and serves the scans
+  (docs-lanes/wlan-w20.md, C3), for 30 minutes, then contains and stops. While
+  STARTING (minutes, from power-up through WMI READY) a scan is over at once
+  with ENETDOWN and Wi-Fi stays on with an empty list. A kernel whose radio lane
+  never reports (no 0099 hooks) still gets Wi-Fi off when iOS first asks for a
+  scan or the state, or 30 s after attach: `radio: no radio lane reported before
+  iOS first asked (code 0x50001); ...` (or `within 30 s of attach`, `0x50002`).
 - `fuxiwifiios=4`: the canned producer, no radio: four networks with locally
   administered BSSIDs `02:46:55:58:4a:01..04`, one channel every 40 ms: "Fuxi
   Canned WPA2" (channel 6 heard on 5, the DS correction, RSN, -48 dBm), "Fuxi
@@ -362,9 +368,13 @@ never sees MMIO or DMA. The tables (about 140 KB) are allocated only with
 - Wi-Fi goes off for the boot when the producer stops, when 3 scans in a row
   time out (`0x60003`), when there is no producer, or when `ready()` names no
   listed channel (`0x7000n`, n channels named: MHz expected, no 6 GHz); SET 19
-  "on" is answered and Wi-Fi stays off.
+  "on" is answered and Wi-Fi stays off. A radio lane serving scans (C3) then
+  ends its service at its next idle poll (`W25 complete: the iOS side stopped`)
+  and contains; the user's own Wi-Fi switch only cancels and ends nothing.
 - Producer API, for the radio lane: `starting`, `ready(freqs)`, `take`,
-  `cancelled(seq)`, `frame(seq, frame, length, MHz, dBm, noise)` or
+  `cancelled(seq)`, `wanted()` (C3: false once STOPPED, so the radio lane's
+  service ends when this side has given up instead of idling to its lifetime;
+  true with `=4`), `frame(seq, frame, length, MHz, dBm, noise)` or
   `bss(seq, record)`, `done(seq, status)`, `stopped(code)`. It never sleeps and
   never calls the iOS side; before the consumer exists only the state word is
   stored. Stop codes are class << 16 | detail: 1 not requested, 2 refused,
@@ -380,6 +390,20 @@ never sees MMIO or DMA. The tables (about 140 KB) are allocated only with
 - `fuxiwifiios=1` and `=2` are unchanged: the same lines and the same GET 11
   bytes (no noise figure, an active channel `0x8a`, a room of 0 still gives no
   elements).
+- M2 (C3: `fuxiwifiios=3` with `fuxiwlan=28 fuxiwlanqrtr=8` and ADT
+  `fuxiwlansalami=2`, `--wlan-node`): `radio: radio producer ready, 38 channels
+  (13 at 2.4 GHz, 25 at 5 GHz), passive only`, then per scan `radio: scan K: 38
+  channels passive, R heard (...), T ms, status 0` (T about 5.7 s for 38
+  channels), and at the end `radio: the radio lane stopped (code 0x40000); Wi-Fi
+  reported off, no retry this boot`. tools/test-fuxi-wlan-ce.py links this
+  unit's fuxi_wifi_radio.c with the radio lane model end to end (a request of
+  {2437, 5180} out as one passive START_SCAN of those channels, the beaconed
+  networks back through `fuxi_wifi_radio_results` intact).
+- M2c (C3 rebased onto the C2c RX rung): M2 with the C2c w20 bits in ADT
+  /defaults (`--wlan-defaults fuxiwlanw20=<n>`) and `fuxiwlansalami=2` on the
+  cmdline instead of `fuxicpuload=10` (the ADT has no room for both numbers;
+  docs-lanes/wlan-w20.md, C3, Kit (M2c)). This side's lines are those of M2;
+  only the radio lane adds its W26 lines around the first scan.
 - `tools/fuxi-wifi-ios-test.c --scan-only` lists what one scan heard (band,
   channel, RSSI, privacy, RSN, the name's length) and refuses any join on these
   backends. `scan PASS` (exit 0) only when a network was heard; none is
@@ -437,7 +461,9 @@ reason, 20000 fuzzed frames), the table, a fake radio lane (passive forced,
 GET 11 field by field, timeouts, a stop or a power-off mid-scan, no producer,
 READY while the backstop re-arms, a `ready()` with no usable channel), the
 canned producer, a default boot that allocates nothing, static rules for the
-leaf lock and the producer, and 17 mutants. The model's radio thread call
+leaf lock and the producer (and that patch 0099's copy of the producer API,
+its request struct and stop codes equals sys/fuxi_wifi_radio.h), and 17
+mutants. The model's radio thread call
 follows XNU's ONCE rule: entered while it runs, it runs once more, when the
 last entry says.
 

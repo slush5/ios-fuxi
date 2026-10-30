@@ -5,7 +5,10 @@
  * MGMT_RX parsing and a BSS table; nothing is transmitted on the air. C2b:
  * the CHAN_INFO words and the pdev stats answer after the scan. C2c (W26,
  * w20 0x100/0x200/0x400): host RX rings, the WBM idle link-descriptor list
- * and the pdev chain masks, with the watch, content and guard counts.
+ * and the pdev chain masks, with the watch, content and guard counts. W25
+ * (fuxiwlanqrtr=8, C3): the same scan as a service for the iOS side, passive
+ * scans of a request's channels (wlwmi_encode_start_scan_list), events of
+ * other scan ids ignored, the MGMT_RX frames handed on (wlscan.heard).
  * Pure C: no XNU or Linux includes. The includer provides uint8_t..uint64_t,
  * size_t, bool and memcpy (bsd/dev/fuxi_wlan.c in the kernel,
  * tools/fuxi-wlan-ce-model.c on the host).
@@ -561,6 +564,7 @@ wlce_send(struct wlce *ce, const struct wlce_io *io, struct wlce_pipe *p, uint32
 #define WLHTC_PIPEDIR_IN 1u             /* ce.h:35-39 */
 #define WLHTC_PIPEDIR_OUT 2u
 #define WLHTC_PIPEDIR_INOUT 3u
+#define WLHTC_CREDITS_MOST 0xffff       /* C3: an endpoint never holds more (READY's count is a u16) */
 _Static_assert(WLHTC_READY_BYTES == 8 && WLHTC_CONNECT_RESP_BYTES == 12, "HTC wire sizes");
 
 struct wlhtc_ep {
@@ -636,7 +640,10 @@ wlhtc_init(struct wlhtc *htc, const uint32_t (*map)[3], unsigned n)
  * {eid, credits, pad, pad} (htc.c:144-233). A record longer than what is left
  * is an error (L19 compares against the length before its header); a report
  * for an endpoint >= 9 ends that record as in L19; credits for an endpoint
- * that is not a connected credit-flow endpoint are counted and dropped. */
+ * that is not a connected credit-flow endpoint are counted and dropped. An
+ * endpoint's credits stop at WLHTC_CREDITS_MOST (C3: a service runs for 30
+ * minutes, and a target that over-reports must not wrap the int; L19 adds
+ * without a bound, htc.c:165). */
 static inline int
 wlhtc_trailer(struct wlhtc *htc, const uint8_t *p, uint32_t len)
 {
@@ -650,8 +657,10 @@ wlhtc_trailer(struct wlhtc *htc, const uint8_t *p, uint32_t len)
 			for (uint32_t i = 0; i + 4 <= rlen; i += 4) {
 				uint32_t e = p[4 + i], c = p[5 + i];
 				if (e >= WLHTC_EPS) { htc->bad_reports++; break; }
-				if (htc->ep[e].used && htc->ep[e].flow) { htc->ep[e].credits += (int)c; }
-				else { htc->bad_reports++; }
+				if (htc->ep[e].used && htc->ep[e].flow) {
+					htc->ep[e].credits = htc->ep[e].credits > WLHTC_CREDITS_MOST - (int)c ? WLHTC_CREDITS_MOST :
+					    htc->ep[e].credits + (int)c;
+				} else { htc->bad_reports++; }
 			}
 		}
 		p += 4 + rlen; len -= 4 + rlen;
@@ -1438,6 +1447,15 @@ wlscan_chan(uint32_t i)
 static inline bool wlscan_is_dfs(uint32_t mhz) { return (mhz >= 5260u && mhz <= 5320u) || (mhz >= 5500u && mhz <= 5720u); }
 static inline uint32_t wlscan_max_time(uint32_t n) { return n * WLSCAN_DWELL_PASSIVE * 3u / 2u; }
 
+/* C3: whether MHZ is one of the first N channels of the list (the ones the
+ * channel list gave the firmware: 38, or 13 with w20 0x10). */
+static inline bool
+wlscan_listed(uint32_t mhz, uint32_t n)
+{
+	for (uint32_t i = 0; i < n && i < WLSCAN_NCHAN; i++) { if (wlscan_chan(i) == mhz) { return true; } }
+	return false;
+}
+
 static inline uint32_t
 wlwmi_popcount(uint32_t v)
 {
@@ -1605,6 +1623,30 @@ wlwmi_encode_start_scan(uint32_t n, uint32_t max_time, uint8_t *out, uint32_t ro
 	return 0;
 }
 
+/* C3 (W25, one scan per iOS request): the START_SCAN above for the N
+ * channels of MHZ, scan id ID and passive dwell DWELL ms; then only those
+ * three things differ. PASSIVE and CHAN_STAT_EVENT stay forced (there is no
+ * flags argument), still no SSID, IE or probe. Refused: N outside 1..38, a
+ * channel not on the list, a dwell outside 50..200 ms (the iOS side's own
+ * range), an id outside WLSCAN_ID_FIRST..WLSCAN_ID_LAST. Ids: ATH12K_SCAN_ID
+ * (0xa000, the C2 scan) with a 12-bit counter in the low bits, so a late
+ * event of an earlier scan never matches the scan in flight. */
+#define WLSCAN_ID_FIRST 0xa001u
+#define WLSCAN_ID_LAST 0xafffu
+static inline int
+wlwmi_encode_start_scan_list(const uint16_t *mhz, uint32_t n, uint32_t id, uint32_t dwell, uint32_t max_time,
+    uint8_t *out, uint32_t room, uint32_t *len)
+{
+	if (!mhz || n > WLSCAN_NCHAN || dwell < 50u || dwell > 200u || id < WLSCAN_ID_FIRST || id > WLSCAN_ID_LAST) { return 1; }
+	for (uint32_t i = 0; i < n; i++) { if (!wlscan_listed(mhz[i], WLSCAN_NCHAN)) { return 1; } }
+	if (wlwmi_encode_start_scan(n, max_time, out, room, len)) { return 1; }
+	uint8_t *f = out + 4, *p = f + WLWMI_START_SCAN_BYTES + 4u;
+	wlce_put32(f + 4 * WLWMI_SS_SCAN_ID, id);
+	wlce_put32(f + 4 * WLWMI_SS_DWELL_PASSIVE, dwell);
+	for (uint32_t i = 0; i < n; i++) { wlce_put32(p + 4 * i, mhz[i]); }
+	return 0;
+}
+
 /* What the scan heard. One entry per BSSID: the strongest reception's
  * frequency and dBm, every flag seen, the first usable SSID. */
 enum { WLSCAN_SSID_NONE, WLSCAN_SSID_OK, WLSCAN_SSID_HIDDEN, WLSCAN_SSID_BAD };
@@ -1632,6 +1674,12 @@ struct wlscan {
 	uint32_t nbss;
 	struct wlscan_bss bss[WLSCAN_BSS_MAX];
 	const char *why;
+	/* C3 (W25), 0 in C2 (wlscan_init): the scan id SCAN_EVENTs must carry (0 = any; others counted in
+	 * wrong_id and ignored), and who gets every beacon or probe response the table took, during the
+	 * call that has its RX buffer: the frame, its length, the RX MHz, dBm (SNR + noise floor), the floor. */
+	uint32_t want_id, wrong_id;
+	void (*heard)(void *ctx, const uint8_t *frame, uint32_t len, uint32_t mhz, int32_t dbm, int32_t nf);
+	void *heard_ctx;
 };
 
 static inline void
@@ -1689,6 +1737,7 @@ wlscan_parse_event(struct wlscan *s, const uint8_t *p, uint32_t len)
 	s->ev_type = wlce_get32(v); s->ev_reason = wlce_get32(v + 4); s->ev_freq = wlce_get32(v + 8);
 	s->ev_scan_id = wlce_get32(v + 16); s->ev_vdev = wlce_get32(v + 20);
 	if (s->ev_vdev != WLWMI_VDEV_ID) { s->wrong_vdev++; return 0; }
+	if (s->want_id && s->ev_scan_id != s->want_id) { s->wrong_id++; return 0; }   /* C3: another scan's */
 	bool starting = !s->started && !s->start_failed && !s->done, running = s->started && !s->done;
 	switch (s->ev_type) {
 	case WLWMI_SCAN_EV_STARTED:
@@ -1867,6 +1916,7 @@ wlscan_parse_mgmt_rx(struct wlscan *s, const uint8_t *p, uint32_t len)
 	if (!b.chan) { b.chan = (uint8_t)channel; }
 	s->frames++;
 	wlscan_bss_add(s, &b);
+	if (s->heard) { s->heard(s->heard_ctx, frame, buf_len, freq, b.dbm, s->noise_floor); }   /* C3: still in its RX buffer */
 	return 0;
 }
 
