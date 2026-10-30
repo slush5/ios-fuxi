@@ -1412,9 +1412,19 @@ needs.
    ring 128/130/132, REO reinject 16; then C2d's WBM2SW3 release 131 and REO2SW0 exception 0; then `wl29_common_post`: REO
    command 20 with its command-number init and REO status 21; then `ath12k_hal_reo_hw_setup`); then the RX refill and
    monitor status fills. With cookie conversion on the refill buffer cookies are the cookie-converted shape (ppt << 9 | spt).
-   No CMEM region: `W29 cookie conversion not programmed: ...; w20 0x4000 cc dropped for this boot`, the rings still run.
+   Ownership first (review fix H1): `wl29_cc_init` is called inside `wl27_setup`, after C2d's REO pre-reads and W29's
+   common-ring pre-reads, and touches CMEM only when both are ours; its CMEM writes still come before the first common-ring
+   write. It then pre-reads the six cc_config registers (REO cfg0/1, WBM cfg0/1/2, convert; read allowlist only) and drops
+   cc if either cfg0 is non-zero, REO cfg1 has ENABLE or GLOBAL_ENABLE, or the convert-config has GLOBAL_EN (hal.h:284,
+   333-334). The CMEM region is checked before any use (review fix M1): upper 32 bits zero, start 4-byte aligned in
+   [0x80000, 0x2000000) with all 280 PPT entries below 0x2000000, size >= 0x460; every CMEM address must fall inside
+   start..start+size, the region is cleared at the start of each QMI capability parse, and `wl_win` refuses an offset
+   past its 6-bit window field. Any of these (REO or common rings not ours, no region, region out of bounds, a cc register
+   already configured, a PPT entry non-zero): one `W29 cookie conversion not programmed: ...; w20 0x4000 cc dropped for
+   this boot` line, no CMEM write, no cc_config write; the rings that are ours still run.
 2. W21, after `W21 wmi service ready complete` and before INIT (core.c:923 < 925): `wl29_cc_config` writes the REO and WBM
-   cookie configuration registers, then C2d's eight REO destination rings.
+   cookie configuration registers (only with cc on, the REO path on and the common rings ours), then C2d's eight REO
+   destination rings.
 3. W23: `wl29_macstart_pre` (PMF_QOS 1, DYNAMIC_BW 1, ARP_AC_OVERRIDE 0, the DFS phyerr offload, the two HTT PPDU_STATS_CFG,
    MESH_MCAST 1) before the chain mask; `wl29_macstart_post` (LRO config with fixed zero seeds, idle-PS 1) after the channel
    list; `wl29_encap_decap` (TX_ENCAP_TYPE then RX_DECAP_TYPE, ETHERNET when service 461 is set, else NATIVE_WIFI) right
@@ -1741,7 +1751,13 @@ the latch, no transmit and no ring post, cc gated on the CMEM region, the latch 
 cc_config addresses and values, the CMEM/PPT/SPT and cookie math (DEFAULT profile 24 rx + 256 tx pages, ppt << 9 | spt, page
 paddr >> 12), the ten common rings (ids, hal.h + hw.c R0/R2 bases, dp.h sizes with tx_comp 32768, hal_desc.h entry dwords
 8/8/8/12/28 by struct walk, dp.c TX vs other thresholds, the src/dst hw-init word encodings) and the mac-start / encap /
-PPDU enum values; the model's dump word by word. Mutants (`C2F_MUTANTS`, 24 rules broken once each) are all caught.
+PPDU enum values; the model's dump word by word. The review fixes add `s_c2f_gate`: the production `wl27_setup` and
+`wl29_cc_config` against the REO script and a W29 register file / CMEM window of the model's own (CMEM written after every
+pre-read and before the first common-ring write; REO owned or common rings owned: no CMEM and no cc_config write, cc_config
+refusing even with cc_on forced; each cc register showing configured or unreadable: cc dropped with its line, field bits
+alone not; the CMEM region absent, too small, below 0x80000, at or past 0x2000000, misaligned or with upper bits: dropped,
+no CMEM access, the two boundaries accepted; the CMEM allowlist inside start..start+size; `wl_win` refusing an offset past
+its field without touching the window register). Mutants (`C2F_MUTANTS`, 41 rules broken once each) are all caught.
 test-fuxi-wlan-salami.py covers the gate for 0x4000 (cmdline and ADT /defaults, the kit route with 32514 in /defaults).
 
 What only the device can answer: whether the firmware fetches from the rings at all with zero interrupt

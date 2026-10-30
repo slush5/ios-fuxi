@@ -3475,7 +3475,7 @@ static bool wl13_delayed, wl13_negotiated;
 static bool wl14_ready, wl14_init_done, wl14_board_valid;
 static uint64_t wl15_ready_time;
 static uint32_t wl14_board;
-static uint32_t wl_cmem_base; static bool wl_cmem_valid;   /* C2f: QMI dev_mem[0] CMEM region, read in wl_qmi_cap */
+static uint64_t wl_cmem_base, wl_cmem_size; static bool wl_cmem_valid;   /* C2f: QMI dev_mem[0] CMEM region as reported, read in wl_qmi_cap */
 static int wl_w12_run(void);
 static int wl_qmi_w12(const uint8_t *, unsigned);
 
@@ -3660,6 +3660,7 @@ wl_qmi_cap(const uint8_t *p, unsigned len)
 		/* Unsolicited indications and unrelated transactions are not replies. */
 		return 0;
 	}
+	wl_cmem_valid = false; wl_cmem_base = wl_cmem_size = 0;   /* C2f: set again only from this reply's dev_mem[0] */
 	uint32_t seen = 0, chip = 0, family = 0, board = 0, soc = 0, version = 0;
 	char stamp[33] = "absent", build[129] = "absent";
 	uint32_t macs = 0, mv = 0, hz = 0, otp = 0, cal_timeout = 0, chain = 0;
@@ -3759,9 +3760,9 @@ wl_qmi_cap(const uint8_t *p, unsigned len)
 	}
 	wl14_board = board; wl14_board_valid = !!(seen & (2u << 1));
 	/* C2f: the CMEM region (dev_mem[0], ATH12K_QMI_DEVMEM_CMEM_INDEX) cookie
-	 * conversion needs; low 32 bits as the window accessor takes. Kept for W29
-	 * only; refused there if absent. */
-	if ((seen & (2u << 12)) && dev_size[0]) { wl_cmem_base = (uint32_t)dev_start[0]; wl_cmem_valid = true; }
+	 * conversion needs, as reported. Kept for W29 only; refused there if absent
+	 * or out of bounds (wlcm_cmem_region_ok, before any use). */
+	if ((seen & (2u << 12)) && dev_size[0]) { wl_cmem_base = dev_start[0]; wl_cmem_size = dev_size[0]; wl_cmem_valid = true; }
 	wl_cap_done = true;
 	return 0;
 }
@@ -4870,7 +4871,8 @@ static void wl29_report(void);
 static int
 wl_win(uint32_t off, bool wr, uint32_t *value)
 {
-	uint32_t saved = wl_mrd(0x310c), win = (saved & ~0x3fu) | 0x40000000 | (off >> 19);
+	if ((off >> 19) > 0x3fu) { return 1; }   /* the 6-bit window field: an offset beyond it is refused, never folded into the register */
+	uint32_t saved = wl_mrd(0x310c), win = (saved & ~0x3fu) | 0x40000000 | ((off >> 19) & 0x3fu);
 	if (saved == ~0u || fw_faults) { return 1; }
 	wl_mwr(0x310c, win);
 	int e = wl_mrd(0x310c) != win || fw_faults;
@@ -5590,7 +5592,6 @@ wl26_setup(void)
 		    (unsigned)wl_cm_arena.size, wl_cm.rdp_iova, wl_cm.spt_iova);
 	}
 	if ((wl20_bits & WL20_IDLELINK) && wl26_idle()) { return 1; }
-	if (wl29_cc_init()) { return 1; }   /* C2f: cookie converter, after the idle list and before the common SRNGs (dp_alloc order) */
 	if (wl27_setup()) { return 1; }  /* C2d: release and exception rings, REO setup (dp_alloc's common setup, before its RX alloc) */
 	if (wl20_bits & WL20_RXRING) {
 		if (wlrx_fill_refill(&wl_rx) || wlrx_publish_refill(&wl_rx, &wl_ce_io)) { return wl_w11_fail("W26 refill fill"); }
@@ -5984,6 +5985,7 @@ wl27_setup(void)
 	    p[3u * WLRD_NRING + 7u], wl_rd.own == WLRD_FREE ? "not owned" : "refused");
 	if (wl_rd.own != WLRD_FREE) {
 		printf("FUXI WLAN: W27 reo not programmed: %s; w20 0x1000 dropped for this boot\n", wlrd_why(wl_rd.own));
+		if (wl29_cc_init()) { return 1; }   /* C2f: cc dropped with the REO path (its line; nothing written); silent without 0x4000 */
 		return 0;
 	}
 	if (wl29_common_pre()) { return 1; }   /* C2f: SW2WBM release, TCL+comp x3, reinject (L19 common setup, before rx_rel) */
@@ -6232,8 +6234,9 @@ wl28_report(void)
  * 0x100 and 0x02) (docs-lanes/wlan-w20.md, C2f; the layout, encoders, cc cookie
  * math, allowlists and guards are in fuxi_wlan_ce.h). In L19's order: at dp_alloc
  * (wl26_setup), after the idle list and before the common SRNGs, ath12k_dp_cc_init
- * (wl29_cc_init: the CMEM PPT table and the SPT pages, gated on the QMI CMEM
- * region, dropped for the boot without it); inside wl27_setup the common rings of
+ * (wl29_cc_init: the CMEM PPT table and the SPT pages, called inside wl27_setup
+ * once the REO and common-ring pre-reads show both ours, gated on the QMI CMEM
+ * region and the cc_config pre-reads, dropped for the boot otherwise); inside wl27_setup the common rings of
  * ath12k_dp_srng_common_setup around C2d's rel/exc (wl29_common_pre: SW2WBM
  * release, three TCL data rings each with its WBM completion ring, the REO
  * reinject ring; wl29_common_post: the REO command ring with its command-number
@@ -6314,22 +6317,34 @@ wl29_ring(unsigned i)
 }
 
 /* dp_alloc's cookie-converter init (ath12k_dp_cc_init, dp.c:1583-1667): the PPT
- * table in CMEM and the SPT pages. Gated on the QMI CMEM region; dropped for the
- * boot (cc_config and the converted-entry decode go with it) when it is absent or
- * already owned. On success the RX buffer cookies and the returned entries become
- * cookie-converted. */
+ * table in CMEM and the SPT pages. Called from wl27_setup once C2d's REO
+ * pre-reads and W29's common-ring pre-reads are read, before any common-ring
+ * write; only when both are ours. Gated then on the QMI CMEM region (present
+ * and within bounds) and on the six cc_config registers and the 280 PPT entries
+ * pre-reading as unconfigured; otherwise dropped for the boot, one line (cc_config
+ * and the converted-entry decode go with it). On success the RX buffer cookies
+ * and the returned entries become cookie-converted. */
 static int
 wl29_cc_init(void)
 {
+	uint32_t regs[WLCM_CC_REGS][2];
 	unsigned own;
 	if (!(wl20_bits & WL20_L19ORDER)) { return 0; }
-	wl_cm.cmem_base = wl_cmem_base; wl_cm.cmem_valid = wl_cmem_valid;
-	if (!wl_cmem_valid) {
-		printf("FUXI WLAN: W29 cookie conversion not programmed: %s; w20 0x4000 cc dropped for this boot\n", wlcm_why(WLCM_NOCMEM));
-		return 0;
+	own = wl_rd.own != WLRD_FREE ? WLCM_REO_OWNED : !wl_cm.rings_on ? WLCM_RINGS_OWNED : WLCM_FREE;
+	if (own == WLCM_FREE) {   /* the region QMI reported, validated before any use */
+		wl_cm.cmem_base = (uint32_t)wl_cmem_base; wl_cm.cmem_size = wl_cmem_size;
+		wl_cm.cmem_valid = wl_cmem_valid && wlcm_cmem_region_ok(wl_cmem_base, wl_cmem_size);
+		own = !wl_cmem_valid ? WLCM_NOCMEM : !wl_cm.cmem_valid ? WLCM_CMEM_BAD : WLCM_FREE;
 	}
-	for (unsigned i = 0; i < WLCM_NSPT; i++) { wl_cm.ppt_pre[i] = wl29_cmem_rd(wlcm_ppt_addr(&wl_cm, i)); }
-	own = wlcm_cmem_owned(&wl_cm);
+	if (own == WLCM_FREE) {   /* the six cc_config registers, refused when already configured */
+		wlcm_cc_regs(&wl_cm, 0u, 0u, regs);
+		for (unsigned k = 0; k < WLCM_CC_REGS; k++) { wl_cm.cc_pre[k] = wl29_reg_rd(regs[k][0]); }
+		own = wlcm_cc_owned(wl_cm.cc_pre);
+	}
+	if (own == WLCM_FREE) {
+		for (unsigned i = 0; i < WLCM_NSPT; i++) { wl_cm.ppt_pre[i] = wl29_cmem_rd(wlcm_ppt_addr(&wl_cm, i)); }
+		own = wlcm_cmem_owned(&wl_cm);
+	}
 	if (own != WLCM_FREE) {
 		printf("FUXI WLAN: W29 cookie conversion not programmed: %s; w20 0x4000 cc dropped for this boot\n", wlcm_why(own));
 		return 0;
@@ -6350,8 +6365,8 @@ wl29_cc_init(void)
 }
 
 /* The common-ring ownership pre-reads (wl27_setup calls this once, before the
- * pre group). Any owner: no common-ring write at all, W29 common rings dropped
- * for the boot (cc and C2d's own rings stand). */
+ * pre group). Any owner: no common-ring write at all, W29 common rings and cc
+ * dropped for the boot (C2d's own rings stand). */
 static int
 wl29_common_owned(void)
 {
@@ -6381,8 +6396,9 @@ wl29_common_pre(void)
 	static const unsigned pre[] = { WLCM_R_SW2WBM, WLCM_R_TCL0, WLCM_R_COMP0, WLCM_R_TCL1, WLCM_R_COMP1, WLCM_R_TCL2,
 		WLCM_R_COMP2, WLCM_R_REINJECT };
 	if (!(wl20_bits & WL20_L19ORDER)) { return 0; }
-	if (wl29_common_owned()) { return 0; }   /* dropped for the boot; C2d rings still run */
+	if (wl29_common_owned()) { return wl29_cc_init(); }   /* dropped for the boot; C2d rings still run; cc dropped with them */
 	wl_cm.rings_on = true;
+	if (wl29_cc_init()) { return 1; }   /* C2f: cookie converter, after the ownership checks and before the common SRNGs (dp_alloc order) */
 	for (unsigned j = 0; j < sizeof(pre) / sizeof(pre[0]); j++) { if (wl29_ring(pre[j])) { return 1; } }
 	return 0;
 }
@@ -6404,12 +6420,13 @@ wl29_common_post(void)
 
 /* ath12k_dp_cc_config (dp.c:1330-1380), at service ready before the REO
  * destination rings: the REO and WBM cookie configuration registers. CFG2 and
- * the convert-config are read-modify-write. Silent without cc. */
+ * the convert-config are read-modify-write. Silent without cc, and without the
+ * REO path and the common rings being ours. */
 static int
 wl29_cc_config(void)
 {
 	uint32_t regs[WLCM_CC_REGS][2], cfg2, conv;
-	if (!(wl20_bits & WL20_L19ORDER) || !wl_cm.cc_on) { return 0; }
+	if (!(wl20_bits & WL20_L19ORDER) || !wl_cm.cc_on || !wl_rd.reo_on || !wl_cm.rings_on) { return 0; }
 	cfg2 = wl29_reg_rd(WLCM_WBM_CC_CFG2);
 	conv = wl29_reg_rd(WLCM_WBM_CC_CONVERT);
 	if (cfg2 == ~0u || conv == ~0u) { return wl_w11_fail("W29 cc_config read"); }

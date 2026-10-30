@@ -3605,7 +3605,11 @@ wlms_diag_ok(uint32_t off, uint32_t bhi)
  *     PPT table in CMEM, the per-descriptor SPT entries. The CMEM base comes
  *     from QMI dev_mem[0] (ATH12K_QMI_DEVMEM_CMEM_INDEX, qmi.c:2875-2884); with
  *     no CMEM region the whole cookie converter is dropped for the boot (the
- *     cc_config registers and the converted-entry decode go with it);
+ *     cc_config registers and the converted-entry decode go with it), as it is
+ *     when the region is out of bounds, a cc_config register pre-reads as
+ *     already configured, or the REO path or the common rings are not ours
+ *     (the CMEM writes come after those ownership checks, still before any
+ *     common-ring write);
  *   - the common SRNGs (ath12k_dp_srng_common_setup, dp.c:491-595): the SW2WBM
  *     release ring, three TCL data rings each with its WBM completion ring, the
  *     REO reinject ring (W29 pre group), then the WBM2SW3 release ring and the
@@ -3677,6 +3681,17 @@ _Static_assert(WLCM_RX_SPT_USED * WLCM_SPT_ENTRIES >= WLRX_NBUF &&
 #define WLCM_CC_REGS 6u
 _Static_assert(WLCM_REO_CC_CFG1_VAL == 0x1d1310u && WLCM_CC_CFG1_COMMON == 0x51310u &&
     WLCM_WBM_CC_CFG2_OR == 0xbu && WLCM_WBM_CC_CONVERT_OR == 0x13au, "W29 cc_config values");
+/* The "already configured" bits of the cc pre-reads (hal.h:284, 333-334): REO
+ * CFG1 ENABLE | GLOBAL_ENABLE, the convert-config GLOBAL_EN. */
+#define WLCM_REO_CC_CFG1_EN ((1u << 19) | (1u << 20))
+#define WLCM_WBM_CC_CONVERT_GLOBAL (1u << 8)
+/* The QMI CMEM region (dev_mem[0]) as accepted: upper 32 bits zero, start 4-byte
+ * aligned in [0x80000, 0x2000000) (the window register's 6-bit field reaches
+ * 64 x 512 KiB) with all 280 PPT entries below 0x2000000, size >= 0x460. */
+#define WLCM_CMEM_LO 0x80000u
+#define WLCM_CMEM_HI 0x2000000u
+#define WLCM_CMEM_MIN (4u * WLCM_NSPT)
+_Static_assert(WLCM_CMEM_MIN == 0x460u, "W29 CMEM region minimum");
 
 /* mac-start pdev parameters and the vdev encap/decap of ath12k_mac_start and
  * ath12k_mac_update_vif_offload (mac.c:9363-9469, 9782-9827). WMI command ids
@@ -3764,7 +3779,8 @@ _Static_assert(WLCM_REO_CC_CFG1_VAL == 0x1d1310u && WLCM_CC_CFG1_COMMON == 0x513
 /* ring order: L19's common-setup order */
 enum { WLCM_R_SW2WBM, WLCM_R_TCL0, WLCM_R_COMP0, WLCM_R_TCL1, WLCM_R_COMP1, WLCM_R_TCL2, WLCM_R_COMP2,
 	WLCM_R_REINJECT, WLCM_R_REOCMD, WLCM_R_REOSTATUS };
-enum { WLCM_FREE, WLCM_SRNG, WLCM_BASE, WLCM_UNREADABLE, WLCM_NOCMEM, WLCM_CMEM_OWNED };
+enum { WLCM_FREE, WLCM_SRNG, WLCM_BASE, WLCM_UNREADABLE, WLCM_NOCMEM, WLCM_CMEM_OWNED, WLCM_REO_OWNED, WLCM_RINGS_OWNED,
+	WLCM_CC_OWNED, WLCM_CMEM_BAD };
 
 struct wlcm_ring {
 	uint16_t id;
@@ -3781,7 +3797,9 @@ struct wlcm {
 	uint8_t *spt; uint64_t spt_iova;                  /* 280 pages */
 	struct wlcm_ring ring[WLCM_NRING];
 	uint32_t cmem_base; bool cmem_valid;              /* QMI dev_mem[0].start */
+	uint64_t cmem_size;                               /* QMI dev_mem[0].size (wlcm_cmem_ok bounds) */
 	uint32_t pre[2u * WLCM_NRING + 2u];               /* BASE_LSB, MISC of each ring; cfg2, convert */
+	uint32_t cc_pre[WLCM_CC_REGS];                    /* the six cc_config registers, wlcm_cc_regs order */
 	unsigned own;
 	uint32_t ppt_pre[WLCM_NSPT];                      /* PPT pre-reads */
 	uint32_t writes, cmem_writes;
@@ -3967,14 +3985,19 @@ wlcm_why(unsigned own)
 	case WLCM_UNREADABLE: return "a pre-read is ~0 (unreadable, ownership not established)";
 	case WLCM_NOCMEM: return "no QMI CMEM region (dev_mem[0]); cookie conversion needs it";
 	case WLCM_CMEM_OWNED: return "a CMEM PPT entry is already non-zero (cookie converter owned)";
+	case WLCM_REO_OWNED: return "the REO path is not ours (W27 refused it); cookie conversion needs it";
+	case WLCM_RINGS_OWNED: return "the common rings are not ours (refused above); cookie conversion needs them";
+	case WLCM_CC_OWNED: return "a REO/WBM cookie register is already configured (cfg0 base, cfg1 enable or convert global)";
+	case WLCM_CMEM_BAD: return "the QMI CMEM region is out of bounds (upper bits, start, alignment or size)";
 	default: return "free";
 	}
 }
 
 /* The W29 register allowlist: reads of the pre-read addresses (the cc_config
- * read-modify-writes are among them); writes of the ten rings' registers, the
- * six cc_config registers. Nothing else in the REO, WBM or TCL blocks; never a
- * CE or C2c/C2d/C2e register. */
+ * read-modify-writes are among them) and of the six cc_config registers (their
+ * ownership pre-read); writes of the ten rings' registers, the six cc_config
+ * registers. Nothing else in the REO, WBM or TCL blocks; never a CE or
+ * C2c/C2d/C2e register. */
 static inline bool
 wlcm_reg_ok(const struct wlcm *cm, uint32_t off, bool wr)
 {
@@ -3983,6 +4006,7 @@ wlcm_reg_ok(const struct wlcm *cm, uint32_t off, bool wr)
 	static const uint8_t dst_f[8] = { WLCE_R0_BASE_LSB, WLCE_R0_BASE_MSB, WLCE_R0_ID, WLCE_R0_PROD_INT, WLCE_R0_HP_ADDR_LSB,
 		WLCE_R0_HP_ADDR_MSB, WLCE_R0_MISC, 0xffu };
 	if (!wr) {
+		if (off == WLCM_REO_CC_CFG0 || off == WLCM_REO_CC_CFG1 || off == WLCM_WBM_CC_CFG0 || off == WLCM_WBM_CC_CFG1) { return true; }
 		for (unsigned i = 0; i < 2u * WLCM_NRING + 2u; i++) { if (off == wlcm_pre_addr(cm, i)) { return true; } }
 		return false;
 	}
@@ -3998,12 +4022,33 @@ wlcm_reg_ok(const struct wlcm *cm, uint32_t off, bool wr)
 }
 
 /* The CMEM allowlist: writes of the 280 PPT entries only; reads of the same for
- * the ownership pre-reads. */
+ * the ownership pre-reads; every address also inside the region QMI reported
+ * (start..start+size). */
 static inline bool
 wlcm_cmem_ok(const struct wlcm *cm, uint32_t off)
 {
 	if (!cm->cmem_valid || off < cm->cmem_base || off >= cm->cmem_base + 4u * WLCM_NSPT || (off & 3u)) { return false; }
+	if ((uint64_t)off + 4u > (uint64_t)cm->cmem_base + cm->cmem_size) { return false; }
 	return true;
+}
+
+/* The QMI CMEM region (dev_mem[0]) before any use (WLCM_CMEM_LO/HI/MIN). */
+static inline bool
+wlcm_cmem_region_ok(uint64_t start, uint64_t size)
+{
+	return !(start >> 32) && !(start & 3u) && start >= WLCM_CMEM_LO && start < WLCM_CMEM_HI &&
+	    start + WLCM_CMEM_MIN <= WLCM_CMEM_HI && size >= WLCM_CMEM_MIN;
+}
+
+/* The six cc_config registers' pre-reads (wlcm_cc_regs order: REO CFG0, CFG1,
+ * WBM CFG0, CFG1, CFG2, CONVERT): any ~0u unreadable; a base in either CFG0, REO
+ * CFG1 ENABLE/GLOBAL_ENABLE or the convert GLOBAL_EN set: already configured. */
+static inline unsigned
+wlcm_cc_owned(const uint32_t pre[WLCM_CC_REGS])
+{
+	for (unsigned k = 0; k < WLCM_CC_REGS; k++) { if (pre[k] == ~0u) { return WLCM_UNREADABLE; } }
+	if (pre[0] || pre[2] || (pre[1] & WLCM_REO_CC_CFG1_EN) || (pre[5] & WLCM_WBM_CC_CONVERT_GLOBAL)) { return WLCM_CC_OWNED; }
+	return WLCM_FREE;
 }
 
 /* The PPT pre-reads' reading: all zero = free; any non-zero = owned; ~0u =

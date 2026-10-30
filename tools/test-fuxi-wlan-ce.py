@@ -1573,15 +1573,26 @@ def static_c2f():
                  'wl29_macstart_pre', 'wl29_macstart_post', 'wl29_encap_decap', 'wl29_report', 'wl29_ppdu_stats'):
         assert name in fns, name
     w26 = c_functions(between(drv, W26_START, W27_START))
-    # dp_alloc order: cc_init after the idle list and before the common SRNGs (wl27_setup).
+    # dp_alloc order: the idle list, then the common setup (wl27_setup) with cc_init inside it, before the refill.
     st = w26['wl26_setup']
-    assert st.index('wl26_idle()') < st.index('wl29_cc_init()') < st.index('wl27_setup()')
-    assert st.index('wl29_cc_init()') < st.index('wlrx_fill_refill(&wl_rx)')
+    assert st.index('wl26_idle()') < st.index('wl27_setup()') < st.index('wlrx_fill_refill(&wl_rx)')
+    assert 'wl29_cc_init' not in st
     assert 'wl26_alloc(&wl_cm_arena, WLCM_ARENA_BYTES' in st
     # common setup: the pre group before rel/exc, the post group after exc and before reo_hw_setup (the GEN_ENABLE read).
     su = between(drv, 'static int\nwl27_setup(void)\n{', '\n}\n')
     assert su.index('wl29_common_pre()') < su.index('wl27_ring(WLRD_R_REL) || wl27_ring(WLRD_R_EXC)') < \
         su.index('wl29_common_post()') < su.index('wl27_reo_rd(WLRD_REO_GEN_ENABLE)')
+    # cc_init only after the ownership checks: C2d's REO pre-reads (a refusal reaches cc_init only for its drop line) and
+    # W29's common-ring pre-reads (likewise), its CMEM writes before the first common-ring write.
+    assert su.index('if (wl_rd.own != WLRD_FREE) {') < su.index('wl29_cc_init()') < su.index('wl29_common_pre()')
+    cp = fns['wl29_common_pre']
+    assert cp.index('if (wl29_common_owned()) { return wl29_cc_init(); }') < cp.index('wl_cm.rings_on = true;') < \
+        cp.index('if (wl29_cc_init()) { return 1; }   /* C2f: cookie converter') < cp.index('wl29_ring(pre[j])')
+    # The QMI CMEM region: cleared at the start of every capability parse, set only from that reply's dev_mem[0].
+    qmi = between(drv, 'static int\nwl_qmi_cap(const uint8_t *p, unsigned len)\n{', '\n}\n')
+    assert qmi.index('wl_cmem_valid = false;') < qmi.index('for (unsigned off = 7; off < len;)') < \
+        qmi.index('wl_cmem_valid = true;')
+    assert code.count('wl_cmem_valid = true;') == 1
     # cc_config at service ready, before the destination rings (core.c:923 < 925).
     w21 = between(drv, 'static int\nwl_w21_run(void)\n{', '\n}\n')
     assert w21.index('wl29_cc_config()') < w21.index('wl27_dest()')
@@ -1609,18 +1620,21 @@ def static_c2f():
     assert w29.count('wl_win(') == 2  # wl29_reg, wl29_cmem
     # cc is gated on the QMI CMEM region (dropped for the boot without it); on success all three decode flags are set so the
     # refill cookies and the returned entries are decoded as cookie-converted.
-    assert 'if (!wl_cmem_valid) {' in fns['wl29_cc_init'] and 'cc dropped for this boot' in region
+    assert 'own = !wl_cmem_valid ? WLCM_NOCMEM : !wl_cm.cmem_valid ? WLCM_CMEM_BAD : WLCM_FREE;' in fns['wl29_cc_init'] and \
+        'cc dropped for this boot' in region
     assert 'wl_cm.cc_on = wl_rx.cc_on = wl_rd.cc_on = true;' in fns['wl29_cc_init']
     # The REO command ring's per-entry command numbers; never a TX descriptor posted.
     assert 'c->va[i * c->entry_dw + 2u] = (i + 1u) & 0xffffu;' in fns['wl29_common_post']
-    print('C2f static: gate (0x4000 needs 0x1000, qrtr 6 refuses it), L19 dp_alloc order (cc_init after the idle list and '
-          'before the common rings, the pre group before rel/exc and the post group after them, cc_config before the '
+    print('C2f static: gate (0x4000 needs 0x1000, qrtr 6 refuses it), L19 dp_alloc order (cc_init after the idle list, the '
+          'REO and common-ring ownership checks and before the common rings, the pre group before rel/exc and the post '
+          'group after them, the QMI CMEM region cleared per capability parse, cc_config before the '
           'destination rings, mac-start params around the chain mask and channel list, encap/decap before NSS, W29 report '
           'after W27), the two wl_win accessors (wlcm_reg_ok, wlcm_cmem_ok) refused after the latch, no transmit and no ring '
           'post, cc gated on the CMEM region, the latch and the single zeroed free')
 
 
-# Each C2f rule broken in the production code must be caught by the C2f static checks or the model's C2f pure scenario.
+# Each C2f rule broken in the production code must be caught by the C2f static checks or the model's C2f scenarios
+# (s_c2f_pure, s_c2f_gate).
 C2F_MUTANTS = [
     ('h', '#define WLCM_REO_CC_CFG1_VAL (WLCM_CC_CFG1_COMMON | (1u << 19) | (1u << 20))',
      '#define WLCM_REO_CC_CFG1_VAL (WLCM_CC_CFG1_COMMON | (1u << 20))', 'cc cfg1 without ENABLE'),
@@ -1659,6 +1673,33 @@ C2F_MUTANTS = [
      'cm arena not zeroed'),
     ('d', '	wl_dma_free(&wl_cm_arena);\n', '', 'cm arena never freed'),
     ('d', 'wl_cm.cc_on = wl_rx.cc_on = wl_rd.cc_on = true;', 'wl_cm.cc_on = wl_rx.cc_on = true;', 'reo decode cc flag not set'),
+    # C2f review fixes: the cc ownership gate (H1) and the CMEM bounds (M1).
+    ('d', 'own = wl_rd.own != WLRD_FREE ? WLCM_REO_OWNED : !wl_cm.rings_on ? WLCM_RINGS_OWNED : WLCM_FREE;', 'own = WLCM_FREE;',
+     'cc_init without the REO/common-ring gate'),
+    ('d', ' || !wl_rd.reo_on || !wl_cm.rings_on) { return 0; }', ') { return 0; }', 'cc_config without the REO/common-ring gate'),
+    ('d', 'for (unsigned k = 0; k < WLCM_CC_REGS; k++) { wl_cm.cc_pre[k] = wl29_reg_rd(regs[k][0]); }', '(void)regs;',
+     'cc registers not pre-read'),
+    ('d', 'wl_cm.cmem_valid = wl_cmem_valid && wlcm_cmem_region_ok(wl_cmem_base, wl_cmem_size);', 'wl_cm.cmem_valid = wl_cmem_valid;',
+     'CMEM region not validated'),
+    ('d', 'wl_cm.cmem_base = (uint32_t)wl_cmem_base; wl_cm.cmem_size = wl_cmem_size;', 'wl_cm.cmem_base = (uint32_t)wl_cmem_base;',
+     'CMEM size not kept'),
+    ('d', '\tif ((off >> 19) > 0x3fu) { return 1; }   /* the 6-bit window field: an offset beyond it is refused, never folded into '
+     'the register */\n', '', 'window offset past its field not refused'),
+    ('d', '\twl_cmem_valid = false; wl_cmem_base = wl_cmem_size = 0;   /* C2f: set again only from this reply\'s dev_mem[0] */\n', '',
+     'QMI parse keeps a stale CMEM region'),
+    ('h', '\t\tif (off == WLCM_REO_CC_CFG0 || off == WLCM_REO_CC_CFG1 || off == WLCM_WBM_CC_CFG0 || off == WLCM_WBM_CC_CFG1) '
+     '{ return true; }\n', '', 'cc registers not in the read allowlist'),
+    ('h', 'if (pre[0] || pre[2] || ', 'if (', 'a configured cc CFG0 base not refused'),
+    ('h', '(pre[1] & WLCM_REO_CC_CFG1_EN) || ', '', 'REO cc CFG1 enable not refused'),
+    ('h', '#define WLCM_REO_CC_CFG1_EN ((1u << 19) | (1u << 20))', '#define WLCM_REO_CC_CFG1_EN (1u << 19)',
+     'REO cc CFG1 GLOBAL_ENABLE not refused'),
+    ('h', ' || (pre[5] & WLCM_WBM_CC_CONVERT_GLOBAL)', '', 'convert GLOBAL_EN not refused'),
+    ('h', '!(start & 3u) && ', '', 'CMEM alignment not checked'),
+    ('h', 'start >= WLCM_CMEM_LO && ', '', 'CMEM lower bound not checked'),
+    ('h', 'start + WLCM_CMEM_MIN <= WLCM_CMEM_HI && ', '', 'CMEM PPT end past the window'),
+    ('h', '&& size >= WLCM_CMEM_MIN;', '&& size >= 4u;', 'CMEM size not checked'),
+    ('h', '\tif ((uint64_t)off + 4u > (uint64_t)cm->cmem_base + cm->cmem_size) { return false; }\n', '',
+     'CMEM allowlist ignores the region size'),
 ]
 
 

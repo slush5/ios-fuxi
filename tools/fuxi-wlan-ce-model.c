@@ -134,7 +134,7 @@ static uint32_t wl_bhi = 0x1000u;  /* C2e: BHIOFF as milestone 5 found it */
 static uint64_t wl_iova_next, wl_iova_base = 0xa0000000ull, wl_iova_end = 0xb0000000ull;
 static struct wl_dma wl_ce_arena, wl_msi_sink, wl_tables, wl_rxvectors, wl_rddm, wl_target[WL_TARGET_MAX];
 static struct wl_dma wl_rx_arena, wl_link_arena, wl_reo_arena, wl_mon_arena, wl_cm_arena;  /* C2c, C2d, C2e, C2f */
-static uint32_t wl_cmem_base; static bool wl_cmem_valid;  /* C2f: QMI dev_mem[0] CMEM region (set by the scenario) */
+static uint64_t wl_cmem_base, wl_cmem_size; static bool wl_cmem_valid;  /* C2f: QMI dev_mem[0] CMEM region (set by the scenario) */
 static struct wl_dma wl14_regdb, wl14_bdf, wl14_m3, wl_ipcr, wl_contexts, wl_vectors, wl_amss, wl_image;
 static uint32_t wl_mrd(uint32_t off);
 static void wl_mwr(uint32_t off, uint32_t v);
@@ -1948,12 +1948,66 @@ wl_mwr(uint32_t off, uint32_t v)
 	ce_access(wl15_shadow_v3[i], true, &v, true);
 }
 
+/* C2f gate scenarios (s_c2f_gate) only: the W29 register file and CMEM as the model's own address set, not the
+ * production allowlists: the six cc_config registers (pre-read as the scenario sets), the ten common rings' R0 blocks
+ * and R2 HP/TP (each keeps what the host writes, for the readback; pre-read as the scenario seeds), CMEM the window
+ * [cmem_lo, cmem_hi). Every access counted by kind; the order of the first CMEM write and the first ring write kept. */
+static const uint32_t m_cm_ring[10][2] = {  /* r0, r2 in L19's common-setup order (hal.h, hw.c) */
+	{ 0xa3437cu, 0xa37010u }, { 0xa44900u, 0xa46000u }, { 0xa34e08u, 0xa370c8u }, { 0xa44978u, 0xa46008u },
+	{ 0xa34ef8u, 0xa370d8u }, { 0xa449f0u, 0xa46010u }, { 0xa34fe8u, 0xa370e8u }, { 0xa38304u, 0xa3b028u },
+	{ 0xa3828cu, 0xa3b020u }, { 0xa38a84u, 0xa3b0a8u },
+};
+static struct {
+	bool on;
+	uint32_t cmem_lo, cmem_hi, cc_pre[6];
+	uint32_t cmem_rd, cmem_wr, cc_rd, cc_wr, ring_rd, ring_wr, ring_wr_before_cmem, cmem_wr_after_ring;
+	uint32_t n, addr[256], val[256];
+} cmd;
+
+static void
+cm_set(uint32_t off, uint32_t v)
+{
+	for (uint32_t i = 0; i < cmd.n; i++) { if (cmd.addr[i] == off) { cmd.val[i] = v; return; } }
+	CHECK(cmd.n < 256u, "model W29 register file");
+	cmd.addr[cmd.n] = off; cmd.val[cmd.n++] = v;
+}
+
+static bool
+cm_access(uint32_t off, bool wr, uint32_t *v)
+{
+	static const uint32_t cc[6] = { 0xa38050u, 0xa38054u, 0xa34040u, 0xa34044u, 0xa34090u, 0xa34094u };
+	if (!cmd.on) { return false; }
+	CHECK(!wl_cm.stopping, "a W29 access after wl26_contain");
+	if (off >= cmd.cmem_lo && off < cmd.cmem_hi) {
+		CHECK(!(off & 3u), "a misaligned CMEM access");
+		if (wr) {
+			if (!cmd.cmem_wr) { cmd.ring_wr_before_cmem = cmd.ring_wr; }
+			cmd.cmem_wr++; cmd.cmem_wr_after_ring += cmd.ring_wr != 0;
+		} else { cmd.cmem_rd++; *v = 0; }
+		return true;
+	}
+	for (unsigned k = 0; k < 6; k++) {
+		if (off != cc[k]) { continue; }
+		if (wr) { cmd.cc_wr++; } else { cmd.cc_rd++; *v = cmd.cc_pre[k]; }
+		return true;
+	}
+	for (unsigned i = 0; i < 10; i++) {
+		if (!((off >= m_cm_ring[i][0] && off < m_cm_ring[i][0] + 0x38u) || off == m_cm_ring[i][1] || off == m_cm_ring[i][1] + 4u)) { continue; }
+		if (wr) { cmd.ring_wr++; cm_set(off, *v); return true; }
+		cmd.ring_rd++; *v = 0;
+		for (uint32_t j = 0; j < cmd.n; j++) { if (cmd.addr[j] == off) { *v = cmd.val[j]; } }
+		return true;
+	}
+	return false;
+}
+
 /* A window access: the WBM block (C2c) or the CE registers. */
 static void
 win_access(uint64_t pa, bool wr, uint32_t *v)
 {
 	uint32_t off = (bar_win & 0x3fu) << 19 | (uint32_t)(pa - WL_BAR0 - 0x80000ull);
 	CHECK(bar_win & 0x40000000u, "window access with the window disabled");
+	if (cm_access(off, wr, v)) { return; }  /* C2f gate scenarios only */
 	if (off >= 0x00a30000u && off < 0x00a40000u) {
 		if (m_reo_addr(off)) { reo_access(off, wr, v, false); } else { wbm_access(off, wr, v, false); }  /* C2d / C2c */
 		return;
@@ -2142,6 +2196,7 @@ reset(void)
 	memcpy(mr, mreo_plan, sizeof(mr)); memset(fw_sel_w, 0, sizeof(fw_sel_w)); rd_hp = 0;
 	memset(dslot, 0, sizeof(dslot)); dslot[4095] = 3;
 	memset(&wl_rd, 0, sizeof(wl_rd)); wl27_reo_writes = 0;
+	memset(&cmd, 0, sizeof(cmd));  /* C2f gate scenarios */
 	rx_host = ln_host = NULL; rx_iova = ln_iova = 0;
 	rx_mapped = ln_mapped = rx_pub = smmu_undone = fw_rx_ready = idle_live = idle_pub = rx_inject = false;
 	rx_allocs = rx_frees = ln_allocs = ln_frees = wbm_reads = wbm_writes = wbm_rbs = wbm_watch_reads = wbm_pubs = 0;
@@ -5073,6 +5128,155 @@ s_c2f_pure(void)
 	     "round-trip and foreign-cookie refusal, the PPT math, and the mac-start/encap/PPDU param values");
 }
 
+/* C2f gate: the production wl27_setup (C2d's REO pre-reads, then W29's common-ring pre-reads, cc_init and the common
+ * rings around rel/exc) and wl29_cc_config, against the REO script and the W29 register file / CMEM of cm_access. */
+static uint8_t *c2f_ro, *c2f_ca;
+static void
+c2f_gate_reset(void)
+{
+	reset();
+	cmd.on = true; cmd.cmem_lo = 0x113000u; cmd.cmem_hi = 0x114000u;
+	wl20_bits = 0x5902u;
+	if (!c2f_ro) { c2f_ro = aligned_alloc(16384, REOA); c2f_ca = aligned_alloc(16384, WLCM_ARENA_BYTES); }
+	CHECK(c2f_ro && c2f_ca, "c2f gate alloc");
+	memset(c2f_ro, 0, REOA);
+	reo_host = c2f_ro; reo_iova = 0xa2600000ull; reo_mapped = true;
+	CHECK(wlrd_layout(&wl_rd, c2f_ro, reo_iova, REOA) == 0, "c2f gate REO layout");
+	memset(&wl_cm, 0, sizeof(wl_cm));
+	CHECK(wlcm_layout(&wl_cm, c2f_ca, 0xa5000000ull, WLCM_ARENA_BYTES) == 0, "c2f gate cm layout");
+	wl29_writes = wl29_cmem_writes = 0;
+	wl_cmem_base = 0x113000u; wl_cmem_size = 0x1000u; wl_cmem_valid = true;
+}
+
+static void
+c2f_gate_done(void)
+{
+	memset(&wl_cm, 0, sizeof(wl_cm));
+	wl_cmem_base = wl_cmem_size = 0; wl_cmem_valid = false;
+	reset();
+}
+
+static void
+s_c2f_gate(void)
+{
+	static const char why_cc[] = "FUXI WLAN: W29 cookie conversion not programmed: a REO/WBM cookie register is already "
+	    "configured (cfg0 base, cfg1 enable or convert global); w20 0x4000 cc dropped for this boot\n";
+	static const char why_bad[] = "FUXI WLAN: W29 cookie conversion not programmed: the QMI CMEM region is out of bounds "
+	    "(upper bits, start, alignment or size); w20 0x4000 cc dropped for this boot\n";
+	/* both ours, the region good, the cc registers clear: the CMEM writes after every pre-read and before the first
+	 * common-ring write (dp_alloc order), the rings, then the six cc_config writes at service ready */
+	c2f_gate_reset();
+	CHECK(wl27_setup() == 0 && wl_rd.reo_on && wl_cm.rings_on && wl_cm.cc_on && wl_rx.cc_on && wl_rd.cc_on, "c2f gate happy");
+	CHECK(cmd.cmem_rd == 280u && cmd.cmem_wr == 280u && wl29_cmem_writes == 280u && !cmd.ring_wr_before_cmem &&
+	    !cmd.cmem_wr_after_ring && cmd.ring_wr && cmd.cc_rd == 8u && !cmd.cc_wr, "c2f gate happy: CMEM after the pre-reads, before the rings");
+	{
+		static const char *const order[] = { "FUXI WLAN: W27 reo before:", "FUXI WLAN: W29 common before: rings 10 enabled 0 based 0 unreadable 0; not owned\n",
+			"FUXI WLAN: W29 cookie conversion cmem base 0x113000 pages 280 (rx 24 tx 256)", "FUXI WLAN: W29 common ring 121 sw2wbm-rel",
+			"FUXI WLAN: W29 common ring 16 reinject", "FUXI WLAN: W27 reo ring 131", "FUXI WLAN: W29 common ring 21 reo-status",
+			"FUXI WLAN: W27 reo setup gen-enable" };
+		expect_order(order, sizeof(order) / sizeof(order[0]));
+	}
+	CHECK(wl29_cc_config() == 0 && cmd.cc_wr == 6u && cmd.cc_rd == 10u, "c2f gate happy cc_config");
+	expect("FUXI WLAN: W29 cc_config reo-cfg1 0x1d1310 wbm-cfg1 0x51310 cfg2 0->0xb convert 0->0x13a; writes 6\n");
+	expect_not("cc dropped for this boot");
+	/* REO owned (C2d refuses it): no W29 access at all, cc dropped with its line; cc_init and cc_config called again
+	 * directly still write nothing */
+	c2f_gate_reset();
+	C.reo_pre[2] = 0x40u;
+	CHECK(wl27_setup() == 0 && !wl_rd.reo_on && !wl_cm.rings_on && !wl_cm.cc_on && !wl_rx.cc_on && !wl_rd.cc_on, "c2f gate REO owned");
+	expect("FUXI WLAN: W29 cookie conversion not programmed: the REO path is not ours (W27 refused it); cookie conversion needs it; "
+	    "w20 0x4000 cc dropped for this boot\n");
+	CHECK(wl29_cc_init() == 0 && wl29_cc_config() == 0 && !wl_cm.cc_on, "c2f gate REO owned, direct");
+	CHECK(!cmd.cmem_rd && !cmd.cmem_wr && !cmd.cc_rd && !cmd.cc_wr && !cmd.ring_rd && !cmd.ring_wr && !wl29_cmem_writes,
+	    "c2f gate REO owned: a CMEM, cc_config or common-ring access");
+	/* the common rings owned (W29's pre-reads refuse them): C2d's own rings still run; no CMEM access, no cc_config
+	 * register beyond the two ring pre-reads; cc_config refuses even with cc_on forced unless the REO path and the
+	 * rings are both ours */
+	c2f_gate_reset();
+	cm_set(0xa44900u + 0x10u, 0x40u);
+	CHECK(wl27_setup() == 0 && wl_rd.reo_on && !wl_cm.rings_on && !wl_cm.cc_on, "c2f gate rings owned");
+	expect("FUXI WLAN: W29 common rings not programmed: a common ring has SRNG_ENABLE set (already owned)");
+	expect("FUXI WLAN: W29 cookie conversion not programmed: the common rings are not ours (refused above); cookie conversion "
+	    "needs them; w20 0x4000 cc dropped for this boot\n");
+	CHECK(wl29_cc_init() == 0 && wl29_cc_config() == 0, "c2f gate rings owned, direct");
+	wl_cm.cc_on = true;
+	CHECK(wl29_cc_config() == 0, "c2f gate cc_config, rings not ours");
+	wl_cm.rings_on = true; wl_rd.reo_on = false;
+	CHECK(wl29_cc_config() == 0, "c2f gate cc_config, REO not ours");
+	CHECK(!cmd.cmem_rd && !cmd.cmem_wr && cmd.cc_rd == 2u && !cmd.cc_wr && !cmd.ring_wr, "c2f gate rings owned: a CMEM or cc_config access");
+	/* the cc_config pre-reads: a CFG0 base, REO CFG1 ENABLE or GLOBAL_ENABLE, the convert GLOBAL_EN or any ~0 drop cc
+	 * (one line, no CMEM access, nothing written to the cc registers; the rings still run); field bits alone do not */
+	{
+		static const struct { unsigned k; uint32_t v; int drop; } cs[] = {
+			{ 0, 0x113000u, 1 }, { 2, 0x1u, 1 }, { 1, 1u << 19, 1 }, { 1, 1u << 20, 1 }, { 5, 1u << 8, 1 }, { 3, ~0u, 2 },
+			{ 1, 0x51310u, 0 }, { 5, 0x3au, 0 }, { 4, 0xbu, 0 }, { 3, 0x51310u, 0 },
+		};
+		for (unsigned i = 0; i < sizeof(cs) / sizeof(cs[0]); i++) {
+			c2f_gate_reset();
+			cmd.cc_pre[cs[i].k] = cs[i].v;
+			CHECK(wl27_setup() == 0 && wl_rd.reo_on && wl_cm.rings_on && wl_cm.ring[WLCM_R_REOSTATUS].on, "c2f gate cc pre-read run");
+			CHECK(wl29_cc_config() == 0, "c2f gate cc pre-read cc_config");
+			if (cs[i].drop) {
+				CHECK(!wl_cm.cc_on && !cmd.cmem_rd && !cmd.cmem_wr && !cmd.cc_wr, "c2f gate: a configured cc register not refused");
+				if (cs[i].drop == 1) { expect(why_cc); }
+				else { expect("FUXI WLAN: W29 cookie conversion not programmed: a pre-read is ~0 (unreadable, ownership not established)"); }
+			} else {
+				CHECK(wl_cm.cc_on && cmd.cmem_wr == 280u && cmd.cc_wr == 6u, "c2f gate: an unconfigured cc register refused");
+				expect_not("cc dropped for this boot");
+			}
+		}
+	}
+	/* the QMI CMEM region: absent, too small, below 0x80000, at or past 0x2000000 (start or PPT end), misaligned, upper bits
+	 * set: dropped with its line, no CMEM access; the two boundaries accepted */
+	{
+		static const struct { uint64_t start, size; int ok; } rg[] = {
+			{ 0x113000u, 0x45cu, 0 }, { 0x7fffcu, 0x1000u, 0 }, { 0x2000000u, 0x1000u, 0 }, { 0x1fffe00u, 0x1000u, 0 },
+			{ 0x113002u, 0x1000u, 0 }, { 0x100113000ull, 0x1000u, 0 }, { 0x80000u, 0x460u, 1 }, { 0x1fffba0u, 0x460u, 1 },
+		};
+		for (unsigned i = 0; i < sizeof(rg) / sizeof(rg[0]); i++) {
+			c2f_gate_reset();
+			wl_cmem_base = rg[i].start; wl_cmem_size = rg[i].size;
+			cmd.cmem_lo = (uint32_t)rg[i].start & ~3u; cmd.cmem_hi = cmd.cmem_lo + 0x1000u;
+			CHECK(wl27_setup() == 0 && wl_rd.reo_on && wl_cm.rings_on, "c2f gate region run");
+			CHECK(wl29_cc_config() == 0, "c2f gate region cc_config");
+			if (rg[i].ok) {
+				CHECK(wl_cm.cc_on && cmd.cmem_rd == 280u && cmd.cmem_wr == 280u && cmd.cc_wr == 6u, "c2f gate: a good CMEM region refused");
+			} else {
+				CHECK(!wl_cm.cc_on && !cmd.cmem_rd && !cmd.cmem_wr && cmd.cc_rd == 2u && !cmd.cc_wr, "c2f gate: a bad CMEM region used");
+				expect(why_bad);
+			}
+		}
+		c2f_gate_reset();
+		wl_cmem_valid = false;
+		CHECK(wl27_setup() == 0 && !wl_cm.cc_on && !cmd.cmem_rd && !cmd.cmem_wr && cmd.cc_rd == 2u, "c2f gate no CMEM region");
+		expect("FUXI WLAN: W29 cookie conversion not programmed: no QMI CMEM region (dev_mem[0]); cookie conversion needs it");
+	}
+	/* the CMEM allowlist keeps every address inside start..start+size; the window refuses an offset past its 6-bit field
+	 * without touching the window register */
+	{
+		struct wlcm cm;
+		uint32_t v = 0, sel, w;
+		memset(&cm, 0, sizeof(cm));
+		cm.cmem_valid = true; cm.cmem_base = 0x113000u; cm.cmem_size = 0x460u;
+		CHECK(wlcm_cmem_ok(&cm, 0x113000u) && wlcm_cmem_ok(&cm, 0x11345cu) && !wlcm_cmem_ok(&cm, 0x113460u) &&
+		    !wlcm_cmem_ok(&cm, 0x113002u) && !wlcm_cmem_ok(&cm, 0x112ffcu), "c2f CMEM allowlist (size 0x460)");
+		cm.cmem_size = 0x45cu;
+		CHECK(wlcm_cmem_ok(&cm, 0x113458u) && !wlcm_cmem_ok(&cm, 0x11345cu), "c2f CMEM allowlist (start..start+size)");
+		c2f_gate_reset();
+		cmd.cmem_lo = 0x1fff000u; cmd.cmem_hi = 0x2000000u;
+		sel = win_selects; w = bar_win;
+		CHECK(wl_win(0x2000000u, false, &v) == 1 && wl_win(0xffffffffu, true, &v) == 1 && win_selects == sel && bar_win == w,
+		    "c2f window: an offset past the 6-bit field not refused, or the window register touched");
+		CHECK(wl_win(0x1fffffcu, false, &v) == 0 && win_selects == sel + 1u, "c2f window: the top offset refused");
+	}
+	c2f_gate_done();
+	puts("C2f gate: CMEM written only after the REO and common-ring pre-reads and before the first common-ring write; REO "
+	     "owned or common rings owned: no CMEM or cc_config write (cc_config refuses even with cc_on forced); a cc register "
+	     "pre-read configured or unreadable: cc dropped with its line; the QMI CMEM region absent, too small, out of range, "
+	     "misaligned or with upper bits: cc dropped, no CMEM access; the CMEM allowlist inside start..start+size; the window "
+	     "refuses an offset past its field");
+}
+
 static void
 dump_c2f(void)
 {
@@ -5197,6 +5401,7 @@ main(int argc, char **argv)
 	}
 	if (argc == 2 && !strcmp(argv[1], "c2f")) {  /* the C2f scenarios alone (the mutant runs of tools/test-fuxi-wlan-ce.py) */
 		s_c2f_pure();
+		s_c2f_gate();
 		reset();
 		puts("C2f model: all scenarios passed");
 		return 0;
@@ -5252,6 +5457,7 @@ main(int argc, char **argv)
 	s_c2e_readings();
 	s_c2e_contain();
 	s_c2f_pure();
+	s_c2f_gate();
 	reset();
 	puts("W20 model: all scenarios passed");
 	return 0;
