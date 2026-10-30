@@ -278,6 +278,8 @@ struct cfg {
 	uint32_t mon_tp_raw;                /* rdp[193] written raw on the last channel, after its status writes */
 	/* C2g */
 	bool mac_hp_silent;                 /* the phone: the firmware fills MAC rings 161/169 but writes no HP into wrp[1]/[9] */
+	bool svc299;                        /* C2h: the firmware advertises WMI_SERVICE_MGMT_RX_REO_SUPPORTED (ext word 1 bit 11) */
+	unsigned srng_reap;                 /* C2h: MGMT_SRNG_REAP events at STARTED */
 };
 static struct cfg C;
 static unsigned restores;
@@ -621,7 +623,7 @@ fw_service_ready_set(void)
 	}
 	m_reset();  /* SERVICE_AVAILABLE: 220 in segment word 2 bit 28, 281 in ext word 0 bit 25 */
 	m_tlv(0x22f, 20); m_u32(0); m_u32(0); m_u32(0); m_u32(C.no_ext2_service ? 0u : 1u << 28); m_u32(0);
-	m_tlv(0x10, 16); m_u32(1u << 25); m_u32(0); m_u32(0); m_u32(0);
+	m_tlv(0x10, 16); m_u32(1u << 25); m_u32(C.svc299 ? 1u << 11 : 0u); m_u32(0); m_u32(0);
 	fw_svc281 = true;
 	wmi_out(0x3, 0, 3);
 	/* SERVICE_READY_EXT: fixed, 2 hw modes, SINGLE (PHY map 0x1) then DBS (0x3), and the 3 MAC/PHY caps that
@@ -671,7 +673,7 @@ fw_check_init(const uint8_t *p, uint32_t len)
 	want[8] = want[9] = (1u << fw_chains) - 1; want[10] = want[11] = want[12] = 100; want[13] = 40;
 	want[14] = 1; want[15] = 4; want[16] = 3; want[17] = 3; want[18] = 8; want[22] = 1024; want[28] = 2;
 	want[29] = 0x400; want[30] = 0xa; want[31] = 1; want[32] = 8; want[33] = 2; want[34] = 0x20; want[35] = 0x16;
-	want[44] = 1u << 5 | 1u << 18; want[54] = 1; want[57] = 1; want[68] = 1u << 9; want[69] = fw_svc281 ? 1u << 4 : 0;
+	want[44] = 1u << 5 | 1u << 18 | (wl30_mask & WL30_IPADIS ? 1u << 30 : 0u); want[54] = 1;  /* C2h: IPA_DISABLE */ want[57] = 1; want[68] = 1u << 9; want[69] = fw_svc281 ? 1u << 4 : 0;
 	for (unsigned i = 1; i < 73; i++) {
 		if (g32(rc + 4 * i) != want[i]) { fprintf(stderr, "INIT word %u = %#x, want %#x\n", i, g32(rc + 4 * i), want[i]); fail("INIT resource config"); }
 	}
@@ -1093,6 +1095,31 @@ fw_rxsel(const uint8_t *pl, uint32_t plen)
 	fw_sel_n++;
 }
 
+/* C2h: RX_FSE_SETUP_CFG then RX_FISA_CFG, checked word by word against the vendor's words written down here again
+ * (dp_htt.c:4667-4790, 4958-5045; htt.h:8812-8990, 9218-9360; wlan_cfg.c:2414-2420; the CMEM base the scenario gave),
+ * each once, after the two RX_RING_SELECTION_CFG and before the channel list; nothing answers. */
+static unsigned fw_fse_n, fw_fisa_n;
+static void
+fw_fse(const uint8_t *pl, uint32_t plen)
+{
+	static const uint32_t fse[14] = { 0x12u, 128u | 16u << 20 | 2u << 28, 0x114000u, 0x10u, 0xda565a6du, 0xc20e5b25u, 0x3d256741u,
+		0xb08fa343u, 0xcb2bcad0u, 0xb4307baeu, 0xa32dcb77u, 0x0cf23080u, 0x3bb7426au, 0xfa01acbeu };
+	static const uint32_t fisa[3] = { 0x15u, 0x1fu, 0xffffffffu };
+	const bool is_fse = (g32(pl) & 0xffu) == 0x12u;
+	const uint32_t *want = is_fse ? fse : fisa, n = is_fse ? 14u : 3u;
+	CHECK(wl30_mask & WL30_FSE, "an FSE/FISA message without fuxiwlanvrx 0x08");
+	CHECK(fw_sel_n == 2 && fw_c2_step == 0 && !fw_chan_cmds && !fw_pset_n, "FSE/FISA before the ring selection, or after the channel list");
+	CHECK(is_fse ? !fw_fse_n && !fw_fisa_n : fw_fse_n == 1 && !fw_fisa_n, "FSE/FISA twice or out of order");
+	CHECK(plen == 4u * n, "FSE/FISA length");
+	for (unsigned k = 0; k < n; k++) {
+		if (g32(pl + 4 * k) != want[k]) {
+			fprintf(stderr, "%s word %u = %#x, want %#x\n", is_fse ? "RX_FSE_SETUP_CFG" : "RX_FISA_CFG", k, g32(pl + 4 * k), want[k]);
+			fail("FSE/FISA word");
+		}
+	}
+	if (is_fse) { fw_fse_n++; } else { fw_fisa_n++; }
+}
+
 /* A device access to the REO arena: the HP words of the ten rings (rdp 0..8, 131) and the rings, nothing else. */
 static uint8_t *
 reod(uint32_t off, uint32_t len, const char *what)
@@ -1505,6 +1532,12 @@ fw_chan_info(uint32_t flags, uint32_t freq, int32_t nf, unsigned idx, unsigned f
 static void
 fw_mgmt_rx(const struct mbeacon *b, uint32_t at)
 {
+	if (b->mode == 5) {  /* C2h: the firmware consumed the frame: WMI_MGMT_RX_FW_CONSUMED, TLV 0x3d3, subtype in word 4 */
+		m_reset(); m_tlv(0x3d3, 36); m_u32(1000); m_u32(0); m_u32(0); m_u32((uint32_t)(b->f[0] >> 4) << 28 | 1u << 16);
+		m_u32(b->chan_freq); m_u32(77); m_u32(1u << 15 | 9u << 16); m_zero(8);
+		wmi_out(0x700d, 0, at);
+		return;
+	}
 	m_reset();
 	m_tlv(0x2c, b->mode == 3 ? 64u : 68u);
 	m_u32(b->rx_channel); m_u32(b->snr); m_u32(6000); m_u32(b->rx_channel <= 14 ? 1u : 0u);
@@ -1514,6 +1547,9 @@ fw_mgmt_rx(const struct mbeacon *b, uint32_t at)
 	if (b->mode != 1) {
 		uint32_t pad = (b->len + 3) & ~3u;
 		m_tlv(0x11, pad); memcpy(mb + ml, b->f, b->len); ml += pad;
+	}
+	if (b->mode == 4 || b->mode == 6) {  /* C2h: the REO params TLV 0x3d2 after the frame (6: counter not valid) */
+		m_tlv(0x3d2, 16); m_u32(1234); m_u32(b->mode == 4 ? 1u << 15 | 7u << 16 : 0u); m_u32(0); m_u32(0);
 	}
 	wmi_out(0x7001, 0, at);
 }
@@ -1560,6 +1596,7 @@ fw_scan_script(unsigned n)
 	if (C.scan_mode == 2) { return; }
 	if (C.scan_mode == 4) { fw_scan_event(1u << 1, 0, 0, 0, t); return; }
 	fw_scan_event(1u << 0, 0, 0, 0, t);
+	for (unsigned i = 0; i < C.srng_reap; i++) { m_reset(); m_tlv(0x400, 4); m_zero(4); wmi_out(0x700e, 0, t); }  /* C2h */
 	if (C.wrong_vdev) { fw_scan_event(1u << 3, 0, 2412, 3, t); }
 	const bool deliver_mgmt = C.rx_rule == 6 ? m_rx_live() : fw_rule_ok();  /* C2c; C2d rule 6: the whole RX path */
 	const bool wedged = C.wedge && !m_rx_live();  /* C2d: the phone's r1c2c-all readout */
@@ -1922,6 +1959,10 @@ fw_rx(unsigned ce, uint32_t eid, const uint8_t *d, uint32_t len)
 		if (ce == 4 && flags == 0 && plen >= 4 && (g32(pl) & 0xffu) == 0xbu) { fw_sring(pl, plen); return; }  /* C2c */
 		if (ce == 4 && flags == 0 && plen >= 4 && (g32(pl) & 0xffu) == 0xcu) { fw_rxsel(pl, plen); return; }  /* C2d */
 		if (ce == 4 && flags == 0 && plen >= 4 && (g32(pl) & 0xffu) == 0x11u) { fw_w29_ppdu(pl, plen); return; }  /* C2f */
+		if (ce == 4 && flags == 0 && plen >= 4 && ((g32(pl) & 0xffu) == 0x12u || (g32(pl) & 0xffu) == 0x15u)) {  /* C2h */
+			fw_fse(pl, plen);
+			return;
+		}
 		CHECK(ce == 4 && flags == 0 && plen == 8 && g32(pl) == 0 && g32(pl + 4) == (5u | 4u << 8 | 2u << 16),
 		    "HTT VERSION_REQ is not {msg 0, TCL metadata option tag 5 len 4 value 2} on CE4");
 		CHECK(fw_init_ok == 1 && fw_c2_step == 0, "HTT VERSION_REQ out of order");
@@ -2046,6 +2087,8 @@ static struct {
 	uint32_t cmem_lo, cmem_hi, cc_pre[6];
 	uint32_t cmem_rd, cmem_wr, cc_rd, cc_wr, ring_rd, ring_wr, ring_wr_before_cmem, cmem_wr_after_ring;
 	uint32_t n, addr[256], val[256];
+	uint32_t seed[0x5000u / 4u];   /* C2h: what CMEM reads return, word index from cmem_lo (written words land here too) */
+	uint32_t wr_hi, rd_rest, rd_fst, rd_other;  /* C2h: the highest written offset + 4, reads past our 280, flow table reads */
 } cmd;
 
 static void
@@ -2063,11 +2106,17 @@ cm_access(uint32_t off, bool wr, uint32_t *v)
 	if (!cmd.on) { return false; }
 	CHECK(!wl_cm.stopping, "a W29 access after wl26_contain");
 	if (off >= cmd.cmem_lo && off < cmd.cmem_hi) {
-		CHECK(!(off & 3u), "a misaligned CMEM access");
+		const uint32_t rel = off - cmd.cmem_lo;
+		CHECK(!(off & 3u) && rel < sizeof(cmd.seed), "a misaligned CMEM access, or one past the model's CMEM");
 		if (wr) {
 			if (!cmd.cmem_wr) { cmd.ring_wr_before_cmem = cmd.ring_wr; }
 			cmd.cmem_wr++; cmd.cmem_wr_after_ring += cmd.ring_wr != 0;
-		} else { cmd.cmem_rd++; *v = 0; }
+			cmd.seed[rel / 4u] = *v; if (rel + 4u > cmd.wr_hi) { cmd.wr_hi = rel + 4u; }
+		} else {
+			cmd.cmem_rd++; *v = cmd.seed[rel / 4u];
+			if (rel >= 0x1000u) { cmd.rd_fst++; } else if (rel >= 4u * 280u) { cmd.rd_rest++; }
+			if (rel >= 0x1000u && ((rel - 0x1000u) % 64u != 0x24u || rel >= 0x1000u + 128u * 64u)) { cmd.rd_other++; }
+		}
 		return true;
 	}
 	for (unsigned k = 0; k < 6; k++) {
@@ -2289,6 +2338,7 @@ reset(void)
 	memset(fw_mac_hp, 0, sizeof(fw_mac_hp)); memset(fw_mac_tp, 0, sizeof(fw_mac_tp)); memset(fw_pset_w, 0, sizeof(fw_pset_w));
 	memset(slot_listed, 0, sizeof(slot_listed)); wbm_log_n = 0; n_acts = acts_done = 0; fw_cmd_n = 0;
 	fw_w29_n = fw_w29_at = 0; wl29_mask = WL29_ALL;  /* C2f bisect */
+	wl30_mask = 0; memset(&wl30_reo, 0, sizeof(wl30_reo)); fw_fse_n = fw_fisa_n = 0;  /* C2h */
 	memset(&wl_rx, 0, sizeof(wl_rx)); wl26_wbm_writes = 0; wl26_heard_none = false;
 	memset(&C, 0, sizeof(C));
 	C.rx_take = 2048; C.rx_post[0] = C.rx_post[1] = 1024;
@@ -5791,6 +5841,302 @@ s_no_w20(void)
 	puts("W20 never ran: the containment hook is silent and touches nothing");
 }
 
+/* ---- C2h (fuxiwlanvrx): the vendor's kiwi RX extras, each behind its bit ---- */
+
+/* Pure: the counts of wlvrx_note, the IPA flag, the FSE/FISA words (the vendor's, written down here again), the region
+ * and read allowlists, the PPT count. */
+static void
+s_c2h_pure(void)
+{
+	struct wlvrx_reo r;
+	uint8_t ev[96];
+	memset(&r, 0, sizeof(r));
+	/* FW_CONSUMED: a beacon, a probe response, an action frame, a short TLV, a TLV past the event */
+	for (unsigned k = 0; k < 5; k++) {
+		static const uint32_t sub[5] = { 8, 5, 13, 8, 8 };
+		memset(ev, 0, sizeof(ev));
+		p32(ev, (0x3d3u << 16) | (k == 3 ? 32u : k == 4 ? 80u : 36u));
+		p32(ev + 4 + 12, sub[k] << 28);
+		wlvrx_note(&r, 0x700du, ev, 40);
+	}
+	CHECK(r.consumed == 5 && r.consumed_bcn == 1 && r.consumed_prsp == 1 && r.consumed_bad == 2, "c2h: fw-consumed counts");
+	wlvrx_note(&r, 0x700eu, ev, 0); wlvrx_note(&r, 0x7002u, ev, 44); wlvrx_note(&r, 0x4002u, ev, 44);
+	CHECK(r.srng_reap == 1 && r.mgmt_rx == 0 && r.consumed == 5, "c2h: srng-reap and other ids");
+	/* MGMT_RX: header TLV then REO params with the counter valid, without, short, absent */
+	for (unsigned k = 0; k < 4; k++) {
+		memset(ev, 0, sizeof(ev));
+		p32(ev, 0x2cu << 16 | 8u);
+		p32(ev + 12, (k == 3 ? 0x11u : 0x3d2u) << 16 | (k == 2 ? 12u : 16u));
+		p32(ev + 12 + 8, k == 0 ? 1u << 15 : 0x7fffu);
+		wlvrx_note(&r, 0x7001u, ev, 32);
+	}
+	CHECK(r.mgmt_rx == 4 && r.reo_tlv == 2 && r.reo_valid == 1, "c2h: mgmt-rx reo params counts");
+	/* IPA_DISABLE: set without IPA, cleared with it, every other flag1 bit kept */
+	CHECK(wlvrx_flag1_ipa(0x40020u, false) == 0x40040020u && wlvrx_flag1_ipa(0x40040020u, false) == 0x40040020u &&
+	    wlvrx_flag1_ipa(0xffffffffu, true) == 0xbfffffffu && wlvrx_flag1_ipa(0u, true) == 0u, "c2h: flag1 IPA_DISABLE");
+	{
+		static const uint32_t fse[14] = { 0x12u, 0x21000080u, 0x114000u, 0x10u, 0xda565a6du, 0xc20e5b25u, 0x3d256741u,
+			0xb08fa343u, 0xcb2bcad0u, 0xb4307baeu, 0xa32dcb77u, 0x0cf23080u, 0x3bb7426au, 0xfa01acbeu };
+		static const uint8_t key[40] = { 0x6d, 0x5a, 0x56, 0xda, 0x25, 0x5b, 0x0e, 0xc2, 0x41, 0x67, 0x25, 0x3d, 0x43, 0xa3,
+			0x8f, 0xb0, 0xd0, 0xca, 0x2b, 0xcb, 0xae, 0x7b, 0x30, 0xb4, 0x77, 0xcb, 0x2d, 0xa3, 0x80, 0x30, 0xf2, 0x0c, 0x6a,
+			0x42, 0xb7, 0x3b, 0xbe, 0xac, 0x01, 0xfa };
+		uint32_t w[WLVRX_FSE_WORDS], f[WLVRX_FISA_WORDS];
+		wlvrx_fse_words(0x113000u, w);
+		CHECK(!memcmp(w, fse, sizeof(fse)), "c2h: FSE_SETUP words");
+		for (unsigned i = 0; i < 10; i++) { CHECK(w[4 + i] == g32(key + 4 * i), "c2h: the key as native little-endian words"); }
+		wlvrx_fse_words(0x80000u, w);
+		CHECK(w[2] == 0x81000u && w[3] == 0x10u, "c2h: FSE base follows the CMEM base");
+		wlvrx_fisa_words(f);
+		CHECK(f[0] == 0x15u && f[1] == 0x1fu && f[2] == 0xffffffffu, "c2h: FISA_CFG words");
+	}
+	CHECK(wlvrx_fst_region_ok(0x113000u, 0x5000u) && !wlvrx_fst_region_ok(0x113000u, 0x4ffcu) &&
+	    !wlvrx_fst_region_ok(0x1ffc000u, 0x5000u) && wlvrx_fst_region_ok(0x1ffb000u, 0x5000u) &&
+	    !wlvrx_fst_region_ok(0x100113000ull, 0x5000u) && !wlvrx_fst_region_ok(0x113002u, 0x5000u), "c2h: flow table region");
+	CHECK(wlvrx_fst_rd_ok(0x113000u, 0x5000u, 0x114024u) && wlvrx_fst_rd_ok(0x113000u, 0x5000u, 0x114000u + 127u * 64u + 0x24u) &&
+	    !wlvrx_fst_rd_ok(0x113000u, 0x5000u, 0x114000u + 128u * 64u + 0x24u) && !wlvrx_fst_rd_ok(0x113000u, 0x5000u, 0x114020u) &&
+	    !wlvrx_fst_rd_ok(0x113000u, 0x5000u, 0x113024u) && !wlvrx_fst_rd_ok(0x113000u, 0x1000u, 0x114024u), "c2h: flow table reads");
+	{
+		struct wlcm cm;
+		struct wlvrx_ppt c;
+		memset(&cm, 0, sizeof(cm));
+		cm.cmem_base = 0x113000u; cm.cmem_size = 0x1000u; cm.cmem_valid = true;
+		CHECK(!wlvrx_ppt_rest_ok(&cm, 0x113000u + 4u * 279u) && wlvrx_ppt_rest_ok(&cm, 0x113000u + 4u * 280u) &&
+		    wlvrx_ppt_rest_ok(&cm, 0x113ffcu) && !wlvrx_ppt_rest_ok(&cm, 0x114000u) && !wlvrx_ppt_rest_ok(&cm, 0x113462u), "c2h: ppt rest");
+		cm.cmem_size = 0x800u;
+		CHECK(wlvrx_ppt_rest_ok(&cm, 0x1137fcu) && !wlvrx_ppt_rest_ok(&cm, 0x113800u), "c2h: ppt rest inside the region");
+		cm.cmem_valid = false;
+		CHECK(!wlvrx_ppt_rest_ok(&cm, 0x113800u - 4u), "c2h: ppt rest without a region");
+		cm.ppt_pre[3] = 0x80003u; cm.ppt_pre[200] = ~0u; cm.ppt_pre[279] = 1u;
+		wlvrx_ppt_count(&cm, &c);
+		CHECK(c.stale == 3 && c.ones == 1 && c.first == 3 && c.last == 279, "c2h: ppt count");
+	}
+	reset();
+	puts("C2h pure: fw-consumed / srng-reap / reo-params counts (beacon and probe-resp subtypes, short and overrunning TLVs, "
+	     "other ids), flag1 IPA_DISABLE set and cleared, the vendor's FSE_SETUP and FISA_CFG words (the key as native words), "
+	     "the flow table region and its valid-word read allowlist, the PPT rest allowlist and count");
+}
+
+/* 0x02: cookie conversion over a stale PPT, against the W29 register file / CMEM of cm_access (the C2f gate). */
+static void
+c2h_seed_android(void)
+{
+	for (unsigned i = 0; i < 64; i++) { cmd.seed[i] = 0x9a000u + i; cmd.seed[128 + i] = 0x9b000u + i; }
+	for (unsigned i = 300; i < 310; i++) { cmd.seed[i] = 0x9c000u + i; }
+}
+
+static void
+s_c2h_ccstale(void)
+{
+	/* the stale table: our 280 overwritten (the C2f writes, nothing past them), the other 744 read and left; cc_config */
+	c2f_gate_reset();
+	wl30_mask = WL30_CCSTALE;
+	c2h_seed_android();
+	CHECK(wl27_setup() == 0 && wl_cm.rings_on && wl_cm.cc_on && wl_rx.cc_on && wl_rd.cc_on, "c2h ccstale: cc on");
+	CHECK(cmd.cmem_wr == 280u && cmd.wr_hi == 4u * 280u && cmd.rd_rest == 744u && cmd.cmem_rd == 1024u && !cmd.rd_fst,
+	    "c2h ccstale: 280 writes, 744 rest reads, nothing past the 280 written");
+	for (unsigned i = 0; i < 280; i++) { CHECK(cmd.seed[i] == wlcm_ppt_val(&wl_cm, i), "c2h ccstale: an entry not overwritten"); }
+	for (unsigned i = 300; i < 310; i++) { CHECK(cmd.seed[i] == 0x9c000u + i, "c2h ccstale: a rest entry changed"); }
+	{
+		static const char *const order[] = {
+			"FUXI WLAN: W29 cc before: ",
+			("FUXI WLAN: W30 ccstale: ppt stale 128 of 280 (first 0 last 191) to be overwritten; rest read 744 non-zero 10 "
+			 "(first 300) all-ones 0, left as found (fuxiwlanvrx 0x02)\n"),
+			"FUXI WLAN: W29 cookie conversion cmem base 0x113000 pages 280 (rx 24 tx 256) spt 0xa5001000 ppt writes 280; cc on\n",
+			"FUXI WLAN: W29 common ring 121 sw2wbm-rel",
+		};
+		expect_order(order, sizeof(order) / sizeof(order[0]));
+	}
+	expect_not("cookie conversion not programmed");
+	CHECK(wl29_cc_config() == 0 && cmd.cc_wr == 6u, "c2h ccstale: the six cc_config writes follow");
+	c2f_gate_done();
+	/* the region smaller than the vendor's 4 KiB table: the rest read only up to its end */
+	c2f_gate_reset();
+	wl30_mask = WL30_CCSTALE; wl_cmem_size = 0x800u;
+	c2h_seed_android();
+	CHECK(wl27_setup() == 0 && wl_cm.cc_on && cmd.rd_rest == 0x800u / 4u - 280u && cmd.cmem_wr == 280u, "c2h ccstale: small region");
+	expect("FUXI WLAN: W30 ccstale: ppt stale 128 of 280 (first 0 last 191) to be overwritten; rest read 232 non-zero 10 ");
+	c2f_gate_done();
+	/* a clean PPT: the C2f path, the rest still read and counted */
+	c2f_gate_reset();
+	wl30_mask = WL30_CCSTALE;
+	cmd.seed[1023] = 5u;
+	CHECK(wl27_setup() == 0 && wl_cm.cc_on && cmd.cmem_wr == 280u && cmd.rd_rest == 744u, "c2h ccstale: clean");
+	expect("FUXI WLAN: W30 ccstale: ppt clean (non-zero 0 of 280); rest read 744 non-zero 1 all-ones 0, left as found (fuxiwlanvrx 0x02)\n");
+	c2f_gate_done();
+	/* an unreadable entry among our 280: refused, the C2f refusal line, nothing written */
+	c2f_gate_reset();
+	wl30_mask = WL30_CCSTALE;
+	c2h_seed_android(); cmd.seed[250] = ~0u; cmd.seed[700] = ~0u;
+	CHECK(wl27_setup() == 0 && !wl_cm.cc_on && !cmd.cmem_wr && cmd.rd_rest == 744u, "c2h ccstale: ~0 refused");
+	expect("FUXI WLAN: W30 ccstale refused: ppt non-zero 129 of 280, all-ones 1 (unreadable); rest read 744 non-zero 10 all-ones 1; "
+	    "nothing written (fuxiwlanvrx 0x02)\n");
+	expect("FUXI WLAN: W29 cookie conversion not programmed: a CMEM PPT entry is already non-zero (cookie converter owned); ");
+	CHECK(wl29_cc_config() == 0 && !cmd.cc_wr, "c2h ccstale: no cc_config after the refusal");
+	c2f_gate_done();
+	/* a cc register configured: the C2f gate stands, no CMEM access at all */
+	c2f_gate_reset();
+	wl30_mask = WL30_CCSTALE;
+	c2h_seed_android(); cmd.cc_pre[0] = 0x113000u;
+	CHECK(wl27_setup() == 0 && !wl_cm.cc_on && !cmd.cmem_rd && !cmd.cmem_wr, "c2h ccstale: cc owned");
+	expect("FUXI WLAN: W30 ccstale not applied: a REO/WBM cookie register is already configured (cfg0 base, wbm cfg1 enable or "
+	    "convert global) (fuxiwlanvrx 0x02)\n");
+	c2f_gate_done();
+	/* no CMEM region: not applied, no access */
+	c2f_gate_reset();
+	wl30_mask = WL30_CCSTALE; wl_cmem_valid = false;
+	CHECK(wl27_setup() == 0 && !wl_cm.cc_on && !cmd.cmem_rd, "c2h ccstale: no region");
+	expect("FUXI WLAN: W30 ccstale not applied: no QMI CMEM region (dev_mem[0]); cookie conversion needs it (fuxiwlanvrx 0x02)\n");
+	c2f_gate_done();
+	/* without the bit: the stale table refuses cc as at c398819, no W30 line, no read past the 280 */
+	c2f_gate_reset();
+	c2h_seed_android();
+	CHECK(wl27_setup() == 0 && !wl_cm.cc_on && !cmd.cmem_wr && cmd.cmem_rd == 280u && !cmd.rd_rest, "c2h ccstale: off");
+	expect_not("W30");
+	expect("FUXI WLAN: W29 cookie conversion not programmed: a CMEM PPT entry is already non-zero");
+	c2f_gate_done();
+	puts("C2h ccstale: a stale PPT (the vendor's TX pages) overwritten by our 280 C2f writes, nothing past them written, the "
+	     "other 744 read and left, cc_config follows; the rest read only inside a smaller region; a clean PPT; a ~0 entry "
+	     "refused with nothing written; a configured cc register or no CMEM region: not applied, no CMEM access; without "
+	     "the bit the C2f refusal unchanged");
+}
+
+/* 0x04: WMI INIT flag1 bit 30 (the firmware's INIT check wants it with the bit, not without). */
+static void
+s_c2h_ipadis(void)
+{
+	c2_reset();
+	happy_frames();
+	wl30_mask = WL30_IPADIS;
+	CHECK(run() == 0 && fw_init_ok == 1, "c2h ipadis run");
+	expect("FUXI WLAN: W30 ipadis: wmi init flag1 0x40020 -> 0x40040020 (IPA_DISABLE bit 30 = !ipa-enabled; no IPA on this host) "
+	    "(fuxiwlanvrx 0x04)\n");
+	expect("FUXI WLAN: W22 wmi init sent bytes 332 (vdevs 4 peers 16 chains 0x3 flag1 0x40040020 flags2 0x200 host-svc 0x10 mem-chunks 0)\n");
+	expect("FUXI WLAN: W23 scan completed reason 0 after ");
+	contained_and_freed();
+	reset();
+	puts("C2h ipadis: WMI INIT flag1 0x40020 -> 0x40040020, every other INIT word as before, the scan completes");
+}
+
+/* 0x08: FSE_SETUP and FISA_CFG in a 0x902 run (RX rings and ring selection), the table's valid words pre-read through
+ * the CMEM window of cm_access, nothing written to CMEM. */
+static void
+c2h_fse_reset(uint32_t size)
+{
+	c2c_reset(0x902u);
+	C.rx_rule = 2; C.rx_frames = 2;
+	happy_frames();
+	memset(&wl_cm, 0, sizeof(wl_cm));
+	cmd.on = true; cmd.cmem_lo = 0x113000u; cmd.cmem_hi = 0x118000u;  /* off again before containment (the latch check) */
+	wl_cmem_base = 0x113000u; wl_cmem_size = size; wl_cmem_valid = true;
+	wl30_mask = WL30_FSE;
+}
+
+static void
+s_c2h_fse(void)
+{
+	c2h_fse_reset(0x5000u);
+	cmd.seed[(0x1000u + 3u * 64u + 0x24u) / 4u] = 0x100u; cmd.seed[(0x1000u + 100u * 64u + 0x24u) / 4u] = 0x4fffu;
+	cmd.seed[(0x1000u + 101u * 64u + 0x24u) / 4u] = 0x400u; cmd.seed[(0x1000u + 127u * 64u + 0x24u) / 4u] = ~0u;
+	CHECK(run() == 0, "c2h fse run");
+	cmd.on = false;
+	CHECK(fw_fse_n == 1 && fw_fisa_n == 1 && cmd.rd_fst == 128u && !cmd.rd_other && !cmd.cmem_wr && !cmd.rd_rest, "c2h fse: messages and reads");
+	expect("FUXI WLAN: W30 fse setup sent base 0x114000/0x10 records 128 depth 16 prefix 2 key da565a6d..fa01acbe; table valid 2 "
+	    "unreadable 1; fisa cfg sent 0x1f/0xffffffff; no cmem write (fuxiwlanvrx 0x08)\n");
+	{
+		static const char *const order[] = { "FUXI WLAN: W27 htt rx ring selection mac1 ", "FUXI WLAN: W30 fse setup sent",
+			"FUXI WLAN: W26 rx watch setup+100ms", "FUXI WLAN: W23 chan list 38 passive", "FUXI WLAN: W23 scan completed reason 0" };
+		expect_order(order, sizeof(order) / sizeof(order[0]));
+	}
+	contained_and_freed();
+	/* a region too small for the flow table, or none: not sent, no CMEM read, the scan as without the bit */
+	for (unsigned t = 0; t < 2; t++) {
+		c2h_fse_reset(0x1000u);
+		if (t) { wl_cmem_valid = false; }
+		CHECK(run() == 0 && !fw_fse_n && !fw_fisa_n && !cmd.cmem_rd && !cmd.cmem_wr, "c2h fse refused");
+		cmd.on = false;
+		expect(t ? "FUXI WLAN: W30 fse/fisa cfg not sent: no QMI CMEM region (dev_mem[0]) (fuxiwlanvrx 0x08)\n" :
+		    "FUXI WLAN: W30 fse/fisa cfg not sent: the QMI CMEM region cannot hold the 4 KiB PPT and the 16 KiB flow table (fuxiwlanvrx 0x08)\n");
+		expect("FUXI WLAN: W23 scan completed reason 0 after ");
+		contained_and_freed();
+	}
+	reset();
+	puts("C2h fse: RX_FSE_SETUP_CFG (CMEM 0x114000, hi 0x10, 128 records, search 16, prefix 2, the vendor's key) and "
+	     "RX_FISA_CFG (0x1f, 0xffffffff) word by word after the ring selection and before the channel list, the table's 128 "
+	     "valid words read and nothing else, nothing written; too small a region or none: not sent, no CMEM access");
+}
+
+/* 0x01: nothing sent; the counts of what the firmware does with management frames (REO params TLV in MGMT_RX, FW_CONSUMED,
+ * SRNG_REAP); the scan itself unchanged (the frames with the REO TLV still reach the BSS table). */
+static void
+s_c2h_mgmtreo(void)
+{
+	static const uint8_t B_R1[6] = {2, 0, 0, 0, 0, 0x21}, B_R2[6] = {2, 0, 0, 0, 0, 0x22};
+	uint32_t base_frames, base_mgmt, cmds;
+	char want[256];
+	struct mbeacon *b;
+	c2_reset();
+	happy_frames();
+	b = add_frame(2, 30, 8, B_R1, 0x0401, "ReoA", 4, 3, 0, false); (void)b;
+	b = add_frame(3, 30, 8, B_R2, 0x0401, "ReoB", 4, 4, 0, false); (void)b;
+	CHECK(run() == 0, "c2h mgmtreo baseline");
+	base_frames = wl_scan.frames; base_mgmt = wl_scan.mgmt; cmds = fw_wmi_msgs;
+	expect_not("W30");
+	CHECK(!wl30_reo.mgmt_rx && !wl30_reo.consumed && !wl30_reo.srng_reap, "c2h mgmtreo: counted without the bit");
+	contained_and_freed();
+	c2_reset();
+	C.svc299 = true; C.srng_reap = 2;
+	happy_frames();
+	b = add_frame(2, 30, 8, B_R1, 0x0401, "ReoA", 4, 3, 0, false); b->mode = 4;
+	b = add_frame(3, 30, 8, B_R2, 0x0401, "ReoB", 4, 4, 0, false); b->mode = 6;
+	b = add_frame(5, 30, 8, B_R1, 0x0401, "Gone", 4, 6, 0, false); b->mode = 5;
+	b = add_frame(6, 30, 5, B_R2, 0x0401, "Gone", 4, 7, 0, false); b->mode = 5;
+	b = add_frame(20, 30, 8, B_R2, 0x0401, "Gone", 4, 0, 0, false); b->mode = 5;
+	wl30_mask = WL30_MGMTREO;
+	CHECK(run() == 0, "c2h mgmtreo run");
+	CHECK(wl_scan.frames == base_frames && wl_scan.mgmt == base_mgmt && fw_wmi_msgs == cmds, "c2h mgmtreo: the scan and the commands as without the bit");
+	CHECK(wl30_reo.mgmt_rx == wl_scan.mgmt && wl30_reo.reo_tlv == 2 && wl30_reo.reo_valid == 1 && wl30_reo.consumed == 3 &&
+	    wl30_reo.consumed_bcn == 2 && wl30_reo.consumed_prsp == 1 && wl30_reo.srng_reap == 2, "c2h mgmtreo: counts");
+	expect("FUXI WLAN: W30 mgmtreo: nothing sent (mgmt rx reo is host-side reordering, absent from the vendor kiwi build and L19); "
+	    "service 299 set; counting fw-consumed, srng-reap, reo-params (fuxiwlanvrx 0x01)\n");
+	snprintf(want, sizeof(want), "FUXI WLAN: W30 mgmtreo counts: mgmt-rx %u (reo-params 2, ctr-valid 1), fw-consumed 3 (beacon 2, "
+	    "probe-resp 1, no hdr 0), srng-reap 2\n", wl_scan.mgmt);
+	expect(want);
+	{
+		static const char *const order[] = { "FUXI WLAN: W21 wmi service ready complete\n", "FUXI WLAN: W30 mgmtreo: nothing sent",
+			"FUXI WLAN: W22 wmi init sent", "FUXI WLAN: W24 ", "FUXI WLAN: W30 mgmtreo counts:" };
+		expect_order(order, sizeof(order) / sizeof(order[0]));
+	}
+	contained_and_freed();
+	/* without service 299: said so, still nothing sent */
+	c2_reset();
+	happy_frames();
+	wl30_mask = WL30_MGMTREO;
+	CHECK(run() == 0, "c2h mgmtreo no 299");
+	expect("service 299 not set; counting");
+	expect("FUXI WLAN: W30 mgmtreo counts: mgmt-rx ");
+	contained_and_freed();
+	reset();
+	puts("C2h mgmtreo: nothing sent (the WMI command stream as without the bit), service 299 reported, the REO params TLV "
+	     "(counter valid or not), FW_CONSUMED (beacon, probe response) and SRNG_REAP counted; frames with the TLV still "
+	     "reach the BSS table");
+}
+
+/* All four at once in a 0x5902 + 0x4000 gate-free full run is covered piecewise above; here the four bits together in the
+ * 0x902 run (mgmtreo, ipadis, fse) end to end. */
+static void
+s_c2h_all(void)
+{
+	c2h_fse_reset(0x5000u);
+	wl30_mask = WL30_MGMTREO | WL30_IPADIS | WL30_FSE;
+	CHECK(run() == 0 && fw_fse_n == 1 && fw_fisa_n == 1 && fw_init_ok == 1, "c2h all run");
+	cmd.on = false;
+	CHECK(count_text("FUXI WLAN: W30 ") == 4, "c2h all: four W30 lines");
+	expect("W23 scan completed reason 0");
+	contained_and_freed();
+	reset();
+	puts("C2h all: mgmtreo, ipadis and fse together in one 0x902 scan, four W30 lines, the scan completes");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -5810,6 +6156,12 @@ main(int argc, char **argv)
 		s_c2d_pure(); s_c2d_happy(); s_c2d_wedge(); s_c2d_exhaust(); s_c2d_entries(); s_c2d_contain(); s_c2d_failures(); s_c2d_widest();
 		reset();
 		puts("C2d model: all scenarios passed");
+		return 0;
+	}
+	if (argc == 2 && !strcmp(argv[1], "c2h")) {  /* the C2h scenarios alone (the mutant runs of tools/test-fuxi-wlan-ce.py) */
+		s_c2h_pure(); s_c2h_ccstale(); s_c2h_ipadis(); s_c2h_fse(); s_c2h_mgmtreo(); s_c2h_all();
+		reset();
+		puts("C2h model: all scenarios passed");
 		return 0;
 	}
 	if (argc == 2 && !strcmp(argv[1], "c2f")) {  /* the C2f scenarios alone (the mutant runs of tools/test-fuxi-wlan-ce.py) */
@@ -5881,6 +6233,12 @@ main(int argc, char **argv)
 	s_c2f_mask_gate();
 	s_c2f_bisect();
 	s_c2g_ptrs();
+	s_c2h_pure();
+	s_c2h_ccstale();
+	s_c2h_ipadis();
+	s_c2h_fse();
+	s_c2h_mgmtreo();
+	s_c2h_all();
 	reset();
 	puts("W20 model: all scenarios passed");
 	return 0;

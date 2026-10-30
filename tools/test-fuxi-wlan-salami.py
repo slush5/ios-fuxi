@@ -47,6 +47,11 @@ Host-only, synthetic cmd-db and RSC registers, fake boot-args and a fake ADT
     default 0x9f (no LRO, no IDLE_PS: they stall a polled host), listed as
     "fuxiwlanw29 0x9f default"; 0xff still sends every piece; 0, negative, unknown
     bits, 0x02 without 0x01, without 0x4000 or qrtr 7 refused.
+  - C2h: fuxiwlanvrx (cmdline and ADT /defaults) selects the vendor pieces of a
+    valid qrtr 7 w20 0x4000 boot (0x01 mgmt-reo counts, 0x02 stale PPT overwrite,
+    0x04 INIT IPA_DISABLE, 0x08 FSE/FISA) and lists them in a W30 line; absent or
+    0 = none and no W30 line; negative, bits outside 0xf, 0x02 without fuxiwlanw29
+    0x02, 0x08 without w20 0x800, without 0x4000 or qrtr 7 refused.
 """
 from pathlib import Path
 import importlib.util
@@ -683,6 +688,31 @@ def gate_suite(tmp, mk):
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=5 fuxiwlanw29=1', 0, 0,
          'W20 fuxiwlanw29 0x1 needs fuxiwlanqrtr=7 with w20 0x4000; refused'),
         ('fuxiwlan=11 fuxiwlansalami=1 fuxiwlanw29=0x41', 0, 0, 'W20 fuxiwlanw29 0x41 needs fuxiwlanqrtr=7 with w20 0x4000; refused'),
+        # C2h: fuxiwlanvrx selects the vendor pieces of a valid qrtr 7 w20 0x4000 boot; 0 = none (no W30 line); refused when
+        # negative, with a bit outside 0xf, 0x02 without fuxiwlanw29 0x02, 0x08 without w20 0x800, without 0x4000 or qrtr 7
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32514 fuxiwlanvrx=1', 1, 28,
+         'W30 selected: vendor kiwi rx, fuxiwlanvrx 0x1: mgmt-reo counts yes, stale ppt overwrite no, init ipa-disable no, '
+         'fse/fisa cfg no; nothing transmitted'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32514 fuxiwlanvrx=15', 1, 28,
+         'W30 selected: vendor kiwi rx, fuxiwlanvrx 0xf: mgmt-reo counts yes, stale ppt overwrite yes, init ipa-disable yes, '
+         'fse/fisa cfg yes; nothing transmitted'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32514 fuxiwlanvrx=2', 1, 28, 'fuxiwlanvrx 0x2: mgmt-reo counts no, stale ppt overwrite yes'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32514 fuxiwlanvrx=4', 1, 28, 'init ipa-disable yes, fse/fisa cfg no'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32514 fuxiwlanvrx=8', 1, 28, 'init ipa-disable no, fse/fisa cfg yes'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32514 fuxiwlanw29=0x83 fuxiwlanvrx=2', 1, 28, 'fuxiwlanvrx 0x2: '),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32514 fuxiwlanvrx=0', 1, 28, 'w20 0x7f02 valid 1'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32514 fuxiwlanvrx=16', 0, 0,
+         'W20 fuxiwlanvrx 0x10 refused: needs a valid w20 0x4000, bits 0xf only, 0x02 only with fuxiwlanw29 0x02, 0x08 only with w20 0x800'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32514 fuxiwlanvrx=-1', 0, 0, 'W20 fuxiwlanvrx 0xffffffff refused'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32514 fuxiwlanw29=1 fuxiwlanvrx=2', 0, 0, 'W20 fuxiwlanvrx 0x2 refused'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0x7702 fuxiwlanvrx=8', 0, 0, 'W20 fuxiwlanvrx 0x8 refused'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0x7702 fuxiwlanvrx=7', 1, 28, 'fse/fisa cfg no; nothing transmitted'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=15106 fuxiwlanvrx=1', 0, 0, 'W20 fuxiwlanvrx 0x1 refused'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanvrx=1', 0, 0, 'W20 fuxiwlanvrx 0x1 refused'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw20=0x45 fuxiwlanvrx=1', 0, 0, 'W20 fuxiwlanvrx 0x1 refused'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=5 fuxiwlanvrx=1', 0, 0,
+         'W20 fuxiwlanvrx 0x1 needs fuxiwlanqrtr=7 with w20 0x4000; refused'),
+        ('fuxiwlan=11 fuxiwlansalami=1 fuxiwlanvrx=4', 0, 0, 'W20 fuxiwlanvrx 0x4 needs fuxiwlanqrtr=7 with w20 0x4000; refused'),
     ]
     for args, starts, limit, text in cases:
         s, lim, names, out, reads = run(salami, args)
@@ -696,7 +726,7 @@ def gate_suite(tmp, mk):
             assert 'M6g IOVA' not in out  # refused before any configuration
         if 'fuxiwlanrails' not in args:
             assert 'rails variant' not in out, (args, out)
-        if not re.search(r'fuxiwlanqrtr=([6-9]|-)|fuxiwlanw20=[^0]|fuxiwlanw29=', args):
+        if not re.search(r'fuxiwlanqrtr=([6-9]|-)|fuxiwlanw20=[^0]|fuxiwlanw29=|fuxiwlanvrx=[^0]', args):
             assert 'W20' not in out, (args, out)  # every other boot logs exactly as before W20
         m20 = re.search(r'fuxiwlanw20=(\S+)', args)  # C2c: a W26 line only for a valid qrtr 7 boot with a W26 bit
         w26 = bool(m20 and 'fuxiwlanqrtr=7' in args and int(m20[1], 0) & 0x700 and re.search(r'w20 0x[0-9a-f]+ valid 1', out))
@@ -713,6 +743,11 @@ def gate_suite(tmp, mk):
         assert 'cookie conversion (CMEM from QMI)' not in out, (args, out)
         if m29 and not w29:
             assert 'fuxiwlanw29' in out and 'refused' in out, (args, out)
+        mvrx = re.search(r'fuxiwlanvrx=(\S+)', args)  # C2h: a W30 line only for a valid 0x4000 boot with a non-zero fuxiwlanvrx
+        w30 = bool(w29 and mvrx and int(mvrx[1], 0))
+        assert ('W30' in out) == w30, (args, out)
+        if mvrx and int(mvrx[1], 0) and not w30:
+            assert 'fuxiwlanvrx' in out and 'refused' in out, (args, out)
     # Firmware names: salami Android defaults, boot-arg overrides, bad names refused.
     s, _, names, out, _ = run(salami, f'fuxiwlan=1 fuxiwlansalami=1 {W14}')
     assert s == 1 and names == {'bdf': 'bdwlan.b0e', 'regdb': 'regdb.bin', 'm3': 'phy_ucode20.elf', 'amss': ''}, names
@@ -787,6 +822,14 @@ def gate_suite(tmp, mk):
         'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32514 fuxiwlanw29=129',
         'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32514 fuxiwlanw29=256',
         'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=15106 fuxiwlanw29=1',
+        # C2h: the suggested kits' fuxiwlanvrx values and two refusals
+        'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32514 fuxiwlanvrx=1',
+        'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32514 fuxiwlanvrx=2',
+        'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32514 fuxiwlanvrx=4',
+        'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32514 fuxiwlanvrx=8',
+        'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32514 fuxiwlanvrx=15',
+        'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32514 fuxiwlanvrx=16',
+        'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=15106 fuxiwlanvrx=1',
     ]
     for args in equal:
         want = run(salami, args)
@@ -852,6 +895,20 @@ def gate_suite(tmp, mk):
         assert f'W29 selected: L19 dp_alloc order, fuxiwlanw29 {dec:#x}: ' in out and sel in out, (dec, out)
     s, lim, _, out, _ = run(salami, 'fuxiwlan=28 fuxiwlanclk=1 fuxiwlanqrtr=7', enc(f'{s4} fuxiwlanw20=32514 fuxiwlanw29=512'))
     assert s == 0 and 'W20 fuxiwlanw29 0x200 refused' in out and 'w20 0x7f02 valid 0' in out, out
+    # C2h kit route: the r1c2 cmdline, fuxiwlanw20=32514 and fuxiwlanvrx both from ADT /defaults (the suggested kits)
+    vrx = {1: 'mgmt-reo counts yes, stale ppt overwrite no, init ipa-disable no, fse/fisa cfg no',
+           2: 'mgmt-reo counts no, stale ppt overwrite yes, init ipa-disable no, fse/fisa cfg no',
+           4: 'mgmt-reo counts no, stale ppt overwrite no, init ipa-disable yes, fse/fisa cfg no',
+           8: 'mgmt-reo counts no, stale ppt overwrite no, init ipa-disable no, fse/fisa cfg yes',
+           3: 'mgmt-reo counts yes, stale ppt overwrite yes, init ipa-disable no, fse/fisa cfg no',
+           15: 'mgmt-reo counts yes, stale ppt overwrite yes, init ipa-disable yes, fse/fisa cfg yes'}
+    for dec, sel in vrx.items():
+        s, lim, _, out, _ = run(salami, 'fuxiwlan=28 fuxiwlanclk=1 fuxiwlanqrtr=7', enc(f'{s4} fuxiwlanw20=32514 fuxiwlanvrx={dec}'))
+        assert (s, lim) == (1, 28) and 'salami fuxiwlanvrx from ADT /defaults' in out and 'w20 0x7f02 valid 1' in out, (dec, out)
+        assert f'W30 selected: vendor kiwi rx, fuxiwlanvrx {dec:#x}: {sel}; nothing transmitted' in out, (dec, out)
+        assert 'W29 selected: L19 dp_alloc order, fuxiwlanw29 0x9f default: ' in out, (dec, out)
+    s, lim, _, out, _ = run(salami, 'fuxiwlan=28 fuxiwlanclk=1 fuxiwlanqrtr=7', enc(f'{s4} fuxiwlanw20=32514 fuxiwlanvrx=32'))
+    assert s == 0 and 'W20 fuxiwlanvrx 0x20 refused' in out and 'w20 0x7f02 valid 0' in out and 'W30' not in out, out
     # (c) A boot-arg wins over /defaults, number or string, also when the boot-arg says less.
     s, lim, names, out, _ = run(salami, 'fuxiwlan=12 fuxiwlansalami=1 fuxiwlanrails=2 fuxiwlanqrtr=4 fuxiwlanbdf=a.bin',
                                 enc('fuxiwlan=11 fuxiwlansalami=0 fuxiwlanrails=1 fuxiwlanbdf=b.bin fuxiwlanm3=c.elf'))
@@ -910,6 +967,9 @@ def gate_suite(tmp, mk):
     print(f'C2f bisect: fuxiwlanw29 parsed (cmdline and ADT /defaults), the selected set in the W29 line, absent = the C2g '
           f'default 0x9f (no LRO, no IDLE_PS); 0, negative, unknown bits, 0x02 without 0x01, without 0x4000 or without qrtr 7 refused; {len(bisect)} '
           'bisect kit values from /defaults')
+    print(f'C2h: fuxiwlanvrx parsed (cmdline and ADT /defaults), the selected pieces in the W30 line; absent or 0 = no W30 line; '
+          f'negative, bits outside 0xf, 0x02 without fuxiwlanw29 0x02, 0x08 without w20 0x800, without 0x4000 or qrtr 7 '
+          f'refused; {len(vrx)} kit values from /defaults')
     print(f'C2c..C2f kit route: r1c2 cmdline with fuxiwlanw20 from ADT /defaults for {len(kits)} kit values (512 .. 32514, '
           'including C2d/C2e/C2f 6402/15106/32514), each read from /defaults and giving its W26..W29 selection; the bits '
           'refused with qrtr 6, keep/stop22, 0x100 without 0x02, 0x4000 without 0x1000')

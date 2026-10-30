@@ -4208,4 +4208,162 @@ wlcm_guard_count(const struct wlcm *cm, uint32_t *rdp_gap, uint32_t *ring_gap, u
 	for (uint32_t i = WLCM_OFF_TAIL / 4u; i < WLCM_ARENA_BYTES / 4u; i++) { *tail += a[i] != 0; }
 }
 
+/* ---- C2h (fuxiwlanvrx, qrtr 7 with a valid w20 0x4000): the vendor's kiwi RX extras ----
+ * Behaviour described from the ISC vendor host driver for kiwi (qca-wifi-host-cmn,
+ * qcacld-3.0, fw-api; LineageOS/android_kernel_oneplus_sm8550-modules @ 9c16bd2)
+ * in docs-lanes/wlan-mgmt-rx-study.md, with file:line cites there; the code is
+ * our own. Four pieces, each behind one fuxiwlanvrx bit, default off. */
+
+/* 0x01: MGMT RX REO needs no host part on kiwi (the study): nothing is sent or
+ * written. Read only, the evidence of what the firmware does with management
+ * frames: WMI_MGMT_RX_FW_CONSUMED (frames the firmware kept or dropped, with
+ * their subtype), WMI_MGMT_SRNG_REAP (frames on a management SRNG, which needs a
+ * flags2 bit we never set) and the REO params TLV in MGMT_RX. */
+#define WLVRX_SVC_MGMT_RX_REO 299u              /* WMI_SERVICE_MGMT_RX_REO_SUPPORTED */
+#define WLVRX_EV_MGMT_RX_FW_CONSUMED 0x700du    /* WMI_GRP_MGMT event 13 (L19 wmi.h:796) */
+#define WLVRX_EV_MGMT_SRNG_REAP 0x700eu         /* WMI_GRP_MGMT event 14 */
+#define WLVRX_TAG_MGMT_RX_REO_PARAMS 0x3d2u
+#define WLVRX_TAG_FW_CONSUMED_HDR 0x3d3u
+#define WLVRX_FW_CONSUMED_BYTES 36u             /* the fixed struct after its TLV header, 9 words */
+#define WLVRX_REO_PARAMS_BYTES 16u
+#define WLVRX_REO_CTR_VALID (1u << 15)          /* mgmt_pkt_ctr_link_info bit 15 */
+struct wlvrx_reo {
+	uint32_t consumed, consumed_bcn, consumed_prsp, consumed_bad, srng_reap;
+	uint32_t mgmt_rx, reo_tlv, reo_valid;
+};
+
+/* One WMI event, after wlwmi_rx: counts only, nothing kept from the frame and
+ * nothing that can fail the run (a TLV past the event stops the walk). */
+static inline void
+wlvrx_note(struct wlvrx_reo *r, uint32_t id, const uint8_t *p, uint32_t len)
+{
+	struct wlwmi_it it;
+	bool hit = false;
+	if (id != WLVRX_EV_MGMT_RX_FW_CONSUMED && id != WLVRX_EV_MGMT_SRNG_REAP && id != WLWMI_EV_MGMT_RX) { return; }
+	if (id == WLVRX_EV_MGMT_SRNG_REAP) { r->srng_reap++; return; }
+	if (id == WLWMI_EV_MGMT_RX) { r->mgmt_rx++; } else { r->consumed++; }
+	wlwmi_it_init(&it, p, len);
+	while (!hit && wlwmi_next(&it) > 0) {
+		if (id == WLVRX_EV_MGMT_RX_FW_CONSUMED && it.tag == WLVRX_TAG_FW_CONSUMED_HDR && it.tlen >= WLVRX_FW_CONSUMED_BYTES) {
+			const uint32_t sub = wlce_get32(it.v + 12) >> 28;   /* peer_info_subtype [31:28] */
+			r->consumed_bcn += sub == 8u; r->consumed_prsp += sub == 5u;
+			hit = true;
+		} else if (id == WLWMI_EV_MGMT_RX && it.tag == WLVRX_TAG_MGMT_RX_REO_PARAMS && it.tlen >= WLVRX_REO_PARAMS_BYTES) {
+			r->reo_tlv++; r->reo_valid += (wlce_get32(it.v + 4) & WLVRX_REO_CTR_VALID) != 0;
+			hit = true;
+		}
+	}
+	if (!hit && id == WLVRX_EV_MGMT_RX_FW_CONSUMED) { r->consumed_bad++; }
+}
+
+/* 0x02: the stale PPT (CCSTALE). The vendor's PPT is 1024 entries (4 KiB) at the
+ * CMEM base; its init writes the entries it uses over whatever an earlier
+ * session left and never clears the rest. We write our 280 as C2f does; the
+ * other 744 are read only, counted, never written. */
+#define WLVRX_PPT_ENTRIES 1024u
+_Static_assert(WLVRX_PPT_ENTRIES > WLCM_NSPT, "C2h PPT rest");
+struct wlvrx_ppt { uint32_t stale, ones, first, last, rest_read, rest_nonzero, rest_ones, rest_first; };
+
+/* The read-only allowlist for the PPT entries past our 280: inside the vendor's
+ * 4 KiB table and inside the region QMI reported. */
+static inline bool
+wlvrx_ppt_rest_ok(const struct wlcm *cm, uint32_t off)
+{
+	if (!cm->cmem_valid || (off & 3u) || off < cm->cmem_base + 4u * WLCM_NSPT || off >= cm->cmem_base + 4u * WLVRX_PPT_ENTRIES) {
+		return false;
+	}
+	return (uint64_t)off + 4u <= (uint64_t)cm->cmem_base + cm->cmem_size;
+}
+
+/* Our 280 pre-reads: non-zero (stale, to be overwritten), ~0 (unreadable: refused,
+ * the C2f refusal stands), first and last non-zero index. */
+static inline void
+wlvrx_ppt_count(const struct wlcm *cm, struct wlvrx_ppt *s)
+{
+	s->stale = s->ones = 0; s->first = s->last = ~0u;
+	for (uint32_t i = 0; i < WLCM_NSPT; i++) {
+		const uint32_t v = cm->ppt_pre[i];
+		if (!v) { continue; }
+		s->stale++; s->ones += v == ~0u;
+		if (s->first == ~0u) { s->first = i; }
+		s->last = i;
+	}
+}
+
+/* 0x04: WMI INIT flag1 bit 30 IPA_DISABLE. The vendor sets the field to
+ * !ucfg_ipa_is_enabled() every boot (WMI_RSRC_CFG_FLAG_SET clears it, then sets
+ * it); this host has no IPA, so it is 1. */
+#define WLVRX_FLAG1_IPA_DISABLE (1u << 30)
+static inline uint32_t
+wlvrx_flag1_ipa(uint32_t flag1, bool ipa_enabled)
+{
+	return (flag1 & ~WLVRX_FLAG1_IPA_DISABLE) | (ipa_enabled ? 0u : WLVRX_FLAG1_IPA_DISABLE);
+}
+
+/* 0x08: HTT RX_FSE_SETUP_CFG and RX_FISA_CFG as the vendor sends them on kiwi,
+ * after the ring selection: the flow table in CMEM at the base + 0x1000 (after
+ * the 4 KiB PPT), 16 KiB carved, address hi = (base >> 32) | 0x10 (CMEM, not
+ * DDR); 128 records (the INI default), search depth 16 (Beryllium), the
+ * IPv4-compatible IPv6 prefix (2), the vendor's 40-byte Toeplitz key as ten
+ * native (LE) words, the last ORed in whole as the vendor's build does (its
+ * field check only logs). FISA: pdev 0, enable with aggregation limit 0xf, the
+ * timeout 0xffffffff. In CMEM mode the vendor writes no table entry at setup:
+ * nor do we. The table's valid words are pre-read (read only) for the line. */
+#define WLHTT_H2T_RX_FSE_SETUP_CFG 0x12u
+#define WLHTT_H2T_RX_FISA_CFG 0x15u
+#define WLVRX_FST_OFF 0x1000u
+#define WLVRX_FST_BYTES 0x4000u
+#define WLVRX_FST_ENTRIES 128u
+#define WLVRX_FSE_BYTES 64u
+#define WLVRX_FSE_VALID_OFF 0x24u
+#define WLVRX_FSE_VALID (1u << 8)
+#define WLVRX_FST_SEARCH 16u
+#define WLVRX_FST_PREFIX 2u
+#define WLVRX_FST_ADDR_HI 0x10u
+#define WLVRX_FSE_WORDS 14u
+#define WLVRX_FISA_WORDS 3u
+#define WLVRX_FISA_CTRL (1u | 0xfu << 1)
+#define WLVRX_FISA_TIMEOUT 0xffffffffu
+_Static_assert(WLVRX_FST_ENTRIES * WLVRX_FSE_BYTES <= WLVRX_FST_BYTES && WLVRX_FISA_CTRL == 0x1fu, "C2h flow table");
+
+/* The region can hold the PPT and the flow table (the vendor's own check: 16 KiB
+ * left after the 4 KiB PPT) and the table stays inside the window's reach. */
+static inline bool
+wlvrx_fst_region_ok(uint64_t start, uint64_t size)
+{
+	return wlcm_cmem_region_ok(start, size) && size >= WLVRX_FST_OFF + WLVRX_FST_BYTES &&
+	    start + WLVRX_FST_OFF + WLVRX_FST_BYTES <= WLCM_CMEM_HI;
+}
+
+/* The flow table read allowlist: the valid word of each of the 128 records,
+ * nothing else; never a write. */
+static inline bool
+wlvrx_fst_rd_ok(uint64_t start, uint64_t size, uint32_t off)
+{
+	const uint64_t lo = start + WLVRX_FST_OFF;
+	if (!wlvrx_fst_region_ok(start, size) || off < lo || off >= lo + (uint64_t)WLVRX_FST_ENTRIES * WLVRX_FSE_BYTES) { return false; }
+	return (off - lo) % WLVRX_FSE_BYTES == WLVRX_FSE_VALID_OFF;
+}
+
+static inline void
+wlvrx_fse_words(uint64_t cmem_base, uint32_t w[WLVRX_FSE_WORDS])
+{
+	static const uint32_t key[10] = { 0xda565a6du, 0xc20e5b25u, 0x3d256741u, 0xb08fa343u, 0xcb2bcad0u, 0xb4307baeu,
+		0xa32dcb77u, 0x0cf23080u, 0x3bb7426au, 0xfa01acbeu };
+	const uint64_t fst = cmem_base + WLVRX_FST_OFF;
+	w[0] = WLHTT_H2T_RX_FSE_SETUP_CFG;   /* pdev_id 0 (bits 15:8): both MACs */
+	w[1] = WLVRX_FST_ENTRIES | WLVRX_FST_SEARCH << 20 | WLVRX_FST_PREFIX << 28;
+	w[2] = (uint32_t)fst;
+	w[3] = (uint32_t)(fst >> 32) | WLVRX_FST_ADDR_HI;
+	for (unsigned i = 0; i < 10u; i++) { w[4 + i] = key[i]; }
+}
+
+static inline void
+wlvrx_fisa_words(uint32_t w[WLVRX_FISA_WORDS])
+{
+	w[0] = WLHTT_H2T_RX_FISA_CFG;   /* pdev_id 0 */
+	w[1] = WLVRX_FISA_CTRL;
+	w[2] = WLVRX_FISA_TIMEOUT;
+}
+
 #endif /* FUXI_WLAN_CE_H */
