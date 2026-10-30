@@ -294,6 +294,10 @@ static uint64_t fw_stats_at;
 static uint32_t fw_stats_pdev = 1;  /* the pdev the last REQUEST_STATS named; UPDATE_STATS carries it back */
 static uint32_t fw_cmd_log[64];
 static unsigned fw_cmd_n;
+/* C2f bisect: the W29 mac-start / encap commands as the firmware saw them, in order (the PDEV/VDEV param id, 0xd DFS,
+ * 0x11 an HTT PPDU_STATS_CFG, 0x1d LRO) */
+static uint32_t fw_w29_log[16];
+static unsigned fw_w29_n, fw_w29_at;
 struct mbeacon { unsigned idx; uint32_t rx_channel, snr, status, chan_freq, mode, len; uint8_t f[400]; };
 static struct mbeacon beacons[96];
 static unsigned n_beacons;
@@ -1803,6 +1807,78 @@ fw_stats_cmd(const uint8_t *pl, uint32_t plen, unsigned need)
 	fw_stats_answer(need);
 }
 
+/* C2f (W29): the mac-start pdev params, DFS offload, LRO, idle-PS and the vdev encap/decap, each checked word by word
+ * against L19 (mac.c:9363-9469, 9782-9827) and in its place: PMF_QOS, DYNAMIC_BW, ARP_AC_OVERRIDE, DFS, the two PPDU
+ * stats and MESH_MCAST after the HTT version exchange and before the chain mask and the channel list; LRO and idle-PS
+ * after the whole channel list and before VDEV_CREATE; TX_ENCAP then RX_DECAP right after VDEV_CREATE, before NSS. Only
+ * with w20 0x4000, each only once and in L19's order among those sent (fw_w29_log). */
+static bool
+m_w29_cmd(uint32_t id, const uint8_t *pl, uint32_t plen)
+{
+	const uint32_t prm = plen >= 16 ? g32(pl + 12) : ~0u;
+	if (id == 0xa005u || id == 0x1d010u) { return true; }
+	if (id == 0x4003u) { return prm == 0x22u || prm == 0x0au || prm == 0x23u || prm == 0x8fu || prm == 0x2cu; }
+	if (id == 0x5008u) { return prm == 0x30u || prm == 0x5bu; }
+	return false;
+}
+
+static void
+fw_w29_order(uint32_t code)
+{
+	static const uint32_t l19[11] = { 0x22u, 0x0au, 0x23u, 0xdu, 0x11u, 0x11u, 0x8fu, 0x1du, 0x2cu, 0x30u, 0x5bu };
+	unsigned at = fw_w29_at;
+	CHECK(wl20_bits & WL20_L19ORDER, "a W29 command without w20 0x4000");
+	while (at < 11u && l19[at] != code) { at++; }
+	CHECK(at < 11u && fw_w29_n < 16u, "a W29 command out of L19's order, or sent twice");
+	fw_w29_at = at + 1u;
+	fw_w29_log[fw_w29_n++] = code;
+}
+
+static void
+fw_w29_pre_place(void)
+{
+	CHECK(fw_c2_step == 0 && !fw_chan_cmds && !fw_pset_n && (!(wl20_bits & WL20_HTTVER) || (fw_htt_req == 1 && q_head > fw_htt_conf_q)) &&
+	    (!(wl20_bits & WL20_RXRING) || fw_sring_n == m_nsring()), "a mac-start pre command out of place (L19: before the chain mask)");
+}
+
+static void
+fw_w29_ppdu(const uint8_t *pl, uint32_t plen)
+{
+	unsigned i = fw_w29_n && fw_w29_log[fw_w29_n - 1u] == 0x11u ? 1u : 0u;
+	fw_w29_pre_place();
+	CHECK(plen == 4 && g32(pl) == (0x11u | (1u << i) << 9 | 0xe67u << 16), "HTT PPDU_STATS_CFG is not {0x11, pdev mask 1 << i, 0xe67}");
+	fw_w29_order(0x11u);
+}
+
+static void
+fw_w29_cmd(uint32_t id, const uint8_t *pl, uint32_t plen, unsigned need)
+{
+	const uint8_t *v = pl + 8;
+	const uint32_t pdev = C.exp_pdev;
+	if (id == 0x4003u) {
+		const uint32_t prm = g32(v + 4), want = prm == 0x23u ? 0u : 1u;
+		CHECK(plen == 20 && g32(pl + 4) == (0x52u << 16 | 12u) && g32(v) == pdev && g32(v + 8) == want, "mac-start PDEV_SET_PARAM words");
+		if (prm == 0x2cu) { CHECK(fw_c2_step == 1, "IDLE_PS before the whole channel list or after VDEV_CREATE"); }
+		else { fw_w29_pre_place(); }
+		fw_w29_order(prm);
+	} else if (id == 0xa005u) {
+		CHECK(plen == 12 && g32(pl + 4) == (0x250u << 16 | 4u) && g32(v) == pdev, "DFS_PHYERR_OFFLOAD_ENABLE words");
+		fw_w29_pre_place();
+		fw_w29_order(0xdu);
+	} else if (id == 0x1d010u) {
+		CHECK(plen == 8 + 76 && g32(pl + 4) == (0x1aau << 16 | 76u), "LRO_CONFIG length/tag");
+		for (unsigned i = 0; i < 18u; i++) { CHECK(!g32(v + 4 * i), "LRO_CONFIG: lro_enable or a seed non-zero"); }
+		CHECK(g32(v + 72) == pdev && fw_c2_step == 1, "LRO_CONFIG pdev, or before the whole channel list or after VDEV_CREATE");
+		fw_w29_order(0x1du);
+	} else {
+		CHECK(plen == 20 && g32(pl + 4) == (0x5fu << 16 | 12u) && g32(v) == 0 && g32(v + 8) == 1u,
+		    "VDEV_SET_PARAM encap/decap is not {vdev 0, param, NATIVE_WIFI}");
+		CHECK(fw_c2_step == 2, "encap/decap not right after VDEV_CREATE");
+		fw_w29_order(g32(v + 4));
+	}
+	fw_refund(need, 1);
+}
+
 static void
 fw_rx(unsigned ce, uint32_t eid, const uint8_t *d, uint32_t len)
 {
@@ -1840,6 +1916,7 @@ fw_rx(unsigned ce, uint32_t eid, const uint8_t *d, uint32_t len)
 	if (eid != C.wmi_eid && eid == C.htt_eid) {  /* C2 w20 0x02: HTT VERSION_REQ (dp_tx.c:1277-1305) on CE4 */
 		if (ce == 4 && flags == 0 && plen >= 4 && (g32(pl) & 0xffu) == 0xbu) { fw_sring(pl, plen); return; }  /* C2c */
 		if (ce == 4 && flags == 0 && plen >= 4 && (g32(pl) & 0xffu) == 0xcu) { fw_rxsel(pl, plen); return; }  /* C2d */
+		if (ce == 4 && flags == 0 && plen >= 4 && (g32(pl) & 0xffu) == 0x11u) { fw_w29_ppdu(pl, plen); return; }  /* C2f */
 		CHECK(ce == 4 && flags == 0 && plen == 8 && g32(pl) == 0 && g32(pl + 4) == (5u | 4u << 8 | 2u << 16),
 		    "HTT VERSION_REQ is not {msg 0, TCL metadata option tag 5 len 4 value 2} on CE4");
 		CHECK(fw_init_ok == 1 && fw_c2_step == 0, "HTT VERSION_REQ out of order");
@@ -1892,6 +1969,8 @@ fw_rx(unsigned ce, uint32_t eid, const uint8_t *d, uint32_t len)
 		fw_hw_mode_ok++;
 		m_reset(); m_tlv(0x206, 8); m_zero(8);
 		wmi_out(0x4010, (unsigned)need, 3);
+	} else if (m_w29_cmd(id, pl, plen)) {  /* C2f: a mac-start / encap command (param ids the C2 ones never use) */
+		fw_w29_cmd(id, pl, plen, (unsigned)need);
 	} else if (id == 0x3001 || id == 0x3002 || id == 0x3003 || id == 0x5001 || id == 0x5008 || id == 0x9001 || id == 0x9002 ||
 	    id == 0x4003) {
 		CHECK(wl_w23, "a C2 command with qrtr 6");
@@ -2204,6 +2283,7 @@ reset(void)
 	m_idle_hp = m_idle_tp = fw_refill_tp = fw_err_hp = 0;
 	memset(fw_mac_hp, 0, sizeof(fw_mac_hp)); memset(fw_mac_tp, 0, sizeof(fw_mac_tp)); memset(fw_pset_w, 0, sizeof(fw_pset_w));
 	memset(slot_listed, 0, sizeof(slot_listed)); wbm_log_n = 0; n_acts = acts_done = 0; fw_cmd_n = 0;
+	fw_w29_n = fw_w29_at = 0; wl29_mask = WL29_ALL;  /* C2f bisect */
 	memset(&wl_rx, 0, sizeof(wl_rx)); wl26_wbm_writes = 0; wl26_heard_none = false;
 	memset(&C, 0, sizeof(C));
 	C.rx_take = 2048; C.rx_post[0] = C.rx_post[1] = 1024;
@@ -5277,6 +5357,219 @@ s_c2f_gate(void)
 	     "refuses an offset past its field");
 }
 
+/* C2f bisect, the guard: the phone's r1c2g false SPILL (cookie conversion dropped, so the SPT was never filled, yet
+ * every RX SPT entry counted as spt-lost 4095) is gone: unfilled, the guard counts non-zero SPT dwords instead (the
+ * device was never given those pages); filled, the lost entries as before. Run through the production wl27_setup and
+ * wl29_report. */
+static void
+s_c2f_guard(void)
+{
+	volatile uint32_t *spt;
+	/* cc dropped (REO CFG1 ENABLE already set, the phone's case): no SPILL; one non-zero SPT dword is one */
+	c2f_gate_reset();
+	wl_rx.bufs_iova = 0xa1a20000ull;
+	cmd.cc_pre[1] = 1u << 19;
+	CHECK(wl27_setup() == 0 && wl_cm.rings_on && !wl_cm.cc_on && !wl_cm.spt_filled, "c2f guard: cc dropped run");
+	wl29_report();
+	expect("FUXI WLAN: W29 guard nonzero dwords: rdp 0, ring-gap 0, spt-nonzero 0, tail 0\n");
+	expect_not("SPILL");
+	spt = (volatile uint32_t *)(void *)wl_cm.spt;
+	spt[3u * 1024u + 7u] = 1u;   /* a TX SPT page the device was never given */
+	loglen = 0; logbuf[0] = 0;
+	wl29_report();
+	expect("FUXI WLAN: W29 guard SPILL nonzero dwords: rdp 0, ring-gap 0, spt-nonzero 1, tail 0; stop; owner review before any "
+	    "further kit\n");
+	spt[3u * 1024u + 7u] = 0u;
+	spt[(WLCM_RX_SPT_OFFSET + 2u) * 1024u + 5u] = 0xa5a5a5a5u;   /* an RX SPT page too */
+	loglen = 0; logbuf[0] = 0;
+	wl29_report();
+	expect("spt-nonzero 1, tail 0; stop");
+	/* cc on: the SPT filled; no SPILL; a cleared RX entry is spt-lost 1 */
+	c2f_gate_reset();
+	wl_rx.bufs_iova = 0xa1a20000ull;
+	CHECK(wl27_setup() == 0 && wl_cm.cc_on && wl_cm.spt_filled, "c2f guard: cc on run");
+	wl29_report();
+	expect("FUXI WLAN: W29 guard nonzero dwords: rdp 0, ring-gap 0, spt-lost 0, tail 0\n");
+	expect_not("SPILL");
+	spt = (volatile uint32_t *)(void *)wl_cm.spt;
+	spt[WLCM_RX_SPT_OFFSET * 1024u + 2u * 100u] = 0u; spt[WLCM_RX_SPT_OFFSET * 1024u + 2u * 100u + 1u] = 0u;   /* slot 100 */
+	loglen = 0; logbuf[0] = 0;
+	wl29_report();
+	expect("FUXI WLAN: W29 guard SPILL nonzero dwords: rdp 0, ring-gap 0, spt-lost 1, tail 0; stop; owner review before any "
+	    "further kit\n");
+	/* cc not selected (fuxiwlanw29 0x01): never filled, counted as unfilled */
+	c2f_gate_reset();
+	wl_rx.bufs_iova = 0xa1a20000ull;
+	wl29_mask = WL29_RINGS;
+	CHECK(wl27_setup() == 0 && wl_cm.rings_on && !wl_cm.cc_on && !wl_cm.spt_filled, "c2f guard: cc not selected run");
+	wl29_report();
+	expect("FUXI WLAN: W29 guard nonzero dwords: rdp 0, ring-gap 0, spt-nonzero 0, tail 0\n");
+	expect_not("SPILL");
+	c2f_gate_done();
+	puts("C2f guard: cc dropped or not selected (SPT never filled): no false spt-lost, a non-zero SPT dword (TX or RX page) is a "
+	     "SPILL; cc on: the filled entries intact, a cleared one is a SPILL");
+}
+
+/* C2f bisect, the cc_config pre-reads printed read-only (address and value of all six, then the hal.h names set per
+ * register), when cc goes on and when it is dropped; the widest decode fits its buffer and the console untruncated. */
+static void
+s_c2f_ccvals(void)
+{
+	static const char why_cc[] = "FUXI WLAN: W29 cookie conversion not programmed: a REO/WBM cookie register is already "
+	    "configured (cfg0 base, cfg1 enable or convert global); w20 0x4000 cc dropped for this boot\n";
+	c2f_gate_reset();
+	CHECK(wl27_setup() == 0 && wl_cm.cc_on, "c2f cc values: happy");
+	{
+		static const char *const order[] = {
+			"FUXI WLAN: W29 cc before: reo-cfg0@0xa38050 0, reo-cfg1@0xa38054 0, wbm-cfg0@0xa34040 0, wbm-cfg1@0xa34044 0, "
+			"wbm-cfg2@0xa34090 0, convert@0xa34094 0\n",
+			"FUXI WLAN: W29 cookie conversion cmem base 0x113000 pages 280",
+		};
+		expect_order(order, 2);
+	}
+	expect_not("cc before decode");
+	/* the firmware already configured cookie conversion as L19 would (the phone's r1c2g reading, values assumed) */
+	c2f_gate_reset();
+	{
+		static const uint32_t v[6] = { 0x113000u, 0x1d1310u, 0x113000u, 0x51310u, 0xbu, 0x13au };
+		memcpy(cmd.cc_pre, v, sizeof(v));
+	}
+	CHECK(wl27_setup() == 0 && wl_cm.rings_on && !wl_cm.cc_on && !cmd.cmem_rd && !cmd.cc_wr, "c2f cc values: configured");
+	{
+		static const char *const order[] = {
+			"FUXI WLAN: W29 cc before: reo-cfg0@0xa38050 0x113000, reo-cfg1@0xa38054 0x1d1310, wbm-cfg0@0xa34040 0x113000, "
+			"wbm-cfg1@0xa34044 0x51310, wbm-cfg2@0xa34090 0xb, convert@0xa34094 0x13a\n",
+			"FUXI WLAN: W29 cc before decode reo-cfg1 0x1d1310 HAL_REO1_SW_COOKIE_CFG_*: CMEM_BASE_ADDR_MSB=0x10 COOKIE_PPT_MSB=0x13 "
+			"COOKIE_SPT_MSB=0x8 ALIGN ENABLE GLOBAL_ENABLE\n",
+			"FUXI WLAN: W29 cc before decode wbm-cfg1 0x51310 HAL_WBM_SW_COOKIE_CFG_*: CMEM_BASE_ADDR_MSB=0x10 COOKIE_PPT_MSB=0x13 "
+			"COOKIE_SPT_MSB=0x8 ALIGN\n",
+			"FUXI WLAN: W29 cc before decode wbm-cfg2 0xb HAL_WBM_SW_COOKIE_CFG_*: RELEASE_PATH_EN ERR_PATH_EN CONV_IND_EN\n",
+			"FUXI WLAN: W29 cc before decode convert 0x13a HAL_WBM_SW_COOKIE_CONV_CFG_*: WBM2SW0_EN WBM2SW2_EN WBM2SW3_EN WBM2SW4_EN "
+			"GLOBAL_EN\n",
+			why_cc,
+		};
+		expect_order(order, sizeof(order) / sizeof(order[0]));
+	}
+	CHECK(count_text("cc before decode") == 4, "c2f cc values: CFG0 has no named bits");
+	/* the widest: every register 0xfffffffe (one ~0 is unreadable: printed, not decoded) */
+	c2f_gate_reset();
+	for (unsigned k = 0; k < 6; k++) { cmd.cc_pre[k] = k == 4 ? ~0u : 0xfffffffeu; }
+	CHECK(wl27_setup() == 0 && !wl_cm.cc_on && !cmd.cmem_rd, "c2f cc values: widest");
+	expect("FUXI WLAN: W29 cc before: reo-cfg0@0xa38050 0xfffffffe, reo-cfg1@0xa38054 0xfffffffe, wbm-cfg0@0xa34040 0xfffffffe, "
+	    "wbm-cfg1@0xa34044 0xfffffffe, wbm-cfg2@0xa34090 0xffffffff, convert@0xa34094 0xfffffffe\n");
+	expect("FUXI WLAN: W29 cc before decode reo-cfg1 0xfffffffe HAL_REO1_SW_COOKIE_CFG_*: CMEM_BASE_ADDR_MSB=0xfe COOKIE_PPT_MSB=0x1f "
+	    "COOKIE_SPT_MSB=0x1f ALIGN ENABLE GLOBAL_ENABLE other 0xffe00000\n");
+	expect("FUXI WLAN: W29 cc before decode wbm-cfg1 0xfffffffe HAL_WBM_SW_COOKIE_CFG_*: CMEM_BASE_ADDR_MSB=0xfe COOKIE_PPT_MSB=0x1f "
+	    "COOKIE_SPT_MSB=0x1f ALIGN other 0xfff80000\n");
+	expect("FUXI WLAN: W29 cc before decode convert 0xfffffffe HAL_WBM_SW_COOKIE_CONV_CFG_*: WBM2SW0_EN WBM2SW1_EN WBM2SW2_EN "
+	    "WBM2SW3_EN WBM2SW4_EN GLOBAL_EN other 0xfffffec0\n");
+	expect("FUXI WLAN: W29 cookie conversion not programmed: a pre-read is ~0 (unreadable, ownership not established)");
+	CHECK(count_text("cc before decode") == 3, "c2f cc values: a ~0 or CFG0 register decoded");
+	/* CFG2 bits alone do not refuse cc: the values and the decode are printed and cc goes on */
+	c2f_gate_reset();
+	cmd.cc_pre[4] = 0xfffffffeu;
+	CHECK(wl27_setup() == 0 && wl_cm.cc_on, "c2f cc values: cfg2 set");
+	{
+		static const char *const order[] = {
+			"FUXI WLAN: W29 cc before: reo-cfg0@0xa38050 0, reo-cfg1@0xa38054 0, wbm-cfg0@0xa34040 0, wbm-cfg1@0xa34044 0, "
+			"wbm-cfg2@0xa34090 0xfffffffe, convert@0xa34094 0\n",
+			"FUXI WLAN: W29 cc before decode wbm-cfg2 0xfffffffe HAL_WBM_SW_COOKIE_CFG_*: ERR_PATH_EN CONV_IND_EN other 0xfffffff4\n",
+			"FUXI WLAN: W29 cookie conversion cmem base 0x113000 pages 280",
+		};
+		expect_order(order, 3);
+	}
+	CHECK(count_text("cc before decode") == 1, "c2f cc values: zero registers decoded");
+	/* no pre-reads (no QMI CMEM region): no value line */
+	c2f_gate_reset();
+	wl_cmem_valid = false;
+	CHECK(wl27_setup() == 0 && !wl_cm.cc_on, "c2f cc values: no CMEM");
+	expect_not("cc before");
+	c2f_gate_done();
+	puts("C2f cc values: the six cc_config pre-reads printed with their addresses, cc on and dropped; the hal.h names set "
+	     "decoded per register (CFG0 and ~0 not), other bits as other; the widest within the console");
+}
+
+/* C2f bisect, fuxiwlanw29 at W20: the common rings (0x01) and cookie conversion (0x02) each run only when selected; without
+ * 0x01 not even the common-ring pre-reads; C2d's own rings stand either way. */
+static void
+s_c2f_mask_gate(void)
+{
+	c2f_gate_reset();
+	wl29_mask = WL29_RINGS;
+	CHECK(wl27_setup() == 0 && wl_rd.reo_on && wl_cm.rings_on && wl_cm.ring[WLCM_R_REOSTATUS].on && !wl_cm.cc_on, "c2f mask 0x01");
+	CHECK(wl29_cc_config() == 0 && !cmd.cmem_rd && !cmd.cmem_wr && cmd.cc_rd == 2u && !cmd.cc_wr && cmd.ring_wr, "c2f mask 0x01 accesses");
+	expect("FUXI WLAN: W29 common ring 21 reo-status");
+	expect_not("cookie conversion"); expect_not("cc before");
+	c2f_gate_reset();
+	wl29_mask = WL29_RINGS;
+	C.reo_pre[2] = 0x40u;   /* REO owned: cc not selected, so not even its drop line */
+	CHECK(wl27_setup() == 0 && !wl_rd.reo_on && !wl_cm.cc_on, "c2f mask 0x01 REO owned");
+	expect_not("cookie conversion");
+	c2f_gate_reset();
+	wl29_mask = WL29_PPDU | WL29_ENCAP;
+	CHECK(wl27_setup() == 0 && wl_rd.reo_on && !wl_cm.rings_on && !wl_cm.cc_on, "c2f mask 0x84");
+	CHECK(wl29_cc_config() == 0 && !cmd.ring_rd && !cmd.ring_wr && !cmd.cc_rd && !cmd.cc_wr && !cmd.cmem_rd, "c2f mask 0x84 accesses");
+	expect("FUXI WLAN: W27 reo ring 131");
+	expect_not("W29 common"); expect_not("cookie conversion");
+	c2f_gate_reset();
+	wl29_mask = WL29_RINGS | WL29_CC;
+	CHECK(wl27_setup() == 0 && wl_cm.rings_on && wl_cm.cc_on && cmd.cmem_wr == 280u, "c2f mask 0x03");
+	CHECK(wl29_cc_config() == 0 && cmd.cc_wr == 6u, "c2f mask 0x03 cc_config");
+	c2f_gate_done();
+	puts("C2f mask gate: fuxiwlanw29 0x01 the common rings alone (no CMEM, no cc register beyond the two ring pre-reads, no cc "
+	     "line, also with the REO path refused), 0x84 no common-ring or cc access at all (C2d's rings stand), 0x03 both");
+}
+
+/* C2f bisect, fuxiwlanw29 in a full qrtr 7 scan (w20 0x4002: the mac-start pieces need no ring): the firmware sees exactly
+ * the selected mac-start / encap commands, word by word, in L19's order and place, and the scan still completes. */
+static void
+s_c2f_bisect(void)
+{
+	static const uint32_t l19[11] = { 0x22u, 0x0au, 0x23u, 0xdu, 0x11u, 0x11u, 0x8fu, 0x1du, 0x2cu, 0x30u, 0x5bu };
+	static const uint8_t bit[11] = { WL29_PDEV, WL29_PDEV, WL29_PDEV, WL29_DFS, WL29_PPDU, WL29_PPDU, WL29_PDEV, WL29_LRO, WL29_IDLEPS,
+		WL29_ENCAP, WL29_ENCAP };
+	static const unsigned masks[] = { 0xffu, 0x01u, 0x05u, 0x09u, 0x11u, 0x21u, 0x41u, 0x81u, 0x5cu, 0xa0u, 0x03u };
+	for (unsigned t = 0; t < sizeof(masks) / sizeof(masks[0]); t++) {
+		const unsigned m = masks[t];
+		unsigned n = 0;
+		c2_reset();
+		wl20_bits = WL20_HTTVER | WL20_L19ORDER;
+		wl29_mask = m;
+		CHECK(run() == 0, "c2f bisect run");
+		expect("FUXI WLAN: W23 scan completed reason 0 after ");
+		CHECK(fw_scan_cmds == 1 && fw_c2_step == 8, "c2f bisect: the scan");
+		for (unsigned i = 0; i < 11u; i++) {
+			if (!(m & bit[i])) { continue; }
+			CHECK(n < fw_w29_n && fw_w29_log[n] == l19[i], "c2f bisect: a selected command missing or out of order");
+			n++;
+		}
+		CHECK(n == fw_w29_n, "c2f bisect: a command fuxiwlanw29 did not select");
+		CHECK(count_text("W29 htt ppdu stats cfg") == (m & WL29_PPDU ? 2u : 0u), "c2f bisect: ppdu lines");
+		CHECK(count_text("FUXI WLAN: W29 vdev 0 encap/decap native-wifi (service 461 not set)\n") == (m & WL29_ENCAP ? 1u : 0u),
+		    "c2f bisect: encap line");
+		if ((m & 0x1cu) == 0x1cu) {
+			expect("FUXI WLAN: W29 mac-start pdev params pmf-qos 1 dynamic-bw 1 arp-ac 0 dfs-offload mesh-mcast 1 ppdu-stats 2 pdev 0\n");
+		}
+		if ((m & 0x60u) == 0x60u) { expect("FUXI WLAN: W29 mac-start lro cfg (seeds 0, lro-enable 0) idle-ps 1 pdev 0\n"); }
+		if (!(m & 0x1cu)) { expect_not("W29 mac-start pdev params"); }
+		if (!(m & 0x60u)) { expect_not("W29 mac-start lro"); }
+		if (m == 0x05u) { expect("FUXI WLAN: W29 mac-start pdev params not sent, dfs-offload not sent, ppdu-stats 2, pdev 0 (fuxiwlanw29 0x5)\n"); }
+		if (m == 0x09u) {
+			expect("FUXI WLAN: W29 mac-start pdev params pmf-qos 1 dynamic-bw 1 arp-ac 0 mesh-mcast 1, dfs-offload not sent, ppdu-stats 0, "
+			    "pdev 0 (fuxiwlanw29 0x9)\n");
+		}
+		if (m == 0x11u) { expect("FUXI WLAN: W29 mac-start pdev params not sent, dfs-offload sent, ppdu-stats 0, pdev 0 (fuxiwlanw29 0x11)\n"); }
+		if (m == 0x21u) { expect("FUXI WLAN: W29 mac-start lro cfg (seeds 0, lro-enable 0), idle-ps not sent, pdev 0 (fuxiwlanw29 0x21)\n"); }
+		if (m == 0x41u) { expect("FUXI WLAN: W29 mac-start lro cfg not sent, idle-ps 1, pdev 0 (fuxiwlanw29 0x41)\n"); }
+		expect_not("W23 failure");
+		contained_and_freed();
+	}
+	reset();
+	puts("C2f bisect: fuxiwlanw29 0xff, 0x01, 0x05, 0x09, 0x11, 0x21, 0x41, 0x81, 0x5c, 0xa0 and 0x03 in a full scan: exactly the "
+	     "selected mac-start pdev params, DFS offload, PPDU stats, LRO, idle-PS and encap/decap, word by word, in L19's order "
+	     "and place; the scan completes");
+}
+
 static void
 dump_c2f(void)
 {
@@ -5295,6 +5588,12 @@ dump_c2f(void)
 		for (unsigned k = 0; k < n; k++) { fprintf(stdout, "ring %u %u %u %u\n", cm.ring[i].id, k, regs[k][0], regs[k][1]); }
 	}
 	for (unsigned i = 0; i < 2u * WLCM_NRING + 2u; i++) { fprintf(stdout, "cmpre %u %u\n", i, wlcm_pre_addr(&cm, i)); }
+	for (unsigned k = 0; k < WLCM_CC_REGS; k++) {   /* C2f bisect: the cc decode's hal.h names (tools/test-fuxi-wlan-ce.py l19_c2f) */
+		const struct wlcm_cc_field *f = NULL;
+		const char *pfx = NULL;
+		unsigned n = wlcm_cc_fields(k, &f, &pfx);
+		for (unsigned i = 0; i < n; i++) { fprintf(stdout, "ccfield %u %s%s %u %u\n", k, pfx, f[i].name, f[i].shift, f[i].width); }
+	}
 	{
 		const uint32_t ks[4] = { 0u, 511u, 512u, WLRX_NBUF - 1u };
 		for (unsigned i = 0; i < 4; i++) { fprintf(stdout, "cookie %u %u %u\n", ks[i], wlcm_buf_cookie(ks[i]), wlcm_cookie_slot(wlcm_buf_cookie(ks[i]))); }
@@ -5402,6 +5701,10 @@ main(int argc, char **argv)
 	if (argc == 2 && !strcmp(argv[1], "c2f")) {  /* the C2f scenarios alone (the mutant runs of tools/test-fuxi-wlan-ce.py) */
 		s_c2f_pure();
 		s_c2f_gate();
+		s_c2f_guard();
+		s_c2f_ccvals();
+		s_c2f_mask_gate();
+		s_c2f_bisect();
 		reset();
 		puts("C2f model: all scenarios passed");
 		return 0;
@@ -5458,6 +5761,10 @@ main(int argc, char **argv)
 	s_c2e_contain();
 	s_c2f_pure();
 	s_c2f_gate();
+	s_c2f_guard();
+	s_c2f_ccvals();
+	s_c2f_mask_gate();
+	s_c2f_bisect();
 	reset();
 	puts("W20 model: all scenarios passed");
 	return 0;

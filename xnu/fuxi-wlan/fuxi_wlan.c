@@ -43,6 +43,10 @@
  *                 0x200 WBM idle link-descriptor list, 0x400 pdev chain masks; 0x08 (active
  *                 scan), 0x20 (whole BSSIDs; the owner masks every BSSID) and every other bit
  *                 refused, as is 0x01 with 0x02 (docs-lanes/wlan-w20.md)
+ *   fuxiwlanw29=N  C2f bisect, only with qrtr=7 and a valid w20 0x4000: the W29 pieces
+ *                 (0x01 common rings, 0x02 cookie conversion (needs 0x01), 0x04 PPDU stats,
+ *                 0x08 pdev params, 0x10 DFS offload, 0x20 LRO, 0x40 IDLE_PS, 0x80 encap/decap);
+ *                 absent = all; 0, unknown bits or any other use refused
  * Salami (FUXI_SALAMI, OnePlus 11, K-W1): the driver runs only when
  * fuxiwlansalami=1 is present as well; its absence or any other value refuses
  * before the thread starts, as do fuxiwlanseq with cyclerails and any invalid
@@ -896,6 +900,21 @@ static bool wl16_large, wl16_redrive;
 #define WL20_BITS (WL20_NOHTT | WL20_MRRS128 | WL20_NOHWMODE)
 #define WL23_BITS (WL20_BITS | WL20_HTTVER | WL20_BAND24 | WL20_PDEVCAP | WL26_BITS | WL27_BITS | WL20_MONSTAT | WL20_L19ORDER)
 #define WL20_QRTR_MAX 7
+/* C2f bisect (fuxiwlanw29, only with a valid qrtr 7 w20 0x4000): which W29
+ * pieces run, each in its L19 place. Absent = all (the C2f boot); given, it
+ * must be non-zero, inside WL29_ALL, and 0x02 needs 0x01 (cookie conversion
+ * takes ownership from the common-ring pre-reads); anything else refuses the
+ * run before any access. The arena and its guards stay with 0x4000. */
+#define WL29_RINGS 0x01u      /* common rings (sw2wbm, tcl+comp x3, reinject, reo cmd/status) */
+#define WL29_CC 0x02u         /* cookie conversion (cc_init, cc_config) */
+#define WL29_PPDU 0x04u       /* the two HTT PPDU_STATS_CFG */
+#define WL29_PDEV 0x08u       /* pdev params PMF_QOS, DYNAMIC_BW, ARP_AC_OVERRIDE, MESH_MCAST */
+#define WL29_DFS 0x10u        /* DFS phyerr offload */
+#define WL29_LRO 0x20u        /* LRO config */
+#define WL29_IDLEPS 0x40u     /* IDLE_PS */
+#define WL29_ENCAP 0x80u      /* vdev encap/decap */
+#define WL29_ALL 0xffu
+static unsigned wl29_mask = WL29_ALL;
 static bool wl_w20, wl_w23;
 static unsigned wl20_bits;
 static unsigned wl20_qrtr; /* 6 or 7 when wl_w20, for the init lines */
@@ -1195,7 +1214,7 @@ wl_probe_configure(void)
 		printf("FUXI WLAN: rails variant %d (1 early before WLAN_EN, 2 late before WLAN_MODE) valid %u\n",
 		    rails, !wl_variant_invalid);
 	}
-	int stop22 = 0, keep = 0, qrtr = 0, w20 = 0;
+	int stop22 = 0, keep = 0, qrtr = 0, w20 = 0, w29 = 0;
 	(void)PE_parse_boot_argn("fuxiwlanstop22", &stop22, sizeof(stop22));
 	(void)PE_parse_boot_argn("fuxiwlankeep", &keep, sizeof(keep));
 	(void)PE_parse_boot_argn("fuxiwlanqrtr", &qrtr, sizeof(qrtr));
@@ -1255,6 +1274,8 @@ wl_probe_configure(void)
 	 * 0x2000 without 0x100 is refused; qrtr 6 refuses it. */
 	wl20_bits = 0;
 	bool w20_given = PE_parse_boot_argn("fuxiwlanw20", &w20, sizeof(w20));
+	wl29_mask = WL29_ALL;
+	bool w29_given = PE_parse_boot_argn("fuxiwlanw29", &w29, sizeof(w29));
 	if (qrtr < 0 || qrtr > WL20_QRTR_MAX) {
 		wl_variant_invalid = true;
 		printf("FUXI WLAN: W20 fuxiwlanqrtr=%d is not 0..%d in this build; refused\n", qrtr, WL20_QRTR_MAX);
@@ -1267,6 +1288,14 @@ wl_probe_configure(void)
 		    (((unsigned)w20 & WL20_MONSTAT) && !((unsigned)w20 & WL20_RXRING)) ||
 		    (((unsigned)w20 & WL20_L19ORDER) && !((unsigned)w20 & WL20_REORX))) { wl_variant_invalid = true; }
 		else { wl20_bits = (unsigned)w20; }
+		/* C2f bisect: fuxiwlanw29 only with a valid 0x4000, non-zero, known bits, 0x02 with 0x01 */
+		if (w29_given && (!(wl20_bits & WL20_L19ORDER) || w29 <= 0 || ((unsigned)w29 & ~WL29_ALL) ||
+		    (((unsigned)w29 & WL29_CC) && !((unsigned)w29 & WL29_RINGS)))) {
+			wl_variant_invalid = true;
+			wl20_bits = 0;
+			printf("FUXI WLAN: W20 fuxiwlanw29 %#x refused: needs a valid w20 0x4000, non-zero, bits 0xff only, 0x02 only with 0x01\n",
+			    (unsigned)w29);
+		} else if (w29_given) { wl29_mask = (unsigned)w29; }
 		printf("FUXI WLAN: W20 selected qrtr=%d (%s) w20 %#x valid %u\n", qrtr,
 		    wl_w23 ? "CE/HTC/WMI init, then W23 passive scan" : "CE/HTC/WMI init to READY", (unsigned)w20, !wl_variant_invalid);
 		if (wl_w23) {
@@ -1289,13 +1318,23 @@ wl_probe_configure(void)
 			printf("FUXI WLAN: W28 selected: monitor status rings 185/193, 1023 buffers each (w20 0x2000), watched, not reaped; "
 			    "crash line at the COMPLETED timeout and before MHI reset; nothing transmitted\n");
 		}
-		if (wl20_bits & WL20_L19ORDER) {
+		if ((wl20_bits & WL20_L19ORDER) && !w29_given) {
 			printf("FUXI WLAN: W29 selected: L19 dp_alloc order, cookie conversion (CMEM from QMI), common rings sw2wbm/tcl+comp x3/"
 			    "reinject/reo-cmd/reo-status programmed never posted, mac-start pdev params and vdev encap/decap (w20 0x4000); nothing transmitted\n");
+		} else if (wl20_bits & WL20_L19ORDER) {   /* C2f bisect: the pieces fuxiwlanw29 selects, in L19 order */
+			const unsigned m = wl29_mask;
+			printf("FUXI WLAN: W29 selected: L19 dp_alloc order, fuxiwlanw29 %#x: common rings %s, cookie conversion %s, pdev params %s, "
+			    "dfs-offload %s, ppdu-stats %s, lro %s, idle-ps %s, encap/decap %s (w20 0x4000); nothing transmitted\n", m,
+			    m & WL29_RINGS ? "yes" : "no", m & WL29_CC ? "yes" : "no", m & WL29_PDEV ? "yes" : "no", m & WL29_DFS ? "yes" : "no",
+			    m & WL29_PPDU ? "yes" : "no", m & WL29_LRO ? "yes" : "no", m & WL29_IDLEPS ? "yes" : "no", m & WL29_ENCAP ? "yes" : "no");
 		}
 	} else if (w20_given && w20) {
 		wl_variant_invalid = true;
 		printf("FUXI WLAN: W20 fuxiwlanw20 %#x needs fuxiwlanqrtr=6; refused\n", (unsigned)w20);
+	}
+	if (!wl_w20 && w29_given) {   /* C2f bisect: fuxiwlanw29 without qrtr 7 and w20 0x4000 */
+		wl_variant_invalid = true;
+		printf("FUXI WLAN: W20 fuxiwlanw29 %#x needs fuxiwlanqrtr=7 with w20 0x4000; refused\n", (unsigned)w29);
 	}
 	wl_stop22 = stop22 == 1; wl_keep = keep == 1;
 	if (wl_w14) {
@@ -5849,8 +5888,9 @@ wl26_free(void)
 	if (wl_cm_arena.va && wl_cm.base) {  /* C2f */
 		uint32_t rdp_gap = 0, ring_gap = 0, spt_lost = 0;
 		wlcm_guard_count(&wl_cm, &rdp_gap, &ring_gap, &spt_lost, &tail);
-		printf("FUXI WLAN: W29 guard after containment nonzero dwords: rdp %u, ring-gap %u, spt-lost %u, tail %u%s\n", rdp_gap,
-		    ring_gap, spt_lost, tail, rdp_gap || ring_gap || spt_lost || tail ? "; SPILL: owner review before any further kit" : "");
+		printf("FUXI WLAN: W29 guard after containment nonzero dwords: rdp %u, ring-gap %u, %s %u, tail %u%s\n", rdp_gap,
+		    ring_gap, wlcm_spt_what(&wl_cm), spt_lost, tail,
+		    rdp_gap || ring_gap || spt_lost || tail ? "; SPILL: owner review before any further kit" : "");
 	}
 	if (wl_rx_arena.va) { bzero((void *)wl_rx_arena.va, wl_rx_arena.size); bytes += (uint32_t)wl_rx_arena.size; }
 	if (wl_link_arena.va) { bzero((void *)wl_link_arena.va, wl_link_arena.size); bytes += (uint32_t)wl_link_arena.size; }
@@ -6316,6 +6356,40 @@ wl29_ring(unsigned i)
 	return 0;
 }
 
+/* The six cc_config pre-reads as read (read-only, nothing written): one line of
+ * address and value each, then per register a line of the hal.h names set
+ * (wlcm_cc_field; flags by name, fields as NAME=value, bits L19 does not name as
+ * other). CFG0 is the CMEM base (no named bits); a zero or ~0 value has none. */
+static void
+wl29_cc_before(const uint32_t regs[WLCM_CC_REGS][2])
+{
+	const uint32_t *p = wl_cm.cc_pre;
+	printf("FUXI WLAN: W29 cc before: %s@%#x %#x, %s@%#x %#x, %s@%#x %#x, %s@%#x %#x, %s@%#x %#x, %s@%#x %#x\n",
+	    wlcm_cc_name(0), regs[0][0], p[0], wlcm_cc_name(1), regs[1][0], p[1], wlcm_cc_name(2), regs[2][0], p[2],
+	    wlcm_cc_name(3), regs[3][0], p[3], wlcm_cc_name(4), regs[4][0], p[4], wlcm_cc_name(5), regs[5][0], p[5]);
+	for (unsigned k = 0; k < WLCM_CC_REGS; k++) {
+		const struct wlcm_cc_field *f = NULL;
+		const char *pfx = NULL;
+		unsigned n = wlcm_cc_fields(k, &f, &pfx);
+		char dec[200];
+		uint32_t named = 0;
+		int len;
+		if (!n || !p[k] || p[k] == ~0u) { continue; }
+		len = snprintf(dec, sizeof(dec), "%s %#x %s*:", wlcm_cc_name(k), p[k], pfx);
+		for (unsigned i = 0; i < n && len > 0 && (size_t)len < sizeof(dec); i++) {
+			const uint32_t mask = ((1u << f[i].width) - 1u) << f[i].shift, v = (p[k] & mask) >> f[i].shift;
+			named |= mask;
+			if (!v) { continue; }
+			len += f[i].width == 1u ? snprintf(dec + len, sizeof(dec) - (size_t)len, " %s", f[i].name) :
+			    snprintf(dec + len, sizeof(dec) - (size_t)len, " %s=%#x", f[i].name, v);
+		}
+		if (len > 0 && (size_t)len < sizeof(dec) && (p[k] & ~named)) {
+			(void)snprintf(dec + len, sizeof(dec) - (size_t)len, " other %#x", p[k] & ~named);
+		}
+		printf("FUXI WLAN: W29 cc before decode %s\n", dec);
+	}
+}
+
 /* dp_alloc's cookie-converter init (ath12k_dp_cc_init, dp.c:1583-1667): the PPT
  * table in CMEM and the SPT pages. Called from wl27_setup once C2d's REO
  * pre-reads and W29's common-ring pre-reads are read, before any common-ring
@@ -6329,7 +6403,7 @@ wl29_cc_init(void)
 {
 	uint32_t regs[WLCM_CC_REGS][2];
 	unsigned own;
-	if (!(wl20_bits & WL20_L19ORDER)) { return 0; }
+	if (!(wl20_bits & WL20_L19ORDER) || !(wl29_mask & WL29_CC)) { return 0; }   /* C2f bisect: fuxiwlanw29 0x02 */
 	own = wl_rd.own != WLRD_FREE ? WLCM_REO_OWNED : !wl_cm.rings_on ? WLCM_RINGS_OWNED : WLCM_FREE;
 	if (own == WLCM_FREE) {   /* the region QMI reported, validated before any use */
 		wl_cm.cmem_base = (uint32_t)wl_cmem_base; wl_cm.cmem_size = wl_cmem_size;
@@ -6339,6 +6413,7 @@ wl29_cc_init(void)
 	if (own == WLCM_FREE) {   /* the six cc_config registers, refused when already configured */
 		wlcm_cc_regs(&wl_cm, 0u, 0u, regs);
 		for (unsigned k = 0; k < WLCM_CC_REGS; k++) { wl_cm.cc_pre[k] = wl29_reg_rd(regs[k][0]); }
+		wl29_cc_before(regs);
 		own = wlcm_cc_owned(wl_cm.cc_pre);
 	}
 	if (own == WLCM_FREE) {
@@ -6395,7 +6470,7 @@ wl29_common_pre(void)
 {
 	static const unsigned pre[] = { WLCM_R_SW2WBM, WLCM_R_TCL0, WLCM_R_COMP0, WLCM_R_TCL1, WLCM_R_COMP1, WLCM_R_TCL2,
 		WLCM_R_COMP2, WLCM_R_REINJECT };
-	if (!(wl20_bits & WL20_L19ORDER)) { return 0; }
+	if (!(wl20_bits & WL20_L19ORDER) || !(wl29_mask & WL29_RINGS)) { return 0; }   /* C2f bisect: fuxiwlanw29 0x01 */
 	if (wl29_common_owned()) { return wl29_cc_init(); }   /* dropped for the boot; C2d rings still run; cc dropped with them */
 	wl_cm.rings_on = true;
 	if (wl29_cc_init()) { return 1; }   /* C2f: cookie converter, after the ownership checks and before the common SRNGs (dp_alloc order) */
@@ -6472,18 +6547,27 @@ wl29_macstart_pre(void)
 		{ 0, WLWMI_PDEV_PARAM_ARP_AC_OVERRIDE, 0u }, { 0, WLWMI_PDEV_PARAM_MESH_MCAST_ENABLE, 1u },
 	};
 	const uint32_t dfs[1] = { wl23_pdev };
+	const unsigned m = wl29_mask & (WL29_PDEV | WL29_DFS | WL29_PPDU);   /* C2f bisect: fuxiwlanw29 0x08, 0x10, 0x04 */
 	uint32_t a[3];
-	if (!(wl20_bits & WL20_L19ORDER)) { return 0; }
-	for (unsigned i = 0; i < 3u; i++) {   /* PMF_QOS, DYNAMIC_BW, ARP_AC_OVERRIDE */
+	if (!(wl20_bits & WL20_L19ORDER) || !m) { return 0; }
+	for (unsigned i = 0; (m & WL29_PDEV) && i < 3u; i++) {   /* PMF_QOS, DYNAMIC_BW, ARP_AC_OVERRIDE */
 		a[0] = wl23_pdev; a[1] = pp[i][1]; a[2] = pp[i][2];
 		if (wl23_words(WLWMI_CMD_PDEV_SET_PARAM, WLWMI_TAG_PDEV_SET_PARAM_CMD, a, 3, "WMI PDEV_SET_PARAM (mac-start)")) { return 1; }
 	}
-	if (wl23_words(WLWMI_CMD_DFS_PHYERR_OFFLOAD, WLWMI_TAG_DFS_PHYERR_OFFLOAD_CMD, dfs, 1, "WMI DFS_PHYERR_OFFLOAD_ENABLE")) { return 1; }
-	if (wl29_ppdu_stats()) { return 1; }
+	if ((m & WL29_DFS) &&
+	    wl23_words(WLWMI_CMD_DFS_PHYERR_OFFLOAD, WLWMI_TAG_DFS_PHYERR_OFFLOAD_CMD, dfs, 1, "WMI DFS_PHYERR_OFFLOAD_ENABLE")) { return 1; }
+	if ((m & WL29_PPDU) && wl29_ppdu_stats()) { return 1; }
 	a[0] = wl23_pdev; a[1] = pp[3][1]; a[2] = pp[3][2];
-	if (wl23_words(WLWMI_CMD_PDEV_SET_PARAM, WLWMI_TAG_PDEV_SET_PARAM_CMD, a, 3, "WMI PDEV_SET_PARAM MESH_MCAST")) { return 1; }
-	printf("FUXI WLAN: W29 mac-start pdev params pmf-qos 1 dynamic-bw 1 arp-ac 0 dfs-offload mesh-mcast 1 ppdu-stats 2 pdev %u\n",
-	    wl23_pdev);
+	if ((m & WL29_PDEV) &&
+	    wl23_words(WLWMI_CMD_PDEV_SET_PARAM, WLWMI_TAG_PDEV_SET_PARAM_CMD, a, 3, "WMI PDEV_SET_PARAM MESH_MCAST")) { return 1; }
+	if (m == (WL29_PDEV | WL29_DFS | WL29_PPDU)) {
+		printf("FUXI WLAN: W29 mac-start pdev params pmf-qos 1 dynamic-bw 1 arp-ac 0 dfs-offload mesh-mcast 1 ppdu-stats 2 pdev %u\n",
+		    wl23_pdev);
+	} else {
+		printf("FUXI WLAN: W29 mac-start pdev params %s, dfs-offload %s, ppdu-stats %u, pdev %u (fuxiwlanw29 %#x)\n",
+		    m & WL29_PDEV ? "pmf-qos 1 dynamic-bw 1 arp-ac 0 mesh-mcast 1" : "not sent", m & WL29_DFS ? "sent" : "not sent",
+		    m & WL29_PPDU ? 2u : 0u, wl23_pdev, wl29_mask);
+	}
 	return 0;
 }
 
@@ -6497,13 +6581,21 @@ wl29_macstart_post(void)
 	static uint8_t buf[8 + 4 * WLCM_LRO_WORDS];
 	uint32_t w[WLCM_LRO_WORDS], len = 0;
 	const uint32_t ips[3] = { wl23_pdev, WLWMI_PDEV_PARAM_IDLE_PS_CONFIG, 1u };
-	if (!(wl20_bits & WL20_L19ORDER)) { return 0; }
+	const unsigned m = wl29_mask & (WL29_LRO | WL29_IDLEPS);   /* C2f bisect: fuxiwlanw29 0x20, 0x40 */
+	if (!(wl20_bits & WL20_L19ORDER) || !m) { return 0; }
 	for (unsigned i = 0; i < WLCM_LRO_WORDS; i++) { w[i] = 0; }   /* lro_enable 0, res 0, th_4/th_6 fixed 0 seeds */
 	w[WLCM_LRO_WORDS - 1u] = wl23_pdev;
-	if (wlwmi_encode_words(WLWMI_CMD_LRO_CONFIG, WLWMI_TAG_LRO_INFO_CMD, w, WLCM_LRO_WORDS, buf, sizeof(buf), &len) ||
-	    wl_ce_send(wl_htc.wmi_eid, buf, len, "WMI LRO_CONFIG")) { return 1; }
-	if (wl23_words(WLWMI_CMD_PDEV_SET_PARAM, WLWMI_TAG_PDEV_SET_PARAM_CMD, ips, 3, "WMI PDEV_SET_PARAM IDLE_PS")) { return 1; }
-	printf("FUXI WLAN: W29 mac-start lro cfg (seeds 0, lro-enable 0) idle-ps 1 pdev %u\n", wl23_pdev);
+	if ((m & WL29_LRO) &&
+	    (wlwmi_encode_words(WLWMI_CMD_LRO_CONFIG, WLWMI_TAG_LRO_INFO_CMD, w, WLCM_LRO_WORDS, buf, sizeof(buf), &len) ||
+	    wl_ce_send(wl_htc.wmi_eid, buf, len, "WMI LRO_CONFIG"))) { return 1; }
+	if ((m & WL29_IDLEPS) &&
+	    wl23_words(WLWMI_CMD_PDEV_SET_PARAM, WLWMI_TAG_PDEV_SET_PARAM_CMD, ips, 3, "WMI PDEV_SET_PARAM IDLE_PS")) { return 1; }
+	if (m == (WL29_LRO | WL29_IDLEPS)) {
+		printf("FUXI WLAN: W29 mac-start lro cfg (seeds 0, lro-enable 0) idle-ps 1 pdev %u\n", wl23_pdev);
+	} else {
+		printf("FUXI WLAN: W29 mac-start lro cfg %s, idle-ps %s, pdev %u (fuxiwlanw29 %#x)\n",
+		    m & WL29_LRO ? "(seeds 0, lro-enable 0)" : "not sent", m & WL29_IDLEPS ? "1" : "not sent", wl23_pdev, wl29_mask);
+	}
 	return 0;
 }
 
@@ -6517,7 +6609,7 @@ wl29_encap_decap(void)
 	const uint32_t mode = wlwmi_svc(&wl_wmi, WLWMI_SVC_ETH_OFFLOAD) ? WLWMI_TXRX_ETHERNET : WLWMI_TXRX_NATIVE_WIFI;
 	const uint32_t enc[3] = { WLWMI_VDEV_ID, WLWMI_VDEV_PARAM_TX_ENCAP_TYPE, mode };
 	const uint32_t dec[3] = { WLWMI_VDEV_ID, WLWMI_VDEV_PARAM_RX_DECAP_TYPE, mode };
-	if (!(wl20_bits & WL20_L19ORDER)) { return 0; }
+	if (!(wl20_bits & WL20_L19ORDER) || !(wl29_mask & WL29_ENCAP)) { return 0; }   /* C2f bisect: fuxiwlanw29 0x80 */
 	if (wl23_words(WLWMI_CMD_VDEV_SET_PARAM, WLWMI_TAG_VDEV_SET_PARAM_CMD, enc, 3, "WMI VDEV_SET_PARAM TX_ENCAP_TYPE") ||
 	    wl23_words(WLWMI_CMD_VDEV_SET_PARAM, WLWMI_TAG_VDEV_SET_PARAM_CMD, dec, 3, "WMI VDEV_SET_PARAM RX_DECAP_TYPE")) { return 1; }
 	printf("FUXI WLAN: W29 vdev 0 encap/decap %s (service 461 %s)\n", mode == WLWMI_TXRX_ETHERNET ? "ethernet" : "native-wifi",
@@ -6538,8 +6630,8 @@ wl29_report(void)
 	    on, WLCM_NRING, wl29_writes, wl_cm.cc_on ? "on" : "off", wl29_cmem_writes, wl_rd.cc_entries);
 	if (!wl_cm.stopping && wl_cm.base) {
 		wlcm_guard_count(&wl_cm, &rdp_gap, &ring_gap, &spt_lost, &tail);
-		printf("FUXI WLAN: W29 guard %snonzero dwords: rdp %u, ring-gap %u, spt-lost %u, tail %u%s\n",
-		    rdp_gap || ring_gap || spt_lost || tail ? "SPILL " : "", rdp_gap, ring_gap, spt_lost, tail,
+		printf("FUXI WLAN: W29 guard %snonzero dwords: rdp %u, ring-gap %u, %s %u, tail %u%s\n",
+		    rdp_gap || ring_gap || spt_lost || tail ? "SPILL " : "", rdp_gap, ring_gap, wlcm_spt_what(&wl_cm), spt_lost, tail,
 		    rdp_gap || ring_gap || spt_lost || tail ? "; stop; owner review before any further kit" : "");
 	}
 }

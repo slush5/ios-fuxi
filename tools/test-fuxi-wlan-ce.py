@@ -68,6 +68,11 @@ count, RBM and cookie, the HTT ring id and type, thresholds, the announcement
 and fill order, the MSI and reap facts the deviations rest on, compared word by
 word with the model's dump. Mutants: every C2e rule broken once in the
 production code is caught by the static checks or the model's C2e scenarios.
+C2f bisect (fuxiwlanw29): the guard counts spt-lost only for a filled SPT and the
+non-zero SPT dwords otherwise (the phone's r1c2g false SPILL), the cc_config
+pre-reads printed read-only with their hal.h names, and each W29 piece gated on
+its bit in L19 order (model s_c2f_guard, s_c2f_ccvals, s_c2f_mask_gate,
+s_c2f_bisect; mutants; the decode names re-derived from hal.h).
 No device, no network.
 """
 from pathlib import Path
@@ -497,7 +502,7 @@ def static_c2c():
     assert header_define('WLRX_ERR_W5_FRAME') == 0x003fff00 and header_define('WLRX_ERR_W6_FRAME') == 0x7ff80780
     own = between(HEADER, 'static inline unsigned\nwlrx_idle_owned(', '\n}\n')
     assert own.index('WLRX_IDLE_UNREADABLE') < own.index('WLRX_IDLE_SRNG') < own.index('WLRX_IDLE_BASE') < own.index('WLRX_IDLE_AMBIGUOUS')
-    longest = c2c_line_bounds(fns, cfg)
+    longest = c2c_line_bounds(fns, cfg, extra={'dec': 199})
     print('C2c static: gate (0x100 needs 0x02, qrtr 6 refuses W26), W26 in L19\'s order (W20 between the CE rings and the RX '
           'post, W23 between VERSION_CONF and the channel list, watches at STARTED/mid/COMPLETED), one window path for the CE '
           'and WBM allowlists, one shadow-19 HP publish, no WBM write before the pre-reads or after a refusal, arena fills only '
@@ -521,6 +526,9 @@ def c2c_line_bounds(fns, cfg, tag='W26', min_lines=28, extra=None):
         body = between(HEADER, f'static inline const char *\n{name}(', '\n}\n')
         pure[name] = max(len(''.join(x)) for x in re.findall(r'return [^;]*?"([^"]*)"(?:\s*"([^"]*)")?', body) +
                          re.findall(r'[:?]\s*"([^"]*)"(?:\s*"([^"]*)")?', body))
+    for name in ('wlcm_spt_what', 'wlcm_cc_name'):  # C2f bisect: the longest literal anywhere in the body (a table or ?:)
+        body = between(HEADER, f'static inline const char *\n{name}(', '\n}\n')
+        pure[name] = max(len(x) for x in re.findall(r'"([^"]*)"', body))
     bounded = {'tp %u taken %u left %u': [4, 4, 4], 'hp %u tp %u avail %u': [5, 5, 5], 'hp %u fill %u': [4, 4],
                'hp %u tp %u taken %u left %u written %u': [4, 4, 4, 4, 4], 'hp %u tp %u %s written %u': [4, 10, 0, 4]}
 
@@ -561,6 +569,8 @@ def c2c_line_bounds(fns, cfg, tag='W26', min_lines=28, extra=None):
             buf = re.match(r'(\w+)', a[0])[1]
             if buf in ('item', 'line'):
                 continue  # wl26_list's own buffers: checked below
+            if buf == 'dec' and name == 'wl29_cc_before':
+                continue  # the cc decode buffer, char dec[200] (bounded by its size; s_c2f_bisect prints its widest untruncated)
             w = worst(fmt_of(a[2]), a[3:], local, assigned)
             assert w <= sizes[buf] - 1, (name, buf, w, sizes[buf])
             local[buf] = max(local.get(buf, 0), w)
@@ -1020,12 +1030,21 @@ def l19_c2f(dump):
             total += base[m[1]] * (int(m[3]) if m[3] else 1)
         return total
 
-    words = {}
+    words, ccfields = {}, []
     for line in dump.splitlines():
         k, *v = line.split()
+        if k == 'ccfield':  # C2f bisect: reg index, hal.h macro name, shift, width
+            ccfields.append((int(v[0]), v[1], int(v[2]), int(v[3])))
+            continue
         words.setdefault(k, []).append([int(x) for x in v])
 
     REO, WBM, TCL = 0xa38000, 0xa34000, 0xa44000
+    # C2f bisect: every name the read-only cc decode prints is a hal.h macro of that register's family, at its bits;
+    # the CFG0 registers (the CMEM base) have none.
+    families = {1: 'HAL_REO1_SW_COOKIE_CFG_', 3: 'HAL_WBM_SW_COOKIE_CFG_', 4: 'HAL_WBM_SW_COOKIE_CFG_', 5: 'HAL_WBM_SW_COOKIE_CONV_CFG_'}
+    assert {k for k, *_ in ccfields} == set(families), ccfields
+    for k, name, sh, wd in ccfields:
+        assert name.startswith(families[k]) and field(name, hal_h) == (sh, (1 << wd) - 1), (k, name, sh, wd)
     assert num('HAL_SEQ_WCSS_UMAC_REO_REG', hal_h) == REO and num('HAL_SEQ_WCSS_UMAC_WBM_REG', hal_h) == WBM and \
         num('HAL_SEQ_WCSS_UMAC_TCL_REG', hal_h) == TCL
     # Cookie conversion cc_config values (dp.c:1330-1380; hal.h masks; dp.h constants; hw.c wbm2sw_cc_enable).
@@ -1700,6 +1719,26 @@ C2F_MUTANTS = [
     ('h', '&& size >= WLCM_CMEM_MIN;', '&& size >= 4u;', 'CMEM size not checked'),
     ('h', '\tif ((uint64_t)off + 4u > (uint64_t)cm->cmem_base + cm->cmem_size) { return false; }\n', '',
      'CMEM allowlist ignores the region size'),
+    # C2f bisect: the guard (the r1c2g false SPILL), the cc value lines and the fuxiwlanw29 piece gates.
+    ('h', 'for (uint32_t k = 0; cm->spt_filled && k < WLRX_NBUF; k++) {', 'for (uint32_t k = 0; k < WLRX_NBUF; k++) {',
+     'guard counts spt-lost with the SPT never filled (the r1c2g false SPILL)'),
+    ('h', 'for (uint32_t i = 0; !cm->spt_filled && i < WLCM_NSPT', 'for (uint32_t i = 0; cm->spt_filled && i < WLCM_NSPT',
+     'guard ignores non-zero dwords of an unfilled SPT'),
+    ('h', '\tcm->spt_filled = true;\n}', '}', 'spt_filled never set'),
+    ('h', '{ "WBM2SW1_EN", 2, 1 }, ', '', 'cc decode drops a hal.h name'),
+    ('d', '\t\twl29_cc_before(regs);\n', '', 'cc pre-read values not printed'),
+    ('d', 'if (!n || !p[k] || p[k] == ~0u) { continue; }', 'if (!n || !p[k]) { continue; }', 'an unreadable cc register decoded'),
+    ('d', ' || !(wl29_mask & WL29_CC)) { return 0; }', ') { return 0; }', 'cc not gated on fuxiwlanw29 0x02'),
+    ('d', ' || !(wl29_mask & WL29_RINGS)) { return 0; }', ') { return 0; }', 'common rings not gated on fuxiwlanw29 0x01'),
+    ('d', 'for (unsigned i = 0; (m & WL29_PDEV) && i < 3u; i++)', 'for (unsigned i = 0; i < 3u; i++)', 'pdev params not gated'),
+    ('d', 'if ((m & WL29_DFS) &&\n', 'if (1 &&\n', 'DFS offload not gated'),
+    ('d', 'if ((m & WL29_PPDU) && wl29_ppdu_stats())', 'if (wl29_ppdu_stats())', 'PPDU stats not gated'),
+    ('d', 'if ((m & WL29_LRO) &&\n', 'if (1 &&\n', 'LRO not gated'),
+    ('d', 'if ((m & WL29_IDLEPS) &&\n', 'if (1 &&\n', 'IDLE_PS not gated'),
+    ('d', ' || !(wl29_mask & WL29_ENCAP)) { return 0; }', ') { return 0; }', 'encap/decap not gated'),
+    ('d', 'if ((m & WL29_PDEV) &&\n\t    wl23_words(WLWMI_CMD_PDEV_SET_PARAM, WLWMI_TAG_PDEV_SET_PARAM_CMD, a, 3, "WMI PDEV_SET_PARAM MESH_MCAST"))',
+     'if (\n\t    wl23_words(WLWMI_CMD_PDEV_SET_PARAM, WLWMI_TAG_PDEV_SET_PARAM_CMD, a, 3, "WMI PDEV_SET_PARAM MESH_MCAST"))',
+     'MESH_MCAST not gated'),
 ]
 
 
