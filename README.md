@@ -69,6 +69,23 @@ Not in git: partition backups, device trees, recovery images, Apple firmware and
 
 You need an unlocked bootloader, a rooted recovery for installing the root file, and backups of your critical partitions (`tools/fuxi-backup-critical.py`). Everything here is temporary-boot only, but you can still lose data.
 
+## Before pushing
+
+The repo is public, so every push must pass `tools/check-hygiene.py`. It checks `salami..HEAD` by default (or `origin/salami` when there is no local `salami`) and prints one line per problem:
+
+- errors: en/em dashes (U+2013, U+2014) in changed lines or commit messages, any commit not authored and committed by `slush5 <83555836+slush5@users.noreply.github.com>`, NUL bytes in changed text files, and touched `xnu/patches/*.patch` files whose `tools/sync-*.py --check` fails;
+- warnings: lines that look like a printed BSSID (a 6-octet MAC that is not locally administered) or SSID (`ssid "..."`, `SSID=...` with a real-looking value). Fixtures use `02:00:00:xx` MACs and made-up names; add a `hygiene: allow` comment to accept a line on purpose.
+
+```sh
+git config user.name slush5
+git config user.email 83555836+slush5@users.noreply.github.com
+python3 tools/check-hygiene.py                 # or: tools/check-hygiene.py origin/salami..HEAD --strict
+python3 tools/check-hygiene.py --files a.c b.md   # whole files, no commit checks
+python3 tools/test-check-hygiene.py            # the checker's own tests
+```
+
+Run it on a clean working tree, since the sync tools read the files on disk. To run it on every push, put `exec python3 tools/check-hygiene.py --strict "origin/salami..HEAD"` in `.git/hooks/pre-push`.
+
 ## Credits
 
 - **HackiOS ([kernel](https://github.com/oosexgang/hackios-xnu-kernel), APSL 2.0; [userland](https://github.com/oosexgang/hackios-xnu-userland), MIT) by OOSEX GANG**: xnu + iOS 16.5 on the POCO X5 Pro. Ported or adapted, each with its licence header kept:
