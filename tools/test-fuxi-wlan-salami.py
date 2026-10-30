@@ -637,6 +637,17 @@ def gate_suite(tmp, mk):
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw20=0x2000', 0, 0, 'w20 0x2000 valid 0'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw20=15106', 0, 0, 'w20 0x3b02 valid 0'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=8 fuxiwlanw20=15106', 0, 0, 'W20 fuxiwlanqrtr=8 is not 0..7 in this build; refused'),
+        # C2f (W29): 0x4000 L19ORDER with qrtr 7, needing 0x1000 (so 0x100 and 0x02); the kit value 32514 (0x7f02) = everything;
+        # refused without 0x1000, with qrtr 6, with keep, alone.
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32514', 1, 28,
+         'W29 selected: L19 dp_alloc order, cookie conversion (CMEM from QMI), common rings'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32514', 1, 28, 'w20 0x7f02 valid 1'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0x7f02', 1, 28, 'w20 0x7f02 valid 1'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0x4902', 0, 0, 'w20 0x4902 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0x4302', 0, 0, 'w20 0x4302 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0x4000', 0, 0, 'w20 0x4000 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32514 fuxiwlankeep=1', 0, 0, 'w20 0x7f02 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw20=32514', 0, 0, 'w20 0x7f02 valid 0'),
     ]
     for args, starts, limit, text in cases:
         s, lim, names, out, reads = run(salami, args)
@@ -659,6 +670,8 @@ def gate_suite(tmp, mk):
         assert ('W27' in out) == w27, (args, out)
         w28 = bool(w26 and int(m20[1], 0) & 0x2000)  # C2e: a W28 line only for a valid qrtr 7 boot with 0x2000
         assert ('W28' in out) == w28, (args, out)
+        w29 = bool(w26 and int(m20[1], 0) & 0x4000)  # C2f: a W29 line only for a valid qrtr 7 boot with 0x4000
+        assert ('W29' in out) == w29, (args, out)
     # Firmware names: salami Android defaults, boot-arg overrides, bad names refused.
     s, _, names, out, _ = run(salami, f'fuxiwlan=1 fuxiwlansalami=1 {W14}')
     assert s == 1 and names == {'bdf': 'bdwlan.b0e', 'regdb': 'regdb.bin', 'm3': 'phy_ucode20.elf', 'amss': ''}, names
@@ -761,7 +774,9 @@ def gate_suite(tmp, mk):
             15106: (0x3b02, 'rx rings 4095 buffers, rings 160/161/169/186 (w20 0x100); wbm idle list 32767 link descriptors (w20 '
                     '0x200); chain mask no'),
             8962: (0x2302, 'rx rings 4095 buffers, rings 160/161/169/186 (w20 0x100); wbm idle list 32767 link descriptors (w20 '
-                   '0x200); chain mask no')}
+                   '0x200); chain mask no'),
+            32514: (0x7f02, 'rx rings 4095 buffers, rings 160/161/169/186 (w20 0x100); wbm idle list 32767 link descriptors (w20 '
+                    '0x200); chain mask pdev tx/rx (w20 0x400)')}
     for dec, (hexv, sel) in kits.items():
         s, lim, _, out, reads = run(salami, 'fuxiwlan=28 fuxiwlanclk=1 fuxiwlanqrtr=7', enc(f'{s4} fuxiwlanw20={dec}'))
         assert (s, lim) == (1, 28) and 'salami fuxiwlanw20 from ADT /defaults' in out and f'w20 {hexv:#x} valid 1' in out, (dec, out)
@@ -772,6 +787,7 @@ def gate_suite(tmp, mk):
             bool(hexv & 0x1800), (dec, out)
         assert ('FUXI WLAN: W28 selected: monitor status rings 185/193, 1023 buffers each (w20 0x2000)' in out) == \
             bool(hexv & 0x2000), (dec, out)
+        assert ('FUXI WLAN: W29 selected: L19 dp_alloc order' in out) == bool(hexv & 0x4000), (dec, out)
     # (c) A boot-arg wins over /defaults, number or string, also when the boot-arg says less.
     s, lim, names, out, _ = run(salami, 'fuxiwlan=12 fuxiwlansalami=1 fuxiwlanrails=2 fuxiwlanqrtr=4 fuxiwlanbdf=a.bin',
                                 enc('fuxiwlan=11 fuxiwlansalami=0 fuxiwlanrails=1 fuxiwlanbdf=b.bin fuxiwlanm3=c.elf'))
@@ -827,8 +843,9 @@ def gate_suite(tmp, mk):
     print(f'K-W1 gate: {len(cases)} salami boot-arg cases, firmware names/overrides/refusals, Fuxi control passed')
     print(f'K-W1b /defaults: {len(equal)} knob sets equal from ADT alone and split cmdline/ADT; boot-arg wins; '
           'absent from both is off; oversize/unterminated properties; Fuxi ignores /defaults')
-    print(f'C2c kit route: r1c2 cmdline with fuxiwlanw20 from ADT /defaults for {len(kits)} kit values (512 .. 1810), each '
-          'read from /defaults and giving its W26 selection; W26 bits refused with qrtr 6, keep/stop22, 0x100 without 0x02')
+    print(f'C2c..C2f kit route: r1c2 cmdline with fuxiwlanw20 from ADT /defaults for {len(kits)} kit values (512 .. 32514, '
+          'including C2d/C2e/C2f 6402/15106/32514), each read from /defaults and giving its W26..W29 selection; the bits '
+          'refused with qrtr 6, keep/stop22, 0x100 without 0x02, 0x4000 without 0x1000')
 
 
 def mkadt_suite(mk):
