@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,7787 @@
+@@ -0,0 +1,7822 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -78,7 +78,9 @@
 + *   fuxiwlanw29=N  C2f bisect, only with qrtr=7 and a valid w20 0x4000: the W29 pieces
 + *                 (0x01 common rings, 0x02 cookie conversion (needs 0x01), 0x04 PPDU stats,
 + *                 0x08 pdev params, 0x10 DFS offload, 0x20 LRO, 0x40 IDLE_PS, 0x80 encap/decap);
-+ *                 absent = all; 0, unknown bits or any other use refused
++ *                 absent = 0x9f (all but LRO and IDLE_PS, which stall WMI on this polled,
++ *                 interrupt-less host; sent only when selected); 0, unknown bits or any
++ *                 other use refused
 + * Salami (FUXI_SALAMI, OnePlus 11, K-W1): the driver runs only when
 + * fuxiwlansalami=1 is present as well; its absence or any other value refuses
 + * before the thread starts, as do fuxiwlanseq with cyclerails and any invalid
@@ -933,7 +935,10 @@
 +#define WL23_BITS (WL20_BITS | WL20_HTTVER | WL20_BAND24 | WL20_PDEVCAP | WL26_BITS | WL27_BITS | WL20_MONSTAT | WL20_L19ORDER)
 +#define WL20_QRTR_MAX 7
 +/* C2f bisect (fuxiwlanw29, only with a valid qrtr 7 w20 0x4000): which W29
-+ * pieces run, each in its L19 place. Absent = all (the C2f boot); given, it
++ * pieces run, each in its L19 place. Absent = WL29_DEFAULT (C2g: 0x9f, every
++ * piece but LRO 0x20 and IDLE_PS 0x40; the fuxiwlanw29 bisect showed each of
++ * those two stalls WMI processing on this polled host, so they are sent only
++ * when selected; 0xff is the C2f boot); given, it
 + * must be non-zero, inside WL29_ALL, and 0x02 needs 0x01 (cookie conversion
 + * takes ownership from the common-ring pre-reads); anything else refuses the
 + * run before any access. The arena and its guards stay with 0x4000. */
@@ -946,7 +951,8 @@
 +#define WL29_IDLEPS 0x40u     /* IDLE_PS */
 +#define WL29_ENCAP 0x80u      /* vdev encap/decap */
 +#define WL29_ALL 0xffu
-+static unsigned wl29_mask = WL29_ALL;
++#define WL29_DEFAULT (WL29_ALL & ~(WL29_LRO | WL29_IDLEPS))   /* 0x9f */
++static unsigned wl29_mask = WL29_DEFAULT;
 +static bool wl_w20, wl_w23;
 +static unsigned wl20_bits;
 +static unsigned wl20_qrtr; /* 6 or 7 when wl_w20, for the init lines */
@@ -1306,7 +1312,7 @@
 +	 * 0x2000 without 0x100 is refused; qrtr 6 refuses it. */
 +	wl20_bits = 0;
 +	bool w20_given = PE_parse_boot_argn("fuxiwlanw20", &w20, sizeof(w20));
-+	wl29_mask = WL29_ALL;
++	wl29_mask = WL29_DEFAULT;
 +	bool w29_given = PE_parse_boot_argn("fuxiwlanw29", &w29, sizeof(w29));
 +	if (qrtr < 0 || qrtr > WL20_QRTR_MAX) {
 +		wl_variant_invalid = true;
@@ -1350,13 +1356,11 @@
 +			printf("FUXI WLAN: W28 selected: monitor status rings 185/193, 1023 buffers each (w20 0x2000), watched, not reaped; "
 +			    "crash line at the COMPLETED timeout and before MHI reset; nothing transmitted\n");
 +		}
-+		if ((wl20_bits & WL20_L19ORDER) && !w29_given) {
-+			printf("FUXI WLAN: W29 selected: L19 dp_alloc order, cookie conversion (CMEM from QMI), common rings sw2wbm/tcl+comp x3/"
-+			    "reinject/reo-cmd/reo-status programmed never posted, mac-start pdev params and vdev encap/decap (w20 0x4000); nothing transmitted\n");
-+		} else if (wl20_bits & WL20_L19ORDER) {   /* C2f bisect: the pieces fuxiwlanw29 selects, in L19 order */
++		if (wl20_bits & WL20_L19ORDER) {   /* C2f bisect: the pieces fuxiwlanw29 selects (C2g: absent = the default), in L19 order */
 +			const unsigned m = wl29_mask;
-+			printf("FUXI WLAN: W29 selected: L19 dp_alloc order, fuxiwlanw29 %#x: common rings %s, cookie conversion %s, pdev params %s, "
++			printf("FUXI WLAN: W29 selected: L19 dp_alloc order, fuxiwlanw29 %#x%s: common rings %s, cookie conversion %s, pdev params %s, "
 +			    "dfs-offload %s, ppdu-stats %s, lro %s, idle-ps %s, encap/decap %s (w20 0x4000); nothing transmitted\n", m,
++			    w29_given ? "" : " default",
 +			    m & WL29_RINGS ? "yes" : "no", m & WL29_CC ? "yes" : "no", m & WL29_PDEV ? "yes" : "no", m & WL29_DFS ? "yes" : "no",
 +			    m & WL29_PPDU ? "yes" : "no", m & WL29_LRO ? "yes" : "no", m & WL29_IDLEPS ? "yes" : "no", m & WL29_ENCAP ? "yes" : "no");
 +		}
@@ -5745,6 +5749,36 @@
 +	return (wl20_bits & WL20_CHAINMASK) ? wl26_chainmask() : 0;
 +}
 +
++/* C2g, at each W26 watch with the RX rings, host reads only: the raw remote
++ * pointer words of every LMAC ring set up (160, 161, 169, 186, and 185/193 with
++ * C2e), each named by where L19 puts it, then the valid entries of 161/169 with
++ * the first and last index. LMAC ring pointers have no register or shadow in
++ * L19 (wlrx_ptrs_read), so these memory words are the whole truth the host can
++ * see; nothing is written. */
++static void
++wl26_ptr_lines(const char *lb)
++{
++	/* the words, in wlrx_ptrs_read's order: an SRC ring's HP in wrp[id - 160] and TP in rdp[id], ring 186 (DST) the reverse */
++	static const char *const wl26_ptr_hp[WLRX_NPTR] = { "160 hp wrp[0]", "161 hp wrp[1]", "169 hp wrp[9]", "186 hp rdp[186]",
++		"185 hp wrp[25]", "193 hp wrp[33]" };
++	static const char *const wl26_ptr_tp[WLRX_NPTR] = { "rdp[160]", "rdp[161]", "rdp[169]", "wrp[26]", "rdp[185]", "rdp[193]" };
++	struct wlrx_ptrs p;
++	char it[WLRX_NPTR][56], sp[2][56];
++	wlrx_ptrs_read(&wl_rx, &wl_ce_io, wl_rx.mon_named, &p);
++	wlrx_ptrs_span(&wl_rx, &wl_ce_io, &p);
++	for (unsigned i = 0; i < p.n; i++) {
++		snprintf(it[i], sizeof(it[i]), "%s %#x tp %s %#x", wl26_ptr_hp[i], p.hp[i], wl26_ptr_tp[i], p.tp[i]);
++	}
++	printf("FUXI WLAN: W26 rx ptr words %s: %s; %s; %s\n", lb, it[0], it[1], it[2]);
++	if (p.n == WLRX_NPTR) { printf("FUXI WLAN: W26 rx ptr words %s: %s; %s; %s\n", lb, it[3], it[4], it[5]); }
++	else { printf("FUXI WLAN: W26 rx ptr words %s: %s; 185/193 not set up\n", lb, it[3]); }
++	for (unsigned m = 0; m < 2; m++) {
++		if (p.valid[m]) { snprintf(sp[m], sizeof(sp[m]), "valid %u first %u last %u", p.valid[m], p.first[m], p.last[m]); }
++		else { snprintf(sp[m], sizeof(sp[m]), "valid 0 first none last none"); }
++	}
++	printf("FUXI WLAN: W26 rx valid span %s: mac0 %s; mac1 %s\n", lb, sp[0], sp[1]);
++}
++
 +/* A watch (B4, D2): the four rings' device-side words and ring 120's R2 HP and
 + * TP, raw and derived, two lines; host reads only. */
 +static void
@@ -5782,6 +5816,7 @@
 +		    " mac0" : "", (w->exhausted & WLRX_F_MAC1) ? " mac1" : "", (w->exhausted & WLRX_F_ERR) ? " err" : "");
 +		printf("FUXI WLAN: W26 rx watch %s refill %s mac0 %s mac1 %s err %s; exhausted%s%s\n", lb, rf, mc[0], mc[1], er,
 +		    fl[0] ? fl : " none", w->refill_empty ? "; refill-empty" : "");
++		wl26_ptr_lines(lb);  /* C2g, read-only */
 +	}
 +	if (wl_rx.idle_on) {
 +		printf("FUXI WLAN: W26 idle watch %s %s; exhausted %s\n", lb, mc[2], (w->exhausted & WLRX_F_IDLE) ? "idle" : "none");
@@ -7819,7 +7854,7 @@
 +#endif /* FUXI */
 --- a/bsd/dev/fuxi_wlan_ce.h
 +++ b/bsd/dev/fuxi_wlan_ce.h
-@@ -0,0 +1,4148 @@
+@@ -0,0 +1,4211 @@
 +/*
 + * FUXI WLAN W20/W21/W22 (fuxiwlanqrtr=6, C1): WCN7850 copy engines on SRNG
 + * rings, HTC and WMI init to WMI READY, polled. W23/W24 (fuxiwlanqrtr=7, C2):
@@ -10334,6 +10369,61 @@
 +	w->err_hp = WLRX_LOAD(&rx->rdp[WLRX_RING_ERR]); io->rbarrier(io->ctx);
 +}
 +
++/* C2g, read-only: the raw remote pointer words of every LMAC ring set up, where
++ * L19 puts them. LMAC (DMAC/PMAC) rings have no host register and no shadow:
++ * ath12k_hal_srng_setup returns before hw_init for them (hal.c:2434-2435) and
++ * the shadow config skips them (hal.c:2523-2525); their pointers live only in
++ * host memory, an SRC ring's HP in wrp[id - 160] and TP in rdp[id], a DST ring
++ * the reverse (hal.c:2374-2431), the words SRING_SETUP names (hal.c:1881-1911,
++ * dp_tx.c:1180-1181, 1231-1235). Order 160, 161, 169, 186, then 185 and 193
++ * (C2e); each load followed by the read barrier. */
++#define WLRX_NPTR 6u
++struct wlrx_ptrs {
++	uint16_t id[WLRX_NPTR];
++	uint8_t src[WLRX_NPTR];            /* 1 SRC: hp = wrp[id - 160], tp = rdp[id]; 0 DST: the reverse */
++	uint32_t hp[WLRX_NPTR], tp[WLRX_NPTR];
++	unsigned n;                        /* 4, or 6 with the monitor status rings */
++	uint32_t valid[2], first[2], last[2];   /* per-MAC rings 161/169: valid entries, first and last index */
++};
++
++static inline void
++wlrx_ptrs_read(const struct wlrx *rx, const struct wlce_io *io, bool mon, struct wlrx_ptrs *p)
++{
++	static const struct { uint16_t id; uint8_t src; } ring[WLRX_NPTR] = {
++		{ WLRX_RING_REFILL, 1 }, { WLRX_RING_MAC0, 1 }, { WLRX_RING_MAC1, 1 }, { WLRX_RING_ERR, 0 },
++		{ WLRX_RING_MON0, 1 }, { WLRX_RING_MON1, 1 },
++	};
++	p->n = mon ? WLRX_NPTR : 4u;
++	for (unsigned i = 0; i < p->n; i++) {
++		volatile uint32_t *w = &rx->wrp[ring[i].id - WLRX_DMAC_START], *r = &rx->rdp[ring[i].id];
++		p->id[i] = ring[i].id; p->src[i] = ring[i].src;
++		p->hp[i] = WLRX_LOAD(ring[i].src ? w : r); io->rbarrier(io->ctx);
++		p->tp[i] = WLRX_LOAD(ring[i].src ? r : w); io->rbarrier(io->ctx);
++	}
++}
++
++/* C2g, read-only: the valid entries of the per-MAC rings 161/169 (the
++ * wlrx_content rule: the address alone is the start of a posted slot) with the
++ * index of the first and the last; first = last = ~0u when none. */
++static inline void
++wlrx_ptrs_span(const struct wlrx *rx, const struct wlce_io *io, struct wlrx_ptrs *p)
++{
++	io->rbarrier(io->ctx);
++	for (unsigned m = 0; m < 2; m++) {
++		const struct wlrx_ring *r = &rx->ring[WLRX_R_MAC0 + m];
++		p->valid[m] = 0; p->first[m] = p->last[m] = ~0u;
++		for (uint32_t i = 0; i < r->entries; i++) {
++			uint32_t w0 = r->va[WLRX_BUF_DW * i], w1 = r->va[WLRX_BUF_DW * i + 1u];
++			uint64_t a = w0 | (uint64_t)(w1 & 0xffu) << 32;
++			if ((!w0 && !w1) || a < rx->bufs_iova || (a - rx->bufs_iova) % WLRX_SLOT_BYTES ||
++			    (a - rx->bufs_iova) / WLRX_SLOT_BYTES >= WLRX_NBUF) { continue; }
++			if (!p->valid[m]) { p->first[m] = i; }
++			p->last[m] = i;
++			p->valid[m]++;
++		}
++	}
++}
++
 +/* 0 = a pointer of a ring of SIZE words with entries of DW words; 1 = bad (not a
 + * multiple of the entry or not below the ring); 2 = unreadable (~0u). */
 +static inline unsigned
@@ -11503,9 +11593,13 @@
 +#define WLCM_CC_REGS 6u
 +_Static_assert(WLCM_REO_CC_CFG1_VAL == 0x1d1310u && WLCM_CC_CFG1_COMMON == 0x51310u &&
 +    WLCM_WBM_CC_CFG2_OR == 0xbu && WLCM_WBM_CC_CONVERT_OR == 0x13au, "W29 cc_config values");
-+/* The "already configured" bits of the cc pre-reads (hal.h:284, 333-334): REO
-+ * CFG1 ENABLE | GLOBAL_ENABLE, the convert-config GLOBAL_EN. */
-+#define WLCM_REO_CC_CFG1_EN ((1u << 19) | (1u << 20))
++/* The "already configured" bits of the cc pre-reads: the WBM CFG1 enable and
++ * the convert-config GLOBAL_EN (hal.h:284). L19 names no enable field in WBM
++ * CFG1 (hal.h:270-273 stop at ALIGN, bit 18); its bits 19 and 20, where the REO
++ * twin has ENABLE and GLOBAL_ENABLE (hal.h:333-334), are taken as the WBM
++ * enable (conservative: either refuses). C2g: REO CFG1 ENABLE/GLOBAL_ENABLE are
++ * decoded by name but are no owner on their own (wlcm_cc_owned). */
++#define WLCM_WBM_CC_CFG1_EN ((1u << 19) | (1u << 20))
 +#define WLCM_WBM_CC_CONVERT_GLOBAL (1u << 8)
 +/* The QMI CMEM region (dev_mem[0]) as accepted: upper 32 bits zero, start 4-byte
 + * aligned in [0x80000, 0x2000000) (the window register's 6-bit field reaches
@@ -11811,7 +11905,7 @@
 +	case WLCM_CMEM_OWNED: return "a CMEM PPT entry is already non-zero (cookie converter owned)";
 +	case WLCM_REO_OWNED: return "the REO path is not ours (W27 refused it); cookie conversion needs it";
 +	case WLCM_RINGS_OWNED: return "the common rings are not ours (refused above); cookie conversion needs them";
-+	case WLCM_CC_OWNED: return "a REO/WBM cookie register is already configured (cfg0 base, cfg1 enable or convert global)";
++	case WLCM_CC_OWNED: return "a REO/WBM cookie register is already configured (cfg0 base, wbm cfg1 enable or convert global)";
 +	case WLCM_CMEM_BAD: return "the QMI CMEM region is out of bounds (upper bits, start, alignment or size)";
 +	default: return "free";
 +	}
@@ -11865,13 +11959,17 @@
 +}
 +
 +/* The six cc_config registers' pre-reads (wlcm_cc_regs order: REO CFG0, CFG1,
-+ * WBM CFG0, CFG1, CFG2, CONVERT): any ~0u unreadable; a base in either CFG0, REO
-+ * CFG1 ENABLE/GLOBAL_ENABLE or the convert GLOBAL_EN set: already configured. */
++ * WBM CFG0, CFG1, CFG2, CONVERT): any ~0u unreadable; a base in either CFG0, the
++ * WBM CFG1 enable or the convert GLOBAL_EN set: already configured. C2g: REO
++ * CFG1 alone is not an owner. L19 writes it unconditionally, the whole register
++ * and never a read-modify-write (dp.c:1340-1352), and with both bases 0 no
++ * conversion can be live (the phone reads reo-cfg1 0x111700, GLOBAL_ENABLE
++ * with base 0, at every boot: a reset or leftover value). */
 +static inline unsigned
 +wlcm_cc_owned(const uint32_t pre[WLCM_CC_REGS])
 +{
 +	for (unsigned k = 0; k < WLCM_CC_REGS; k++) { if (pre[k] == ~0u) { return WLCM_UNREADABLE; } }
-+	if (pre[0] || pre[2] || (pre[1] & WLCM_REO_CC_CFG1_EN) || (pre[5] & WLCM_WBM_CC_CONVERT_GLOBAL)) { return WLCM_CC_OWNED; }
++	if (pre[0] || pre[2] || (pre[3] & WLCM_WBM_CC_CFG1_EN) || (pre[5] & WLCM_WBM_CC_CONVERT_GLOBAL)) { return WLCM_CC_OWNED; }
 +	return WLCM_FREE;
 +}
 +

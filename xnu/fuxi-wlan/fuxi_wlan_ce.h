@@ -2512,6 +2512,61 @@ wlrx_watch_read(const struct wlrx *rx, const struct wlce_io *io, struct wlrx_wat
 	w->err_hp = WLRX_LOAD(&rx->rdp[WLRX_RING_ERR]); io->rbarrier(io->ctx);
 }
 
+/* C2g, read-only: the raw remote pointer words of every LMAC ring set up, where
+ * L19 puts them. LMAC (DMAC/PMAC) rings have no host register and no shadow:
+ * ath12k_hal_srng_setup returns before hw_init for them (hal.c:2434-2435) and
+ * the shadow config skips them (hal.c:2523-2525); their pointers live only in
+ * host memory, an SRC ring's HP in wrp[id - 160] and TP in rdp[id], a DST ring
+ * the reverse (hal.c:2374-2431), the words SRING_SETUP names (hal.c:1881-1911,
+ * dp_tx.c:1180-1181, 1231-1235). Order 160, 161, 169, 186, then 185 and 193
+ * (C2e); each load followed by the read barrier. */
+#define WLRX_NPTR 6u
+struct wlrx_ptrs {
+	uint16_t id[WLRX_NPTR];
+	uint8_t src[WLRX_NPTR];            /* 1 SRC: hp = wrp[id - 160], tp = rdp[id]; 0 DST: the reverse */
+	uint32_t hp[WLRX_NPTR], tp[WLRX_NPTR];
+	unsigned n;                        /* 4, or 6 with the monitor status rings */
+	uint32_t valid[2], first[2], last[2];   /* per-MAC rings 161/169: valid entries, first and last index */
+};
+
+static inline void
+wlrx_ptrs_read(const struct wlrx *rx, const struct wlce_io *io, bool mon, struct wlrx_ptrs *p)
+{
+	static const struct { uint16_t id; uint8_t src; } ring[WLRX_NPTR] = {
+		{ WLRX_RING_REFILL, 1 }, { WLRX_RING_MAC0, 1 }, { WLRX_RING_MAC1, 1 }, { WLRX_RING_ERR, 0 },
+		{ WLRX_RING_MON0, 1 }, { WLRX_RING_MON1, 1 },
+	};
+	p->n = mon ? WLRX_NPTR : 4u;
+	for (unsigned i = 0; i < p->n; i++) {
+		volatile uint32_t *w = &rx->wrp[ring[i].id - WLRX_DMAC_START], *r = &rx->rdp[ring[i].id];
+		p->id[i] = ring[i].id; p->src[i] = ring[i].src;
+		p->hp[i] = WLRX_LOAD(ring[i].src ? w : r); io->rbarrier(io->ctx);
+		p->tp[i] = WLRX_LOAD(ring[i].src ? r : w); io->rbarrier(io->ctx);
+	}
+}
+
+/* C2g, read-only: the valid entries of the per-MAC rings 161/169 (the
+ * wlrx_content rule: the address alone is the start of a posted slot) with the
+ * index of the first and the last; first = last = ~0u when none. */
+static inline void
+wlrx_ptrs_span(const struct wlrx *rx, const struct wlce_io *io, struct wlrx_ptrs *p)
+{
+	io->rbarrier(io->ctx);
+	for (unsigned m = 0; m < 2; m++) {
+		const struct wlrx_ring *r = &rx->ring[WLRX_R_MAC0 + m];
+		p->valid[m] = 0; p->first[m] = p->last[m] = ~0u;
+		for (uint32_t i = 0; i < r->entries; i++) {
+			uint32_t w0 = r->va[WLRX_BUF_DW * i], w1 = r->va[WLRX_BUF_DW * i + 1u];
+			uint64_t a = w0 | (uint64_t)(w1 & 0xffu) << 32;
+			if ((!w0 && !w1) || a < rx->bufs_iova || (a - rx->bufs_iova) % WLRX_SLOT_BYTES ||
+			    (a - rx->bufs_iova) / WLRX_SLOT_BYTES >= WLRX_NBUF) { continue; }
+			if (!p->valid[m]) { p->first[m] = i; }
+			p->last[m] = i;
+			p->valid[m]++;
+		}
+	}
+}
+
 /* 0 = a pointer of a ring of SIZE words with entries of DW words; 1 = bad (not a
  * multiple of the entry or not below the ring); 2 = unreadable (~0u). */
 static inline unsigned
@@ -3681,9 +3736,13 @@ _Static_assert(WLCM_RX_SPT_USED * WLCM_SPT_ENTRIES >= WLRX_NBUF &&
 #define WLCM_CC_REGS 6u
 _Static_assert(WLCM_REO_CC_CFG1_VAL == 0x1d1310u && WLCM_CC_CFG1_COMMON == 0x51310u &&
     WLCM_WBM_CC_CFG2_OR == 0xbu && WLCM_WBM_CC_CONVERT_OR == 0x13au, "W29 cc_config values");
-/* The "already configured" bits of the cc pre-reads (hal.h:284, 333-334): REO
- * CFG1 ENABLE | GLOBAL_ENABLE, the convert-config GLOBAL_EN. */
-#define WLCM_REO_CC_CFG1_EN ((1u << 19) | (1u << 20))
+/* The "already configured" bits of the cc pre-reads: the WBM CFG1 enable and
+ * the convert-config GLOBAL_EN (hal.h:284). L19 names no enable field in WBM
+ * CFG1 (hal.h:270-273 stop at ALIGN, bit 18); its bits 19 and 20, where the REO
+ * twin has ENABLE and GLOBAL_ENABLE (hal.h:333-334), are taken as the WBM
+ * enable (conservative: either refuses). C2g: REO CFG1 ENABLE/GLOBAL_ENABLE are
+ * decoded by name but are no owner on their own (wlcm_cc_owned). */
+#define WLCM_WBM_CC_CFG1_EN ((1u << 19) | (1u << 20))
 #define WLCM_WBM_CC_CONVERT_GLOBAL (1u << 8)
 /* The QMI CMEM region (dev_mem[0]) as accepted: upper 32 bits zero, start 4-byte
  * aligned in [0x80000, 0x2000000) (the window register's 6-bit field reaches
@@ -3989,7 +4048,7 @@ wlcm_why(unsigned own)
 	case WLCM_CMEM_OWNED: return "a CMEM PPT entry is already non-zero (cookie converter owned)";
 	case WLCM_REO_OWNED: return "the REO path is not ours (W27 refused it); cookie conversion needs it";
 	case WLCM_RINGS_OWNED: return "the common rings are not ours (refused above); cookie conversion needs them";
-	case WLCM_CC_OWNED: return "a REO/WBM cookie register is already configured (cfg0 base, cfg1 enable or convert global)";
+	case WLCM_CC_OWNED: return "a REO/WBM cookie register is already configured (cfg0 base, wbm cfg1 enable or convert global)";
 	case WLCM_CMEM_BAD: return "the QMI CMEM region is out of bounds (upper bits, start, alignment or size)";
 	default: return "free";
 	}
@@ -4043,13 +4102,17 @@ wlcm_cmem_region_ok(uint64_t start, uint64_t size)
 }
 
 /* The six cc_config registers' pre-reads (wlcm_cc_regs order: REO CFG0, CFG1,
- * WBM CFG0, CFG1, CFG2, CONVERT): any ~0u unreadable; a base in either CFG0, REO
- * CFG1 ENABLE/GLOBAL_ENABLE or the convert GLOBAL_EN set: already configured. */
+ * WBM CFG0, CFG1, CFG2, CONVERT): any ~0u unreadable; a base in either CFG0, the
+ * WBM CFG1 enable or the convert GLOBAL_EN set: already configured. C2g: REO
+ * CFG1 alone is not an owner. L19 writes it unconditionally, the whole register
+ * and never a read-modify-write (dp.c:1340-1352), and with both bases 0 no
+ * conversion can be live (the phone reads reo-cfg1 0x111700, GLOBAL_ENABLE
+ * with base 0, at every boot: a reset or leftover value). */
 static inline unsigned
 wlcm_cc_owned(const uint32_t pre[WLCM_CC_REGS])
 {
 	for (unsigned k = 0; k < WLCM_CC_REGS; k++) { if (pre[k] == ~0u) { return WLCM_UNREADABLE; } }
-	if (pre[0] || pre[2] || (pre[1] & WLCM_REO_CC_CFG1_EN) || (pre[5] & WLCM_WBM_CC_CONVERT_GLOBAL)) { return WLCM_CC_OWNED; }
+	if (pre[0] || pre[2] || (pre[3] & WLCM_WBM_CC_CFG1_EN) || (pre[5] & WLCM_WBM_CC_CONVERT_GLOBAL)) { return WLCM_CC_OWNED; }
 	return WLCM_FREE;
 }
 

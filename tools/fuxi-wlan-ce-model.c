@@ -69,6 +69,9 @@
  *   the firmware stops the scan after 15 channels (3 with ring selection), MHI
  *   goes to SYS_ERR with the phone's ERRDBG words and the MHI reset is never
  *   confirmed.
+ *   C2g: the phone's per-MAC rings (C.mac_hp_silent: the firmware fills 161/169 and writes no HP word), the
+ *   read-only pointer-word and valid-span lines at every W26 watch, the phone's cc values (programmed), and the
+ *   fuxiwlanw29 default 0x9f in a full scan.
  * No device, no network. L19 = Linux ath12k v6.19 (BSD-3-Clause-Clear).
  */
 #include <assert.h>
@@ -273,6 +276,8 @@ struct cfg {
 	bool mon_alloc_fail;                /* the monitor status arena allocation fails */
 	bool mon_late;                      /* RXDMA writes one status during the MHI reset, before bus master off */
 	uint32_t mon_tp_raw;                /* rdp[193] written raw on the last channel, after its status writes */
+	/* C2g */
+	bool mac_hp_silent;                 /* the phone: the firmware fills MAC rings 161/169 but writes no HP into wrp[1]/[9] */
 };
 static struct cfg C;
 static unsigned restores;
@@ -899,7 +904,7 @@ fw_mac_post(unsigned m, const uint32_t *e)
 	d = rxd(m_mac_off[m] + 4u * fw_mac_hp[m], 8, true, "MAC ring entry");
 	p32(d, e[0]); p32(d + 4, e[1]);
 	fw_mac_hp[m] = (fw_mac_hp[m] + 2u) % 4096u;
-	p32(rxd(0x400u + 4u * (m_mac_id[m] - 160u), 4, true, "wrp of a MAC ring"), fw_mac_hp[m]);
+	if (!C.mac_hp_silent) { p32(rxd(0x400u + 4u * (m_mac_id[m] - 160u), 4, true, "wrp of a MAC ring"), fw_mac_hp[m]); }
 }
 
 /* The firmware takes N refill entries at the TP: each the start of a posted slot, RBM 6, cookie = slot, once. */
@@ -5240,7 +5245,7 @@ static void
 s_c2f_gate(void)
 {
 	static const char why_cc[] = "FUXI WLAN: W29 cookie conversion not programmed: a REO/WBM cookie register is already "
-	    "configured (cfg0 base, cfg1 enable or convert global); w20 0x4000 cc dropped for this boot\n";
+	    "configured (cfg0 base, wbm cfg1 enable or convert global); w20 0x4000 cc dropped for this boot\n";
 	static const char why_bad[] = "FUXI WLAN: W29 cookie conversion not programmed: the QMI CMEM region is out of bounds "
 	    "(upper bits, start, alignment or size); w20 0x4000 cc dropped for this boot\n";
 	/* both ours, the region good, the cc registers clear: the CMEM writes after every pre-read and before the first
@@ -5284,12 +5289,14 @@ s_c2f_gate(void)
 	wl_cm.rings_on = true; wl_rd.reo_on = false;
 	CHECK(wl29_cc_config() == 0, "c2f gate cc_config, REO not ours");
 	CHECK(!cmd.cmem_rd && !cmd.cmem_wr && cmd.cc_rd == 2u && !cmd.cc_wr && !cmd.ring_wr, "c2f gate rings owned: a CMEM or cc_config access");
-	/* the cc_config pre-reads: a CFG0 base, REO CFG1 ENABLE or GLOBAL_ENABLE, the convert GLOBAL_EN or any ~0 drop cc
-	 * (one line, no CMEM access, nothing written to the cc registers; the rings still run); field bits alone do not */
+	/* the cc_config pre-reads: a CFG0 base, the WBM CFG1 enable (bits 19/20), the convert GLOBAL_EN or any ~0 drop cc
+	 * (one line, no CMEM access, nothing written to the cc registers; the rings still run); field bits alone do not, nor
+	 * (C2g) REO CFG1 with both bases 0, whatever it holds: L19 writes it whole (dp.c:1340-1352) */
 	{
 		static const struct { unsigned k; uint32_t v; int drop; } cs[] = {
-			{ 0, 0x113000u, 1 }, { 2, 0x1u, 1 }, { 1, 1u << 19, 1 }, { 1, 1u << 20, 1 }, { 5, 1u << 8, 1 }, { 3, ~0u, 2 },
+			{ 0, 0x113000u, 1 }, { 2, 0x1u, 1 }, { 3, 1u << 19, 1 }, { 3, 1u << 20, 1 }, { 5, 1u << 8, 1 }, { 3, ~0u, 2 },
 			{ 1, 0x51310u, 0 }, { 5, 0x3au, 0 }, { 4, 0xbu, 0 }, { 3, 0x51310u, 0 },
+			{ 1, 1u << 19, 0 }, { 1, 1u << 20, 0 }, { 1, 0x111700u, 0 }, { 1, 0x1d1310u, 0 }, { 1, 0xfffffffeu, 0 },
 		};
 		for (unsigned i = 0; i < sizeof(cs) / sizeof(cs[0]); i++) {
 			c2f_gate_reset();
@@ -5365,10 +5372,11 @@ static void
 s_c2f_guard(void)
 {
 	volatile uint32_t *spt;
-	/* cc dropped (REO CFG1 ENABLE already set, the phone's case): no SPILL; one non-zero SPT dword is one */
+	/* cc dropped (C2g: the WBM CFG1 enable already set; REO CFG1 alone no longer drops it): no SPILL; one non-zero SPT
+	 * dword is one */
 	c2f_gate_reset();
 	wl_rx.bufs_iova = 0xa1a20000ull;
-	cmd.cc_pre[1] = 1u << 19;
+	cmd.cc_pre[3] = 1u << 19;
 	CHECK(wl27_setup() == 0 && wl_cm.rings_on && !wl_cm.cc_on && !wl_cm.spt_filled, "c2f guard: cc dropped run");
 	wl29_report();
 	expect("FUXI WLAN: W29 guard nonzero dwords: rdp 0, ring-gap 0, spt-nonzero 0, tail 0\n");
@@ -5416,7 +5424,7 @@ static void
 s_c2f_ccvals(void)
 {
 	static const char why_cc[] = "FUXI WLAN: W29 cookie conversion not programmed: a REO/WBM cookie register is already "
-	    "configured (cfg0 base, cfg1 enable or convert global); w20 0x4000 cc dropped for this boot\n";
+	    "configured (cfg0 base, wbm cfg1 enable or convert global); w20 0x4000 cc dropped for this boot\n";
 	c2f_gate_reset();
 	CHECK(wl27_setup() == 0 && wl_cm.cc_on, "c2f cc values: happy");
 	{
@@ -5479,6 +5487,28 @@ s_c2f_ccvals(void)
 		expect_order(order, 3);
 	}
 	CHECK(count_text("cc before decode") == 1, "c2f cc values: zero registers decoded");
+	/* C2g: the phone's values at every boot (reo-cfg1 0x111700, wbm-cfg2 0x40, the rest 0): no base anywhere, WBM off, so
+	 * not owned; cc goes on and cc_config programs all six, CFG2 and CONVERT read-modify-write over what they hold */
+	c2f_gate_reset();
+	{
+		static const uint32_t v[6] = { 0, 0x111700u, 0, 0, 0x40u, 0 };
+		memcpy(cmd.cc_pre, v, sizeof(v));
+	}
+	CHECK(wl27_setup() == 0 && wl_cm.rings_on && wl_cm.cc_on && wl_rx.cc_on && wl_rd.cc_on && cmd.cmem_wr == 280u, "c2g cc: phone values");
+	{
+		static const char *const order[] = {
+			"FUXI WLAN: W29 cc before: reo-cfg0@0xa38050 0, reo-cfg1@0xa38054 0x111700, wbm-cfg0@0xa34040 0, wbm-cfg1@0xa34044 0, "
+			"wbm-cfg2@0xa34090 0x40, convert@0xa34094 0\n",
+			"FUXI WLAN: W29 cc before decode reo-cfg1 0x111700 HAL_REO1_SW_COOKIE_CFG_*: COOKIE_PPT_MSB=0x17 COOKIE_SPT_MSB=0x8 "
+			"GLOBAL_ENABLE\n",
+			"FUXI WLAN: W29 cc before decode wbm-cfg2 0x40 HAL_WBM_SW_COOKIE_CFG_*: other 0x40\n",
+			"FUXI WLAN: W29 cookie conversion cmem base 0x113000 pages 280",
+		};
+		expect_order(order, sizeof(order) / sizeof(order[0]));
+	}
+	expect_not("cc dropped for this boot");
+	CHECK(wl29_cc_config() == 0 && cmd.cc_wr == 6u, "c2g cc: phone values, cc_config");
+	expect("FUXI WLAN: W29 cc_config reo-cfg1 0x1d1310 wbm-cfg1 0x51310 cfg2 0x40->0x4b convert 0->0x13a; writes 6\n");
 	/* no pre-reads (no QMI CMEM region): no value line */
 	c2f_gate_reset();
 	wl_cmem_valid = false;
@@ -5486,7 +5516,8 @@ s_c2f_ccvals(void)
 	expect_not("cc before");
 	c2f_gate_done();
 	puts("C2f cc values: the six cc_config pre-reads printed with their addresses, cc on and dropped; the hal.h names set "
-	     "decoded per register (CFG0 and ~0 not), other bits as other; the widest within the console");
+	     "decoded per register (CFG0 and ~0 not), other bits as other; the widest within the console; C2g: the phone's "
+	     "values (reo-cfg1 0x111700, wbm-cfg2 0x40) are not an owner and cc is programmed");
 }
 
 /* C2f bisect, fuxiwlanw29 at W20: the common rings (0x01) and cookie conversion (0x02) each run only when selected; without
@@ -5528,7 +5559,8 @@ s_c2f_bisect(void)
 	static const uint32_t l19[11] = { 0x22u, 0x0au, 0x23u, 0xdu, 0x11u, 0x11u, 0x8fu, 0x1du, 0x2cu, 0x30u, 0x5bu };
 	static const uint8_t bit[11] = { WL29_PDEV, WL29_PDEV, WL29_PDEV, WL29_DFS, WL29_PPDU, WL29_PPDU, WL29_PDEV, WL29_LRO, WL29_IDLEPS,
 		WL29_ENCAP, WL29_ENCAP };
-	static const unsigned masks[] = { 0xffu, 0x01u, 0x05u, 0x09u, 0x11u, 0x21u, 0x41u, 0x81u, 0x5cu, 0xa0u, 0x03u };
+	static const unsigned masks[] = { 0xffu, 0x01u, 0x05u, 0x09u, 0x11u, 0x21u, 0x41u, 0x81u, 0x5cu, 0xa0u, 0x03u, WL29_DEFAULT };
+	_Static_assert(WL29_DEFAULT == 0x9fu, "C2g: the fuxiwlanw29 default");
 	for (unsigned t = 0; t < sizeof(masks) / sizeof(masks[0]); t++) {
 		const unsigned m = masks[t];
 		unsigned n = 0;
@@ -5565,9 +5597,91 @@ s_c2f_bisect(void)
 		contained_and_freed();
 	}
 	reset();
-	puts("C2f bisect: fuxiwlanw29 0xff, 0x01, 0x05, 0x09, 0x11, 0x21, 0x41, 0x81, 0x5c, 0xa0 and 0x03 in a full scan: exactly the "
-	     "selected mac-start pdev params, DFS offload, PPDU stats, LRO, idle-PS and encap/decap, word by word, in L19's order "
-	     "and place; the scan completes");
+	puts("C2f bisect: fuxiwlanw29 0xff, 0x01, 0x05, 0x09, 0x11, 0x21, 0x41, 0x81, 0x5c, 0xa0, 0x03 and the C2g default 0x9f in "
+	     "a full scan: exactly the selected mac-start pdev params, DFS offload, PPDU stats, LRO, idle-PS and encap/decap, word by "
+	     "word, in L19's order and place (the default: no LRO, no idle-PS); the scan completes");
+}
+
+/* C2g, read-only: at every W26 watch the raw remote pointer words of each LMAC ring set up, named by where L19 puts
+ * them (an SRC ring's HP in wrp[id - 160] and TP in rdp[id], a DST ring the reverse), then the valid entries of the
+ * MAC rings 161/169 with the first and last index. The model's firmware mirrors its MAC ring HP into wrp[1]/[9]; the
+ * phone's (C.mac_hp_silent) fills the rings and leaves both words 0, which is what L19 itself would read there (it
+ * never reads or writes these two rings' pointers after SRING_SETUP). */
+static void
+s_c2g_ptrs(void)
+{
+	/* the C2c happy path: 2048 refill entries taken, 1024 to each MAC ring, HP mirrored */
+	c2c_happy_run(0);
+	show("c2g 0x702");
+	{
+		static const char *const lines[] = {
+			("FUXI WLAN: W26 rx watch setup+100ms refill tp 4096 taken 2048 left 2047 mac0 hp 2048 tp 0 avail 1024 mac1 hp 2048 tp 0 "
+			 "avail 1024 err hp 0 fill 0; exhausted none\n"),
+			("FUXI WLAN: W26 rx ptr words setup+100ms: 160 hp wrp[0] 0x1ffe tp rdp[160] 0x1000; 161 hp wrp[1] 0x800 tp rdp[161] 0; "
+			 "169 hp wrp[9] 0x800 tp rdp[169] 0\n"),
+			"FUXI WLAN: W26 rx ptr words setup+100ms: 186 hp rdp[186] 0 tp wrp[26] 0; 185/193 not set up\n",
+			"FUXI WLAN: W26 rx valid span setup+100ms: mac0 valid 1024 first 0 last 1023; mac1 valid 1024 first 0 last 1023\n",
+			"FUXI WLAN: W26 idle watch setup+100ms ",
+			"FUXI WLAN: W26 rx watch started ",
+			"FUXI WLAN: W26 rx ptr words started: 160 hp wrp[0] 0x1ffe ",
+			"FUXI WLAN: W26 rx valid span started: ",
+			"FUXI WLAN: W26 rx watch mid (foreign 19) ",
+			("FUXI WLAN: W26 rx ptr words mid (foreign 19): 160 hp wrp[0] 0x1ffe tp rdp[160] 0x1000; 161 hp wrp[1] 0x800 tp rdp[161] "
+			 "0x34; 169 hp wrp[9] 0x800 tp rdp[169] 0"),
+			"FUXI WLAN: W26 rx watch completed ",
+			"FUXI WLAN: W26 rx ptr words completed: ",
+			"FUXI WLAN: W26 rx ptr words completed: 186 hp rdp[186] 0 tp wrp[26] 0; 185/193 not set up\n",
+			"FUXI WLAN: W26 rx valid span completed: mac0 valid 1024 first 0 last 1023; mac1 valid 1024 first 0 last 1023\n",
+			"FUXI WLAN: W26 rx content mac0 entries 1024 valid 1024 ",
+		};
+		expect_order(lines, sizeof(lines) / sizeof(lines[0]));
+	}
+	CHECK(count_text("W26 rx ptr words") == 8 && count_text("W26 rx valid span") == 4, "c2g: two word lines and one span line per watch");
+	contained_and_freed();
+	/* the phone (r1c2c-all, w20 0x702): 4095 taken, 2047 and 2016 entries written to 161/169, no HP word written: the
+	 * watch shows the phone's "hp 0 tp 0 avail 0", the raw words are 0 and the span shows where the entries are */
+	c2d_reset(0x702); c2d_phone(); C.mac_hp_silent = true; C.d_frames = 120; happy_frames();
+	CHECK(run() == 1, "c2g phone: the wedge");
+	show("c2g phone");
+	{
+		static const char *const lines[] = {
+			("FUXI WLAN: W26 rx watch setup+100ms refill tp 8190 taken 4095 left 0 mac0 hp 0 tp 0 avail 0 mac1 hp 0 tp 0 avail 0 "),
+			("FUXI WLAN: W26 rx ptr words setup+100ms: 160 hp wrp[0] 0x1ffe tp rdp[160] 0x1ffe; 161 hp wrp[1] 0 tp rdp[161] 0; "
+			 "169 hp wrp[9] 0 tp rdp[169] 0\n"),
+			"FUXI WLAN: W26 rx ptr words setup+100ms: 186 hp rdp[186] 0 tp wrp[26] 0; 185/193 not set up\n",
+			"FUXI WLAN: W26 rx valid span setup+100ms: mac0 valid 2047 first 0 last 2046; mac1 valid 2016 first 0 last 2015\n",
+			"FUXI WLAN: W26 rx valid span completed: mac0 valid 2047 first 0 last 2046; mac1 valid 2016 first 0 last 2015\n",
+			"FUXI WLAN: W26 rx content mac0 entries 2047 valid 2047 foreign 0 rbm-other 0 cookie-other 0\n",
+			"FUXI WLAN: W26 rx content mac1 entries 2016 valid 2016 foreign 0 rbm-other 0 cookie-other 0\n",
+		};
+		expect_order(lines, sizeof(lines) / sizeof(lines[0]));
+	}
+	expect_not("not owned; refused");
+	contained_and_freed();
+	/* with the monitor status rings (C2e, w20 0x3b02): the second word line names 185/193 */
+	c2e_reset(0x3b02); C.d_frames = 120; happy_frames();
+	CHECK(run() == 0, "c2g 0x3b02");
+	show("c2g 0x3b02");
+	expect("FUXI WLAN: W26 rx ptr words setup+100ms: 186 hp rdp[186] 0 tp wrp[26] 0; 185 hp wrp[25] 0x7fe tp rdp[185] 0; "
+	    "193 hp wrp[33] 0x7fe tp rdp[193] 0\n");
+	expect_not("185/193 not set up");
+	c2e_contained(false);
+	/* the RXDMA error ring 186 (DST): its HP is the device's rdp[186], its TP the host's wrp[26] (never moved, 0) */
+	c2c_reset(0x312); C.exp_n = 13; C.rx_rule = 5; C.rx_frames = 1; C.err_n = 1100; C.err_code = 0; C.err_rbm = 1;
+	CHECK(run() == 0, "c2g err full");
+	show("c2g err full");
+	expect("FUXI WLAN: W26 rx ptr words completed: 186 hp rdp[186] 0x1ff8 tp wrp[26] 0; 185/193 not set up\n");
+	c2c_contained();
+	/* with no MAC ring entry at all (the firmware takes nothing): "valid 0 first none last none" */
+	c2d_reset(0x702); C.rx_take = 0; C.rx_post[0] = C.rx_post[1] = 0; C.d_frames = 120; happy_frames();
+	(void)run();
+	show("c2g none");
+	expect("FUXI WLAN: W26 rx valid span setup+100ms: mac0 valid 0 first none last none; mac1 valid 0 first none last none\n");
+	contained_and_freed();
+	reset();
+	puts("C2g pointer words: at every W26 watch the raw HP/TP words of 160/161/169/186 (and 185/193 with 0x2000) where L19 puts "
+	     "them, and the valid span of 161/169; the phone's silent HP (raw 0 with 2047/2016 valid entries at 0..2046/0..2015), "
+	     "no entry at all, host reads only");
 }
 
 static void
@@ -5705,6 +5819,7 @@ main(int argc, char **argv)
 		s_c2f_ccvals();
 		s_c2f_mask_gate();
 		s_c2f_bisect();
+		s_c2g_ptrs();
 		reset();
 		puts("C2f model: all scenarios passed");
 		return 0;
@@ -5765,6 +5880,7 @@ main(int argc, char **argv)
 	s_c2f_ccvals();
 	s_c2f_mask_gate();
 	s_c2f_bisect();
+	s_c2g_ptrs();
 	reset();
 	puts("W20 model: all scenarios passed");
 	return 0;
