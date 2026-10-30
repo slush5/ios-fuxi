@@ -5597,7 +5597,7 @@ wl26_rings(void)
 	unsigned took = 0;
 	if (wl_rx.rx_on) {
 		for (unsigned i = 0; i < WLRX_NRING; i++) { if (wl26_sring(i)) { return 1; } }
-		if ((wl20_bits & WL20_RXSEL) && (wl27_sel(0) || wl27_sel(1))) { return 1; }  /* C2d: dp_rx.c:4670 */
+		if ((wl20_bits & WL20_RXSEL) && (wl27_sel(0) || wl27_sel(1))) { return 1; }  /* C2d: dp_rx.c:4672 */
 		if (wl23_poll_for(WL20_W_NONE, 100, &took) == 1) { return 1; }
 	}
 	wl26_watch(WLRX_P_SETUP);
@@ -5616,6 +5616,7 @@ wl26_watch(unsigned p)
 	if (wl_rx.rx_on) { wlrx_watch_read(&wl_rx, &wl_ce_io, w); }
 	if (wl_rx.idle_on) { w->idle_hp = wl26_wbm_rd(WLRX_WBM_IDLE_HP); w->idle_tp = wl26_wbm_rd(WLRX_WBM_IDLE_TP); }
 	w->foreign = wl_scan.foreign;
+	wl_rx.refill_head = wl_rd.reo_on ? wl_rd.refill_hp : 0u;   /* C2d re-posts move the head */
 	wlrx_watch_derive(&wl_rx, p);
 	if (p == WLRX_P_MID) { snprintf(lb, sizeof(lb), "mid (foreign %u)", w->foreign); }
 	else {

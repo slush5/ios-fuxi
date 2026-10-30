@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,7167 @@
+@@ -0,0 +1,7168 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -5629,7 +5629,7 @@
 +	unsigned took = 0;
 +	if (wl_rx.rx_on) {
 +		for (unsigned i = 0; i < WLRX_NRING; i++) { if (wl26_sring(i)) { return 1; } }
-+		if ((wl20_bits & WL20_RXSEL) && (wl27_sel(0) || wl27_sel(1))) { return 1; }  /* C2d: dp_rx.c:4670 */
++		if ((wl20_bits & WL20_RXSEL) && (wl27_sel(0) || wl27_sel(1))) { return 1; }  /* C2d: dp_rx.c:4672 */
 +		if (wl23_poll_for(WL20_W_NONE, 100, &took) == 1) { return 1; }
 +	}
 +	wl26_watch(WLRX_P_SETUP);
@@ -5648,6 +5648,7 @@
 +	if (wl_rx.rx_on) { wlrx_watch_read(&wl_rx, &wl_ce_io, w); }
 +	if (wl_rx.idle_on) { w->idle_hp = wl26_wbm_rd(WLRX_WBM_IDLE_HP); w->idle_tp = wl26_wbm_rd(WLRX_WBM_IDLE_TP); }
 +	w->foreign = wl_scan.foreign;
++	wl_rx.refill_head = wl_rd.reo_on ? wl_rd.refill_hp : 0u;   /* C2d re-posts move the head */
 +	wlrx_watch_derive(&wl_rx, p);
 +	if (p == WLRX_P_MID) { snprintf(lb, sizeof(lb), "mid (foreign %u)", w->foreign); }
 +	else {
@@ -7199,7 +7200,7 @@
 +#endif /* FUXI */
 --- a/bsd/dev/fuxi_wlan_ce.h
 +++ b/bsd/dev/fuxi_wlan_ce.h
-@@ -0,0 +1,3238 @@
+@@ -0,0 +1,3242 @@
 +/*
 + * FUXI WLAN W20/W21/W22 (fuxiwlanqrtr=6, C1): WCN7850 copy engines on SRNG
 + * rings, HTC and WMI init to WMI READY, polled. W23/W24 (fuxiwlanqrtr=7, C2):
@@ -9449,6 +9450,7 @@
 +	uint8_t *bufs; uint64_t bufs_iova; uint32_t nbufs;          /* 4095 posted of 4096 slots, stride 4096 */
 +	uint8_t *link; uint64_t link_iova; uint32_t link_bytes;     /* link arena 0x440000 */
 +	struct wlrx_ring idle; uint32_t ndesc;                      /* 32767 */
++	uint32_t refill_head;   /* host HP of ring 160 in words when C2d re-posts; 0 = the fixed 8190 of C2c */
 +	uint32_t wbm_pre[WLRX_PRE_N];                               /* D1: seven pre-reads + the scattered base */
 +	unsigned idle_own;                                          /* WLRX_IDLE_* of the pre-reads */
 +	uint32_t chain_tx, chain_rx;                                /* sent values; 0 = not sent */
@@ -9721,7 +9723,10 @@
 +		unsigned k = wlrx_word(w->refill_tp, rsize, WLRX_BUF_DW);
 +		bool mac_ok[2];
 +		if (k) { w->bad |= k == 1 ? f[0] : 0u; w->unreadable |= k == 2 ? f[0] : 0u; }
-+		else { w->refill_taken = w->refill_tp / WLRX_BUF_DW; w->refill_left = (WLRX_NBUF * WLRX_BUF_DW + rsize - w->refill_tp) % rsize / WLRX_BUF_DW; }
++		else {
++			const uint32_t head = rx->refill_head ? rx->refill_head : WLRX_NBUF * WLRX_BUF_DW;
++			w->refill_taken = w->refill_tp / WLRX_BUF_DW; w->refill_left = (head + rsize - w->refill_tp) % rsize / WLRX_BUF_DW;
++		}
 +		for (unsigned m = 0; m < 2; m++) {
 +			unsigned a = wlrx_word(w->mac_hp[m], msize, WLRX_BUF_DW), b = wlrx_word(w->mac_tp[m], msize, WLRX_BUF_DW);
 +			mac_ok[m] = !a && !b;
@@ -10433,7 +10438,7 @@
 +	}
 +	if (reaped && rd->returned) { return "C3 management forwarding: frames reach the host rings, WMI MGMT_RX stays silent"; }
 +	if (frames_written) { return "owner review: buffers written, nothing returned on the REO/release rings"; }
-+	return (bits & WLRX_W20_RXSEL) && (bits & WLRX_W20_REORX) ? "owner review: RX path complete, RXDMA wrote nothing" :
++	return (bits & WLRX_W20_RXSEL) && (bits & WLRX_W20_REORX) ? "owner review: RXDMA wrote nothing (L19 also has the monitor status and REO cmd/status rings)" :
 +	    "0x1902 (6402): ring selection and the REO path together";
 +}
 +

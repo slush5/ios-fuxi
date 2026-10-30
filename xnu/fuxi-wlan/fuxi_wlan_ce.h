@@ -2247,6 +2247,7 @@ struct wlrx {
 	uint8_t *bufs; uint64_t bufs_iova; uint32_t nbufs;          /* 4095 posted of 4096 slots, stride 4096 */
 	uint8_t *link; uint64_t link_iova; uint32_t link_bytes;     /* link arena 0x440000 */
 	struct wlrx_ring idle; uint32_t ndesc;                      /* 32767 */
+	uint32_t refill_head;   /* host HP of ring 160 in words when C2d re-posts; 0 = the fixed 8190 of C2c */
 	uint32_t wbm_pre[WLRX_PRE_N];                               /* D1: seven pre-reads + the scattered base */
 	unsigned idle_own;                                          /* WLRX_IDLE_* of the pre-reads */
 	uint32_t chain_tx, chain_rx;                                /* sent values; 0 = not sent */
@@ -2519,7 +2520,10 @@ wlrx_watch_derive(struct wlrx *rx, unsigned p)
 		unsigned k = wlrx_word(w->refill_tp, rsize, WLRX_BUF_DW);
 		bool mac_ok[2];
 		if (k) { w->bad |= k == 1 ? f[0] : 0u; w->unreadable |= k == 2 ? f[0] : 0u; }
-		else { w->refill_taken = w->refill_tp / WLRX_BUF_DW; w->refill_left = (WLRX_NBUF * WLRX_BUF_DW + rsize - w->refill_tp) % rsize / WLRX_BUF_DW; }
+		else {
+			const uint32_t head = rx->refill_head ? rx->refill_head : WLRX_NBUF * WLRX_BUF_DW;
+			w->refill_taken = w->refill_tp / WLRX_BUF_DW; w->refill_left = (head + rsize - w->refill_tp) % rsize / WLRX_BUF_DW;
+		}
 		for (unsigned m = 0; m < 2; m++) {
 			unsigned a = wlrx_word(w->mac_hp[m], msize, WLRX_BUF_DW), b = wlrx_word(w->mac_tp[m], msize, WLRX_BUF_DW);
 			mac_ok[m] = !a && !b;
@@ -3231,7 +3235,7 @@ wlrd_next(const struct wlrd *rd, uint32_t bits, uint32_t frames_written)
 	}
 	if (reaped && rd->returned) { return "C3 management forwarding: frames reach the host rings, WMI MGMT_RX stays silent"; }
 	if (frames_written) { return "owner review: buffers written, nothing returned on the REO/release rings"; }
-	return (bits & WLRX_W20_RXSEL) && (bits & WLRX_W20_REORX) ? "owner review: RX path complete, RXDMA wrote nothing" :
+	return (bits & WLRX_W20_RXSEL) && (bits & WLRX_W20_REORX) ? "owner review: RXDMA wrote nothing (L19 also has the monitor status and REO cmd/status rings)" :
 	    "0x1902 (6402): ring selection and the REO path together";
 }
 
