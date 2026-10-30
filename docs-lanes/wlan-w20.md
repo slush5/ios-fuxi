@@ -1,9 +1,11 @@
 # W20-W24: copy engines, HTC and WMI init to WMI READY (WCN7850, `fuxiwlanqrtr=6`, C1), one passive scan (`fuxiwlanqrtr=7`, C2)
 
-Status: C1 committed (c742af3), its first boot pending; C2 host-tested only (tools/test-fuxi-wlan-ce.py).
-Nothing of C2 has run on a device. Every line below that says what the target does is what the model
-does, built from Linux ath12k v6.19. C2 is described in its own section below
-([C2: W23/W24](#c2-w23w24-one-passive-scan-fuxiwlanqrtr7)).
+Status: C1 (c742af3) passed on the phone; C2 (39c80e5) ran clean on the phone (kit r1c2: 38 channels
+tuned, CHAN_INFO on all of them, no MGMT_RX at all); C2b (CHAN_INFO detail and a pdev stats request per
+PHY pdev on top of C2) is host-tested only (tools/test-fuxi-wlan-ce.py). Every line below that says what the target
+does is what the model does, built from Linux ath12k v6.19. C2 and C2b are described in their own
+sections below ([C2: W23/W24](#c2-w23w24-one-passive-scan-fuxiwlanqrtr7),
+[C2b](#c2b-chan_info-detail-and-the-pdev-stats-requests-fuxiwlanqrtr7-diagnostic)).
 
 After this boot's W15 WLAN_MODE reply, the radio lane programs the host side of copy engines CE0..CE4 on
 SRNG rings, posts RX buffers, completes HTC (READY, HTT and WMI connect, SETUP_COMPLETE_EX) and WMI init
@@ -351,6 +353,208 @@ mlo, w15/w16, keep, stop22 and the S4 set; limits 1/11/27/28) on the salami and 
 byte; and HEAD's own C1 host model (46 scenario logs: the whole qrtr 6 run, its failures and wl5_abort)
 built against HEAD's and C2's production code, byte for byte.
 
+## C2b: CHAN_INFO detail and the pdev stats requests (`fuxiwlanqrtr=7`, diagnostic)
+
+Why: on the phone C2 tuned all 38 channels (38 FOREIGN_CHAN, 38 CHAN_INFO, COMPLETED after 2602 ms) and
+not one WMI MGMT_RX (0x7001) came back. The leading hypothesis: on WCN7850 the MAC DMAs received MPDUs
+into host-provided RX buffers (the refill / rx_mac_buf rings set up through HTT SRING_SETUP), which C2
+never provides. C2b adds no transmit, no ring and no register access; it makes the next qrtr 7 boot
+report what the radio measured on each channel and what the firmware counted on each MAC, so that
+hypothesis can be told apart from a receive-chain/filter problem and from an RF-path problem.
+
+Code: `wl23_ci_line`, `wl23_ci_flush`, `wl23_poll_for`, `wl23_stats_pdev`, `wl23_stats` and
+`wl23_stats_report` in the W23 part of the W20 block of `fuxi_wlan.c`; in `fuxi_wlan_ce.h` the CHAN_INFO
+word enum (C2's parser keeps the 14 words of each well-formed event) and the C2b section (ids, tags,
+sizes, the stats event and pdev stats word enums, `wlwmi_encode_stats_req`, `wlstats_parse`); `wlwmi_rx`
+routes UPDATE_STATS to the parser once a request is out; `wlwmi_parse_ext` also keeps L19's `fw_pdev[]`
+pdev ids (the distinct ones of the preferred hw mode's PHYs, at most two, each with its PHYs'
+supported_bands).
+
+No knob. Both additions are host-to-firmware only (WMI commands; log lines), every wait is bounded,
+only the transport can fail the run (a failed poll, or a CE/HTC fault in the send, exactly as in
+wl_ce_send), and no C2 line changes except the containment counters, which now include the stats
+exchanges. A knob would add gate code and a cmdline change for no safety gain (the stats command is the
+same kind of WMI traffic C2 already sends, and L19 sends it whenever mac80211 asks for the TX power), and
+every w20 bit is taken. The r1c2 cmdline (`fuxiwlanqrtr=7 fuxiwlanw20=2`) runs C2b as it is.
+
+### Sequence
+
+1. During the scan, every well-formed CHAN_INFO (TLV 0x26, at least 56 bytes, any vdev, any flags) gets
+   one `W23 chan-info` line right where it arrives (next to the `scan foreign freq` lines), the 14 words
+   as received, 128 lines at most (2 x 64); the rest are counted and the count is printed once, as
+   `W23 chan-info lines suppressed N (cap 128)`: just before `W23 complete`; after a COMPLETED timeout,
+   just before the snapshot; after a failed STARTED wait, scan wait or stats exchange, right after the
+   failure lines. A short CHAN_INFO is counted as C2 counts it and gets no line.
+2. After COMPLETED (or DEQUEUED), the W24 lines and the no-frame hint, before `W23 complete`: one
+   WMI_REQUEST_STATS (0x16001, TLV 0x8f) {stats id PDEV_STAT 0x4, vdev 0, peer MAC 0 + 2 pad, pdev} per
+   pdev id of the preferred hw mode's PHYs, in PHY order, at most two, as
+   `ath12k_wmi_send_stats_request_cmd` builds it (wmi.c:776-794, 890-920) for L19's debugfs pdev_stats
+   reader (debugfs.c:1388-1410). L19 keeps one `fw_pdev` per PHY with its own pdev id (15:0 of word 1) and
+   supported_bands (wmi.c:505-532, 4660-4686); `ath12k_mac_get_target_pdev_id` names `fw_pdev[0]` with no
+   vif up (mac.c:990-1009) and, with a vif up, the `fw_pdev` whose bands match the vif's channel
+   (mac.c:967-986). C2's scan ran on both DBS MACs (2602 ms for 38 x 150 ms of dwell, 2.4 and 5 GHz
+   interleaved), so C2b asks `fw_pdev[0]` first, then the other PHY's pdev. Both PHYs on one pdev id: one
+   request, their bands ORed. No PHY in the preferred mode (L19 leaves `fw_pdev[0]` zeroed): one request
+   for pdev 0. The request line prints the pdev and its bands (1 = 2 GHz, 2 = 5 GHz, wmi.h:220-221). The
+   W21 ext line's `pdev` is the first MAC/PHY entry's, which need not be either of these.
+3. Each request takes wl_ce_send's path: credits (wait at most 3000 ms, L19's WMI_SEND_TIMEOUT_HZ, with a
+   `W23 stats request waits for N HTC credits (has M)` line), frame, slot, publish, TX drain at most
+   1000 ms; then at most 500 ms for an UPDATE_STATS (0x1d004) whose parse yields a pdev entry (L19 waits
+   1 s for the first event and 3 s for the last, mac.c:5069-5115). A CE or HTC fault in frame, slot or
+   publish ends the run as in wl_ce_send (`W23 WMI REQUEST_STATS FAILED`, the W20 snapshot, containment).
+   A request that was not sent (no credits) or whose TX did not drain ends the stats phase: no further
+   request. No usable answer in 500 ms does not: the next pdev is still asked. An answer that arrived
+   although the TX descriptor never drained is printed after the `TX not drained` line ("after 1000 ms").
+4. UPDATE_STATS parse as `ath12k_update_stats_event` (wmi.c:8197-8312, 8389-8434, 8488-8545): the TLV walk
+   of `ath12k_wmi_tlv_iter` (a TLV past the event ends it), the fixed TLV 0x46 (`struct wmi_stats_event`,
+   44 bytes; L19 has no length policy for it, C2b requires the whole struct) before an ARRAY_BYTE, then in
+   each ARRAY_BYTE L19's order: num_vdev_stats x 164 bytes, num_bcn_stats x 12, num_pdev_stats x 176, each
+   bounded by what is left; the first pdev entry is the one L19's dump prints. An event without one
+   (L19 then never completes `fw_stats_done`) is unusable; so is any parse error. Unusable events are
+   counted with the last reason and the wait goes on; the first usable one ends it, later ones (the
+   firmware may send them back to back) are counted, not taken. Other TLVs (per-chain RSSI,
+   ARRAY_STRUCT) are skipped: C2b does not ask for them. Single-pdev chips accept any event pdev id
+   (mac.c:830-838); C2b prints it. The first answer line prints num_vdev_stats, num_bcn_stats and the
+   byte array's length, the counts that place the pdev entry: L19 only ever asks for one stats type
+   (debugfs.c:1405-1407), so its vdev, beacon, pdev order is not exercised with several counts.
+5. Every ending prints the CE messages of its exchange (`ce tx X rx Y`); their sum is also in the
+   containment line (`W20 ce contain posted P reaped R tx T`: tx + X, posted and reaped + Y). No vdev
+   stats: L19 completes those only for started vdevs (wmi.c:8443-8470) and the C2 vdev is never started;
+   they are a connected STA's TX and beacon counters anyway.
+6. After the requests, one `W23 stats after-scan` line: what the scan parser took after COMPLETED.
+   `wl_wmi.scan` stays attached through the exchanges, so a late MGMT_RX, CHAN_INFO or scan event is
+   parsed as C2 parses it (MGMT_RX into the BSS table, CHAN_INFO with its detail line) and counted there,
+   with the unknown events; the W24 lines are not printed again.
+
+### Lines
+
+```
+FUXI WLAN: W23 chan-info freq F flags START|END|0xN nf N rx-clear R cycle C rx-frame X tx-frame T my-bss-rx M mac-clk K
+FUXI WLAN: W23 chan-info lines suppressed N (cap 128)                                           (only past 128 events)
+  per request (pdev P, at most two):
+FUXI WLAN: W23 stats request waits for N HTC credits (has M)                                    (only without credits)
+FUXI WLAN: W23 stats request pdev-stat pdev P bands B vdev 0 sent
+FUXI WLAN: W23 stats pdev P after T ms (stats-id 0x4 pdevs N vdevs V bcns C bytes L events E unusable U; ce tx X rx Y)
+FUXI WLAN: W23 stats base chan-nf N rx-frame N rx-clear N cycle N tx-frame N phy-err N chan-tx-pwr N
+FUXI WLAN: W23 stats rx1 status-rcvd N r0-frags N r1-frags N r2-frags N r3-frags N htt-msdus N htt-mpdus N
+FUXI WLAN: W23 stats rx2 loc-msdus N loc-mpdus N oversize-amsdu N phy-errs N phy-err-drop N mpdu-errs N mid-ppdu-route-change N
+FUXI WLAN: W23 stats tx1 comp-queued N comp-delivered N msdu-enqued N mpdu-enqued N local-enqued N local-freed N hw-queued N
+FUXI WLAN: W23 stats tx2 hw-reaped N underrun N tx-abort N mpdus-requed N tx-ko N self-triggers N pdev-resets N
+  once, after the requests:
+FUXI WLAN: W23 stats after-scan wmi mgmt-rx +N frames +N bss +N scan-events +N chan-info +N other +N
+```
+
+Instead of a request's six answer lines: `W23 stats pdev P no usable UPDATE_STATS in 500 ms (events E
+unusable U[, last: REASON]; ce tx X rx Y)` (the next pdev follows). Instead of the sent line and the
+answer: `W23 stats request pdev-stat pdev P bands B not sent: no HTC credits after 3000 ms (ce tx X rx Y);
+continue to containment` (no further request). After the sent line: `W23 stats request TX not drained
+after 1000 ms (ce tx X rx Y); continue to containment`, then the six answer lines only if the answer came
+anyway (no further request). A CE/HTC fault in the send: `W23 WMI REQUEST_STATS FAILED: WHY`, the W20
+snapshot lines, `W23 failure: WHY; contain, no retry`, no after-scan line and no `W23 complete`. REASON is
+one of `stats TLV past the event`, `stats fixed TLV shorter than 44 bytes`, `stats byte array before the
+fixed TLV`, `stats byte array shorter than its entries`, `no pdev stats in the event`, `no stats fixed
+TLV`. XNU's console keeps at most 255 bytes of a printf line, newline included, and drops the rest with
+the newline when `drain_uart_sync` is off, as on the kits (osfmk/console/serial_general.c:159-188); that
+is why the answer is six lines: the host test computes every C2b format's worst case (10 bytes per `%u`
+or `%#x`, 11 per `%d`, the longest `%s`), at most 215 of 254, and the model fails any longer line.
+
+### What the counters are (L19)
+
+CHAN_INFO (`struct wmi_chan_info_event`, wmi.h:4586-4601; word: field): 1 freq, 2 cmd_flags (0
+START_RESP, 1 END_RESP), 3 noise_floor (dBm, signed), 4 rx_clear_count, 5 cycle_count, 8
+rx_frame_count, 9 my_bss_rx_cycle_count, 11 tx_frame_cnt, 12 mac_clk_mhz (also 0 err_code, 6/7 tx power
+range/tp, 10 11b data duration, 13 vdev_id, not printed). L19 builds the channel's survey from a
+START_RESP alone: noise, time = cycle_count / (mac_clk_mhz x 1000) ms, busy = rx_clear_count / (mac_clk_mhz
+x 1000) ms (with mac_clk_mhz 0: 320000, mac.c:14874), after clearing the entry (wmi.c:7546-7561); an
+END_RESP only ends the report (wmi.c:7514-7517). C2b prints every word of both as received and computes
+no delta. The counters are MAC-clock cycles: a 150 ms dwell at 320 MHz is about 48,000,000. rx_clear_count
+is the time the channel was busy (energy or a preamble on the air, L19's survey "busy"); rx_frame_count the
+time spent receiving frames ("Cycles spent receiving frames", wmi.h:5960); tx_frame_cnt the time spent
+transmitting (0 for a passive scan); my_bss_rx_cycle_count frames of our own BSS (0: not associated).
+
+Pdev stats (`struct ath12k_wmi_pdev_stats_params`, wmi.h:5957-6014, base 7 + tx 23 + rx 14 words; L19's
+debugfs labels, wmi.c:7893-8031): base chan_nf "Channel noise floor" (signed dBm), tx_frame_count,
+rx_frame_count, rx_clear_count, cycle_count (same cycle units as above, for the pdev's current channel),
+phy_err_count, chan_tx_pwr (half dB). RX: status_rcvd "Tot. number of statuses" (receive status entries
+the MAC produced), r0..r3_frags "Extra frags on rings 0..3", htt_msdus/htt_mpdus "MSDUs/MPDUs delivered
+to HTT" (to the host data path), loc_msdus/loc_mpdus "... delivered to stack" (kept by the firmware, the
+path management frames take to WMI), oversize_amsdu, phy_errs, phy_err_drop, mpdu_errs "MPDU errors
+(FCS, MIC, ENC)", mid_ppdu_route_change. TX: comp_queued/comp_delivered "HTT cookies queued/disp.",
+msdu_enqued, mpdu_enqued, local_enqued/local_freed (frames the firmware itself queued), hw_queued "HW
+queued", hw_reaped "PPDUs reaped", underrun, tx_abort "PPDUs cleaned", mpdus_requed, tx_ko "Excessive
+retries", self_triggers, pdev_resets. The a_sle32 fields print signed. L19 shows them as the firmware
+sends them (no delta). There is no rx_ovfl_errs in L19's struct (ath12k v6.19 has none), so an RX
+overflow shows as heard-but-not-delivered: rx-frame / status-rcvd up, htt and loc MPDUs not. A pdev's
+counters are that MAC's only: with DBS each MAC tuned the channels of its own band(s).
+
+### Reading the next boot
+
+First: (a) classify each channel by whichever of its START or END lines has a non-zero cycle count; if
+cycle or rx-clear grow steadily from line to line, read END minus START of each channel instead of the
+raw values. (b) Compare each pdev's stats only with the CHAN_INFO lines of the band(s) in its request
+line's `bands` (0x1: 2412..2472, 0x2: 5180..5825), and check that its answer line names the same pdev.
+(c) Take a pdev's fields as printed only with `vdevs 0 bcns 0` and `bytes` = 176 x `pdevs`; otherwise
+they may be misplaced: decide from the CHAN_INFO lines.
+
+| Pattern | Conclusion | Next rung |
+|---|---|---|
+| CHAN_INFO: rx-frame > 0 on the channels where APs are (the shop's at least), rx-clear >= rx-frame, nf about -90..-105 dBm; W24 frames 0 and after-scan mgmt-rx +0; stats of the pdev with that band: status-rcvd > 0 or rx-frame > 0 with htt-mpdus and loc-mpdus 0 | the radio receives and decodes frames, but no MPDU reaches the firmware's management path or the host: the MAC has nowhere to put them (no host RX buffers) | DP RX: HTT SRING_SETUP of the RXDMA refill / rx_mac_buf rings and the RX filter (the rung the research workflow designs) |
+| htt-mpdus > 0 with W24 frames 0 | the firmware handed MPDUs to the host data path, which does not exist | DP RX (confirmed) |
+| loc-mpdus > 0 on the pdev of the APs' band, MGMT_RX 0 (after-scan mgmt-rx +0 too) | frames reach the firmware and stop there: WMI management forwarding (filter, vdev state) | management-RX forwarding before DP RX |
+| after-scan mgmt-rx > 0 with W24 frames 0 | MGMT_RX is delivered, only after COMPLETED: delayed, not filtered | the receive path works: C3, with the W24 report taken after a short wait past COMPLETED |
+| rx-frame 0 on every channel, rx-clear > 0, nf sane, cycle about dwell x mac-clk | energy on the air, nothing decoded or accepted: receive chain or RX filter (chain masks, filter, vdev/pdev state) | receive chain/filter: the masks the firmware applied (INIT, VDEV_TXRX_STREAMS, NSS), the pdev RX filter; L19's vdev start path |
+| rx-clear 0 and rx-frame 0 on every channel, cycle and nf sane | no energy at all: antenna/FEM path off (or a quiet spot) | RF path: FEM/antenna switch control, BDF; a second boot next to the AP rules out the spot |
+| nf absurd (0, positive, below -120, or identical on every channel) or cycle/mac-clk 0 in both START and END | the RF front end or calibration does not deliver | RF path: BDF and calibration data, FEM control, before anything on the host side |
+| mpdu-errs or phy-errs large on the pdev of the APs' band, frames 0 | frames arrive damaged (FCS/PHY errors) | RF path (calibration) |
+| any of tx-frame (CHAN_INFO or pdev), hw-queued, mpdu-enqued, local-enqued > 0 | something was queued for or sent on the air: the passive rule is broken | stop the radio lane until it is explained |
+| no usable UPDATE_STATS for a pdev (not sent, TX stuck, timeout, unusable) | that pdev's stats are not available in this state | decide from the CHAN_INFO lines of its band(s); the request is not retried |
+| `W23 WMI REQUEST_STATS FAILED` | a transport fault in the send, as any C2 send fault | the W20 snapshot decides; the stats are not the question then |
+| W24 frames > 0 | C2 PASS | C3 |
+
+### Expected log (the model's silent scan, `fuxiwlanw15=1`, after `W23 scan started`)
+
+```
+FUXI WLAN: W23 scan foreign freq 2412
+FUXI WLAN: W23 chan-info freq 2412 flags START nf -96 rx-clear 1440000 cycle 48000000 rx-frame 0 tx-frame 0 my-bss-rx 0 mac-clk 320
+FUXI WLAN: W23 chan-info freq 2412 flags END nf 0 rx-clear 0 cycle 0 rx-frame 0 tx-frame 0 my-bss-rx 0 mac-clk 0
+  ... the same for the other 37 channels ...
+FUXI WLAN: W23 scan completed reason 0 after 5704 ms (foreign 38 chan-info 38)
+FUXI WLAN: W24 scan summary frames 0 bss 0 ssids 0
+FUXI WLAN: W24 scan detail mgmt-rx 0 hidden 0 table-full frames 0 dropped status 0 channel 0 malformed 0 other-mgmt 0 ie-truncated 0 noise-floor -95 dBm (L19 default; rssi-conv events 1, not applied)
+FUXI WLAN: W24 no beacon or probe response heard (chan-info 38); next rung W24b = w20 0x02
+FUXI WLAN: W23 stats request pdev-stat pdev 1 bands 0x1 vdev 0 sent
+FUXI WLAN: W23 stats pdev 1 after 2 ms (stats-id 0x4 pdevs 1 vdevs 0 bcns 0 bytes 176 events 1 unusable 0; ce tx 1 rx 1)
+FUXI WLAN: W23 stats base chan-nf -98 rx-frame 2457600 rx-clear 5068800 cycle 47961000 tx-frame 0 phy-err 112 chan-tx-pwr 0
+FUXI WLAN: W23 stats rx1 status-rcvd 20 r0-frags 0 r1-frags 0 r2-frags 0 r3-frags 0 htt-msdus 0 htt-mpdus 0
+FUXI WLAN: W23 stats rx2 loc-msdus 19 loc-mpdus 19 oversize-amsdu 0 phy-errs 112 phy-err-drop 0 mpdu-errs 1 mid-ppdu-route-change 0
+FUXI WLAN: W23 stats tx1 comp-queued 0 comp-delivered 0 msdu-enqued 0 mpdu-enqued 0 local-enqued 0 local-freed 0 hw-queued 0
+FUXI WLAN: W23 stats tx2 hw-reaped 0 underrun 0 tx-abort 0 mpdus-requed 0 tx-ko 0 self-triggers 0 pdev-resets 0
+FUXI WLAN: W23 stats request pdev-stat pdev 2 bands 0x2 vdev 0 sent
+FUXI WLAN: W23 stats pdev 2 after 2 ms (stats-id 0x4 pdevs 1 vdevs 0 bcns 0 bytes 176 events 1 unusable 0; ce tx 1 rx 1)
+  ... base, rx1, rx2, tx1, tx2 as for pdev 1 ...
+FUXI WLAN: W23 stats after-scan wmi mgmt-rx +0 frames +0 bss +0 scan-events +0 chan-info +0 other +0
+FUXI WLAN: W23 complete; stop/contain
+FUXI WLAN: W23 contain: scan over, no STOP_SCAN
+FUXI WLAN: W20 ce contain posted 261 reaped 137 tx 15
+```
+
+The values are the model's (its DBS PHYs are pdev 1 for 2.4 GHz and pdev 2 for 5 GHz, and its pdev
+answer is the same in every scenario); on the phone each CHAN_INFO line carries the target's counters,
+the END_RESP lines may be fewer or absent, there is one request block per distinct pdev id of the
+preferred mode's PHYs, and the containment counts include every exchange (`ce tx 1 rx Y` each).
+
+### Proof that only new lines were added
+
+Four differentials against HEAD 39c80e5 (scripts in the shop's
+op11-tools/salami-port/wlan/r1/impl/c2b-fix): the W15 harness log (keep 0 and 1) byte for byte; the
+init/configure logs of 761 boot-arg sets with qrtr absent or 0..8 (qrtr 7 included: C2b adds no knob)
+on the salami and the Fuxi build, byte for byte; HEAD's model with its C1 scenarios (46 logs) against
+HEAD's and C2b's production code, byte for byte; and HEAD's model + code against C2b's model + code for
+all 65 HEAD scenario logs: the 46 C1 ones byte for byte, the 19 C2 ones differ only by inserted lines
+starting with `W23 chan-info ` or `W23 stats `, except that in the 9 that reach the stats exchanges (two
+each, one per DBS PHY pdev) the containment line's counters move by exactly the sum of those exchanges'
+`ce tx X rx Y`.
+
 ## Host tests
 
 `CC=cc python3 tools/test-fuxi-wlan-ce.py` (also in tools/ci/build.sh): the model in
@@ -410,6 +614,42 @@ noise floor). Static: the scan only after W22 with qrtr 7, STOP_SCAN before the 
 RX and not after a recorded W11 guard failure, passive flags, no SSID/IE/probe words in the encoder,
 ACTIVE and FULLBSSID outside every accepted set, no whole-BSSID path in W24, the vdev MAC equal to en0's. test-fuxi-wlan-salami.py covers the qrtr 7 gate (salami and
 Fuxi builds, cmdline and ADT /defaults), test-fuxi-wlan-w11/w15/w16.py the selector lattice up to 8.
+
+C2b in the same model: CHAN_INFO START_RESP carries realistic counters (320 MHz, about 150 ms per dwell,
+3 % busy plus 300 us of air time per frame heard there), END_RESP none; the DBS PHYs have their own pdev
+ids (1 for 2.4 GHz, 2 for 5 GHz, as each WCN7850 MAC); the fake firmware checks REQUEST_STATS field by
+field (PDEV_STAT, vdev 0, MAC 0, the preferred mode's PHY pdev ids in PHY order, each once), only after
+COMPLETED and before the latch, and answers with an L19-shaped UPDATE_STATS naming that pdev. Every FUXI
+WLAN line the model prints must fit the console's 254 bytes. Scenarios: the happy path (76 CHAN_INFO
+lines, exact values on several channels, two request blocks of six answer lines, the after-scan line,
+the contain line with both exchanges); L19's vdev/beacon/pdev entry order (two vdev entries, one beacon
+entry) with a distinct value in every pdev word (every printed field at its offset, `vdevs 2 bcns 1 bytes
+516`); every pdev word at its widest (0x80000000); the DBS PHYs as pdevs 2 and 3, listed second and first
+(the W21 line keeps the first entry's pdev); one pdev id for both PHYs (one request, bands 0x3); SINGLE
+alone (pdev 0, bands 0); an unusable event before a usable one; credits back 200 ms after COMPLETED; a
+beacon inside the first exchange (after-scan `mgmt-rx +1 frames +1 bss +1`, no W24 line again); no
+answer (exactly 500 ms per pdev, the run passes), a TLV past the event, a cut pdev entry, refused (stats
+id 0, no entry), the byte array before the fixed TLV, credit starvation (3000 ms, nothing sent, no second
+request), a REQUEST_STATS descriptor that never completes (1000 ms, no second request; with an answer the
+answer is printed): all logged, the run passes; a W11 guard failure in the exchange and a CE fault in the
+send (CE3's TP one entry back: `W23 WMI REQUEST_STATS FAILED`, the snapshot) end the run; 191 CHAN_INFO
+events (one with flags 0x2): 128 lines and `suppressed 63`, also before the snapshot of a COMPLETED
+timeout (no stats request there) and after a failed poll in the scan wait (58) and in the stats wait
+(63). Pure checks: the stats parser on every malformed shape (including 4 billion announced vdev entries
+and pdev and vdev entries one byte short), a later different usable event counted and not taken, the
+counts and byte length kept, routing only after the request and never a WMI failure, the CHAN_INFO words
+kept, the request encoder. Static: the requests only on the COMPLETED path, the three bounds per request,
+at most two requests and the next only after one that drained, only the transport fails the run (1 after
+a failed poll; `wl_ce_fail` on a send fault, the same call as wl_ce_send), PDEV_STAT only, a void parser,
+the 128-line cap and the count flushed on every failed wait from START_SCAN on, every C2b line with a new
+prefix and its worst case within 254 bytes. L19: the ids, tags and sizes, the CHAN_INFO, stats event and
+pdev stats word orders name by name, the signedness of all 35 printed pdev fields, the request words,
+`fw_pdev[0]` with no vif and the band-matched `fw_pdev` with one, L19's waits and parse order. Mutants
+(c2b-mutants, c2b-fix): wrong field offsets, unbounded or longer waits, a stats failure failing the run,
+only one or the wrong order of pdevs, no dedup, bands not ORed or from the wrong word, the counts swapped,
+a send fault taken as a refusal, the after-scan line dropped, the stuck-TX answer dropped, a missing
+flush, a line past 254 bytes, a later event overwriting the first and an entry bound off by one are all
+caught.
 
 What only the device can answer: whether the firmware fetches from the rings at all with zero interrupt
 thresholds, which pipe carries HTC READY (both are polled), the credit numbers, the real pdev id, whether

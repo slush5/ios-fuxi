@@ -2,7 +2,8 @@
  * FUXI WLAN W20/W21/W22 (fuxiwlanqrtr=6, C1): WCN7850 copy engines on SRNG
  * rings, HTC and WMI init to WMI READY, polled. W23/W24 (fuxiwlanqrtr=7, C2):
  * on top of that the passive channel list, a station vdev, one passive scan,
- * MGMT_RX parsing and a BSS table; nothing is transmitted on the air.
+ * MGMT_RX parsing and a BSS table; nothing is transmitted on the air. C2b:
+ * the CHAN_INFO words and the pdev stats answer after the scan.
  * Pure C: no XNU or Linux includes. The includer provides uint8_t..uint64_t,
  * size_t, bool and memcpy (bsd/dev/fuxi_wlan.c in the kernel,
  * tools/fuxi-wlan-ce-model.c on the host).
@@ -24,7 +25,7 @@
  *   htc.h:
  *     Copyright (c) 2018-2021 The Linux Foundation. All rights reserved.
  *     Copyright (c) 2021-2022 Qualcomm Innovation Center, Inc. All rights reserved.
- *   wmi.c, wmi.h, core.c, core.h, mac.c, dp_rx.c:
+ *   wmi.c, wmi.h, core.c, core.h, mac.c, dp_rx.c, debugfs.c:
  *     Copyright (c) 2018-2021 The Linux Foundation. All rights reserved.
  *     Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  *   pci.c:
@@ -867,6 +868,7 @@ _Static_assert(WLWMI_RC_WORDS * 4 == WLWMI_RSRC_BYTES && WLWMI_RC_FLAG1 == 44 &&
     "WMI resource config word order (wmi.h:2534-2605)");
 
 struct wlscan;                      /* C2 scan state, below */
+struct wlstats;                     /* C2b pdev stats answer, below */
 
 struct wlwmi {
 	uint32_t svc_base[WLWMI_SVC_BM_WORDS], svc_seg[4], svc_ext2[WLWMI_EXT2_WORDS];
@@ -884,6 +886,15 @@ struct wlwmi {
 	 * unknown events). */
 	uint32_t phy_bands, phy_tx_mask, phy_rx_mask;
 	struct wlscan *scan;
+	/* C2b: the distinct pdev ids of the preferred hw mode's PHYs in PHY
+	 * order, at most two, each with the supported_bands of its PHYs ORed
+	 * (L19's fw_pdev[], one per PHY, wmi.c:528-532, 4660-4686: [0] is what
+	 * ath12k_mac_get_target_pdev_id returns with no vif up, the other the
+	 * one it picks by band once a vif is up there, mac.c:967-1009), and the
+	 * stats answer the UPDATE_STATS events feed (NULL until a request goes
+	 * out: the id stays an unknown event). */
+	uint32_t phy_pdev[2], phy_pdev_bands[2], phy_pdevs;
+	struct wlstats *stats;
 };
 
 static inline int
@@ -1012,7 +1023,13 @@ wlwmi_hw_mode_pri(uint32_t mode)
  * first (L19 assigns that index, it does not sum: wmi.c:505-517), one per
  * bit up to fls(its own map) (wmi.c:4663-4686). Of those, with at least 22
  * words: supported_bands (word 4) ORed, and the 2 GHz (12/13) or else
- * 5 GHz (20/21) tx/rx chain masks of the last one (wmi.c:525-553). */
+ * 5 GHz (20/21) tx/rx chain masks of the last one (wmi.c:525-553).
+ * C2b also keeps the pdev id (15:0 of word 1, wmi.h:2686) of each of those
+ * PHYs, distinct ids only, at most two, with its supported_bands (word 4,
+ * when the entry has it): L19's fw_pdev[] in order, [0] being what
+ * ath12k_mac_get_target_pdev_id returns on a single-pdev chip with no vif
+ * up (wmi.c:528-532, mac.c:967-1009). No such PHY (nphy 0): none kept,
+ * L19's fw_pdev[0] stays zeroed. */
 static inline int
 wlwmi_parse_ext(struct wlwmi *wmi, const uint8_t *p, uint32_t len)
 {
@@ -1045,6 +1062,14 @@ wlwmi_parse_ext(struct wlwmi *wmi, const uint8_t *p, uint32_t len)
 				}
 				uint32_t k = kphy++;
 				if (!wmi->mac_phy_caps++) { wmi->pdev_id = wlce_get32(in.v + 4) & 0xffffu; wmi->pdev_valid = true; }
+				if (k >= first && k - first < nphy) {
+					uint32_t id = wlce_get32(in.v + 4) & 0xffffu, j = 0;
+					while (j < wmi->phy_pdevs && wmi->phy_pdev[j] != id) { j++; }
+					if (j < 2u) {
+						if (j == wmi->phy_pdevs) { wmi->phy_pdev[j] = id; wmi->phy_pdevs++; }
+						wmi->phy_pdev_bands[j] |= in.tlen >= 5u * 4u ? wlce_get32(in.v + 4 * 4) : 0u;
+					}
+				}
 				if (in.tlen >= 22u * 4u && k >= first && k - first < nphy) {  /* 1/2 = WMI_HOST_WLAN_2GHZ_CAP/5GHZ_CAP (wmi.h:220-221) */
 					uint32_t bands = wlce_get32(in.v + 4 * 4), m = bands & 1u ? 12u : bands & 2u ? 20u : 0u;
 					wmi->phy_bands |= bands;
@@ -1112,9 +1137,13 @@ wlwmi_known(uint32_t id)
 
 static inline bool wlscan_known(uint32_t id);
 static inline int wlscan_rx(struct wlwmi *wmi, uint32_t id, const uint8_t *p, uint32_t len);
+static inline bool wlstats_known(uint32_t id);
+static inline void wlstats_parse(struct wlstats *st, const uint8_t *p, uint32_t len);
 
 /* One WMI event (wmi.c:9798-9960). In the C2 scan stage SCAN, CHAN_INFO and
- * MGMT_RX go to the scan parser (wmi.c:9838-9856). */
+ * MGMT_RX go to the scan parser (wmi.c:9838-9856); once C2b asked for pdev
+ * stats, UPDATE_STATS goes to the stats parser, which never fails
+ * (wmi.c:9869-9870). */
 static inline int
 wlwmi_rx(struct wlwmi *wmi, const uint8_t *msg, uint32_t len, uint32_t *id)
 {
@@ -1124,6 +1153,7 @@ wlwmi_rx(struct wlwmi *wmi, const uint8_t *msg, uint32_t len, uint32_t *id)
 	wmi->events++; wmi->last_event = *id; wmi->last_len = len - 4;
 	const uint8_t *p = msg + 4;
 	if (wmi->scan && wlscan_known(*id)) { return wlscan_rx(wmi, *id, p, len - 4); }
+	if (wmi->stats && wlstats_known(*id)) { wlstats_parse(wmi->stats, p, len - 4); return 0; }
 	switch (*id) {
 	case WLWMI_EV_SERVICE_READY: return wlwmi_parse_service_ready(wmi, p, len - 4);
 	case WLWMI_EV_SERVICE_AVAILABLE: return wlwmi_parse_available(wmi, p, len - 4);
@@ -1371,6 +1401,17 @@ enum {
 _Static_assert(WLWMI_SS_WORDS * 4 == WLWMI_START_SCAN_BYTES && WLWMI_SS_MAX_SCAN_TIME == 13 &&
     WLWMI_SS_CTRL_FLAGS == 15 && WLWMI_SS_N_PROBES == 21, "WMI START_SCAN word order (wmi.h:3432-3464)");
 
+/* C2b: struct wmi_chan_info_event word index (the TLV value, wmi.h:4586-4601);
+ * C2 reads cmd_flags, noise_floor and vdev_id at bytes 8, 12 and 52. */
+enum {
+	WLWMI_CI_ERR_CODE, WLWMI_CI_FREQ, WLWMI_CI_CMD_FLAGS, WLWMI_CI_NOISE_FLOOR, WLWMI_CI_RX_CLEAR_COUNT,
+	WLWMI_CI_CYCLE_COUNT, WLWMI_CI_CHAN_TX_PWR_RANGE, WLWMI_CI_CHAN_TX_PWR_TP, WLWMI_CI_RX_FRAME_COUNT,
+	WLWMI_CI_MY_BSS_RX_CYCLE_COUNT, WLWMI_CI_RX_11B_MODE_DATA_DURATION, WLWMI_CI_TX_FRAME_CNT, WLWMI_CI_MAC_CLK_MHZ,
+	WLWMI_CI_VDEV_ID, WLWMI_CI_WORDS
+};
+_Static_assert(WLWMI_CI_WORDS * 4 == WLWMI_CHAN_INFO_BYTES && WLWMI_CI_CMD_FLAGS == 2 && WLWMI_CI_NOISE_FLOOR == 3 &&
+    WLWMI_CI_VDEV_ID == 13, "WMI CHAN_INFO word order (wmi.h:4586-4601)");
+
 /* The C2 channel list, one for the radio and the iOS side (overnight_plan.md
  * 3.2): 2.4 GHz 1-13, 5 GHz 36-48, 52-64 (DFS), 100-144 (DFS), 149-165; no
  * 6 GHz. The 13 2.4 GHz channels come first: w20 0x10 scans those only. */
@@ -1576,6 +1617,7 @@ struct wlscan {
 	uint32_t ev_type, ev_reason, ev_freq, ev_scan_id, ev_vdev;   /* the last SCAN_EVENT */
 	uint32_t events, foreign, bss_channel, other_types, ignored, wrong_vdev, bad_events;
 	uint32_t ci_start, ci_end, ci_ignored;
+	uint32_t ci_seen, ci[WLWMI_CI_WORDS];   /* C2b: well-formed CHAN_INFO events, the last one's words */
 	int32_t nf_min, nf_max;
 	bool nf_seen;
 	uint32_t mgmt, frames, drop_status, drop_channel, drop_bad, other_mgmt, ie_truncated, table_full;
@@ -1667,7 +1709,8 @@ wlscan_parse_event(struct wlscan *s, const uint8_t *p, uint32_t len)
 }
 
 /* CHAN_INFO (wmi.c:6587-6623, 7493-7560), TLV 0x26: END_RESP ends the report;
- * START_RESP of vdev 0 while the scan runs carries the noise floor. */
+ * START_RESP of vdev 0 while the scan runs carries the noise floor. C2b keeps
+ * every word of each well-formed event for its detail line. */
 static inline int
 wlscan_parse_chan_info(struct wlscan *s, const uint8_t *p, uint32_t len)
 {
@@ -1677,6 +1720,8 @@ wlscan_parse_chan_info(struct wlscan *s, const uint8_t *p, uint32_t len)
 		return wlscan_fail(s, "WMI CHAN_INFO TLV past the buffer");
 	}
 	if (bad || !v) { s->bad_events++; return 0; }
+	for (uint32_t i = 0; i < WLWMI_CI_WORDS; i++) { s->ci[i] = wlce_get32(v + 4 * i); }
+	s->ci_seen++;
 	uint32_t flags = wlce_get32(v + 8), vdev = wlce_get32(v + 52);
 	int32_t nf = (int32_t)wlce_get32(v + 12);
 	if (flags == WLWMI_CHAN_INFO_END_RESP) { s->ci_end++; return 0; }
@@ -1881,6 +1926,123 @@ wlscan_ssid_text(const struct wlscan_bss *b, char *out)
 		out[o++] = '"';
 	}
 	out[o] = 0;
+}
+
+/* ---- C2b (fuxiwlanqrtr=7): the pdev stats requests after the scan ----
+ * Adapted from Linux ath12k wmi.c, wmi.h, mac.c and debugfs.c
+ * (BSD-3-Clause-Clear), v6.19. Ids, tags, sizes and word orders come from
+ * the wmi.h enums and structs (the host test re-derives them). The request
+ * is what ath12k_wmi_send_stats_request_cmd builds (wmi.c:890-920) for L19's
+ * debugfs pdev_stats reader (debugfs.c:1388-1410): stats id PDEV_STAT, vdev
+ * 0, peer MAC 0 + 2 pad (the zeroed skb, wmi.c:776-794), pdev =
+ * ath12k_mac_get_target_pdev_id (wmi->phy_pdev[0], then the other PHY's
+ * wmi->phy_pdev[1]). Host to firmware only. */
+#define WLWMI_CMD_REQUEST_STATS 0x16001u
+#define WLWMI_EV_UPDATE_STATS 0x1d004u
+#define WLWMI_TAG_STATS_EVENT 0x46u
+#define WLWMI_TAG_REQUEST_STATS_CMD 0x8fu
+#define WLWMI_REQUEST_PDEV_STAT (1u << 2)        /* enum wmi_stats_id (wmi.h:5905-5910) */
+#define WLWMI_REQUEST_STATS_BYTES 24u            /* struct wmi_request_stats_cmd (wmi.h:5912-5918) */
+#define WLWMI_REQUEST_STATS_TOTAL (4u + WLWMI_REQUEST_STATS_BYTES)
+#define WLWMI_STATS_EVENT_BYTES 44u              /* struct wmi_stats_event (wmi.h:5891-5903) */
+#define WLWMI_VDEV_STATS_BYTES 164u              /* struct wmi_vdev_stats_params (wmi.h:5934-5949) */
+#define WLWMI_BCN_STATS_BYTES 12u                /* struct ath12k_wmi_bcn_stats_params (wmi.h:5951-5955) */
+#define WLWMI_PDEV_STATS_BYTES 176u              /* struct ath12k_wmi_pdev_stats_params, base 28 + tx 92 + rx 56 (wmi.h:5957-6014) */
+
+/* struct wmi_stats_event word index (the TLV value). */
+enum {
+	WLWMI_SE_STATS_ID, WLWMI_SE_NUM_PDEV_STATS, WLWMI_SE_NUM_VDEV_STATS, WLWMI_SE_NUM_PEER_STATS, WLWMI_SE_NUM_BCNFLT_STATS,
+	WLWMI_SE_NUM_CHAN_STATS, WLWMI_SE_NUM_MIB_STATS, WLWMI_SE_PDEV_ID, WLWMI_SE_NUM_BCN_STATS, WLWMI_SE_NUM_PEER_EXTD_STATS,
+	WLWMI_SE_NUM_PEER_EXTD2_STATS, WLWMI_SE_WORDS
+};
+/* struct ath12k_wmi_pdev_stats_params word index: base (chan_nf .. chan_tx_pwr),
+ * tx (comp_queued .. txop_ovf), rx (mid_ppdu_route_change .. mpdu_errs);
+ * a_sle32 fields are signed (wmi.h:5957-6014, wmi.c:8134-8195). */
+enum {
+	WLWMI_PS_CHAN_NF, WLWMI_PS_TX_FRAME_COUNT, WLWMI_PS_RX_FRAME_COUNT, WLWMI_PS_RX_CLEAR_COUNT, WLWMI_PS_CYCLE_COUNT,
+	WLWMI_PS_PHY_ERR_COUNT, WLWMI_PS_CHAN_TX_PWR,
+	WLWMI_PS_COMP_QUEUED, WLWMI_PS_COMP_DELIVERED, WLWMI_PS_MSDU_ENQUED, WLWMI_PS_MPDU_ENQUED, WLWMI_PS_WMM_DROP,
+	WLWMI_PS_LOCAL_ENQUED, WLWMI_PS_LOCAL_FREED, WLWMI_PS_HW_QUEUED, WLWMI_PS_HW_REAPED, WLWMI_PS_UNDERRUN,
+	WLWMI_PS_TX_ABORT, WLWMI_PS_MPDUS_REQUED, WLWMI_PS_TX_KO, WLWMI_PS_DATA_RC, WLWMI_PS_SELF_TRIGGERS,
+	WLWMI_PS_SW_RETRY_FAILURE, WLWMI_PS_ILLGL_RATE_PHY_ERR, WLWMI_PS_PDEV_CONT_XRETRY, WLWMI_PS_PDEV_TX_TIMEOUT,
+	WLWMI_PS_PDEV_RESETS, WLWMI_PS_STATELESS_TID_ALLOC_FAILURE, WLWMI_PS_PHY_UNDERRUN, WLWMI_PS_TXOP_OVF,
+	WLWMI_PS_MID_PPDU_ROUTE_CHANGE, WLWMI_PS_STATUS_RCVD, WLWMI_PS_R0_FRAGS, WLWMI_PS_R1_FRAGS, WLWMI_PS_R2_FRAGS,
+	WLWMI_PS_R3_FRAGS, WLWMI_PS_HTT_MSDUS, WLWMI_PS_HTT_MPDUS, WLWMI_PS_LOC_MSDUS, WLWMI_PS_LOC_MPDUS,
+	WLWMI_PS_OVERSIZE_AMSDU, WLWMI_PS_PHY_ERRS, WLWMI_PS_PHY_ERR_DROP, WLWMI_PS_MPDU_ERRS, WLWMI_PS_WORDS
+};
+_Static_assert(WLWMI_REQUEST_STATS_BYTES == 24 && WLWMI_SE_WORDS * 4 == WLWMI_STATS_EVENT_BYTES &&
+    WLWMI_PS_WORDS * 4 == WLWMI_PDEV_STATS_BYTES && WLWMI_PS_COMP_QUEUED == 7 && WLWMI_PS_MID_PPDU_ROUTE_CHANGE == 30,
+    "C2b WMI stats wire sizes and word order (wmi.h:5891-6014)");
+
+/* REQUEST_STATS {stats id PDEV_STAT, vdev 0, peer MAC 0 + 2 pad, PDEV}. */
+static inline int
+wlwmi_encode_stats_req(uint32_t pdev, uint8_t *out, uint32_t room, uint32_t *len)
+{
+	const uint32_t w[5] = { WLWMI_REQUEST_PDEV_STAT, 0, 0, 0, pdev };
+	return wlwmi_encode_words(WLWMI_CMD_REQUEST_STATS, WLWMI_TAG_REQUEST_STATS_CMD, w, 5, out, room, len);
+}
+
+/* What came back: the first usable event's fixed TLV and first pdev entry
+ * (raw words) and the length of the byte array that held it, how many
+ * events arrived, how many were unusable and why the last one was. */
+struct wlstats {
+	uint32_t events, unusable, bytes;
+	const char *why;
+	bool have;
+	uint32_t ev[WLWMI_SE_WORDS], w[WLWMI_PS_WORDS];
+};
+
+static inline bool wlstats_known(uint32_t id) { return id == WLWMI_EV_UPDATE_STATS; }
+
+/* UPDATE_STATS as ath12k_update_stats_event takes it for a PDEV_STAT request
+ * (wmi.c:8197-8312, 8389-8434, 8488-8545): the TLVs as ath12k_wmi_tlv_iter
+ * walks them (wmi.c:320-368: a TLV past the event ends it); the fixed TLV 0x46
+ * must come before an ARRAY_BYTE (wmi.c:8210-8213; L19 has no length policy
+ * for it, here it must hold the 44-byte struct); in each ARRAY_BYTE L19 reads
+ * num_vdev_stats vdev entries, then num_bcn_stats beacon entries, then
+ * num_pdev_stats pdev entries, each bounded by what is left
+ * (wmi.c:8228-8312); the first pdev entry is the one its dump prints
+ * (wmi.c:8041-8042). An event without one leaves L19 waiting
+ * (fw_stats_done, wmi.c:8517-8522) and is unusable here too. Never fails: an
+ * unusable event is counted and its reason kept; the first usable one stays. */
+static inline void
+wlstats_parse(struct wlstats *st, const uint8_t *p, uint32_t len)
+{
+	struct wlwmi_it it;
+	const uint8_t *ev = 0, *pev = 0, *pdev = 0;
+	const char *why = 0;
+	uint32_t bytes = 0;
+	int r = 0;
+	st->events++;
+	if (st->have) { return; }
+	wlwmi_it_init(&it, p, len);
+	while (!why && (r = wlwmi_next(&it)) > 0) {
+		if (it.tag == WLWMI_TAG_STATS_EVENT) {
+			if (it.tlen < WLWMI_STATS_EVENT_BYTES) { why = "stats fixed TLV shorter than 44 bytes"; } else { ev = it.v; }
+			continue;
+		}
+		if (it.tag != WLWMI_TAG_ARRAY_BYTE) { continue; }
+		if (!ev) { why = "stats byte array before the fixed TLV"; break; }
+		const uint32_t n[3] = { wlce_get32(ev + 4 * WLWMI_SE_NUM_VDEV_STATS), wlce_get32(ev + 4 * WLWMI_SE_NUM_BCN_STATS),
+		    wlce_get32(ev + 4 * WLWMI_SE_NUM_PDEV_STATS) };
+		const uint32_t sz[3] = { WLWMI_VDEV_STATS_BYTES, WLWMI_BCN_STATS_BYTES, WLWMI_PDEV_STATS_BYTES };
+		const uint8_t *d = it.v;
+		uint32_t left = it.tlen;
+		for (uint32_t k = 0; k < 3 && !why; k++) {
+			for (uint32_t i = 0; i < n[k]; i++) {
+				if (left < sz[k]) { why = "stats byte array shorter than its entries"; break; }
+				if (k == 2 && !pdev) { pdev = d; pev = ev; bytes = it.tlen; }
+				d += sz[k]; left -= sz[k];
+			}
+		}
+	}
+	if (!why && r < 0) { why = "stats TLV past the event"; }
+	if (!why && !pdev) { why = ev ? "no pdev stats in the event" : "no stats fixed TLV"; }
+	if (why) { st->unusable++; st->why = why; return; }
+	for (uint32_t i = 0; i < WLWMI_SE_WORDS; i++) { st->ev[i] = wlce_get32(pev + 4 * i); }
+	for (uint32_t i = 0; i < WLWMI_PS_WORDS; i++) { st->w[i] = wlce_get32(pdev + 4 * i); }
+	st->bytes = bytes;
+	st->have = true;
 }
 
 #endif /* FUXI_WLAN_CE_H */

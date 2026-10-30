@@ -38,6 +38,17 @@
  *   lists SINGLE and DBS with the MAC/PHY caps of both (L19's preferred-mode
  *   PHYs feed the streams); a guard failure after START_SCAN and a STOP_SCAN
  *   whose TX never completes are scripted too.
+ *   C2b: CHAN_INFO START_RESP carries realistic MAC-clock counters (320 MHz,
+ *   about 150 ms per dwell, 3 % busy plus 300 us per frame heard there),
+ *   END_RESP none; the DBS PHYs have their own pdev ids (1 and 2, as each
+ *   WCN7850 MAC); REQUEST_STATS is checked field by field (PDEV_STAT, vdev
+ *   0, MAC 0, the preferred hw mode's PHY pdev ids in PHY order) and only
+ *   after COMPLETED and before the latch, and answered with an L19-shaped
+ *   UPDATE_STATS for that pdev (fixed TLV 0x46, ARRAY_BYTE of vdev, beacon
+ *   and pdev entries in L19's order) or, by scenario, not at all, malformed,
+ *   short, empty, twice, late, at its widest, after a credit drought or
+ *   behind a stuck TX descriptor. Every FUXI WLAN line must fit the
+ *   console's 254 bytes (model_line).
  * No device, no network. L19 = Linux ath12k v6.19 (BSD-3-Clause-Clear).
  */
 #include <assert.h>
@@ -52,6 +63,7 @@
 
 static char logbuf[1 << 21];
 static size_t loglen;
+static void model_line(const char *line, size_t len);
 static void
 test_printf(const char *fmt, ...)
 {
@@ -61,6 +73,12 @@ test_printf(const char *fmt, ...)
 	va_end(ap);
 	assert(n >= 0 && (size_t)n < sizeof(logbuf) - loglen);
 	loglen += (size_t)n;
+	for (size_t i = loglen - (size_t)n; i < loglen; i++) {  /* every line this call completed */
+		if (logbuf[i] != '\n') { continue; }
+		size_t s = i;
+		while (s && logbuf[s - 1] != '\n') { s--; }
+		model_line(logbuf + s, i - s);
+	}
 }
 #define printf test_printf
 
@@ -155,6 +173,16 @@ struct cfg {
 	bool stop_tx_stuck;                 /* CE3 never consumes the STOP_SCAN descriptor */
 	unsigned extra_unknown;             /* unknown WMI events after READY (the 16-line budget) */
 	uint32_t phy_bands, phy_mask, htt_major, htt_minor, exp_n, exp_pdev;
+	/* C2b */
+	unsigned stats_mode;                /* see fw_stats_answer */
+	bool stats_tx_stuck;                /* CE3 never completes the REQUEST_STATS descriptor */
+	bool guard_on_stats;                /* the W11 guard fails once the firmware took REQUEST_STATS */
+	uint32_t start_refund_at;           /* with no_start_refund: the START_SCAN credit comes back this late */
+	unsigned ci_repeat;                 /* extra CHAN_INFO START_RESP per channel (the 128-line cap) */
+	uint32_t dbs_pdev;                  /* pdev id of DBS PHY 0; PHY 1 has dbs_pdev + 1 (WCN7850: one per MAC) */
+	bool dbs_same_pdev;                 /* both DBS PHYs report dbs_pdev */
+	bool ext_single_only;               /* EXT lists SINGLE alone: no preferred-mode PHY (L19's fw_pdev[0] stays 0) */
+	unsigned on_line;                   /* a device-side action when a given line is printed (model_line) */
 };
 static struct cfg C;
 static unsigned restores;
@@ -171,6 +199,9 @@ static bool fw_svc281, guard_bad;
 static uint32_t fw_chains = 2;
 /* C2 firmware: command order step, channels seen, counters */
 static unsigned fw_c2_step, fw_chan_seen, fw_chan_cmds, fw_scan_cmds, fw_stop_cmds, fw_htt_req, fw_stop_pdev;
+static unsigned fw_stats_req;
+static uint64_t fw_stats_at;
+static uint32_t fw_stats_pdev = 1;  /* the pdev the last REQUEST_STATS named; UPDATE_STATS carries it back */
 struct mbeacon { unsigned idx; uint32_t rx_channel, snr, status, chan_freq, mode, len; uint8_t f[400]; };
 static struct mbeacon beacons[96];
 static unsigned n_beacons;
@@ -267,8 +298,11 @@ dev_publish(struct dring *r, uint32_t v)
 			uint8_t copy[WLCE_BUF];
 			memcpy(copy, buf, len);
 			r->dev = (r->dev + 4) % r->size;
-			/* stop_tx_stuck: the STOP_SCAN descriptor's completion never shows in the rdp TP word */
-			if (!(C.stop_tx_stuck && r->ce == 3 && len >= 12 && (g32(copy + 8) & 0xffffffu) == 0x3002u)) { write_rdp(r, r->dev); }
+			/* stop_tx_stuck / stats_tx_stuck: the STOP_SCAN / REQUEST_STATS descriptor's completion never shows in the
+			 * rdp TP word */
+			bool stuck = r->ce == 3 && len >= 12 && (((C.stop_tx_stuck && (g32(copy + 8) & 0xffffffu) == 0x3002u)) ||
+			    (C.stats_tx_stuck && (g32(copy + 8) & 0xffffffu) == 0x16001u));
+			if (!stuck) { write_rdp(r, r->dev); }
 			fw_tx_msgs++;
 			fw_rx(r->ce, w2 & 0xffffu, copy, len);
 		}
@@ -442,12 +476,14 @@ fw_rings_ready(void)
 	q_push(C.ready_ce, 3, d, 16, C.ready_stslen);
 }
 
-/* One MAC/PHY capability TLV (108 bytes): hw mode, pdev 1, phy id, supported_bands (word 4), the 2 GHz
- * (12/13) and 5 GHz (20/21) tx/rx chain masks, the rest 0 (wmi.h ath12k_wmi_mac_phy_caps_params). */
+/* One MAC/PHY capability TLV (108 bytes): hw mode, pdev (1 for SINGLE; C.dbs_pdev + phy for DBS, each MAC its own
+ * as on WCN7850, or C.dbs_pdev for both), phy id, supported_bands (word 4), the 2 GHz (12/13) and 5 GHz (20/21)
+ * tx/rx chain masks, the rest 0 (wmi.h ath12k_wmi_mac_phy_caps_params). */
 static void
 m_mac_phy(uint32_t hw_mode, uint32_t phy, uint32_t bands, uint32_t mask)
 {
-	m_tlv(0x210, 108); m_u32(hw_mode); m_u32(1); m_u32(phy); m_u32(0); m_u32(bands); m_zero(7 * 4);
+	m_tlv(0x210, 108); m_u32(hw_mode); m_u32(hw_mode ? C.dbs_pdev + (C.dbs_same_pdev ? 0u : phy) : 1u); m_u32(phy); m_u32(0);
+	m_u32(bands); m_zero(7 * 4);
 	m_u32(mask); m_u32(mask); m_zero(6 * 4); m_u32(mask); m_u32(mask); m_zero(5 * 4);
 }
 
@@ -484,21 +520,23 @@ fw_service_ready_set(void)
 	fw_svc281 = true;
 	wmi_out(0x3, 0, 3);
 	/* SERVICE_READY_EXT: fixed, 2 hw modes, SINGLE (PHY map 0x1) then DBS (0x3), and the 3 MAC/PHY caps that
-	 * follow from them, pdev 1 in each. SINGLE: both bands, 1x1. DBS PHY 0: 2 GHz (of C.phy_bands), mask
-	 * C.phy_mask & 1; DBS PHY 1: 5 GHz (of C.phy_bands), mask C.phy_mask. ext_single_last lists DBS first. */
+	 * follow from them, pdev 1 for SINGLE, C.dbs_pdev (+ 1 for PHY 1) for DBS (m_mac_phy). SINGLE: both bands,
+	 * 1x1. DBS PHY 0: 2 GHz (of C.phy_bands), mask C.phy_mask & 1; DBS PHY 1: 5 GHz (of C.phy_bands), mask
+	 * C.phy_mask. ext_single_last lists DBS first; C2b: ext_single_only lists SINGLE and its one MAC/PHY cap. */
+	unsigned nmodes = C.ext_single_only ? 1u : 2u, ncaps = C.ext_single_only ? 1u : 3u;
 	m_reset();
 	m_tlv(0x1ac, 76); m_zero(76);
-	m_tlv(0x212, 8); m_u32(2); m_u32(0);
-	m_tlv(0x12, 2 * 16);
-	for (unsigned i = 0; i < 2; i++) {
+	m_tlv(0x212, 8); m_u32(nmodes); m_u32(0);
+	m_tlv(0x12, nmodes * 16);
+	for (unsigned i = 0; i < nmodes; i++) {
 		unsigned mode = C.ext_single_last ? 1 - i : i;  /* 0 SINGLE, 1 DBS */
 		m_tlv(0x211, 12); m_u32(mode); m_u32(mode ? 3u : 1u); m_u32(mode);
 	}
 	if (C.ext_nested_overrun) {
 		m_tlv(0x12, 40u); m_tlv(0x210, 108u); m_u32(0); m_u32(1); m_zero(28u);
 	} else {
-		m_tlv(0x12, 3u * (4u + 108u));
-		for (unsigned i = 0; i < 3; i++) {
+		m_tlv(0x12, ncaps * (4u + 108u));
+		for (unsigned i = 0; i < ncaps; i++) {
 			bool single = C.ext_single_last ? i == 2 : i == 0;
 			unsigned phy = single ? 0u : C.ext_single_last ? i : i - 1;
 			m_mac_phy(single ? 0u : 1u, phy, single ? 3u : C.phy_bands & (phy ? 2u : 1u), single ? 1u : phy ? C.phy_mask : C.phy_mask & 1u);
@@ -564,11 +602,17 @@ fw_scan_event(uint32_t type, uint32_t reason, uint32_t freq, uint32_t vdev, uint
 	wmi_out(0x3001, 0, at);
 }
 
+/* CHAN_INFO {err 0, freq, flags, nf, rx_clear, cycle, tx power range 0, tp 0, rx_frame, my_bss_rx 0, 11b 0, tx_frame 0,
+ * mac_clk, vdev 0} (wmi.h:4586-4601). C2b: a START_RESP carries the dwell's MAC-clock counters as L19 reads them
+ * (survey time = cycle / (mac_clk x 1000) ms, wmi.c:7546-7561): 320 MHz, 150 ms less a few us per channel, 3 % busy
+ * plus 300 us of frame per frame heard there, nothing sent; an END_RESP (L19 only notes it) carries none. */
 static void
-fw_chan_info(uint32_t flags, uint32_t freq, int32_t nf, uint32_t at)
+fw_chan_info(uint32_t flags, uint32_t freq, int32_t nf, unsigned idx, unsigned frames, uint32_t at)
 {
-	m_reset(); m_tlv(0x26, 56); m_u32(0); m_u32(freq); m_u32(flags); m_u32((uint32_t)nf); m_u32(1200); m_u32(40000);
-	m_zero(7 * 4); m_u32(0);
+	uint32_t cycle = 48000000u - 13000u * (idx % 7u), rx = 96000u * frames, busy = 1440000u + rx + 4000u * idx;
+	m_reset(); m_tlv(0x26, 56); m_u32(0); m_u32(freq); m_u32(flags); m_u32((uint32_t)nf);
+	m_u32(flags ? 0u : busy); m_u32(flags ? 0u : cycle); m_zero(2 * 4); m_u32(flags ? 0u : rx); m_zero(3 * 4);
+	m_u32(flags ? 0u : 320u); m_u32(0);
 	wmi_out(0x4002, 0, at);
 }
 
@@ -634,16 +678,18 @@ fw_scan_script(unsigned n)
 	fw_scan_event(1u << 0, 0, 0, 0, t);
 	if (C.wrong_vdev) { fw_scan_event(1u << 3, 0, 2412, 3, t); }
 	for (unsigned i = 0; i < n; i++) {
-		uint32_t t0 = 5 + 150 * i, k = 0;
+		uint32_t t0 = 5 + 150 * i, k = 0, heard = 0;
+		for (unsigned j = 0; j < n_beacons; j++) { heard += beacons[j].idx == i; }
 		fw_scan_event(1u << 3, 0, m_chan(i), 0, t0);
-		fw_chan_info(0, m_chan(i), -96 - (int32_t)(i % 5), t0 + 1);
+		for (unsigned r = 0; r <= C.ci_repeat; r++) { fw_chan_info(0, m_chan(i), -96 - (int32_t)(i % 5), i, heard, t0 + 1); }
+		if (C.ci_repeat && i == 0) { fw_chan_info(2, m_chan(i), -96, i, heard, t0 + 1); }  /* C2b: flags neither START nor END */
 		if (i == 2) {  /* an unprompted event mid-scan: logged by id only */
 			m_reset(); m_tlv(0x400, 12); m_zero(12); wmi_out(0x402b, 0, t0 + 1);
 		}
 		for (unsigned j = 0; j < n_beacons; j++) {
 			if (beacons[j].idx == i) { fw_mgmt_rx(&beacons[j], t0 + 2 + k++); }
 		}
-		fw_chan_info(1, m_chan(i), 0, t0 + 148);
+		fw_chan_info(1, m_chan(i), 0, i, 0, t0 + 148);
 	}
 	if (C.scan_mode != 3) { fw_scan_event(1u << 1, 0, 0, 0, 5 + 150 * n + 1); }
 }
@@ -728,6 +774,8 @@ fw_c2_cmd(uint32_t id, const uint8_t *pl, uint32_t plen, unsigned need)
 		if (C.guard_after_start) { guard_bad = true; }  /* e.g. AMSS left EE 2 or an SMMU CB fault */
 		if (!C.no_start_refund) { fw_refund(need, 1); }
 		fw_scan_script(exp_n);
+		/* C2b: a credit drought that ends; queued after the script (the queue is delivered in order) */
+		if (C.no_start_refund && C.start_refund_at) { fw_refund(need, C.start_refund_at); }
 		return;
 	} else if (id == 0x3002) {  /* STOP_SCAN (mac.c:4883-4896, wmi.c:2832-2878) */
 		CHECK(fw_c2_step == 8 && !wl_ce.stopping, "STOP_SCAN without a scan, or after the latch");
@@ -740,6 +788,101 @@ fw_c2_cmd(uint32_t id, const uint8_t *pl, uint32_t plen, unsigned need)
 		fail("unexpected C2 WMI command");
 	}
 	fw_refund(need, 1);
+}
+
+/* ---- C2b firmware: REQUEST_STATS and UPDATE_STATS, written down here again from L19 ---- */
+/* The pdev entry (struct ath12k_wmi_pdev_stats_params, 44 words: base 0-6 chan_nf, tx_frame_count, rx_frame_count,
+ * rx_clear_count, cycle_count, phy_err_count, chan_tx_pwr; tx 7-29 comp_queued .. txop_ovf; rx 30-43
+ * mid_ppdu_route_change, status_rcvd, r0..r3_frags, htt_msdus, htt_mpdus, loc_msdus, loc_mpdus, oversize_amsdu,
+ * phy_errs, phy_err_drop, mpdu_errs). Realistic for the model's passive scan: nothing sent (tx 0), the last
+ * channel's noise floor, about 150 ms of cycles, the frames heard counted as local MPDUs and the CRC one as an MPDU
+ * error. DISTINCT: 1000 + word index everywhere, chan_nf -97 (every field's offset shows). */
+static void
+m_pdev_stats(bool distinct)
+{
+	uint32_t w[44] = {0};
+	if (distinct) {
+		for (unsigned i = 1; i < 44; i++) { w[i] = 1000u + i; }
+		w[0] = (uint32_t)-97;
+	} else {
+		w[0] = (uint32_t)-98; w[2] = 2457600; w[3] = 5068800; w[4] = 47961000; w[5] = 112;
+		w[31] = 20; w[38] = 19; w[39] = 19; w[41] = 112; w[43] = 1;
+	}
+	for (unsigned i = 0; i < 44; i++) { m_u32(w[i]); }
+}
+
+/* struct wmi_stats_event, LEN bytes (44 = whole): stats id, num pdev, num vdev, peer/bcnflt/chan/mib 0, pdev id
+ * (the requested one, fw_stats_pdev), num bcn, the rest 0. */
+static void
+m_stats_fixed(uint32_t stats_id, uint32_t npdev, uint32_t nvdev, uint32_t nbcn, uint32_t len)
+{
+	m_tlv(0x46, len); m_u32(stats_id); m_u32(npdev); m_u32(nvdev); m_zero(4 * 4); m_u32(fw_stats_pdev); m_u32(nbcn);
+	m_zero(len - 36);
+}
+
+/* UPDATE_STATS (0x1d004), the credit back in its trailer. Modes: 0 L19-shaped {fixed TLV: stats id 4, 1 pdev;
+ * ARRAY_BYTE of one 176-byte pdev entry}; 1 no answer (the credit in a trailer-only message); 2 the byte array's
+ * TLV runs past the event; 3 one pdev announced, 100 bytes given; 4 refused: stats id 0, no entry (L19 never
+ * completes fw_stats_done then); 5 L19's order: two vdev (164) and a beacon (12) entry before the pdev entry, distinct
+ * values; 6 first a 40-byte fixed TLV (unusable), 3 ms later mode 0; 7 the byte array before the fixed TLV;
+ * 8 every pdev word 0x80000000 (each printed field at its widest). The fixed TLV names the requested pdev. */
+static void
+fw_stats_answer(unsigned need)
+{
+	m_reset();
+	switch (C.stats_mode) {
+	case 1: fw_refund(need, 1); return;
+	case 2: m_stats_fixed(4, 1, 0, 0, 44); m_tlv(0x11, 512); m_pdev_stats(false); break;
+	case 3: m_stats_fixed(4, 1, 0, 0, 44); m_tlv(0x11, 100); m_zero(100); break;
+	case 4: m_stats_fixed(0, 0, 0, 0, 44); m_tlv(0x11, 0); break;
+	case 5:
+		m_stats_fixed(4, 1, 2, 1, 44); m_tlv(0x11, 2 * 164 + 12 + 176);
+		for (unsigned i = 0; i < 82; i++) { m_u32(0xeeeeeeeeu); }
+		for (unsigned i = 0; i < 3; i++) { m_u32(0xddddddddu); }
+		m_pdev_stats(true);
+		break;
+	case 6:
+		m_stats_fixed(4, 1, 0, 0, 40); m_tlv(0x11, 176); m_pdev_stats(false);
+		wmi_out(0x1d004, 0, 2);
+		m_reset(); m_stats_fixed(4, 1, 0, 0, 44); m_tlv(0x11, 176); m_pdev_stats(false);
+		wmi_out(0x1d004, need, 5);
+		return;
+	case 7: m_tlv(0x11, 176); m_pdev_stats(false); m_stats_fixed(4, 1, 0, 0, 44); break;
+	case 8:
+		m_stats_fixed(4, 1, 0, 0, 44); m_tlv(0x11, 176);
+		for (unsigned i = 0; i < 44; i++) { m_u32(0x80000000u); }
+		break;
+	default: m_stats_fixed(4, 1, 0, 0, 44); m_tlv(0x11, 176); m_pdev_stats(false); break;
+	}
+	wmi_out(0x1d004, need, 2);
+}
+
+/* The pdev ids of the preferred hw mode's (DBS) PHYs in PHY order, each once: L19's fw_pdev[] (wmi.c:528-532);
+ * SINGLE alone: none, L19's zeroed fw_pdev[0], pdev 0. Returns how many. */
+static unsigned
+fw_phy_pdevs(uint32_t *out)
+{
+	if (C.ext_single_only) { out[0] = 0; return 1; }
+	out[0] = C.dbs_pdev; out[1] = C.dbs_pdev + 1u;
+	return C.dbs_same_pdev ? 1u : 2u;
+}
+
+/* REQUEST_STATS (wmi.c:890-920; debugfs.c:1405-1407): {tag 0x8f, 20 bytes: stats id PDEV_STAT 4, vdev 0, peer MAC 0
+ * + 2 pad, pdev}, one per pdev of the preferred hw mode's PHYs in PHY order (fw_pdev[0] first, L19's no-vif target;
+ * then the one L19 picks by band, mac.c:967-1009), only after COMPLETED and before the containment latch. */
+static void
+fw_stats_cmd(const uint8_t *pl, uint32_t plen, unsigned need)
+{
+	uint32_t want[2] = {0, 0};
+	unsigned n = fw_phy_pdevs(want);
+	CHECK(wl_w23 && fw_c2_step == 8 && wl_scan.done && !wl_ce.stopping && fw_stats_req < n,
+	    "REQUEST_STATS before COMPLETED, after the latch or more than once per pdev");
+	CHECK(plen == 28 && g32(pl + 4) == (0x8fu << 16 | 20u) && g32(pl + 8) == 4 && g32(pl + 12) == 0 && g32(pl + 16) == 0 &&
+	    g32(pl + 20) == 0 && g32(pl + 24) == want[fw_stats_req], "REQUEST_STATS is not {PDEV_STAT, vdev 0, MAC 0, target pdev}");
+	fw_stats_pdev = want[fw_stats_req];
+	fw_stats_req++; fw_stats_at = now;
+	if (C.guard_on_stats) { guard_bad = true; }  /* e.g. the firmware asserts on the request */
+	fw_stats_answer(need);
 }
 
 static void
@@ -830,6 +973,8 @@ fw_rx(unsigned ce, uint32_t eid, const uint8_t *d, uint32_t len)
 	} else if (id == 0x3001 || id == 0x3002 || id == 0x3003 || id == 0x5001 || id == 0x5008 || id == 0x9001 || id == 0x9002) {
 		CHECK(wl_w23, "a C2 command with qrtr 6");
 		fw_c2_cmd(id, pl, plen, (unsigned)need);
+	} else if (id == 0x16001) {
+		fw_stats_cmd(pl, plen, (unsigned)need);
 	} else {
 		CHECK(id == 0x7ff0, "unexpected WMI command");
 		fw_echoes++;
@@ -960,6 +1105,7 @@ reset(void)
 	memset(&C, 0, sizeof(C));
 	C.credits = 4; C.credit_size = 2048; C.ready_ce = 2; C.htt_eid = 1; C.wmi_eid = 2; C.max_msg = 2048; C.ready_stslen = -1;
 	C.phy_bands = 3; C.phy_mask = 3; C.htt_major = 3; C.htt_minor = 4; C.exp_n = 38; C.exp_pdev = 0;
+	C.dbs_pdev = 1;
 	loglen = 0; logbuf[0] = 0;
 	memcpy(dr, ring_plan, sizeof(dr));
 	for (unsigned i = 0; i < 7; i++) {
@@ -984,6 +1130,7 @@ reset(void)
 	wl23_lines = wl23_pdev = wl23_htt_major = wl23_htt_minor = wl23_rssi_conv = 0; wl23_guard_bad = false;
 	fw_c2_step = fw_chan_seen = fw_chan_cmds = fw_scan_cmds = fw_stop_cmds = fw_htt_req = 0; fw_stop_pdev = ~0u;
 	n_beacons = 0;
+	memset(&wl_stats, 0, sizeof(wl_stats)); wl23_ci_lines = wl23_ci_drop = 0; fw_stats_req = 0; fw_stats_at = 0; fw_stats_pdev = 1;
 }
 
 static void
@@ -1500,9 +1647,54 @@ s_scan_happy(void)
 	contained_and_freed();
 	expect("FUXI WLAN: W23 contain: scan over, no STOP_SCAN\n");
 	CHECK(fw_stop_cmds == 0, "STOP_SCAN after a completed scan");
+	/* C2b: a detail line per CHAN_INFO (38 START with the dwell's counters, 38 END), after COMPLETED one
+	 * REQUEST_STATS per DBS PHY pdev (1: 2 GHz, 2: 5 GHz), each answer in six lines, then the after-scan deltas;
+	 * the contain line counts both exchanges too (tx 13 + 2, rx 156 + 2) */
+	static const char *const c2b[] = {
+		"FUXI WLAN: W23 scan foreign freq 2412\n",
+		"FUXI WLAN: W23 chan-info freq 2412 flags START nf -96 rx-clear 2112000 cycle 48000000 rx-frame 672000 tx-frame 0 "
+		"my-bss-rx 0 mac-clk 320\n",
+		"FUXI WLAN: W23 chan-info freq 2412 flags END nf 0 rx-clear 0 cycle 0 rx-frame 0 tx-frame 0 my-bss-rx 0 mac-clk 0\n",
+		"FUXI WLAN: W23 scan foreign freq 2417\n",
+		"FUXI WLAN: W23 chan-info freq 2417 flags START nf -97 rx-clear 1444000 cycle 47987000 rx-frame 0 tx-frame 0 "
+		"my-bss-rx 0 mac-clk 320\n",
+		"FUXI WLAN: W23 chan-info freq 2437 flags START nf -96 rx-clear 2132000 cycle 47935000 rx-frame 672000 tx-frame 0 "
+		"my-bss-rx 0 mac-clk 320\n",
+		"FUXI WLAN: W23 chan-info freq 5825 flags END nf 0 rx-clear 0 cycle 0 rx-frame 0 tx-frame 0 my-bss-rx 0 mac-clk 0\n",
+		"FUXI WLAN: W23 scan completed reason 0 after ",
+	};
+	expect_order(c2b, sizeof(c2b) / sizeof(c2b[0]));
+	expect_not("FUXI WLAN: W24 no beacon");
+	static const char *const stats[] = {
+		"FUXI WLAN: W24 scan detail mgmt-rx 20 ",
+		"FUXI WLAN: W23 stats request pdev-stat pdev 1 bands 0x1 vdev 0 sent\n",
+		"FUXI WLAN: W23 stats pdev 1 after 2 ms (stats-id 0x4 pdevs 1 vdevs 0 bcns 0 bytes 176 events 1 unusable 0; ce tx 1 rx 1)\n",
+		"FUXI WLAN: W23 stats base chan-nf -98 rx-frame 2457600 rx-clear 5068800 cycle 47961000 tx-frame 0 phy-err 112 chan-tx-pwr 0\n",
+		"FUXI WLAN: W23 stats rx1 status-rcvd 20 r0-frags 0 r1-frags 0 r2-frags 0 r3-frags 0 htt-msdus 0 htt-mpdus 0\n",
+		("FUXI WLAN: W23 stats rx2 loc-msdus 19 loc-mpdus 19 oversize-amsdu 0 phy-errs 112 phy-err-drop 0 mpdu-errs 1 "
+		 "mid-ppdu-route-change 0\n"),
+		("FUXI WLAN: W23 stats tx1 comp-queued 0 comp-delivered 0 msdu-enqued 0 mpdu-enqued 0 local-enqued 0 local-freed 0 "
+		 "hw-queued 0\n"),
+		"FUXI WLAN: W23 stats tx2 hw-reaped 0 underrun 0 tx-abort 0 mpdus-requed 0 tx-ko 0 self-triggers 0 pdev-resets 0\n",
+		"FUXI WLAN: W23 stats request pdev-stat pdev 2 bands 0x2 vdev 0 sent\n",
+		"FUXI WLAN: W23 stats pdev 2 after 2 ms (stats-id 0x4 pdevs 1 vdevs 0 bcns 0 bytes 176 events 1 unusable 0; ce tx 1 rx 1)\n",
+		"FUXI WLAN: W23 stats tx2 hw-reaped 0 ",
+		"FUXI WLAN: W23 stats after-scan wmi mgmt-rx +0 frames +0 bss +0 scan-events +0 chan-info +0 other +0\n",
+		"FUXI WLAN: W23 complete; stop/contain\n",
+		"FUXI WLAN: W23 contain: scan over, no STOP_SCAN\n",
+		"FUXI WLAN: W20 ce contain posted 282 reaped 158 tx 15\n",
+	};
+	expect_order(stats, sizeof(stats) / sizeof(stats[0]));
+	CHECK(count_text("FUXI WLAN: W23 chan-info freq ") == 76 && count_text(" flags START ") == 38 && fw_stats_req == 2 &&
+	    wl_stats.have && wl_scan.ci_seen == 76 && count_text("FUXI WLAN: W23 stats base ") == 2,
+	    "C2b lines and one stats request per DBS PHY pdev");
+	expect_not("chan-info lines suppressed");
+	expect_not("wmi event 0x1d004");  /* UPDATE_STATS feeds the stats parser, not the unknown-event lines */
 	puts("W23 happy path: 38 passive channels in one command, STA vdev (K-W2 MAC) + NSS + 3 STA PS params + PS off, "
 	     "passive START_SCAN word by word, 38 foreign channels, CHAN_INFO, 20 MGMT_RX into 9 BSS (dedup, probe response, "
-	     "hidden, all-zero, 33-byte SSID, cut IEs, HT channel, escaped SSID), drops counted, contained without STOP_SCAN");
+	     "hidden, all-zero, 33-byte SSID, cut IEs, HT channel, escaped SSID), drops counted, contained without STOP_SCAN; "
+	     "C2b: 76 CHAN_INFO lines with the dwell counters, REQUEST_STATS for pdev 1 then 2 after COMPLETED, pdev "
+	     "base/rx/tx lines, after-scan deltas");
 }
 
 static void
@@ -1526,7 +1718,10 @@ s_scan_bits(void)
 	    "HTT version on CE4, 13 channels");
 	expect_not("11:22:33");  /* owner decision 6: no whole BSSID in any line */
 	contained_and_freed();
-	expect("FUXI WLAN: W20 ce contain posted 186 reaped 62 tx 14\n");  /* CE0 + CE3 + the one CE4 send */
+	/* CE0 + CE3 + the one CE4 send; C2b: the two REQUEST_STATS (tx) and their answers (rx), as their lines say */
+	expect("FUXI WLAN: W23 stats pdev 1 after 2 ms (stats-id 0x4 pdevs 1 vdevs 0 bcns 0 bytes 176 events 1 unusable 0; ce tx 1 rx 1)\n");
+	expect("FUXI WLAN: W23 stats pdev 2 after 2 ms (stats-id 0x4 pdevs 1 vdevs 0 bcns 0 bytes 176 events 1 unusable 0; ce tx 1 rx 1)\n");
+	expect("FUXI WLAN: W20 ce contain posted 188 reaped 64 tx 16\n");
 	/* HTT major 2: L19 refuses it (dp_tx.c:1319-1323); a silent target: 3 s */
 	c2_reset(); wl20_bits = WL20_HTTVER; C.htt_major = 2;
 	CHECK(run() == 1, "HTT major 2 accepted");
@@ -1771,6 +1966,390 @@ s_scan_pure(void)
 	     "in flight bound");
 }
 
+/* ---- C2b scenarios (fuxiwlanqrtr=7): CHAN_INFO detail and the pdev stats requests ---- */
+/* Every completed log line. XNU's console keeps at most 255 bytes of a printf line, newline included, and drops the
+ * rest with the newline when drain_uart_sync is off, as on the kits (osfmk/console/serial_general.c:159-188,
+ * SERIAL_CONS_BUF_SIZE 256): no FUXI WLAN line may pass 254 bytes. Then the scenario's device-side action at a line
+ * that has no poll between it and the next production step: C.on_line 1, CE3's device TP word one entry back right
+ * after the W24 detail line (the next CE3 access is the first REQUEST_STATS send); 2, a beacon MGMT_RX 1 ms after
+ * the first REQUEST_STATS went out (inside its TX drain / UPDATE_STATS wait); 3, the W11 guard fails once the
+ * last channel's FOREIGN_CHAN line is out (the scan wait fails). */
+static void
+model_line(const char *l, size_t len)
+{
+	static const uint8_t late[6] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55};
+	if (len >= 9 && !strncmp(l, "FUXI WLAN", 9) && len > 254) { fail("a FUXI WLAN line longer than 254 bytes (console cut)"); }
+	if (C.on_line == 1 && len >= 26 && !strncmp(l, "FUXI WLAN: W24 scan detail", 26)) {
+		C.on_line = 0;
+		write_rdp(&dr[5], (dr[5].dev + dr[5].size - 4u) % dr[5].size);
+	}
+	if (C.on_line == 3 && len >= 37 && !strncmp(l, "FUXI WLAN: W23 scan foreign freq 5825", 37)) {
+		C.on_line = 0;
+		guard_bad = true;  /* the W11 guard fails in the scan wait after the last channel */
+	}
+	if (C.on_line == 2 && len >= 44 && !strncmp(l, "FUXI WLAN: W23 stats request pdev-stat ", 39) && !strncmp(l + len - 5, " sent", 5)) {
+		C.on_line = 0;
+		fw_mgmt_rx(add_frame(0, 40, 8, late, 0x11, "Late", 4, 1, 0, false), 1);
+	}
+}
+
+/* The stats parser alone on the message in mb: the reason an event is unusable, or "usable". */
+static const char *
+c2b_parse(struct wlstats *st)
+{
+	memset(st, 0, sizeof(*st));
+	wlstats_parse(st, mb, ml);
+	CHECK(st->events == 1 && st->have == !st->unusable && st->unusable <= 1 && (st->have || st->why), "stats parse counts");
+	return st->have ? "usable" : st->why;
+}
+
+static void
+s_c2b_pure(void)
+{
+	struct wlstats st;
+	fw_stats_pdev = 1;  /* the fixed TLV's pdev id */
+	/* L19's shape, every word where L19 has it (struct ath12k_wmi_pdev_stats_params, wmi_stats_event) */
+	m_reset(); m_stats_fixed(4, 1, 0, 0, 44); m_tlv(0x11, 176); m_pdev_stats(true);
+	CHECK(!strcmp(c2b_parse(&st), "usable") && (int32_t)st.w[WLWMI_PS_CHAN_NF] == -97 && st.ev[WLWMI_SE_STATS_ID] == 4 &&
+	    st.ev[WLWMI_SE_NUM_PDEV_STATS] == 1 && st.ev[WLWMI_SE_PDEV_ID] == 1 && st.bytes == 176, "L19-shaped event");
+	for (unsigned i = 1; i < WLWMI_PS_WORDS; i++) { CHECK(st.w[i] == 1000u + i, "pdev stats word"); }
+	CHECK(st.w[WLWMI_PS_RX_FRAME_COUNT] == 1002 && st.w[WLWMI_PS_CYCLE_COUNT] == 1004 && st.w[WLWMI_PS_COMP_QUEUED] == 1007 &&
+	    st.w[WLWMI_PS_TXOP_OVF] == 1029 && st.w[WLWMI_PS_STATUS_RCVD] == 1031 && st.w[WLWMI_PS_HTT_MPDUS] == 1037 &&
+	    st.w[WLWMI_PS_LOC_MPDUS] == 1039 && st.w[WLWMI_PS_MPDU_ERRS] == 1043, "named pdev fields at L19's word offsets");
+	/* a second, different usable event (firmware sends UPDATE_STATS back to back) is counted, not taken */
+	m_reset(); m_stats_fixed(4, 1, 0, 0, 44); m_tlv(0x11, 176); m_pdev_stats(false);
+	wlstats_parse(&st, mb, ml);
+	CHECK(st.events == 2 && st.have && st.w[WLWMI_PS_HTT_MPDUS] == 1037 && (int32_t)st.w[WLWMI_PS_CHAN_NF] == -97,
+	    "a later event is counted, the first one kept");
+	/* unusable: the reason is kept, nothing fails */
+	m_reset(); m_stats_fixed(4, 1, 0, 0, 40); m_tlv(0x11, 176); m_pdev_stats(false);
+	CHECK(!strcmp(c2b_parse(&st), "stats fixed TLV shorter than 44 bytes"), "short fixed TLV");
+	m_reset(); m_tlv(0x11, 176); m_pdev_stats(false); m_stats_fixed(4, 1, 0, 0, 44);
+	CHECK(!strcmp(c2b_parse(&st), "stats byte array before the fixed TLV"), "byte array first (L19: no ev, -EPROTO)");
+	m_reset(); m_stats_fixed(4, 1, 0, 0, 44); m_tlv(0x11, 177); m_pdev_stats(false);
+	CHECK(!strcmp(c2b_parse(&st), "stats TLV past the event"), "TLV past the event");
+	m_reset(); m_stats_fixed(4, 1, 0, 0, 44); m_tlv(0x11, 172); m_zero(172);
+	CHECK(!strcmp(c2b_parse(&st), "stats byte array shorter than its entries"), "pdev entry cut");
+	/* the entry bounds at the edge: one byte short of a pdev entry, of a vdev entry */
+	m_reset(); m_stats_fixed(4, 1, 0, 0, 44); m_tlv(0x11, 175); m_zero(175);
+	CHECK(!strcmp(c2b_parse(&st), "stats byte array shorter than its entries"), "pdev entry 1 byte short");
+	m_reset(); m_stats_fixed(4, 1, 1, 0, 44); m_tlv(0x11, 163); m_zero(163);
+	CHECK(!strcmp(c2b_parse(&st), "stats byte array shorter than its entries"), "vdev entry 1 byte short");
+	m_reset(); m_stats_fixed(4, 0, 0, 0, 44); m_tlv(0x11, 176); m_pdev_stats(false);
+	CHECK(!strcmp(c2b_parse(&st), "no pdev stats in the event"), "no pdev entry announced");
+	m_reset();
+	CHECK(!strcmp(c2b_parse(&st), "no stats fixed TLV"), "empty event");
+	m_reset(); m_stats_fixed(4, 1, 0xffffffffu, 0, 44); m_tlv(0x11, 352); m_zero(352);
+	CHECK(!strcmp(c2b_parse(&st), "stats byte array shorter than its entries"), "4 billion vdev entries: bounded by the array");
+	/* L19's order: 2 vdev entries, 1 beacon entry, then 2 pdev entries; the first pdev entry is the one */
+	m_reset(); m_stats_fixed(4, 2, 2, 1, 44); m_tlv(0x11, 2 * 164 + 12 + 2 * 176); m_zero(2 * 164 + 12);
+	m_pdev_stats(true); m_pdev_stats(false);
+	CHECK(!strcmp(c2b_parse(&st), "usable") && st.w[WLWMI_PS_RX_FRAME_COUNT] == 1002 && st.bytes == 2 * 164 + 12 + 2 * 176 &&
+	    st.ev[WLWMI_SE_NUM_VDEV_STATS] == 2 && st.ev[WLWMI_SE_NUM_BCN_STATS] == 1, "vdev, beacon, then pdev entries");
+	/* a later byte array that is short spoils the event, as L19's -EPROTO does */
+	m_reset(); m_stats_fixed(4, 1, 0, 0, 44); m_tlv(0x11, 176); m_pdev_stats(true); m_tlv(0x11, 8); m_zero(8);
+	CHECK(!strcmp(c2b_parse(&st), "stats byte array shorter than its entries"), "second byte array short");
+	/* other TLVs (per-chain RSSI 0x220, an empty ARRAY_STRUCT) are skipped */
+	m_reset(); m_tlv(0x220, 4); m_u32(0); m_stats_fixed(4, 1, 0, 0, 44); m_tlv(0x12, 0); m_tlv(0x11, 176); m_pdev_stats(true);
+	CHECK(!strcmp(c2b_parse(&st), "usable"), "unrelated TLVs");
+	/* routing: an unknown event until the request is out, then the stats parser; never a WMI failure */
+	{
+		static uint8_t ev[WLCE_BUF];
+		struct wlwmi w;
+		uint32_t id = 0;
+		memset(&w, 0, sizeof(w));
+		m_reset(); m_stats_fixed(4, 1, 0, 0, 44); m_tlv(0x11, 999);
+		p32(ev, 0x1d004); memcpy(ev + 4, mb, ml);
+		CHECK(wlwmi_rx(&w, ev, 4 + ml, &id) == 0 && id == 0x1d004 && w.unknown_events == 1, "UPDATE_STATS before the request");
+		w.stats = &st; memset(&st, 0, sizeof(st));
+		CHECK(wlwmi_rx(&w, ev, 4 + ml, &id) == 0 && !w.why && st.unusable == 1 && w.unknown_events == 1 && w.events == 2,
+		    "a malformed UPDATE_STATS failed WMI");
+	}
+	/* CHAN_INFO: every word of a well-formed event kept (the C2b line reads them), nothing from a short one */
+	{
+		struct wlscan *s = calloc(1, sizeof(*s));
+		CHECK(s != NULL, "alloc");
+		wlscan_init(s, 38);
+		s->started = true;
+		m_reset(); m_tlv(0x26, 56);
+		for (unsigned i = 0; i < 14; i++) { m_u32(0x100u + i); }
+		CHECK(wlscan_parse_chan_info(s, mb, ml) == 0 && s->ci_seen == 1, "CHAN_INFO kept");
+		for (unsigned i = 0; i < 14; i++) { CHECK(s->ci[i] == 0x100u + i, "CHAN_INFO word"); }
+		CHECK(s->ci[WLWMI_CI_FREQ] == 0x101 && s->ci[WLWMI_CI_RX_CLEAR_COUNT] == 0x104 && s->ci[WLWMI_CI_CYCLE_COUNT] == 0x105 &&
+		    s->ci[WLWMI_CI_RX_FRAME_COUNT] == 0x108 && s->ci[WLWMI_CI_MY_BSS_RX_CYCLE_COUNT] == 0x109 &&
+		    s->ci[WLWMI_CI_TX_FRAME_CNT] == 0x10b && s->ci[WLWMI_CI_MAC_CLK_MHZ] == 0x10c, "CHAN_INFO fields at L19's offsets");
+		m_reset(); m_tlv(0x26, 52); m_zero(52);
+		CHECK(wlscan_parse_chan_info(s, mb, ml) == 0 && s->ci_seen == 1 && s->bad_events == 1, "short CHAN_INFO kept");
+		free(s);
+	}
+	/* encoder: 28 bytes, bounds */
+	{
+		uint8_t out[64];
+		uint32_t len = 0;
+		CHECK(wlwmi_encode_stats_req(1, out, 27, &len) == 1, "stats request in 27 bytes");
+		CHECK(wlwmi_encode_stats_req(2, out, 28, &len) == 0 && len == 28 && g32(out) == 0x16001 && g32(out + 4) == (0x8fu << 16 | 20u) &&
+		    g32(out + 8) == 4 && !g32(out + 12) && !g32(out + 16) && !g32(out + 20) && g32(out + 24) == 2, "stats request words");
+	}
+	puts("C2b pure: UPDATE_STATS parse (L19 shape, every pdev word, a later different event counted, the first kept; short "
+	     "fixed TLV, array first, TLV past the event, cut entry, pdev and vdev entries 1 byte short, no pdev entry, empty, 4 "
+	     "billion vdev entries, L19's vdev/beacon/pdev order with its counts and bytes, a spoiling second array, unrelated "
+	     "TLVs), routing only after the request and never fatal, CHAN_INFO words kept, request encoder");
+}
+
+static void
+s_c2b_stats(void)
+{
+	/* L19's entry order: two vdev entries and a beacon entry first; every pdev field shows at its own offset, the event's counts
+	 * and the byte array length on the first line */
+	c2_reset(); C.stats_mode = 5;
+	CHECK(run() == 0, "C2b L19 order");
+	static const char *const lines[] = {
+		"FUXI WLAN: W23 stats request pdev-stat pdev 1 bands 0x1 vdev 0 sent\n",
+		"FUXI WLAN: W23 stats pdev 1 after 2 ms (stats-id 0x4 pdevs 1 vdevs 2 bcns 1 bytes 516 events 1 unusable 0; ce tx 1 rx 1)\n",
+		"FUXI WLAN: W23 stats base chan-nf -97 rx-frame 1002 rx-clear 1003 cycle 1004 tx-frame 1001 phy-err 1005 chan-tx-pwr 1006\n",
+		("FUXI WLAN: W23 stats rx1 status-rcvd 1031 r0-frags 1032 r1-frags 1033 r2-frags 1034 r3-frags 1035 htt-msdus 1036 "
+		 "htt-mpdus 1037\n"),
+		("FUXI WLAN: W23 stats rx2 loc-msdus 1038 loc-mpdus 1039 oversize-amsdu 1040 phy-errs 1041 phy-err-drop 1042 "
+		 "mpdu-errs 1043 mid-ppdu-route-change 1030\n"),
+		("FUXI WLAN: W23 stats tx1 comp-queued 1007 comp-delivered 1008 msdu-enqued 1009 mpdu-enqued 1010 local-enqued 1012 "
+		 "local-freed 1013 hw-queued 1014\n"),
+		("FUXI WLAN: W23 stats tx2 hw-reaped 1015 underrun 1016 tx-abort 1017 mpdus-requed 1018 tx-ko 1019 self-triggers 1021 "
+		 "pdev-resets 1026\n"),
+		"FUXI WLAN: W23 stats request pdev-stat pdev 2 bands 0x2 vdev 0 sent\n",
+		"FUXI WLAN: W23 stats pdev 2 after 2 ms (stats-id 0x4 pdevs 1 vdevs 2 bcns 1 bytes 516 events 1 unusable 0; ce tx 1 rx 1)\n",
+		"FUXI WLAN: W23 stats after-scan wmi mgmt-rx +0 frames +0 bss +0 scan-events +0 chan-info +0 other +0\n",
+		"FUXI WLAN: W23 complete; stop/contain\n",
+	};
+	expect_order(lines, sizeof(lines) / sizeof(lines[0]));
+	contained_and_freed();
+	/* every pdev word at its widest (0x80000000: -2147483648 signed): each line still fits the console's 254 bytes
+	 * (model_line fails any longer FUXI WLAN line) */
+	c2_reset(); C.stats_mode = 8;
+	CHECK(run() == 0, "C2b widest pdev fields");
+	expect("FUXI WLAN: W23 stats rx2 loc-msdus -2147483648 loc-mpdus -2147483648 oversize-amsdu -2147483648 phy-errs "
+	       "-2147483648 phy-err-drop -2147483648 mpdu-errs -2147483648 mid-ppdu-route-change -2147483648\n");
+	expect("FUXI WLAN: W23 stats tx2 hw-reaped -2147483648 underrun -2147483648 tx-abort -2147483648 mpdus-requed -2147483648 "
+	       "tx-ko 2147483648 self-triggers 2147483648 pdev-resets 2147483648\n");
+	contained_and_freed();
+	/* the pdevs: the preferred hw mode's (DBS) PHYs in PHY order, L19's fw_pdev[0] and fw_pdev[1], not the first MAC/PHY
+	 * entry; with the DBS listed first too; one id for both PHYs: one request, both bands */
+	c2_reset(); C.dbs_pdev = 2;
+	CHECK(run() == 0, "C2b DBS pdevs 2 and 3");
+	expect("FUXI WLAN: W21 wmi service ready ext hw-modes 2 caps 2 pdev 1\n");
+	static const char *const p23[] = {
+		"FUXI WLAN: W23 stats request pdev-stat pdev 2 bands 0x1 vdev 0 sent\n",
+		"FUXI WLAN: W23 stats pdev 2 after 2 ms ",
+		"FUXI WLAN: W23 stats request pdev-stat pdev 3 bands 0x2 vdev 0 sent\n",
+		"FUXI WLAN: W23 stats pdev 3 after 2 ms ",
+	};
+	expect_order(p23, sizeof(p23) / sizeof(p23[0]));
+	CHECK(fw_stats_req == 2, "two pdev requests");
+	contained_and_freed();
+	c2_reset(); C.dbs_pdev = 2; C.ext_single_last = true;
+	CHECK(run() == 0, "C2b DBS pdevs 2 and 3, DBS listed first");
+	expect("FUXI WLAN: W21 wmi service ready ext hw-modes 2 caps 2 pdev 2\n");
+	expect_order(p23, sizeof(p23) / sizeof(p23[0]));
+	contained_and_freed();
+	c2_reset(); C.dbs_same_pdev = true;
+	CHECK(run() == 0, "C2b one pdev for both DBS PHYs");
+	expect("FUXI WLAN: W23 stats request pdev-stat pdev 1 bands 0x3 vdev 0 sent\n");
+	CHECK(fw_stats_req == 1 && count_text("W23 stats request pdev-stat") == 1, "one request for one pdev id");
+	contained_and_freed();
+	/* SINGLE alone: no PHY of the preferred mode, L19's zeroed fw_pdev[0]: pdev 0, no bands */
+	c2_reset(); C.ext_single_only = true; C.phy_bands = 0;
+	CHECK(run() == 0, "C2b SINGLE only");
+	expect("FUXI WLAN: W21 wmi service ready ext hw-modes 1 caps 1 pdev 1\n");
+	expect("FUXI WLAN: W23 stats request pdev-stat pdev 0 bands 0 vdev 0 sent\n");
+	CHECK(fw_stats_req == 1, "one request with no preferred-mode PHY");
+	contained_and_freed();
+	/* an unusable event (fixed TLV of 40 bytes), then a usable one: the wait goes on until the usable one */
+	c2_reset(); C.stats_mode = 6;
+	CHECK(run() == 0, "C2b unusable, then usable");
+	expect("FUXI WLAN: W23 stats pdev 1 after 5 ms (stats-id 0x4 pdevs 1 vdevs 0 bcns 0 bytes 176 events 2 unusable 1; ce tx 1 rx 2)\n");
+	expect("FUXI WLAN: W23 stats pdev 2 after 5 ms (stats-id 0x4 pdevs 1 vdevs 0 bcns 0 bytes 176 events 2 unusable 1; ce tx 1 rx 2)\n");
+	contained_and_freed();
+	/* a credit drought that ends 200 ms after COMPLETED: the bounded credit wait, then the requests */
+	c2_reset(); C.credits = 1; C.refund_later = true; C.no_start_refund = true; C.start_refund_at = 5906;
+	CHECK(run() == 0, "C2b late credits");
+	static const char *const late[] = {
+		"FUXI WLAN: W24 scan detail ",
+		"FUXI WLAN: W23 stats request waits for 1 HTC credits (has 0)\n",
+		"FUXI WLAN: W23 stats request pdev-stat pdev 1 bands 0x1 vdev 0 sent\n",
+		"FUXI WLAN: W23 stats pdev 1 after 2 ms (stats-id 0x4 pdevs 1 vdevs 0 bcns 0 bytes 176 events 1 unusable 0; ce tx 1 rx 2)\n",
+		"FUXI WLAN: W23 stats request pdev-stat pdev 2 bands 0x2 vdev 0 sent\n",
+		"FUXI WLAN: W23 stats after-scan wmi ",
+		"FUXI WLAN: W23 complete; stop/contain\n",
+	};
+	expect_order(late, sizeof(late) / sizeof(late[0]));
+	contained_and_freed();
+	/* a beacon that arrives in the first exchange: parsed into the table as C2 parses it, and reported (late, not
+	 * filtered); the W24 lines are not printed again */
+	c2_reset(); C.on_line = 2;
+	CHECK(run() == 0, "C2b late MGMT_RX");
+	static const char *const lmgmt[] = {
+		"FUXI WLAN: W24 scan summary frames 0 bss 0 ssids 0\n",
+		"FUXI WLAN: W24 no beacon or probe response heard (chan-info 38); next rung W24b = w20 0x02\n",
+		"FUXI WLAN: W23 stats request pdev-stat pdev 1 bands 0x1 vdev 0 sent\n",
+		"FUXI WLAN: W23 stats pdev 1 after 2 ms (stats-id 0x4 pdevs 1 vdevs 0 bcns 0 bytes 176 events 1 unusable 0; ce tx 1 rx 2)\n",
+		"FUXI WLAN: W23 stats after-scan wmi mgmt-rx +1 frames +1 bss +1 scan-events +0 chan-info +0 other +0\n",
+		"FUXI WLAN: W23 complete; stop/contain\n",
+	};
+	expect_order(lmgmt, sizeof(lmgmt) / sizeof(lmgmt[0]));
+	CHECK(wl_scan.mgmt == 1 && wl_scan.frames == 1 && wl_scan.nbss == 1 && count_text("FUXI WLAN: W24 bss ") == 0, "late beacon");
+	contained_and_freed();
+	puts("C2b stats: L19's vdev/beacon/pdev order with every field at its offset and the counts and bytes printed, the "
+	     "widest fields within 254 bytes, one request per pdev id of the preferred mode's PHYs in PHY order (DBS listed "
+	     "second and first; one id for both PHYs; SINGLE only: pdev 0), an unusable event before a usable one, credits "
+	     "back 200 ms after COMPLETED, a beacon inside the exchange reported as after-scan");
+}
+
+static void
+s_c2b_stats_failures(void)
+{
+	/* no answer: exactly 500 ms per pdev, one line each, then containment; the run still passes */
+	c2_reset(); C.stats_mode = 1;
+	CHECK(run() == 0, "C2b: no UPDATE_STATS failed the run");
+	CHECK(now - fw_stats_at == 500 && fw_stats_req == 2, "the UPDATE_STATS wait is not 500 ms");
+	expect("FUXI WLAN: W23 stats pdev 1 no usable UPDATE_STATS in 500 ms (events 0 unusable 0; ce tx 1 rx 1)\n"
+	       "FUXI WLAN: W23 stats request pdev-stat pdev 2 bands 0x2 vdev 0 sent\n"
+	       "FUXI WLAN: W23 stats pdev 2 no usable UPDATE_STATS in 500 ms (events 0 unusable 0; ce tx 1 rx 1)\n"
+	       "FUXI WLAN: W23 stats after-scan wmi mgmt-rx +0 frames +0 bss +0 scan-events +0 chan-info +0 other +0\n"
+	       "FUXI WLAN: W23 complete; stop/contain\n");
+	contained_and_freed();
+	expect("FUXI WLAN: W23 contain: scan over, no STOP_SCAN\n");
+	/* malformed, short, refused (empty), array first: each logged with its reason, then containment */
+	static const struct { unsigned mode; const char *why; } bad[] = {
+		{2, "stats TLV past the event"}, {3, "stats byte array shorter than its entries"}, {4, "no pdev stats in the event"},
+		{7, "stats byte array before the fixed TLV"},
+	};
+	for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		char want[256];
+		c2_reset(); C.stats_mode = bad[i].mode;
+		CHECK(run() == 0, "C2b: an unusable UPDATE_STATS failed the run");
+		CHECK(now - fw_stats_at == 500, "the UPDATE_STATS wait is not 500 ms");
+		for (unsigned k = 1; k <= 2; k++) {
+			snprintf(want, sizeof(want), "FUXI WLAN: W23 stats pdev %u no usable UPDATE_STATS in 500 ms (events 1 unusable 1, "
+			         "last: %s; ce tx 1 rx 1)\n", k, bad[i].why);
+			expect(want);
+		}
+		expect_not("W23 failure");
+		expect("FUXI WLAN: W23 complete; stop/contain\n");
+		contained_and_freed();
+	}
+	/* credit starvation: the bounded credit wait (3000 ms), no request, no second pdev, the run passes */
+	c2_reset(); C.credits = 1; C.refund_later = true; C.no_start_refund = true;
+	CHECK(run() == 0, "C2b: no credits failed the run");
+	expect("FUXI WLAN: W23 stats request waits for 1 HTC credits (has 0)\nFUXI WLAN: W23 stats request pdev-stat pdev 1 bands "
+	       "0x1 not sent: no HTC credits after 3000 ms (ce tx 0 rx 0); continue to containment\nFUXI WLAN: W23 stats after-scan "
+	       "wmi mgmt-rx +0 frames +0 bss +0 scan-events +0 chan-info +0 other +0\nFUXI WLAN: W23 complete; stop/contain\n");
+	CHECK(fw_stats_req == 0, "REQUEST_STATS without credits");
+	contained_and_freed();
+	/* the request's descriptor never completes: the TX drain gives up at 1000 ms, no wait for the answer, no second pdev */
+	c2_reset(); C.stats_tx_stuck = true; C.stats_mode = 1;
+	CHECK(run() == 0, "C2b: a stuck stats TX failed the run");
+	expect("FUXI WLAN: W23 stats request TX not drained after 1000 ms (ce tx 1 rx 1); continue to containment\n"
+	       "FUXI WLAN: W23 stats after-scan wmi mgmt-rx +0 frames +0 bss +0 scan-events +0 chan-info +0 other +0\n"
+	       "FUXI WLAN: W23 complete; stop/contain\n");
+	CHECK(fw_stats_req == 1 && !wlce_tx_idle(&wl_ce.pipe[3]), "stuck stats drain");
+	contained_and_freed();
+	/* the same, but the firmware answered meanwhile: the answer is printed (already parsed and bounded) */
+	c2_reset(); C.stats_tx_stuck = true;
+	CHECK(run() == 0, "C2b: a stuck stats TX with an answer failed the run");
+	expect("FUXI WLAN: W23 stats request TX not drained after 1000 ms (ce tx 1 rx 1); continue to containment\n"
+	       "FUXI WLAN: W23 stats pdev 1 after 1000 ms (stats-id 0x4 pdevs 1 vdevs 0 bcns 0 bytes 176 events 1 unusable 0; "
+	       "ce tx 1 rx 1)\nFUXI WLAN: W23 stats base chan-nf -98 ");
+	expect("FUXI WLAN: W23 stats tx2 hw-reaped 0 underrun 0 tx-abort 0 mpdus-requed 0 tx-ko 0 self-triggers 0 pdev-resets 0\n"
+	       "FUXI WLAN: W23 stats after-scan wmi ");
+	CHECK(fw_stats_req == 1 && wl_stats.have, "stuck stats drain with an answer");
+	contained_and_freed();
+	/* the transport fails during the exchange (the W11 guard): that ends the run as in every W20..W23 wait */
+	c2_reset(); C.guard_on_stats = true;
+	CHECK(run() == 1, "C2b: a guard failure in the stats wait accepted");
+	expect("FUXI WLAN: W23 stats request pdev-stat pdev 1 bands 0x1 vdev 0 sent\n");
+	expect("FUXI WLAN: W23 failure: AMSS/M0, ownership, discovery or access/SMMU fault; contain, no retry\n");
+	expect_not("W23 complete");
+	expect_not("W23 stats after-scan");
+	contained_and_freed();
+	expect("FUXI WLAN: W23 contain: scan over, no STOP_SCAN\n");
+	/* a CE-layer integrity fault in the send (CE3's device TP one entry back): fatal as in wl_ce_send, with the
+	 * snapshot; nothing sent */
+	c2_reset(); C.on_line = 1;
+	CHECK(run() == 1, "C2b: a CE fault in the stats send accepted");
+	static const char *const ce[] = {
+		"FUXI WLAN: W24 scan detail ",
+		"FUXI WLAN: W23 WMI REQUEST_STATS FAILED: CE device TP passed the host HP or went backwards\n",
+		"FUXI WLAN: W20 snapshot WMI REQUEST_STATS: ",
+		"FUXI WLAN: W23 failure: CE device TP passed the host HP or went backwards; contain, no retry\n",
+	};
+	expect_order(ce, sizeof(ce) / sizeof(ce[0]));
+	expect_not("W23 stats request pdev-stat");
+	expect_not("W23 complete");
+	CHECK(fw_stats_req == 0 && wl_w11_error && wl_ce.errors, "CE fault in the stats send");
+	contained_and_freed();
+	puts("C2b stats failures: no answer (500 ms per pdev), TLV past the event, short entry, refused (no pdev entry), array "
+	     "before the fixed TLV, credit starvation (3000 ms, nothing sent), a stuck TX descriptor (1000 ms; with an answer "
+	     "it is printed): all logged and the run passes; a W11 guard failure in the exchange and a CE fault in the send "
+	     "end the run; every run contained and freed");
+}
+
+static void
+s_c2b_cap(void)
+{
+	/* 4 START_RESP per channel and one with flags 2: 191 events, 128 lines, the rest counted before W23 complete */
+	c2_reset(); C.ci_repeat = 3;
+	CHECK(run() == 0, "C2b 191 CHAN_INFO");
+	CHECK(count_text("FUXI WLAN: W23 chan-info freq ") == 128 && wl_scan.ci_seen == 191, "128 CHAN_INFO lines");
+	expect("FUXI WLAN: W23 chan-info freq 2412 flags 0x2 nf -96 rx-clear 0 cycle 0 rx-frame 0 tx-frame 0 my-bss-rx 0 mac-clk 0\n");
+	expect("FUXI WLAN: W23 scan completed reason 0 after 5704 ms (foreign 38 chan-info 152)\n");
+	static const char *const lines[] = {
+		"FUXI WLAN: W23 stats tx2 ",
+		"FUXI WLAN: W23 stats after-scan wmi ",
+		"FUXI WLAN: W23 chan-info lines suppressed 63 (cap 128)\n",
+		"FUXI WLAN: W23 complete; stop/contain\n",
+	};
+	expect_order(lines, sizeof(lines) / sizeof(lines[0]));
+	contained_and_freed();
+	/* the same with no COMPLETED: the count before the snapshot, no stats request on the failure path */
+	c2_reset(); C.ci_repeat = 3; C.scan_mode = 3;
+	CHECK(run() == 1, "C2b no COMPLETED accepted");
+	static const char *const timeout[] = {
+		"FUXI WLAN: W23 timeout scan COMPLETED (8750 ms); report, contain, no retry\n",
+		"FUXI WLAN: W24 scan summary ",
+		"FUXI WLAN: W23 chan-info lines suppressed 63 (cap 128)\n",
+		"FUXI WLAN: W20 snapshot scan COMPLETED: ",
+		"FUXI WLAN: W23 failure: scan COMPLETED; contain, no retry\n",
+	};
+	expect_order(timeout, sizeof(timeout) / sizeof(timeout[0]));
+	CHECK(fw_stats_req == 0, "REQUEST_STATS after a scan timeout");
+	expect_not("W23 stats");
+	contained_and_freed();
+	expect("FUXI WLAN: W23 contain: STOP_SCAN sent (best effort)");
+	/* a failed poll in the scan wait (the guard, after the last FOREIGN_CHAN): the count still printed, after the
+	 * failure; and the same in the stats wait */
+	c2_reset(); C.ci_repeat = 3; C.on_line = 3;
+	CHECK(run() == 1, "C2b guard failure in the scan wait accepted");
+	static const char *const pollfail[] = {
+		"FUXI WLAN: W23 scan foreign freq 5825\n",
+		"FUXI WLAN: W23 failure: AMSS/M0, ownership, discovery or access/SMMU fault; contain, no retry\n",
+		"FUXI WLAN: W23 chan-info lines suppressed 58 (cap 128)\n",
+	};
+	expect_order(pollfail, sizeof(pollfail) / sizeof(pollfail[0]));
+	CHECK(wl_scan.ci_seen == 186 && fw_stats_req == 0, "186 CHAN_INFO before the guard failure");
+	contained_and_freed();
+	c2_reset(); C.ci_repeat = 3; C.guard_on_stats = true;
+	CHECK(run() == 1, "C2b guard failure in the stats wait accepted");
+	static const char *const statsfail[] = {
+		"FUXI WLAN: W23 stats request pdev-stat pdev 1 bands 0x1 vdev 0 sent\n",
+		"FUXI WLAN: W23 failure: AMSS/M0, ownership, discovery or access/SMMU fault; contain, no retry\n",
+		"FUXI WLAN: W23 chan-info lines suppressed 63 (cap 128)\n",
+	};
+	expect_order(statsfail, sizeof(statsfail) / sizeof(statsfail[0]));
+	contained_and_freed();
+	puts("C2b CHAN_INFO cap: 191 events (one with flags 0x2), 128 lines, 63 counted before W23 complete or before the "
+	     "COMPLETED-timeout snapshot (no stats request there), and after a failed poll in the scan wait (58) and in the "
+	     "stats wait (63)");
+}
+
 static void
 dump_c2(void)
 {
@@ -1790,6 +2369,8 @@ dump_c2(void)
 	for (uint32_t i = 0; i < len / 4; i++) { fprintf(stdout, "nss %u %u\n", i, g32(out + 4 * i)); }
 	wlhtt_version_req(out);
 	fprintf(stdout, "htt 0 %u\nhtt 1 %u\n", g32(out), g32(out + 4));
+	CHECK(wlwmi_encode_stats_req(1, out, sizeof(out), &len) == 0, "dump stats");  /* C2b, pdev 1 */
+	for (uint32_t i = 0; i < len / 4; i++) { fprintf(stdout, "stats %u %u\n", i, g32(out + 4 * i)); }
 	fflush(stdout);
 }
 
@@ -1842,6 +2423,10 @@ main(int argc, char **argv)
 	s_scan_full();
 	s_scan_failures();
 	s_scan_quiet();
+	s_c2b_pure();
+	s_c2b_stats();
+	s_c2b_stats_failures();
+	s_c2b_cap();
 	reset();
 	puts("W20 model: all scenarios passed");
 	return 0;

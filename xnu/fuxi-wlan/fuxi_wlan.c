@@ -31,7 +31,8 @@
  *   fuxiwlanqrtr=6  W20-W22: W15, then copy engines, HTC and WMI init to WMI READY (needs
  *                 fuxiwlan=28 or 1; not with keep/stop22); any other value outside 0..7 is refused
  *   fuxiwlanqrtr=7  W23/W24: all of 6, then the 38-channel passive list, a station vdev and one
- *                 passive scan; logs SSIDs and OUI-only BSSIDs; nothing is transmitted (same needs)
+ *                 passive scan; logs SSIDs and OUI-only BSSIDs; nothing is transmitted (same needs);
+ *                 C2b: a line per CHAN_INFO and a pdev stats request per PHY pdev after the scan
  *   fuxiwlanw15=1  W15 only (qrtr 5..7): omit WLAN_CFG shadow-v3 TLV (default 0); W20 then
  *                 publishes CE pointers to R2 through the window
  *   fuxiwlanw16=N  qrtr=5..7 only: 1 larger IPCR, 2 doorbell redrive, 3 both,
@@ -4747,7 +4748,8 @@ wl14_download(const char *name, struct wl_dma *d, unsigned stage)
  * 868-960): CE init, HTC init, RX post, HTC READY, HTT and WMI connect,
  * SETUP_COMPLETE_EX, SERVICE_READY (+ EXT, EXT2), INIT, READY, HW mode DBS;
  * the data path, regulatory and the HTT version request are skipped.
- * With qrtr 7 (C2) the W23/W24 scan stage below follows W22.
+ * With qrtr 7 (C2) the W23/W24 scan stage below follows W22, with the C2b
+ * diagnostics (CHAN_INFO lines, pdev stats requests) inside it.
  * Per-field provenance and every log line: docs-lanes/wlan-w20.md. */
 static struct wlce wl_ce;
 static struct wlhtc wl_htc;
@@ -4761,6 +4763,11 @@ static unsigned wl_ce_waited, wl_ce_need_eid, wl_ce_need_len, wl_ce_tx_pipe, wl_
 static struct wlscan wl_scan;
 static bool wl23_scan_sent, wl23_htt_seen, wl23_guard_bad;
 static unsigned wl23_lines, wl23_pdev, wl23_htt_major, wl23_htt_minor, wl23_rssi_conv;
+/* C2b: the pdev stats answer (wl23_stats) and the CHAN_INFO detail lines,
+ * WL23_CI_LINES at most, the rest counted (wl23_ci_line, wl23_ci_flush). */
+#define WL23_CI_LINES 128u
+static struct wlstats wl_stats;
+static unsigned wl23_ci_lines, wl23_ci_drop;
 
 /* One CE register access through the dynamic window: the wl_soc_write
  * discipline without its per-access log line (pci.c:163-182, 1201-1285;
@@ -4913,7 +4920,7 @@ wl_ce_init_rings(void)
 }
 
 enum { WL20_W_CTL, WL20_W_TX, WL20_W_CREDITS, WL20_W_SVC, WL20_W_AVAIL, WL20_W_EXT, WL20_W_EXT2, WL20_W_READY, WL20_W_NONE,
-    WL23_W_HTT, WL23_W_STARTED };
+    WL23_W_HTT, WL23_W_STARTED, WL23_W_STATS };
 
 static bool
 wl_ce_done(unsigned what)
@@ -4929,25 +4936,53 @@ wl_ce_done(unsigned what)
 	case WL20_W_READY: return wl_wmi.got_ready;
 	case WL23_W_HTT: return wl23_htt_seen;
 	case WL23_W_STARTED: return wl_scan.started || wl_scan.start_failed;
+	case WL23_W_STATS: return wl_stats.have;
 	default: return false;
 	}
+}
+
+/* C2b: one line per CHAN_INFO the scan parser took, the words of struct
+ * wmi_chan_info_event as received (wmi.h:4586-4601). L19 builds the survey
+ * from a START_RESP's cycle_count and rx_clear_count alone (time = cycle /
+ * (mac_clk_mhz x 1000) ms, busy likewise) and only notes an END_RESP
+ * (wmi.c:7514-7561); what the firmware puts in each is for the log to show,
+ * so START and END are printed raw, no delta. One printf per line (the
+ * scan prints up to 128 of them); other flags values in hex. WL23_CI_LINES
+ * lines at most, the rest counted for wl23_ci_flush. */
+static void
+wl23_ci_line(void)
+{
+	const uint32_t *c = wl_scan.ci;
+	uint32_t fl = c[WLWMI_CI_CMD_FLAGS];
+	char odd[12];
+	const char *fs = fl == WLWMI_CHAN_INFO_END_RESP ? "END" : fl == WLWMI_CHAN_INFO_START_RESP ? "START" : odd;
+	if (wl23_ci_lines >= WL23_CI_LINES) { wl23_ci_drop++; return; }
+	wl23_ci_lines++;
+	if (fs == odd) { snprintf(odd, sizeof(odd), "%#x", fl); }
+	printf("FUXI WLAN: W23 chan-info freq %u flags %s nf %d rx-clear %u cycle %u rx-frame %u tx-frame %u my-bss-rx %u mac-clk %u\n",
+	    c[WLWMI_CI_FREQ], fs, (int)c[WLWMI_CI_NOISE_FLOOR],
+	    c[WLWMI_CI_RX_CLEAR_COUNT], c[WLWMI_CI_CYCLE_COUNT], c[WLWMI_CI_RX_FRAME_COUNT], c[WLWMI_CI_TX_FRAME_CNT],
+	    c[WLWMI_CI_MY_BSS_RX_CYCLE_COUNT], c[WLWMI_CI_MAC_CLK_MHZ]);
 }
 
 /* WMI events: the handled ones fill wl_wmi; the rest are logged by id and
  * length (16 lines at most; with qrtr 7 the first 0x402b also past that)
  * and never fail the run. In the W23 scan stage
  * SCAN, CHAN_INFO and MGMT_RX feed wl_scan; each new foreign channel gets a
- * line (64 at most). */
+ * line (64 at most), each CHAN_INFO a C2b detail line. In the C2b stats wait
+ * UPDATE_STATS feeds wl_stats and gets no line of its own here. */
 static int
 wl_ce_wmi_rx(void *ctx, const uint8_t *msg, uint32_t len)
 {
-	uint32_t id = 0, foreign = wl_scan.foreign;
+	uint32_t id = 0, foreign = wl_scan.foreign, ci = wl_scan.ci_seen;
 	(void)ctx;
 	if (wlwmi_rx(&wl_wmi, msg, len, &id)) { return 1; }
 	if (wl_wmi.scan && wlscan_known(id)) {
 		if (wl_scan.foreign != foreign && wl23_lines++ < 64) { printf("FUXI WLAN: W23 scan foreign freq %u\n", wl_scan.ev_freq); }
+		if (wl_scan.ci_seen != ci) { wl23_ci_line(); }
 		return 0;
 	}
+	if (wl_wmi.stats && wlstats_known(id)) { return 0; }
 	if (!wlwmi_known(id)) {
 		/* C2: L19 moves its MGMT_RX noise floor on 0x402b (wmi.c:9740-9796,
 		 * 7183-7187); C2 keeps -95, counts it and logs the first past the cap. */
@@ -5122,6 +5157,162 @@ wl24_report(void)
 	    wl_scan.other_mgmt, wl_scan.ie_truncated, (int)wl_scan.noise_floor, wl23_rssi_conv);
 }
 
+/* ---- C2b (fuxiwlanqrtr=7): CHAN_INFO detail and the pdev stats requests ----
+ * Diagnostics on top of C2, no knob of their own (docs-lanes/wlan-w20.md, C2b):
+ * every CHAN_INFO gets a line (wl23_ci_line) and, after COMPLETED, one
+ * WMI_REQUEST_STATS per pdev id of the preferred hw mode's PHYs (at most two,
+ * one after the other) asks for pdev stats as L19's debugfs pdev_stats reader
+ * does (debugfs.c:1388-1410, mac.c:5069-5115); with a vif up L19 would name
+ * the pdev of that band (mac.c:967-1009), so with DBS each MAC is asked.
+ * Host to firmware only, through the C1 rings and writers; nothing on the
+ * air. Bounded: credits 3000 ms and the TX drain 1000 ms (wl_ce_send's
+ * bounds), UPDATE_STATS 500 ms (L19: 1 s, then 3 s), per request. A refusal,
+ * a timeout or an unusable event is logged and the run goes on to
+ * containment; a failed poll or a CE/HTC fault in the send (the transport,
+ * as in every W20..W23 wait and wl_ce_send) ends it. No vdev stats: L19
+ * completes those only for started vdevs (wmi.c:8443-8470) and the C2 vdev
+ * is never started.
+ * Adapted from Linux ath12k wmi.c, mac.c and debugfs.c (BSD-3-Clause-Clear),
+ * v6.19; notice in bsd/dev/fuxi_wlan_ce.h. */
+
+/* Poll every 1 ms until WHAT holds, at most MS ms. Unlike wl_ce_wait a
+ * timeout neither snapshots nor fails the run. 0 = done (after *TOOK ms),
+ * 1 = the poll failed (already contained), 2 = timed out. */
+static int
+wl23_poll_for(unsigned what, unsigned ms, unsigned *took)
+{
+	for (unsigned t = 0; t <= ms; t++) {
+		if (wl_ce_poll()) { return 1; }
+		if (wl_ce_done(what)) { *took = t; return 0; }
+		if (t < ms) { wl_sleep(1); }
+	}
+	*took = ms;
+	return 2;
+}
+
+/* The messages the contain line counts: TX posted on CE0/CE3/CE4, RX reaped
+ * on CE1/CE2 (each reaped buffer is posted again). */
+static unsigned wl23_ce_tx(void) { return wl_ce.pipe[0].posted + wl_ce.pipe[3].posted + wl_ce.pipe[4].posted; }
+static unsigned wl23_ce_rx(void) { return wl_ce.pipe[1].reaped + wl_ce.pipe[2].reaped; }
+
+static void
+wl23_ci_flush(void)
+{
+	if (wl23_ci_drop) { printf("FUXI WLAN: W23 chan-info lines suppressed %u (cap %u)\n", wl23_ci_drop, WL23_CI_LINES); }
+	wl23_ci_drop = 0;
+}
+
+/* The pdev entry as L19's debugfs dump prints it (wmi.c:7893-8031, field
+ * names of struct ath12k_wmi_pdev_stats_params): the event's counts, then
+ * base, rx and tx, two lines each. The console keeps at most 255 bytes of a
+ * line, newline included (serial_general.c:159-188 without drain_uart_sync),
+ * so no line here can pass 254 bytes even with every field at its widest
+ * (the host test computes it). */
+static void
+wl23_stats_report(unsigned took, unsigned tx0, unsigned rx0)
+{
+	const uint32_t *s = wl_stats.w, *e = wl_stats.ev;
+	printf("FUXI WLAN: W23 stats pdev %u after %u ms (stats-id %#x pdevs %u vdevs %u bcns %u bytes %u events %u unusable %u; "
+	    "ce tx %u rx %u)\n", e[WLWMI_SE_PDEV_ID], took, e[WLWMI_SE_STATS_ID], e[WLWMI_SE_NUM_PDEV_STATS],
+	    e[WLWMI_SE_NUM_VDEV_STATS], e[WLWMI_SE_NUM_BCN_STATS], wl_stats.bytes, wl_stats.events, wl_stats.unusable,
+	    wl23_ce_tx() - tx0, wl23_ce_rx() - rx0);
+	printf("FUXI WLAN: W23 stats base chan-nf %d rx-frame %u rx-clear %u cycle %u tx-frame %u phy-err %u chan-tx-pwr %u\n",
+	    (int)s[WLWMI_PS_CHAN_NF], s[WLWMI_PS_RX_FRAME_COUNT], s[WLWMI_PS_RX_CLEAR_COUNT], s[WLWMI_PS_CYCLE_COUNT],
+	    s[WLWMI_PS_TX_FRAME_COUNT], s[WLWMI_PS_PHY_ERR_COUNT], s[WLWMI_PS_CHAN_TX_PWR]);
+	printf("FUXI WLAN: W23 stats rx1 status-rcvd %d r0-frags %d r1-frags %d r2-frags %d r3-frags %d htt-msdus %d htt-mpdus %d\n",
+	    (int)s[WLWMI_PS_STATUS_RCVD], (int)s[WLWMI_PS_R0_FRAGS], (int)s[WLWMI_PS_R1_FRAGS], (int)s[WLWMI_PS_R2_FRAGS],
+	    (int)s[WLWMI_PS_R3_FRAGS], (int)s[WLWMI_PS_HTT_MSDUS], (int)s[WLWMI_PS_HTT_MPDUS]);
+	printf("FUXI WLAN: W23 stats rx2 loc-msdus %d loc-mpdus %d oversize-amsdu %d phy-errs %d phy-err-drop %d mpdu-errs %d "
+	    "mid-ppdu-route-change %d\n", (int)s[WLWMI_PS_LOC_MSDUS], (int)s[WLWMI_PS_LOC_MPDUS], (int)s[WLWMI_PS_OVERSIZE_AMSDU],
+	    (int)s[WLWMI_PS_PHY_ERRS], (int)s[WLWMI_PS_PHY_ERR_DROP], (int)s[WLWMI_PS_MPDU_ERRS], (int)s[WLWMI_PS_MID_PPDU_ROUTE_CHANGE]);
+	printf("FUXI WLAN: W23 stats tx1 comp-queued %d comp-delivered %d msdu-enqued %d mpdu-enqued %d local-enqued %d "
+	    "local-freed %d hw-queued %d\n", (int)s[WLWMI_PS_COMP_QUEUED], (int)s[WLWMI_PS_COMP_DELIVERED],
+	    (int)s[WLWMI_PS_MSDU_ENQUED], (int)s[WLWMI_PS_MPDU_ENQUED], (int)s[WLWMI_PS_LOCAL_ENQUED], (int)s[WLWMI_PS_LOCAL_FREED],
+	    (int)s[WLWMI_PS_HW_QUEUED]);
+	printf("FUXI WLAN: W23 stats tx2 hw-reaped %d underrun %d tx-abort %d mpdus-requed %d tx-ko %u self-triggers %u "
+	    "pdev-resets %u\n", (int)s[WLWMI_PS_HW_REAPED], (int)s[WLWMI_PS_UNDERRUN], (int)s[WLWMI_PS_TX_ABORT],
+	    (int)s[WLWMI_PS_MPDUS_REQUED], s[WLWMI_PS_TX_KO], s[WLWMI_PS_SELF_TRIGGERS], s[WLWMI_PS_PDEV_RESETS]);
+}
+
+/* One REQUEST_STATS (PDEV_STAT, vdev 0, PDEV) the way wl_ce_send sends
+ * (credits, frame, slot, publish, drain), then up to 500 ms for a usable
+ * UPDATE_STATS. The waits are bounded and their timeouts are not fatal; a
+ * CE or HTC fault in the send is (wl_ce_fail, as wl_ce_send). Each ending
+ * line carries the CE messages of the exchange (ce tx / rx), so the contain
+ * line's counts reconcile with the C2 run's. 0 = over (answered or not),
+ * 1 = a poll or the send failed (already contained), 2 = not sent or its TX
+ * not drained (no further request). */
+static int
+wl23_stats_pdev(uint32_t pdev, uint32_t bands)
+{
+	static uint8_t cmd[WLWMI_REQUEST_STATS_TOTAL], frame[WLCE_BUF];
+	const uint32_t eid = wl_htc.wmi_eid;
+	const unsigned tx0 = wl23_ce_tx(), rx0 = wl23_ce_rx();
+	const char *why = NULL;
+	uint32_t len = 0, total = 0;
+	unsigned took = 0;
+	int r = 0;
+	bzero(&wl_stats, sizeof(wl_stats));
+	wl_wmi.stats = &wl_stats;
+	if (wlwmi_encode_stats_req(pdev, cmd, sizeof(cmd), &len)) {
+		why = "encode bounds";
+	} else if (!wlhtc_has_credits(&wl_htc, eid, WLHTC_HDR + len)) {
+		wl_ce_need_eid = eid; wl_ce_need_len = WLHTC_HDR + len;
+		printf("FUXI WLAN: W23 stats request waits for %u HTC credits (has %d)\n",
+		    wlhtc_credits_needed(&wl_htc, WLHTC_HDR + len), wl_htc.ep[eid].credits);
+		r = wl23_poll_for(WL20_W_CREDITS, 3000, &took);  /* wl_ce_send's credit bound (wmi.c:435-456) */
+		if (r == 1) { return 1; }
+		if (r == 2) { why = "no HTC credits after 3000 ms"; }
+	}
+	if (why) {
+		printf("FUXI WLAN: W23 stats request pdev-stat pdev %u bands %#x not sent: %s (ce tx %u rx %u); continue to containment\n",
+		    pdev, bands, why, wl23_ce_tx() - tx0, wl23_ce_rx() - rx0);
+		return 2;
+	}
+	wl_ce_tx_pipe = wl_htc.ep[eid].ul_pipe;
+	if (wlhtc_frame(&wl_htc, eid, cmd, len, frame, sizeof(frame), &total) || wlhtc_take_credits(&wl_htc, eid, total) ||
+	    wlce_send(&wl_ce, &wl_ce_io, &wl_ce.pipe[wl_ce_tx_pipe], eid, frame, total)) { return wl_ce_fail("WMI REQUEST_STATS"); }
+	printf("FUXI WLAN: W23 stats request pdev-stat pdev %u bands %#x vdev 0 sent\n", pdev, bands);
+	r = wl23_poll_for(WL20_W_TX, 1000, &took);
+	if (r == 1) { return 1; }
+	if (r == 2) {
+		printf("FUXI WLAN: W23 stats request TX not drained after 1000 ms (ce tx %u rx %u); continue to containment\n",
+		    wl23_ce_tx() - tx0, wl23_ce_rx() - rx0);
+		if (wl_stats.have) { wl23_stats_report(took, tx0, rx0); }  /* answered meanwhile: already parsed and bounded */
+		return 2;
+	}
+	r = wl23_poll_for(WL23_W_STATS, 500, &took);
+	if (r == 1) { return 1; }
+	if (r == 2) {
+		printf("FUXI WLAN: W23 stats pdev %u no usable UPDATE_STATS in 500 ms (events %u unusable %u%s%s; ce tx %u rx %u)\n",
+		    pdev, wl_stats.events, wl_stats.unusable, wl_stats.why ? ", last: " : "", wl_stats.why ? wl_stats.why : "",
+		    wl23_ce_tx() - tx0, wl23_ce_rx() - rx0);
+		return 0;
+	}
+	wl23_stats_report(took, tx0, rx0);
+	return 0;
+}
+
+/* After COMPLETED: a request per pdev id of the preferred hw mode's PHYs
+ * (none kept: L19's zeroed fw_pdev[0], pdev 0), the next only after an
+ * exchange that went out and drained; then what the scan parser took
+ * meanwhile (wl_wmi.scan stays attached: a late MGMT_RX, CHAN_INFO or scan
+ * event is counted here, the W24 lines are not printed again). 1 = a poll
+ * or the send failed (already contained). */
+static int
+wl23_stats(void)
+{
+	const uint32_t mgmt = wl_scan.mgmt, frames = wl_scan.frames, nbss = wl_scan.nbss, events = wl_scan.events,
+	    ci = wl_scan.ci_seen, other = wl_wmi.unknown_events, n = wl_wmi.phy_pdevs ? wl_wmi.phy_pdevs : 1u;
+	int r = 0;
+	for (uint32_t i = 0; i < n && r == 0; i++) { r = wl23_stats_pdev(wl_wmi.phy_pdev[i], wl_wmi.phy_pdev_bands[i]); }
+	if (r == 1) { return 1; }
+	printf("FUXI WLAN: W23 stats after-scan wmi mgmt-rx +%u frames +%u bss +%u scan-events +%u chan-info +%u other +%u\n",
+	    wl_scan.mgmt - mgmt, wl_scan.frames - frames, wl_scan.nbss - nbss, wl_scan.events - events, wl_scan.ci_seen - ci,
+	    wl_wmi.unknown_events - other);
+	return 0;
+}
+
 static int
 wl_w23_run(void)
 {
@@ -5134,6 +5325,7 @@ wl_w23_run(void)
 	wl_wmi.scan = &wl_scan;
 	wl23_scan_sent = wl23_htt_seen = false;
 	wl23_lines = 0;
+	wl23_ci_lines = wl23_ci_drop = 0;  /* C2b */
 	/* L19 sends pdev 0 for a single-pdev chip such as WCN7850 (wmi.c:4688-4691;
 	 * reg.c:178, mac.c:9740, 4894 read it); w20 0x80 takes the EXT MAC/PHY pdev. */
 	wl23_pdev = (wl20_bits & WL20_PDEVCAP) ? wl_wmi.pdev_id : 0u;
@@ -5190,7 +5382,7 @@ wl_w23_run(void)
 	printf("FUXI WLAN: W23 scan start id %#x vdev 0 channels %u passive dwell %u ms max %u ms events %#x flags %#x\n",
 	    WLWMI_SCAN_ID, n, WLSCAN_DWELL_PASSIVE, max_ms, WLSCAN_EVENTS, WLSCAN_FLAGS);
 	/* L19 waits 1 s for STARTED (mac.c:5046-5053) */
-	if (wl_ce_send(eid, cmd, len, "WMI START_SCAN") || wl_ce_wait(WL23_W_STARTED, 1000, "scan STARTED")) { return 1; }
+	if (wl_ce_send(eid, cmd, len, "WMI START_SCAN") || wl_ce_wait(WL23_W_STARTED, 1000, "scan STARTED")) { wl23_ci_flush(); return 1; }
 	if (wl_scan.start_failed) {
 		printf("FUXI WLAN: W23 scan START_FAILED reason %u (ladder: w20 0x80, then 0x10, then 0x40)\n", wl_scan.reason);
 		return wl_w11_fail("W23 scan START_FAILED");
@@ -5198,7 +5390,7 @@ wl_w23_run(void)
 	printf("FUXI WLAN: W23 scan started after %u ms\n", wl_ce_waited);
 	/* L19 arms its scan timeout at max_scan_time + 200 ms (mac.c:5385-5388) */
 	int w = wl23_wait_done(max_ms + 200u, &took);
-	if (w == 1) { return 1; }
+	if (w == 1) { wl23_ci_flush(); return 1; }
 	if (w == 0) {
 		printf("FUXI WLAN: W23 scan completed reason %u after %u ms (foreign %u chan-info %u%s)\n", wl_scan.reason, took,
 		    wl_scan.foreign, wl_scan.ci_start, wl_scan.dequeued ? ", dequeued" : "");
@@ -5207,12 +5399,16 @@ wl_w23_run(void)
 	}
 	wl24_report();
 	if (w == 2) {
+		wl23_ci_flush();
 		wl_ce_snapshot("scan COMPLETED");
 		return wl_w11_fail("scan COMPLETED");
 	}
 	if (!wl_scan.frames) {
-		printf("FUXI WLAN: W24 no beacon or probe response heard (chan-info %u); next rung W24b = w20 0x02\n", wl_scan.ci_start);
+		printf("FUXI WLAN: W24 no beacon or probe response heard (chan-info %u); next rung %s\n", wl_scan.ci_start,
+		    (wl20_bits & WL20_HTTVER) ? "C2c = RX data path" : "W24b = w20 0x02");
 	}
+	if (wl23_stats()) { wl23_ci_flush(); return 1; }  /* C2b: only the transport ends the run here */
+	wl23_ci_flush();
 	printf("FUXI WLAN: W23 complete; stop/contain\n");
 	return 0;
 }

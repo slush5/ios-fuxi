@@ -21,6 +21,14 @@ command word (channel list, VDEV_CREATE, NSS, START_SCAN, STOP_SCAN, HTT
 version request), the event field offsets, the flags and the L19 code facts
 C2 relies on are derived from it again and compared with the header and the
 model's encoder dump; without the tree that part is skipped with a message.
+C2b (same qrtr 7 run): a line per CHAN_INFO and a pdev stats request per PHY
+pdev after COMPLETED. Static: the requests sit only on the COMPLETED path,
+every wait is bounded, only the transport (a failed poll, a CE/HTC fault in
+the send) can fail the run, PDEV_STAT only, the CHAN_INFO lines are capped,
+every new line fits the console (254 bytes) and carries a new prefix; L19:
+the ids, tags, sizes, every word order of the CHAN_INFO, stats event and
+pdev stats structs, the signedness each line prints, the request words, the
+target pdev rule (fw_pdev per PHY, by band) and the parse order.
 No device, no network.
 """
 from pathlib import Path
@@ -130,6 +138,160 @@ def static_checks():
     print('W23 static: scan only after W22 with qrtr 7, STOP_SCAN before the latch with no wait/poll/RX and not after a '
           'W11 guard failure, passive flags, no SSID/IE/probe words, ACTIVE and FULLBSSID outside every accepted set, '
           'BSSIDs always masked, vdev MAC = en0 K-W2 address (locally administered)')
+    static_c2b()
+
+
+def c_calls(body, name):
+    """The argument text of every call NAME(...) in BODY, up to its own closing parenthesis (literals respected: a
+    format may hold '); ')."""
+    out = []
+    for m in re.finditer(r'(?<![A-Za-z0-9_])' + name + r'\(', body):
+        i, depth = m.end(), 1
+        while depth:
+            c = body[i]
+            if c == '"':
+                i += 1
+                while body[i] != '"':
+                    i += 2 if body[i] == '\\' else 1
+            elif c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+            i += 1
+        out.append(body[m.end():i - 1])
+    return out
+
+
+def c_args(call):
+    """The top-level comma-separated arguments of a C call's argument text (string literals and brackets respected)."""
+    out, cur, depth, i = [], '', 0, 0
+    while i < len(call):
+        c = call[i]
+        if c == '"':
+            j = i + 1
+            while call[j] != '"':
+                j += 2 if call[j] == '\\' else 1
+            cur += call[i:j + 1]
+            i = j + 1
+            continue
+        if c in '([':
+            depth += 1
+        elif c in ')]':
+            depth -= 1
+        elif c == ',' and depth == 0:
+            out.append(cur.strip())
+            cur = ''
+            i += 1
+            continue
+        cur += c
+        i += 1
+    out.append(cur.strip())
+    return out
+
+
+def static_c2b():
+    """C2b: where the diagnostics sit and what they may not do."""
+    w23 = between(DRIVER, 'static int\nwl_w23_run(void)\n{', '\n}\n')
+    # The stats exchanges only on the COMPLETED path: after the W24 report and the no-frames line, before W23 complete;
+    # the COMPLETED timeout only flushes the CHAN_INFO count; every failed wait from START_SCAN on flushes it too.
+    timeout_path = w23.split('if (w == 2) {', 1)[1].split('\n\t}\n', 1)[0]
+    assert 'wl23_stats' not in timeout_path and 'wl23_ci_flush();' in timeout_path, timeout_path
+    call = 'if (wl23_stats()) { wl23_ci_flush(); return 1; }'
+    assert DRIVER.count('wl23_stats()') == 1 and w23.count(call) == 1
+    # the hint names W24b only while w20 0x02 is off; r1c2b ran 0x02 and still heard nothing
+    assert '(wl20_bits & WL20_HTTVER) ? "C2c = RX data path" : "W24b = w20 0x02"' in w23
+    assert w23.index('next rung %s') < w23.index(call) < \
+        w23.index('wl23_ci_flush();\n\tprintf("FUXI WLAN: W23 complete; stop/contain\\n");')
+    assert 'wl_ce_wait(WL23_W_STARTED, 1000, "scan STARTED")) { wl23_ci_flush(); return 1; }' in w23
+    assert 'if (w == 1) { wl23_ci_flush(); return 1; }' in w23
+    strip = lambda s: re.sub(r'/\*.*?\*/', '', s, flags=re.S)  # noqa: E731
+    one = strip(between(DRIVER, 'static int\nwl23_stats_pdev(uint32_t pdev, uint32_t bands)\n{', '\n}\n'))
+    loop = strip(between(DRIVER, 'static int\nwl23_stats(void)\n{', '\n}\n'))
+    # Only the transport fails the run: 1 right after a failed poll, or wl_ce_fail when the CE/HTC send itself fails,
+    # exactly as wl_ce_send; no failing wait, other send, fail or snapshot helper.
+    for bad in ('wl_ce_wait', 'wl_ce_send', 'wl_w11_fail', 'wl23_words', 'wl_ce_snapshot', 'wl_w11_'):
+        assert bad not in one and bad not in loop, bad
+    assert 'wl_ce_fail' not in loop and one.count('wl_ce_fail(') == 1
+    assert re.search(r'if \(wlhtc_frame\(&wl_htc, eid, cmd, len, frame, sizeof\(frame\), &total\) \|\| '
+                     r'wlhtc_take_credits\(&wl_htc, eid, total\) \|\|\s+wlce_send\(&wl_ce, &wl_ce_io, '
+                     r'&wl_ce\.pipe\[wl_ce_tx_pipe\], eid, frame, total\)\) \{ return wl_ce_fail\("WMI REQUEST_STATS"\); \}',
+                     one)
+    send = between(DRIVER, 'static int\nwl_ce_send(uint32_t eid, const uint8_t *payload, uint32_t len, const char *what)\n{',
+                   '\n}\n')
+    assert 'wlce_send(&wl_ce, &wl_ce_io, &wl_ce.pipe[wl_ce_tx_pipe], eid, frame, total)) { return wl_ce_fail(what); }' in send
+    assert one.count('return 1;') == 3 and one.count('if (r == 1) { return 1; }') == 3
+    assert loop.count('return 1;') == 1 and 'if (r == 1) { return 1; }' in loop
+    # Bounded: wl_ce_send's credit and TX drain bounds, 500 ms for UPDATE_STATS, all through the 1 ms poll loop, per
+    # request; at most two requests (the pdev ids kept), the next only after one that went out and drained (0).
+    assert 'wl23_poll_for(WL20_W_CREDITS, 3000, &took)' in one and 'wl23_poll_for(WL20_W_TX, 1000, &took)' in one
+    assert 'wl23_poll_for(WL23_W_STATS, 500, &took)' in one and one.count('wl23_poll_for(') == 3
+    assert 'wl23_poll_for(' not in loop
+    assert 'for (uint32_t i = 0; i < n && r == 0; i++) { r = wl23_stats_pdev(wl_wmi.phy_pdev[i], wl_wmi.phy_pdev_bands[i]); }' \
+        in loop and 'n = wl_wmi.phy_pdevs ? wl_wmi.phy_pdevs : 1u' in loop
+    assert one.count('return 2;') == 2 and one.count('return 0;') == 2
+    assert 'uint32_t phy_pdev[2], phy_pdev_bands[2], phy_pdevs;' in HEADER
+    ext = between(HEADER, 'static inline int\nwlwmi_parse_ext(', '\n}\n')
+    assert 'if (k >= first && k - first < nphy) {' in ext and 'if (j < 2u) {' in ext
+    poll = between(DRIVER, 'static int\nwl23_poll_for(unsigned what, unsigned ms, unsigned *took)\n{', '\n}\n')
+    assert 'for (unsigned t = 0; t <= ms; t++) {' in poll and 'if (t < ms) { wl_sleep(1); }' in poll and 'wl_ce_poll()' in poll
+    assert 'printf' not in poll and 'wl_w11_' not in poll
+    # PDEV_STAT only (no vdev stats), the target pdevs of L19's debugfs reader, through the C1 send path.
+    assert 'wlwmi_encode_stats_req(pdev, cmd, sizeof(cmd), &len)' in one
+    enc = between(HEADER, 'static inline int\nwlwmi_encode_stats_req(', '\n}\n')
+    assert '{ WLWMI_REQUEST_PDEV_STAT, 0, 0, 0, pdev }' in enc and 'VDEV' not in enc
+    # The parser cannot fail WMI: void, and wlwmi_rx returns 0 after it.
+    assert 'static inline void\nwlstats_parse(' in HEADER
+    assert 'if (wmi->stats && wlstats_known(*id)) { wlstats_parse(wmi->stats, p, len - 4); return 0; }' in HEADER
+    # CHAN_INFO lines: one per well-formed event, 2 x 64 at most, the rest counted; UPDATE_STATS gets no unknown line.
+    assert '#define WL23_CI_LINES 128u' in DRIVER
+    ci = between(DRIVER, 'static void\nwl23_ci_line(void)\n{', '\n}\n')
+    assert ci.index('if (wl23_ci_lines >= WL23_CI_LINES) { wl23_ci_drop++; return; }') < ci.index('printf')
+    rx = between(DRIVER, 'static int\nwl_ce_wmi_rx(void *ctx, const uint8_t *msg, uint32_t len)\n{', '\n}\n')
+    assert 'if (wl_scan.ci_seen != ci) { wl23_ci_line(); }' in rx
+    assert rx.index('if (wl_wmi.stats && wlstats_known(id)) { return 0; }') < rx.index('if (!wlwmi_known(id)) {')
+    longest = c2b_line_bounds()
+    print('C2b static: stats requests only on the COMPLETED path, waits bounded (credits 3000, TX 1000, UPDATE_STATS 500 ms '
+          'per request, at most two), only the transport fails the run (a failed poll; a CE/HTC send fault as wl_ce_send), '
+          'PDEV_STAT with the PHY pdevs through the C1 send path, a void parser, CHAN_INFO lines capped at 128 and counted '
+          f'(also after a failed wait), every new line with a new prefix and at most {longest} of 254 bytes')
+
+
+def c2b_line_bounds():
+    """Every C2b printf fits the console line: XNU keeps at most 255 bytes of a printf line, newline included, and
+    drops the rest with the newline when drain_uart_sync is off (osfmk/console/serial_general.c:159-188,
+    SERIAL_CONS_BUF_SIZE 256), so each line's worst case (10 bytes per %u or %#x, 11 per %d, the longest string a %s
+    can get) must be 254 or less; and every line starts with one of the two new prefixes (the qrtr 7 rule)."""
+    fns = ('static void\nwl23_ci_line(void)\n{', 'static void\nwl23_ci_flush(void)\n{',
+           'static void\nwl23_stats_report(unsigned took, unsigned tx0, unsigned rx0)\n{',
+           'static int\nwl23_stats_pdev(uint32_t pdev, uint32_t bands)\n{', 'static int\nwl23_stats(void)\n{')
+    parse = between(HEADER, 'static inline void\nwlstats_parse(', '\n}\n')
+    one = between(DRIVER, fns[3], '\n}\n')
+    reasons = re.findall(r'why = (?:ev \? )?"([^"]*)"(?: : "([^"]*)")?;', parse)
+    reasons = [r for pair in reasons for r in pair if r]
+    assert len(reasons) == 6, reasons
+    widths = {
+        'fs': max(len('START'), len('END'), len('0xffffffff')),  # or the %#x of the 32-bit flags word
+        'why': max(len(r) for r in re.findall(r'why = "([^"]*)";', one)),
+        'wl_stats.why ? ", last: " : ""': len(', last: '),
+        'wl_stats.why ? wl_stats.why : ""': max(len(r) for r in reasons),
+    }
+    longest = n = 0
+    for fn in fns:
+        body = between(DRIVER, fn, '\n}\n')
+        for call in c_calls(body, 'printf'):
+            args = c_args(call)
+            fmt = ''.join(re.findall(r'"((?:[^"\\]|\\.)*)"', args[0])).replace('\\n', '\n')
+            assert fmt.startswith(('FUXI WLAN: W23 chan-info ', 'FUXI WLAN: W23 stats ')) and fmt.endswith('\n'), fmt
+            specs = re.findall(r'%#?[a-z]', fmt)
+            assert len(specs) == len(args) - 1, (fmt, args)
+            worst = len(fmt) - 1 - sum(len(s) for s in specs)
+            for spec, arg in zip(specs, args[1:]):
+                worst += {'%u': 10, '%#x': 10, '%d': 11}[spec] if spec != '%s' else widths[arg]
+            assert worst <= 254, (worst, fmt)
+            longest = max(longest, worst)
+            n += 1
+    assert n == 14, n
+    return longest
 
 
 def header_define(name):
@@ -192,7 +354,7 @@ def l19_checks(model, c2dump):
     # Wire struct sizes, nested structs and array sizes resolved from the headers (ETH_ALEN is 6).
     consts = {'ETH_ALEN': 6}
     for k in ('HW_BD_INFO_SIZE', 'WMI_SERVICE_SEGMENT_BM_SIZE32', 'WMI_IE_BITMAP_SIZE', 'ATH_MAX_ANTENNA',
-              'ATH12K_WMI_SSID_LEN'):
+              'ATH12K_WMI_SSID_LEN', 'WLAN_MAX_AC', 'MAX_TX_RATE_VALUES'):
         consts[k] = int(re.search(r'#define ' + k + r'\s+(\d+)', wmi_h)[1])
 
     def struct_fields(name, text=wmi_h):
@@ -596,6 +758,121 @@ def l19_c2(vals, ev, struct_fields, size, word_names, wmi_h, wmi_c, dump):
           'channel list (array header 4 short as L19), VDEV_CREATE, NSS, START_SCAN (init values, priority 0, passive), '
           'STOP_SCAN and the HTT version request; single-pdev pdev 0, preferred hw mode and its PHYs, STA follow-up '
           'order, MGMT_RX drop rules, noise floor')
+    l19_c2b(vals, define, struct_fields, size, word_names, tlv, wmi_h, wmi_c, mac_c, words)
+
+
+def l19_c2b(vals, define, struct_fields, size, word_names, tlv, wmi_h, wmi_c, mac_c, words):
+    """C2b: stats ids, tags, sizes, the three word orders, signedness, request words and the L19 facts it relies on."""
+    debugfs_c = l19_text('debugfs.c')
+    for ours, theirs in (('WLWMI_CMD_REQUEST_STATS', 'WMI_REQUEST_STATS_CMDID'), ('WLWMI_EV_UPDATE_STATS', 'WMI_UPDATE_STATS_EVENTID'),
+                         ('WLWMI_TAG_STATS_EVENT', 'WMI_TAG_STATS_EVENT'), ('WLWMI_TAG_REQUEST_STATS_CMD', 'WMI_TAG_REQUEST_STATS_CMD'),
+                         ('WLWMI_REQUEST_PDEV_STAT', 'WMI_REQUEST_PDEV_STAT'), ('WLWMI_TAG_ARRAY_BYTE', 'WMI_TAG_ARRAY_BYTE')):
+        assert header_define(ours) == vals[theirs], (ours, header_define(ours), theirs, vals[theirs])
+    for ours, theirs in (('WLWMI_REQUEST_STATS_BYTES', 'wmi_request_stats_cmd'), ('WLWMI_STATS_EVENT_BYTES', 'wmi_stats_event'),
+                         ('WLWMI_VDEV_STATS_BYTES', 'wmi_vdev_stats_params'), ('WLWMI_BCN_STATS_BYTES', 'ath12k_wmi_bcn_stats_params'),
+                         ('WLWMI_PDEV_STATS_BYTES', 'ath12k_wmi_pdev_stats_params'), ('WLWMI_CHAN_INFO_BYTES', 'wmi_chan_info_event')):
+        assert header_define(ours) == size(theirs), (ours, header_define(ours), theirs, size(theirs))
+
+    def flat(name):  # word names, nested structs flattened
+        out = []
+        for sub, field, n, _ in struct_fields(name):
+            out += flat(sub) if sub else [field] if n == 1 else [f'{field}[{i}]' for i in range(n)]
+        return out
+    # The header's word-index enums are L19's struct fields in L19's order, name by name.
+    for prefix, struct in (('WLWMI_CI_', 'wmi_chan_info_event'), ('WLWMI_SE_', 'wmi_stats_event'),
+                           ('WLWMI_PS_', 'ath12k_wmi_pdev_stats_params')):
+        want = [prefix + f.upper() for f in flat(struct)] + [prefix + 'WORDS']
+        got = [x.strip() for x in re.search(r'enum \{\s*(' + want[0] + r',.*?)\};', HEADER, re.S)[1].split(',') if x.strip()]
+        assert got == want, (struct, [(a, b) for a, b in zip(got, want) if a != b][:3], len(got), len(want))
+    assert [sub for sub, _, _, _ in struct_fields('ath12k_wmi_pdev_stats_params')] == \
+        ['ath12k_wmi_pdev_base_stats_params', 'ath12k_wmi_pdev_tx_stats_params', 'ath12k_wmi_pdev_rx_stats_params']
+    # Signedness: every a_sle32 field printed through (int) with %d, every __le32 one as is with %u or %#x.
+    types = {}
+    for sub in ('ath12k_wmi_pdev_base_stats_params', 'ath12k_wmi_pdev_tx_stats_params', 'ath12k_wmi_pdev_rx_stats_params'):
+        body = re.search(r'struct\s+' + sub + r'\s*\{(.*?)\}\s*__packed;', wmi_h, re.S)[1]
+        types.update({f.upper(): t for t, f in re.findall(r'(a_sle32|__le32) (\w+);', body)})
+    rep = between(DRIVER, 'static void\nwl23_stats_report(unsigned took, unsigned tx0, unsigned rx0)\n{', '\n}\n')
+    printed = 0
+    for call in re.findall(r'printf\((.*?)\);', rep, re.S):
+        fmt = ''.join(re.findall(r'"((?:[^"\\]|\\.)*)"', call.split('",', 1)[0] + '"'))
+        specs = re.findall(r'%#?[a-z]', fmt)
+        args = [a.strip() for a in call.rsplit('"', 1)[1].split(',')[1:]]
+        assert len(specs) == len(args), (specs, args)
+        for spec, arg in zip(specs, args):
+            m = re.fullmatch(r'(\(int\))?s\[WLWMI_PS_(\w+)\]', arg)
+            if m:
+                printed += 1
+                assert (m[1] == '(int)') == (types[m[2]] == 'a_sle32') and (spec == '%d') == (types[m[2]] == 'a_sle32'), (spec, arg)
+    assert printed == 35, printed
+    ci = between(DRIVER, 'static void\nwl23_ci_line(void)\n{', '\n}\n')
+    assert '(int)c[WLWMI_CI_NOISE_FLOOR]' in ci  # L19 keeps it in an s8 survey field (wmi.c:7556)
+    # The request: ath12k_wmi_send_stats_request_cmd into a zeroed skb, asked as L19's debugfs pdev_stats reader asks.
+    send = fn_body(wmi_c, 'int ath12k_wmi_send_stats_request_cmd(')
+    for fact in ('cmd->tlv_header = ath12k_wmi_tlv_cmd_hdr(WMI_TAG_REQUEST_STATS_CMD,', 'cmd->stats_id = cpu_to_le32(stats_id);',
+                 'cmd->vdev_id = cpu_to_le32(vdev_id);', 'cmd->pdev_id = cpu_to_le32(pdev_id);',
+                 'ath12k_wmi_cmd_send(wmi, skb, WMI_REQUEST_STATS_CMDID)'):
+        assert fact in send, fact
+    assert 'peer_macaddr' not in send and 'memset(skb->data, 0, round_len);' in fn_body(wmi_c, 'struct sk_buff *ath12k_wmi_alloc_skb(')
+    assert re.search(r'param\.pdev_id = ath12k_mac_get_target_pdev_id\(ar\);\s+param\.vdev_id = 0;\s+'
+                     r'param\.stats_id = WMI_REQUEST_PDEV_STAT;', debugfs_c)
+    target = fn_body(mac_c, 'u8 ath12k_mac_get_target_pdev_id(')
+    assert re.search(r'if \(!ab->hw_params->single_pdev_only\)\s+return ar->pdev->pdev_id;', target)
+    assert re.search(r'if \(!arvif\)\s+return ar->ab->fw_pdev\[0\]\.pdev_id;', target)
+    # With a vif up L19 names the fw_pdev whose band matches (one per PHY, its own supported_bands): C2b asks each.
+    assert re.search(r'for \(i = 0; i < ab->fw_pdev_count; i\+\+\) \{\s+if \(ath12k_mac_band_match\(band, '
+                     r'ab->fw_pdev\[i\]\.supported_bands\)\)\s+return ab->fw_pdev\[i\]\.pdev_id;', mac_c)
+    pull = fn_body(wmi_c, 'ath12k_pull_mac_phy_cap_svc_ready_ext(')
+    assert 'fw_pdev = &ab->fw_pdev[ab->fw_pdev_count];' in pull and \
+        'fw_pdev->pdev_id = ath12k_wmi_mac_phy_get_pdev_id(mac_caps);' in pull and \
+        'fw_pdev->supported_bands = le32_to_cpu(mac_caps->supported_bands);' in pull
+    reg = fn_body(wmi_c, 'static int ath12k_wmi_ext_soc_hal_reg_caps_parse(')
+    assert reg.index('soc->num_radios = 0;') < reg.index('soc->fw_pdev_count = 0;') < reg.index('while (phy_id_map')
+    assert define('WMI_CAPS_PARAMS_PDEV_ID') == (15, 0)
+    # Waits: L19 1 s for the first event, 3 s for done (C2b 500 ms); WMI send credits 3 s (WMI_SEND_TIMEOUT_HZ).
+    fw = fn_body(mac_c, 'int ath12k_mac_get_fw_stats(')
+    assert 'wait_for_completion_timeout(&ar->fw_stats_complete, 1 * HZ)' in fw and \
+        'wait_for_completion_timeout(&ar->fw_stats_done, 3 * HZ)' in fw
+    assert re.search(r'#define WMI_SEND_TIMEOUT_HZ \(3 \* HZ\)', wmi_h)
+    # The parse: ev first (else -EPROTO), then vdev, beacon and pdev entries each bounded by what is left; no length
+    # policy for the fixed TLV (C2b requires the whole struct); single-pdev chips accept any event pdev id; the dump
+    # prints the first pdev entry; a PDEV_STAT answer completes fw_stats_done, empty vdev stats never do.
+    data = fn_body(wmi_c, 'static int ath12k_wmi_tlv_fw_stats_data_parse(')
+    assert 'if (!ev) {' in data and data.count('if (len < sizeof(*src)) {') == 3
+    assert data.index('ev->num_vdev_stats') < data.index('ev->num_bcn_stats') < data.index('ev->num_pdev_stats')
+    parse = fn_body(wmi_c, 'static int ath12k_wmi_tlv_fw_stats_parse(')
+    assert re.search(r'case WMI_TAG_STATS_EVENT:\s+parse->ev = ptr;', parse)
+    assert re.search(r'case WMI_TAG_ARRAY_BYTE:\s+ret = ath12k_wmi_tlv_fw_stats_data_parse\(ab, parse, ptr, len\);', parse)
+    policies = wmi_c.split('ath12k_wmi_tlv_policies[] = {', 1)[1].split('};', 1)[0]
+    assert '[WMI_TAG_STATS_EVENT]' not in policies and '[WMI_TAG_ARRAY_BYTE] = { .min_len = 0 }' in policies
+    assert re.search(r'if \(ab->hw_params->single_pdev_only\) \{\s+pdev = rcu_dereference\(ab->pdevs_active\[0\]\);',
+                     fn_body(mac_c, 'struct ath12k *ath12k_mac_get_ar_by_pdev_id('))
+    assert 'list_first_entry_or_null(&fw_stats->pdevs,' in fn_body(wmi_c, 'ath12k_wmi_fw_pdev_stats_dump(')
+    upd = fn_body(wmi_c, 'static void ath12k_update_stats_event(')
+    assert re.search(r'if \(stats\.stats_id == WMI_REQUEST_PDEV_STAT\) \{\s+list_splice_tail_init\(&stats\.pdevs, '
+                     r'&ar->fw_stats\.pdevs\);\s+complete\(&ar->fw_stats_done\);', upd)
+    proc = fn_body(wmi_c, 'static void ath12k_wmi_fw_stats_process(')
+    assert 'total_vdevs_started += pdev->ar->num_started_vdevs;' in proc and \
+        re.search(r'if \(list_empty\(&stats->vdevs\)\) \{\s+ath12k_warn\(ab, "empty vdev stats"\);\s+return;', proc)
+    # CHAN_INFO as L19 uses it: END only noted, START's counters taken whole (no delta, nothing kept), MAC clock in MHz.
+    ch = fn_body(wmi_c, 'static void ath12k_chan_info_event(')
+    assert re.search(r'if \(le32_to_cpu\(ch_info_ev\.cmd_flags\) == WMI_CHAN_INFO_END_RESP\) \{.*?return;', ch, re.S)
+    for fact in ('cc_freq_hz = (le32_to_cpu(ch_info_ev.mac_clk_mhz) * 1000);', 'memset(survey, 0, sizeof(*survey));',
+                 'survey->time = div_u64(le32_to_cpu(ch_info_ev.cycle_count), cc_freq_hz);'):
+        assert fact in ch, fact
+    assert 'last' not in ch and 'prev' not in ch
+    # The request words against L19's struct order and values (the model dumps pdev 1; the peer MAC words stay 0).
+    order = word_names('wmi_request_stats_cmd')
+    assert order == ['tlv_header', 'stats_id', 'vdev_id', 'peer_macaddr', 'peer_macaddr', 'pdev_id'], order
+    req = dict.fromkeys(order, 0)
+    req.update({'tlv_header': tlv('REQUEST_STATS_CMD', size('wmi_request_stats_cmd') - 4),
+                'stats_id': vals['WMI_REQUEST_PDEV_STAT'], 'pdev_id': 1})
+    want = [vals['WMI_REQUEST_STATS_CMDID']] + [req[f] for f in order]
+    assert words['stats'] == want, (words['stats'], want)
+    print('L19 re-derivation (C2b): REQUEST_STATS/UPDATE_STATS ids, tags, PDEV_STAT, five struct sizes, the CHAN_INFO, '
+          'stats event and pdev stats word orders name by name, signedness of all 35 printed pdev fields, the request '
+          'words, target pdev = fw_pdev[0] (then the band-matched fw_pdev), L19 waits, vdev/beacon/pdev parse order, no '
+          'fixed-TLV policy, CHAN_INFO '
+          'without deltas')
 
 
 def dash_check():
