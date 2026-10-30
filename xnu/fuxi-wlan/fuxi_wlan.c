@@ -28,9 +28,14 @@
  *                 align to 2^n of size, 0x40 read-only PMK8550 gpio3 sleep clock log, 0x80 also
  *                 enable it, 0x100 decode BHI error words and scan RDDM text
  *   fuxiwlanqrtr=1  W11 capability-only diagnostic; =2 W12 setup; =3 W13 small-chunk negotiation; =4 W14 downloads; =5 W15 config/mode
- *   fuxiwlanw15=1  W15 only: omit WLAN_CFG shadow-v3 TLV (default 0)
- *   fuxiwlanw16=N  qrtr=5 only: 1 larger IPCR, 2 doorbell redrive, 3 both,
+ *   fuxiwlanqrtr=6  W20-W22: W15, then copy engines, HTC and WMI init to WMI READY (needs
+ *                 fuxiwlan=28 or 1; not with keep/stop22); any other value outside 0..6 is refused
+ *   fuxiwlanw15=1  W15 only (qrtr 5/6): omit WLAN_CFG shadow-v3 TLV (default 0); W20 then
+ *                 publishes CE pointers to R2 through the window
+ *   fuxiwlanw16=N  qrtr=5/6 only: 1 larger IPCR, 2 doorbell redrive, 3 both,
  *                 4 diagnostics only; all include MODE context diagnostics
+ *   fuxiwlanw20=N  qrtr=6 only: 0x01 no HTT connect, 0x04 endpoint MRRS 128, 0x40 no
+ *                 PDEV_SET_HW_MODE; other bits refused (docs-lanes/wlan-w20.md)
  * Salami (FUXI_SALAMI, OnePlus 11, K-W1): the driver runs only when
  * fuxiwlansalami=1 is present as well; its absence or any other value refuses
  * before the thread starts, as do fuxiwlanseq with cyclerails and any invalid
@@ -95,6 +100,7 @@
 #include <vm/pmap.h>
 #include <arm/caches_internal.h>
 #include "sweet_spmi_bus.h"
+#include "fuxi_wlan_ce.h" /* W20: pure CE/HTC/WMI code (Linux ath12k v6.19, Clear BSD) */
 /* osfmk/vm/pmap.h declares these under MACH_KERNEL_PRIVATE only; bsd/ cannot
  * see them, but they are in the same kernel image (M6k fuxiwlanprobe=nc). */
 /* pexpert exposes the string-only parser under XNU_KERNEL_PRIVATE. */
@@ -833,6 +839,26 @@ static unsigned wl15_variant, wl16_variant, wl12_mlo_variant;
 static unsigned wl_rails_variant;
 static bool wl_rails_requested;
 static bool wl16_large, wl16_redrive;
+/* W20 (fuxiwlanqrtr=6, C1): after this boot's W15 MODE reply, copy engines,
+ * HTC and WMI init to WMI READY, then containment. fuxiwlanw20 bits (0 =
+ * default): 0x01 NOHTT no HTT connect; 0x04 MRRS128 endpoint Device Control
+ * max read request 128 bytes before CE init; 0x40 NOHWMODE no
+ * PDEV_SET_HW_MODE. 0x02 HTTVER, 0x10 BAND24, 0x20 FULLBSSID and 0x80 PDEV0
+ * belong to the scan stage (qrtr 7, C2) and 0x08 ACTIVE transmits: all refused
+ * here, as are qrtr 7/8 until those stages exist (raise WL20_QRTR_MAX and
+ * WL20_BITS with them). */
+#define WL20_NOHTT 0x01u
+#define WL20_HTTVER 0x02u
+#define WL20_MRRS128 0x04u
+#define WL20_ACTIVE 0x08u
+#define WL20_BAND24 0x10u
+#define WL20_FULLBSSID 0x20u
+#define WL20_NOHWMODE 0x40u
+#define WL20_PDEV0 0x80u
+#define WL20_BITS (WL20_NOHTT | WL20_MRRS128 | WL20_NOHWMODE)
+#define WL20_QRTR_MAX 6
+static bool wl_w20;
+static unsigned wl20_bits;
 /* ---- P17: opt-in WCN7850 MODE-silence probes (fuxiwlanmlo bits >= 4) ----
  * Low two bits keep the W12 meaning (1 PHY_CAP, 2 omit MLO). Bits:
  *   0x004 HOSTMEM   HOST_CAP vendor TLV 0x33 (u8 1, "host memory on demand")
@@ -968,6 +994,7 @@ static uint32_t wl_target_size[WL_TARGET_MAX], wl_target_type[WL_TARGET_MAX];
 static unsigned wl_target_n;
 static uint64_t wl_target_total;
 static struct wl_dma wl_ipcr;
+static struct wl_dma wl_ce_arena; /* W20: rdp, CE rings, TX slots, RX buffers (fuxi_wlan_ce.h layout) */
 /* W14 inputs are retained through keep/containment, including partial reads. */
 static struct wl_dma wl14_regdb, wl14_bdf, wl14_m3;
 static char wl14_bdf_name[65]; /* one extra byte detects XNU string truncation */
@@ -1126,11 +1153,12 @@ wl_probe_configure(void)
 		printf("FUXI WLAN: rails variant %d (1 early before WLAN_EN, 2 late before WLAN_MODE) valid %u\n",
 		    rails, !wl_variant_invalid);
 	}
-	int stop22 = 0, keep = 0, qrtr = 0;
+	int stop22 = 0, keep = 0, qrtr = 0, w20 = 0;
 	(void)PE_parse_boot_argn("fuxiwlanstop22", &stop22, sizeof(stop22));
 	(void)PE_parse_boot_argn("fuxiwlankeep", &keep, sizeof(keep));
 	(void)PE_parse_boot_argn("fuxiwlanqrtr", &qrtr, sizeof(qrtr));
-	wl_w15 = qrtr == 5; wl_w14 = qrtr == 4 || wl_w15; wl_w13 = qrtr == 3 || wl_w14; wl_w12 = qrtr == 2 || wl_w13; wl_qrtr = qrtr == 1 || wl_w12; wl_w11_attempted = wl_w11_ok = false;
+	wl_w20 = qrtr == 6; /* W20 runs on top of the whole W11..W15 chain */
+	wl_w15 = qrtr == 5 || wl_w20; wl_w14 = qrtr == 4 || wl_w15; wl_w13 = qrtr == 3 || wl_w14; wl_w12 = qrtr == 2 || wl_w13; wl_qrtr = qrtr == 1 || wl_w12; wl_w11_attempted = wl_w11_ok = false;
 	wl12_mlo_variant = 0; wl17_bits = 0;
 	{
 		int variant = 0;
@@ -1172,6 +1200,24 @@ wl_probe_configure(void)
 			printf("FUXI WLAN: W16 variant %d large-IPCR %u doorbell-redrive %u diagnostics %u valid %u\n",
 			    variant, wl16_large, wl16_redrive, !!wl16_variant, !wl_variant_invalid);
 		}
+	}
+	/* W20: qrtr outside 0..WL20_QRTR_MAX used to run silently without QRTR;
+	 * it is refused now, like w20 without qrtr 6, unknown w20 bits, and keep
+	 * or stop22 with qrtr 6 (no keep path exists for live copy engines). */
+	wl20_bits = 0;
+	bool w20_given = PE_parse_boot_argn("fuxiwlanw20", &w20, sizeof(w20));
+	if (qrtr < 0 || qrtr > WL20_QRTR_MAX) {
+		wl_variant_invalid = true;
+		printf("FUXI WLAN: W20 fuxiwlanqrtr=%d is not 0..%d in this build; refused\n", qrtr, WL20_QRTR_MAX);
+	}
+	if (wl_w20) {
+		if (w20 < 0 || ((unsigned)w20 & ~WL20_BITS) || stop22 == 1 || keep == 1) { wl_variant_invalid = true; }
+		else { wl20_bits = (unsigned)w20; }
+		printf("FUXI WLAN: W20 selected qrtr=%d (CE/HTC/WMI init to READY) w20 %#x valid %u\n",
+		    qrtr, (unsigned)w20, !wl_variant_invalid);
+	} else if (w20_given && w20) {
+		wl_variant_invalid = true;
+		printf("FUXI WLAN: W20 fuxiwlanw20 %#x needs fuxiwlanqrtr=6; refused\n", (unsigned)w20);
 	}
 	wl_stop22 = stop22 == 1; wl_keep = keep == 1;
 	if (wl_w14) {
@@ -1232,7 +1278,7 @@ wl_probe_configure(void)
 	if (wl_pre == 5 && retain == 1) { wl_variant_invalid = true; }
 	printf("FUXI WLAN: W10 continue=%u keep=%u (stop22=1 retains BHI diagnostics; no data channels)\n", !wl_stop22, wl_keep);
 	printf("FUXI WLAN: W11 qrtr=%u keep=%u (one conversation after AMSS/M0)\n", wl_qrtr, wl_keep);
-	if (wl_w12) { printf("FUXI WLAN: W12 selected qrtr=%u target memory cap %u bytes\n", wl_w15 ? 5 : wl_w14 ? 4 : wl_w13 ? 3 : 2, WL_TARGET_CAP); }
+	if (wl_w12) { printf("FUXI WLAN: W12 selected qrtr=%u target memory cap %u bytes\n", wl_w20 ? 6 : wl_w15 ? 5 : wl_w14 ? 4 : wl_w13 ? 3 : 2, WL_TARGET_CAP); }
 	if (wl_w13) { printf("FUXI WLAN: W13 small-chunk policy limit %u bytes; one zero-segment negotiation, aligned IOVAs\n", WL13_CHUNK_LIMIT); }
 	printf("FUXI WLAN: M6o seq mask %#x valid=%u (selectors default off)\n",
 	    wl_seq_flags, !wl_variant_invalid);
@@ -2269,7 +2315,7 @@ wl_pt_pa(unsigned table)
 static vm_offset_t
 wl_owned_alias(uint64_t pa, unsigned bytes, bool tables_only)
 {
-	struct wl_dma *bufs[] = { &wl_tables, &wl_image, &wl_vectors, &wl_contexts, &wl_rddm, &wl_rxvectors, &wl_msi_sink, &wl_amss, &wl_ipcr, &wl14_regdb, &wl14_bdf, &wl14_m3 };
+	struct wl_dma *bufs[] = { &wl_tables, &wl_image, &wl_vectors, &wl_contexts, &wl_rddm, &wl_rxvectors, &wl_msi_sink, &wl_amss, &wl_ipcr, &wl14_regdb, &wl14_bdf, &wl14_m3, &wl_ce_arena };
 	unsigned fixed = sizeof(bufs)/sizeof(bufs[0]);
 	for (unsigned i = 0; i < (tables_only ? 1u : fixed + WL_TARGET_MAX); i++) {
 		struct wl_dma *d = i < fixed ? bufs[i] : &wl_target[i-fixed];
@@ -3340,7 +3386,7 @@ static bool wl_cmd_done, wl_hello, wl_cap_sent, wl_cap_done, wl_w11_stopping;
 static unsigned wl_w11_error;
 enum { WL12_DISCOVERY, WL12_IND, WL12_HOST, WL12_REQUEST, WL12_RESPOND,
     WL12_READY, WL12_CAP, WL12_DONE, WL14_REGDB, WL14_BDF, WL14_M3, WL14_READY,
-    WL15_INI, WL15_CFG, WL15_MODE, WL15_OBSERVE };
+    WL15_INI, WL15_CFG, WL15_MODE, WL15_OBSERVE, WL20_CE, WL21_HTC, WL22_WMI };
 static unsigned wl12_stage;
 static uint16_t wl12_txn, wl12_msg;
 static bool wl12_reply, wl12_requested, wl12_ready;
@@ -3410,7 +3456,8 @@ wl16_snapshot(const char *phase)
 static int
 wl_w11_fail(const char *reason)
 {
-	if (!wl_w11_error) { printf("FUXI WLAN: %s failure: %s; contain, no retry\n", wl_w15 && wl12_stage >= WL15_INI ? "W15" : wl_w12 ? "W12" : "W11", reason); }
+	if (!wl_w11_error) { printf("FUXI WLAN: %s failure: %s; contain, no retry\n", wl12_stage == WL22_WMI ? "W22" :
+	    wl12_stage == WL21_HTC ? "W21" : wl12_stage == WL20_CE ? "W20" : wl_w15 && wl12_stage >= WL15_INI ? "W15" : wl_w12 ? "W12" : "W11", reason); }
 	wl_w11_error = 1; wl_w11_ok = false;
 	return 1;
 }
@@ -4661,6 +4708,402 @@ wl14_download(const char *name, struct wl_dma *d, unsigned stage)
 	return 0;
 }
 
+/* ---- W20: CE/HTC/WMI to WMI READY (fuxiwlanqrtr=6, C1) ----
+ * Adapted from Linux ath12k core.c, ce.c, htc.c, wmi.c and pci.c
+ * (BSD-3-Clause-Clear), v6.19; the notice and the file list are in
+ * bsd/dev/fuxi_wlan_ce.h, the pure ring/HTC/WMI code. This block is the
+ * kernel glue: the quiet windowed register access, the arena, the poll
+ * loop, logs, the failure snapshot and the containment hook. Reached only
+ * from wl_w14_run
+ * after this boot's WLAN_MODE reply. Register writes: R0/R2 of the 7 CE rings
+ * and DEST_CTRL of CE1/CE2 (wlce_reg_ok; 0x310c saved, selected, verified and
+ * restored around every access), the 7 shadow registers BAR0 0x8fc-0x998 and,
+ * with w20 0x04 only, the endpoint Device Control register. No interrupt,
+ * MSI, GIC, pdev parameter, vdev or RF activity; the W11 conversation and its
+ * device-wake doorbell stay up. L19 order after MODE (core.c:1274-1300,
+ * 868-960): CE init, HTC init, RX post, HTC READY, HTT and WMI connect,
+ * SETUP_COMPLETE_EX, SERVICE_READY (+ EXT, EXT2), INIT, READY, HW mode DBS;
+ * the data path, regulatory and the HTT version request are skipped.
+ * Per-field provenance and every log line: docs-lanes/wlan-w20.md. */
+static struct wlce wl_ce;
+static struct wlhtc wl_htc;
+static struct wlwmi wl_wmi;
+static bool wl_ce_started;
+static unsigned wl_ce_waited, wl_ce_need_eid, wl_ce_need_len, wl_ce_tx_pipe, wl_ce_logged;
+
+/* One CE register access through the dynamic window: the wl_soc_write
+ * discipline without its per-access log line (pci.c:163-182, 1201-1285;
+ * WCN7850 has no static window map, pci.c:1631-1635). */
+static int
+wl_ce_window(uint32_t off, bool wr, uint32_t *value)
+{
+	if (fw_faults || !wlce_reg_ok(off)) { return 1; }
+	uint32_t saved = wl_mrd(0x310c), win = (saved & ~0x3fu) | 0x40000000 | (off >> 19);
+	if (saved == ~0u || fw_faults) { return 1; }
+	wl_mwr(0x310c, win);
+	int e = wl_mrd(0x310c) != win || fw_faults;
+	if (!e) {
+		uint64_t pa = WL_BAR0 + 0x80000ull + (off & 0x7ffff);
+		if (wr) { wl_pwr(pa, *value); } else { *value = wl_prd(pa); }
+		e = fw_faults != 0;
+	}
+	/* Containment writes remain possible after a latched synchronous fault. */
+	if (wl_contain_wr(WL_BAR0 + 0x310c, saved) || wl_mrd(0x310c) != saved) { e = 1; }
+	return e || fw_faults;
+}
+
+static int wl_ce_io_wr(void *ctx, uint32_t off, uint32_t value) { (void)ctx; return wl_ce_window(off, true, &value); }
+static int wl_ce_io_rd(void *ctx, uint32_t off, uint32_t *value) { (void)ctx; *value = ~0u; return wl_ce_window(off, false, value); }
+
+static int
+wl_ce_io_bar_wr(void *ctx, uint32_t off, uint32_t value)
+{
+	(void)ctx;
+	if (fw_faults || off < WLCE_SHADOW_BASE || off >= WLCE_SHADOW_BASE + 4u * WLCE_SHADOW_REGS || (off & 3)) { return 1; }
+	wl_mwr(off, value);
+	return fw_faults ? 1 : 0;
+}
+
+/* dsb sy on both sides: at least L19's dma_rmb after a device pointer and its
+ * wmb/mb before a pointer publish (hal.c:2154-2162, 2194-2215). */
+static void wl_ce_wbarrier(void *ctx) { (void)ctx; __asm__ volatile("dsb sy" ::: "memory"); }
+static void wl_ce_rbarrier(void *ctx) { (void)ctx; __asm__ volatile("dsb sy" ::: "memory"); }
+static const struct wlce_io wl_ce_io = { wl_ce_io_wr, wl_ce_io_rd, wl_ce_io_bar_wr, wl_ce_wbarrier, wl_ce_rbarrier, NULL };
+
+static const char *
+wl_ce_lane(void)
+{
+	return wl12_stage == WL22_WMI ? "W22" : wl12_stage == WL21_HTC ? "W21" : "W20";
+}
+
+/* Failure evidence, RAM only: host ring pointers next to their rdp words,
+ * buffers, HTC credits and the last WMI event; then the six-read diagnostic. */
+static void
+wl_ce_snapshot(const char *stage)
+{
+	printf("FUXI WLAN: W20 snapshot %s: writes %u errors %u stopping %u why %s\n", stage, wl_ce.writes,
+	    wl_ce.errors, wl_ce.stopping, wl_ce.why ? wl_ce.why : "-");
+	for (unsigned i = 0; wl_ce.rdp && i < WLCE_NRING; i++) {
+		const struct wlce_ring *r = wl_ce.ring[i];
+		if (r) { printf("FUXI WLAN: W20 snapshot ring %u hp %u tp %u rdp %u seen %u\n", r->id, r->hp, r->tp, wl_ce.rdp[r->id], r->seen); }
+	}
+	printf("FUXI WLAN: W20 snapshot tx CE0 %u/%u CE3 %u/%u rx CE1 %u/%u CE2 %u/%u (posted/reaped)\n",
+	    wl_ce.pipe[0].posted, wl_ce.pipe[0].reaped, wl_ce.pipe[3].posted, wl_ce.pipe[3].reaped,
+	    wl_ce.pipe[1].posted, wl_ce.pipe[1].reaped, wl_ce.pipe[2].posted, wl_ce.pipe[2].reaped);
+	printf("FUXI WLAN: W20 snapshot htc ready %u size %u count %u eid:svc/credits", wl_htc.ready, wl_htc.credit_size, wl_htc.credit_count);
+	for (unsigned e = 0; e < WLHTC_EPS; e++) {
+		if (wl_htc.ep[e].used) { printf(" %u:%#x/%d", e, wl_htc.ep[e].svc, wl_htc.ep[e].credits); }
+	}
+	printf(" bad-reports %u htt-rx %u why %s\n", wl_htc.bad_reports, wl_htc.htt_rx, wl_htc.why ? wl_htc.why : "-");
+	printf("FUXI WLAN: W20 snapshot wmi events %u unknown %u last %#x bytes %u svc %u avail %u ext %u ext2 %u ready %u why %s\n",
+	    wl_wmi.events, wl_wmi.unknown_events, wl_wmi.last_event, wl_wmi.last_len, wl_wmi.got_svc, wl_wmi.got_avail,
+	    wl_wmi.got_ext, wl_wmi.got_ext2, wl_wmi.got_ready, wl_wmi.why ? wl_wmi.why : "-");
+	wl_wlfw_diagnostics("W20 snapshot");
+}
+
+/* A pure-layer refusal: the most specific reason, the snapshot, contain. */
+static int
+wl_ce_fail(const char *what)
+{
+	const char *why = wl_wmi.why ? wl_wmi.why : wl_htc.why ? wl_htc.why : wl_ce.why ? wl_ce.why : what;
+	printf("FUXI WLAN: %s %s FAILED: %s\n", wl_ce_lane(), what, why);
+	wl_ce_snapshot(what);
+	return wl_w11_fail(why);
+}
+
+/* w20 0x04: endpoint PCIe Device Control MRRS (14:12) = 0, 128 bytes, before
+ * CE init (an observation from UniXNU-sheng 186abef, not Linux). Device
+ * Status (31:16) is W1C, so only the low half is written. */
+static int
+wl_ce_mrrs128(void)
+{
+	unsigned cap = wl_m6o_cap(0x10);
+	uint32_t old = cap ? wl_prd(WL_EPCFG + cap + 8) : ~0u;
+	if (!cap || old == ~0u || fw_faults) { return wl_w11_fail("W20 MRRS128: no PCIe capability"); }
+	wl_pwr(WL_EPCFG + cap + 8, old & 0xffffu & ~0x7000u);
+	uint32_t rb = wl_prd(WL_EPCFG + cap + 8);
+	printf("FUXI WLAN: W20 endpoint devctl cap %#x MRRS 128: old %#x read %#x\n", cap, old & 0xffffu, rb & 0xffffu);
+	return fw_faults || rb == ~0u || (rb & 0x7000u) ? wl_w11_fail("W20 MRRS128 readback") : 0;
+}
+
+/* The 512 KiB arena, aligned to its size like W13/W14 align target segments,
+ * Normal-NC, mapped leaf by leaf with live SMMU readback (wl12_map_target). */
+static int
+wl_ce_alloc(void)
+{
+	uint64_t align = WLCE_ARENA_BYTES;
+	if (wl_ce_arena.va) { return wl_w11_fail("W20 CE arena already allocated"); }
+	wl_iova_next = (wl_iova_next + align - 1) & ~(align - 1);
+	if (wl_dma_alloc(&wl_ce_arena, WLCE_ARENA_BYTES) || wl_dma_nc(&wl_ce_arena) ||
+	    wl12_map_target(&wl_ce_arena)) { return wl_w11_fail("W20 CE arena allocation/NC/map"); }
+	if (wlce_layout(&wl_ce, (uint8_t *)wl_ce_arena.va, wl_ce_arena.iova, (uint32_t)wl_ce_arena.size,
+	    wl15_shadow_v3, wl15_variant ? 0u : 36u, !wl15_variant)) { return wl_ce_fail("CE layout"); }
+	printf("FUXI WLAN: W20 ce arena IOVA %#llx bytes %#x Normal-NC mapped; rdp %#llx\n",
+	    wl_ce_arena.iova, (unsigned)wl_ce_arena.size, wl_ce.rdp_iova);
+	if (wl15_variant) {
+		printf("FUXI WLAN: W20 ce shadow off (fuxiwlanw15=1): pointers go to R2 through the window\n");
+		return 0;
+	}
+	printf("FUXI WLAN: W20 ce shadow");
+	for (unsigned i = 0; i < WLCE_NRING; i++) { printf(" %u", wl_ce.ring[i]->shadow_idx); }
+	printf(" (from WLAN_CFG table)\n");
+	return 0;
+}
+
+/* Seven rings in L19 order (ce.c:912-971): CE0 SRC, CE1 DST + DEST_CTRL, CE1
+ * STATUS, CE2 DST + DEST_CTRL, CE2 STATUS, CE3 SRC, CE4 SRC; BASE_LSB and MISC
+ * read back after each, DEST_CTRL after its write. */
+static int
+wl_ce_init_rings(void)
+{
+	for (unsigned i = 0; i < WLCE_NRING; i++) {
+		struct wlce_ring *r = wl_ce.ring[i];
+		uint32_t base = 0, misc = 0, dctl = 0;
+		if (wlce_ring_init(&wl_ce, &wl_ce_io, r) ||
+		    (r->kind == WLCE_DST && wlce_dest_ctrl(&wl_ce, &wl_ce_io, r, WLCE_BUF, &dctl)) ||
+		    wlce_ring_check(&wl_ce, &wl_ce_io, r, &base, &misc)) {
+			printf("FUXI WLAN: W20 ce ring %u setup after %u writes (base %#x misc %#x dest-ctrl %#x)\n", r->id,
+			    wl_ce.writes, base, misc, dctl);
+			return wl_ce_fail("CE ring setup");
+		}
+		printf("FUXI WLAN: W20 ce ring %u entries %u base %#x misc %#x", r->id, r->entries, base, misc);
+		if (r->kind == WLCE_DST) { printf(" dest-ctrl %#x", dctl); }
+		printf(" readback ok\n");
+	}
+	printf("FUXI WLAN: W20 ce init ok rings %u writes %u window restore checked\n", WLCE_NRING, wl_ce.writes);
+	return wl_w11_guard();
+}
+
+enum { WL20_W_CTL, WL20_W_TX, WL20_W_CREDITS, WL20_W_SVC, WL20_W_AVAIL, WL20_W_EXT, WL20_W_EXT2, WL20_W_READY, WL20_W_NONE };
+
+static bool
+wl_ce_done(unsigned what)
+{
+	switch (what) {
+	case WL20_W_CTL: return wl_htc.ctl_new;
+	case WL20_W_TX: return wlce_tx_idle(&wl_ce.pipe[wl_ce_tx_pipe]);
+	case WL20_W_CREDITS: return wlhtc_has_credits(&wl_htc, wl_ce_need_eid, wl_ce_need_len);
+	case WL20_W_SVC: return wl_wmi.got_svc;
+	case WL20_W_AVAIL: return wl_wmi.got_avail;
+	case WL20_W_EXT: return wl_wmi.got_ext;
+	case WL20_W_EXT2: return wl_wmi.got_ext2;
+	case WL20_W_READY: return wl_wmi.got_ready;
+	default: return false;
+	}
+}
+
+/* WMI events: the handled ones fill wl_wmi; the rest are logged by id and
+ * length (16 lines at most) and never fail the run. */
+static int
+wl_ce_wmi_rx(void *ctx, const uint8_t *msg, uint32_t len)
+{
+	uint32_t id = 0;
+	(void)ctx;
+	if (wlwmi_rx(&wl_wmi, msg, len, &id)) { return 1; }
+	if (!wlwmi_known(id) && wl_ce_logged++ < 16) {
+		printf("FUXI WLAN: %s wmi event %#x bytes %u (logged only)\n", wl_ce_lane(), id, len - 4);
+	}
+	return 0;
+}
+
+static int wl_ce_rx(void *ctx, const uint8_t *buf, uint32_t len) { (void)ctx; return wlhtc_rx(&wl_htc, buf, len, wl_ce_wmi_rx, NULL); }
+
+/* One poll pass: MHI events, QMI indications and the AMSS/M0/SMMU guard
+ * (W11), RX on CE2 then CE1 (one HTC handler for both, ce.c:154-170), TX
+ * completions on CE0/CE3. */
+static int
+wl_ce_poll(void)
+{
+	if (wl_w11_events()) { return 1; }
+	if (wlce_reap_rx(&wl_ce, &wl_ce_io, &wl_ce.pipe[2], wl_ce_rx, NULL) ||
+	    wlce_reap_rx(&wl_ce, &wl_ce_io, &wl_ce.pipe[1], wl_ce_rx, NULL) ||
+	    wlce_reap_tx(&wl_ce, &wl_ce_io, &wl_ce.pipe[0]) ||
+	    wlce_reap_tx(&wl_ce, &wl_ce_io, &wl_ce.pipe[3])) { return wl_ce_fail("CE poll"); }
+	return wl_w11_guard();
+}
+
+/* A reply is due: poll every 1 ms, at most MS ms, then contain. */
+static int
+wl_ce_wait(unsigned what, unsigned ms, const char *stage)
+{
+	for (unsigned t = 0; t <= ms; t++) {
+		if (wl_ce_poll()) { return 1; }
+		if (wl_ce_done(what)) { wl_ce_waited = t; return 0; }
+		if (t < ms) { wl_sleep(1); }
+	}
+	printf("FUXI WLAN: %s timeout %s (%u ms); contain, no retry\n", wl_ce_lane(), stage, ms);
+	wl_ce_snapshot(stage);
+	return wl_w11_fail(stage);
+}
+
+/* Nothing is due: poll every 10 ms for MS ms (early end when WHAT holds). */
+static int
+wl_ce_observe(unsigned what, unsigned ms)
+{
+	for (unsigned t = 0; t < ms; t += 10) {
+		if (wl_ce_poll()) { return 1; }
+		if (wl_ce_done(what)) { return 0; }
+		wl_sleep(10);
+	}
+	return wl_ce_poll();
+}
+
+/* One HTC message at a time, as W11: credits first (3 s, wmi.c:435-456),
+ * frame, slot copy and publish (wlce_send), then the TX drain. */
+static int
+wl_ce_send(uint32_t eid, const uint8_t *payload, uint32_t len, const char *what)
+{
+	static uint8_t frame[WLCE_BUF];
+	uint32_t total = WLHTC_HDR + len;
+	if (eid >= WLHTC_EPS || !wl_htc.ep[eid].used) { return wl_w11_fail("W21 send on an unconnected HTC endpoint"); }
+	if (!wlhtc_has_credits(&wl_htc, eid, total)) {
+		wl_ce_need_eid = eid; wl_ce_need_len = total;
+		printf("FUXI WLAN: %s %s waits for %u HTC credits (has %d)\n", wl_ce_lane(), what,
+		    wlhtc_credits_needed(&wl_htc, total), wl_htc.ep[eid].credits);
+		if (wl_ce_wait(WL20_W_CREDITS, 3000, "HTC credits")) { return 1; }
+	}
+	wl_ce_tx_pipe = wl_htc.ep[eid].ul_pipe;
+	if (wlhtc_frame(&wl_htc, eid, payload, len, frame, sizeof(frame), &total) ||
+	    wlhtc_take_credits(&wl_htc, eid, total) ||
+	    wlce_send(&wl_ce, &wl_ce_io, &wl_ce.pipe[wl_ce_tx_pipe], eid, frame, total)) { return wl_ce_fail(what); }
+	return wl_ce_wait(WL20_W_TX, 1000, "TX drain");
+}
+
+/* HTC connect (htc.c:557-719): WMI control asks for credit flow with
+ * RECV_ALLOC = all credits as a u8 (one WMI endpoint: single-pdev preferred
+ * hw mode, wmi.c:10207-10211, htc.c:446-489, 763-777); every other service
+ * disables credit flow (htc.c:607-613). */
+static int
+wl_ce_connect(uint32_t svc)
+{
+	uint8_t req[WLHTC_CONNECT_BYTES];
+	bool flow = svc == WLHTC_SVC_WMI;
+	uint32_t alloc = flow ? (uint32_t)(uint8_t)wl_htc.credit_count : 0u, eid = 0, status = 0;
+	wlhtc_connect_req(req, svc, flow ? alloc << WLHTC_CONN_RECV_ALLOC_SHIFT : WLHTC_CONN_DISABLE_FLOW);
+	if (wl_ce_send(0, req, sizeof(req), flow ? "HTC connect WMI" : "HTC connect HTT") ||
+	    wl_ce_wait(WL20_W_CTL, 3000, "HTC connect reply")) { return 1; }
+	if (wlhtc_parse_connect(&wl_htc, svc, flow, alloc, &eid, &status)) {
+		printf("FUXI WLAN: W21 htc svc %#x status %u eid %u refused\n", svc, status, eid);
+		return wl_ce_fail("HTC connect");
+	}
+	const struct wlhtc_ep *ep = &wl_htc.ep[eid];
+	printf("FUXI WLAN: W21 htc svc %#x status %u eid %u maxmsg %u pipes %u/%u", svc, status, eid, ep->max_msg,
+	    ep->ul_pipe, ep->dl_pipe);
+	if (flow) { printf(" credits %d", ep->credits); }
+	printf("\n");
+	return 0;
+}
+
+/* W22: INIT, READY, HW mode DBS (core.c:933-953), a 500 ms look for the HW
+ * mode response and unprompted events, then stop. */
+static int
+wl_w22_run(void)
+{
+	static uint8_t cmd[WLWMI_INIT_TOTAL];
+	const uint8_t *rc = cmd + 4 + WLWMI_INIT_BYTES;
+	uint32_t len = 0;
+	wl12_stage = WL22_WMI;
+	if (wlwmi_encode_init(&wl_wmi, cmd, sizeof(cmd), &len)) { return wl_w11_fail("W22 INIT encode bounds"); }
+	if (wl_ce_send(wl_htc.wmi_eid, cmd, len, "WMI INIT")) { return 1; }
+	printf("FUXI WLAN: W22 wmi init sent bytes %u (vdevs %u peers %u chains %#x flag1 %#x flags2 %#x host-svc %#x mem-chunks 0)\n",
+	    len, wlce_get32(rc + 4 * WLWMI_RC_NUM_VDEVS), wlce_get32(rc + 4 * WLWMI_RC_NUM_PEERS),
+	    wlce_get32(rc + 4 * WLWMI_RC_TX_CHAIN_MASK), wlce_get32(rc + 4 * WLWMI_RC_FLAG1),
+	    wlce_get32(rc + 4 * WLWMI_RC_FLAGS2), wlce_get32(rc + 4 * WLWMI_RC_HOST_SERVICE_FLAGS));
+	if (wl_ce_wait(WL20_W_READY, 5000, "WMI READY")) { return 1; }
+	unsigned mac_zero = !(wl_wmi.mac[0] | wl_wmi.mac[1] | wl_wmi.mac[2] | wl_wmi.mac[3] | wl_wmi.mac[4] | wl_wmi.mac[5]);
+	/* L19 stores the status and never acts on it (wmi.c:6910): logged only. */
+	printf("FUXI WLAN: W22 wmi ready status %u mac-zero %u peers %u\n", wl_wmi.ready_status, mac_zero, wl_wmi.num_total_peers);
+	if (wl20_bits & WL20_NOHWMODE) {
+		printf("FUXI WLAN: W22 hw mode skipped (w20 0x40)\n");
+	} else {
+		static uint8_t hw[WLWMI_HW_MODE_TOTAL];
+		if (wlwmi_encode_hw_mode(hw, sizeof(hw), WLWMI_HW_MODE_DBS, &len)) { return wl_w11_fail("W22 HW mode encode bounds"); }
+		if (wl_ce_send(wl_htc.wmi_eid, hw, len, "WMI PDEV_SET_HW_MODE")) { return 1; }
+		printf("FUXI WLAN: W22 hw mode dbs sent\n");
+	}
+	/* L19 does not wait for the response (wmi.c:4186-4216). */
+	if (wl_ce_observe(WL20_W_NONE, 500)) { return 1; }
+	printf("FUXI WLAN: W22 hw mode response %s; wmi events %u unknown %u\n", wl_wmi.got_hw_resp ? "seen" : "not seen",
+	    wl_wmi.events, wl_wmi.unknown_events);
+	printf("FUXI WLAN: W22 complete; stop/contain\n");
+	return 0;
+}
+
+/* W21: connect HTT (unless w20 0x01) and WMI, SETUP_COMPLETE_EX, then the
+ * service-ready set. L19 completes service ready from EXT when the target has
+ * no EXT2 service, else from EXT2 (wmi.c:4940-4941, 5645), so EXT is always
+ * awaited; AVAILABLE (services 128..) is optional and comes first. */
+static int
+wl_w21_run(void)
+{
+	uint8_t msg[WLHTC_SETUP_COMPLETE_BYTES];
+	wl12_stage = WL21_HTC;
+	if (wl20_bits & WL20_NOHTT) { printf("FUXI WLAN: W21 htc HTT connect skipped (w20 0x01)\n"); }
+	else if (wl_ce_connect(WLHTC_SVC_HTT)) { return 1; }
+	if (wl_ce_connect(WLHTC_SVC_WMI)) { return 1; }
+	wlhtc_setup_complete(msg);
+	if (wl_ce_send(0, msg, sizeof(msg), "HTC SETUP_COMPLETE_EX")) { return 1; }
+	printf("FUXI WLAN: W21 htc setup complete sent\n");
+	if (wl_ce_wait(WL20_W_SVC, 5000, "WMI SERVICE_READY")) { return 1; }
+	printf("FUXI WLAN: W21 wmi service ready fw %#x rf-chains %u mem-reqs %u scan-chans %u\n",
+	    wl_wmi.fw_build, wl_wmi.num_rf_chains, wl_wmi.num_mem_reqs, wl_wmi.max_scan_chans);
+	/* L19 never reads num_mem_reqs and never hands host memory chunks to
+	 * WMI_INIT (wmi.c:4230, 4077-4083); stopping here is overnight_plan.md 4.4. */
+	if (wl_wmi.num_mem_reqs) { return wl_w11_fail("W21 SERVICE_READY asks for host memory chunks (plan rule, not L19)"); }
+	if (wl_ce_observe(WL20_W_AVAIL, 1000)) { return 1; }
+	printf("FUXI WLAN: W21 wmi services ext %u ext2 %u reg-cc-ext %u (available event %u)\n",
+	    wlwmi_svc(&wl_wmi, WLWMI_SVC_EXT_MSG), wlwmi_svc(&wl_wmi, WLWMI_SVC_EXT2_MSG),
+	    wlwmi_svc(&wl_wmi, WLWMI_SVC_REG_CC_EXT), wl_wmi.got_avail);
+	if (wl_ce_wait(WL20_W_EXT, 5000, "WMI SERVICE_READY_EXT")) { return 1; }
+	printf("FUXI WLAN: W21 wmi service ready ext hw-modes %u caps %u pdev %u%s\n", wl_wmi.num_hw_modes,
+	    wl_wmi.hw_mode_caps, wl_wmi.pdev_id, wl_wmi.pdev_valid ? "" : " (no MAC/PHY caps)");
+	if (wlwmi_svc(&wl_wmi, WLWMI_SVC_EXT2_MSG)) {
+		if (wl_ce_wait(WL20_W_EXT2, 5000, "WMI SERVICE_READY_EXT2")) { return 1; }
+		printf("FUXI WLAN: W21 wmi service ready ext2 bytes %u\n", wl_wmi.ext2_bytes);
+	}
+	printf("FUXI WLAN: W21 wmi service ready complete\n");
+	return wl_w22_run();
+}
+
+/* W20: optional MRRS, arena, seven rings, HTC init, 62 + 62 RX buffers, HTC
+ * READY (3 s; L19 waits 1 s, services the CEs, waits 1 s more: htc.c:491-515). */
+static int
+wl_w20_run(void)
+{
+	wl12_stage = WL20_CE;
+	wl_ce_started = true; wl_ce_waited = wl_ce_logged = 0;
+	bzero(&wl_htc, sizeof(wl_htc)); bzero(&wl_wmi, sizeof(wl_wmi));
+	if ((wl20_bits & WL20_MRRS128) && wl_ce_mrrs128()) { return 1; }
+	if (wl_ce_alloc() || wl_ce_init_rings()) { return 1; }
+	if (wlhtc_init(&wl_htc, wl15_service_ce, 14) ||
+	    wlce_post_rx(&wl_ce, &wl_ce_io, &wl_ce.pipe[1], WLCE_RX_POST) ||
+	    wlce_post_rx(&wl_ce, &wl_ce_io, &wl_ce.pipe[2], WLCE_RX_POST)) { return wl_ce_fail("HTC init/RX post"); }
+	printf("FUXI WLAN: W20 ce rx posted CE1 %u CE2 %u\n", wl_ce.pipe[1].posted, wl_ce.pipe[2].posted);
+	if (wl_ce_wait(WL20_W_CTL, 3000, "HTC READY")) { return 1; }
+	if (wlhtc_parse_ready(&wl_htc)) { return wl_ce_fail("HTC READY"); }
+	printf("FUXI WLAN: W20 htc ready credits %u size %u max-ep %u after %u ms\n", wl_htc.credit_count,
+	    wl_htc.credit_size, wl_htc.max_ep, wl_ce_waited);
+	return wl_w21_run();
+}
+
+/* First step of wl5_abort: latch "stopping" so the pure layer posts, sends,
+ * consumes and publishes nothing more. The arena is freed with the other
+ * buffers only when MHI reset, bus master off, PERST and the SMMU undo are
+ * proven, else it stays quarantined (wl5_abort). C2's best-effort STOP_SCAN
+ * goes in this function before the latch (the latch refuses every send): one
+ * bounded send and a short TX drain whose failure never fails the abort. */
+static void
+wl_ce_contain(unsigned step)
+{
+	(void)step;
+	if (!wl_ce_started) { return; }
+	wl_ce_started = false;
+	wl_ce.stopping = true;
+	printf("FUXI WLAN: W20 ce contain posted %u reaped %u tx %u\n", wl_ce.pipe[1].posted + wl_ce.pipe[2].posted,
+	    wl_ce.pipe[1].reaped + wl_ce.pipe[2].reaped, wl_ce.pipe[0].posted + wl_ce.pipe[3].posted);
+}
+/* ---- end W20 ---- */
+
 /* Firmware-start QMI only: no CE allocation, register programming, HTC or WMI.
  * Adapted from Linux ath12k qmi.c (BSD-3-Clause-Clear), v6.12,
  * ath12k_qmi_firmware_start: INI -> CFG -> MODE, one reply at a time. */
@@ -4693,13 +5136,14 @@ wl_w15_run(void)
 	    wl_rails_on(2, "late before WLAN_MODE") ||
 	    wl12_send(&e, 0x22, WL15_MODE) || wl12_wait(0, "WLAN_MODE reply") ||
 	    wl_w11_wait(3, "W15 MODE TX drain") || wl_w11_guard()) { return 1; }
-	printf("FUXI WLAN: W15 wlan mode normal ok; stop before CE/HTC\n");
+	printf("FUXI WLAN: W15 wlan mode normal ok; %s\n", wl_w20 ? "CE/HTC next" : "stop before CE/HTC");
 	wl16_snapshot("MODE reply");
 	wl12_stage = WL15_OBSERVE;
-	printf("FUXI WLAN: W15 observing indications 2000 ms (reported only)\n");
+	unsigned observe = wl_w20 ? 200 : 2000; /* W20 moves on to the copy engines */
+	printf("FUXI WLAN: W15 observing indications %u ms (reported only)\n", observe);
 	/* Transport consumes/reposts IPCR RX buffers as usual, but indication
 	 * contents cannot provision memory or trigger further QMI requests. */
-	for (unsigned ms = 0; ms < 2000; ms += 10) {
+	for (unsigned ms = 0; ms < observe; ms += 10) {
 		if (wl_w11_events()) { return 1; }
 		wl_sleep(10);
 	}
@@ -4736,6 +5180,7 @@ wl_w14_run(void)
 		printf("FUXI WLAN: W15 fw ready; starting WLAN INI/CFG/MODE\n");
 		wl12_stage = WL15_INI;
 		int error = wl_w15_run();
+		if (!error && wl_w20) { error = wl_w20_run(); } /* only after this boot's MODE reply */
 		/* Preserve post-MODE or failure evidence before containment/reset. */
 		wl_wlfw_diagnostics("W15 WLAN start");
 		return error || wl_w11_guard();
@@ -4824,7 +5269,9 @@ wl_w12_run(void)
 		if (wl_w14_run()) { return 1; }
 		if (wl_w11_events() || wl_w11_wait(3, "W14 final TX drain") || wl_w11_guard()) { return 1; }
 		wl_w11_ok = true;
-		printf("FUXI WLAN: %s complete; %s\n", wl_w15 ? "W15" : "W14", wl_keep ? "keep requested, DMA/channels/wake retained (polling ended)" : "stop/contain");
+		if (!wl_w20) { /* W22 printed its own completion line */
+			printf("FUXI WLAN: %s complete; %s\n", wl_w15 ? "W15" : "W14", wl_keep ? "keep requested, DMA/channels/wake retained (polling ended)" : "stop/contain");
+		}
 		return 0;
 	}
 	wl12_stage = WL12_DONE;
@@ -5171,6 +5618,7 @@ wl_contain_wr(uint64_t pa, uint32_t value)
 static void
 wl5_abort(unsigned step)
 {
+	wl_ce_contain(step); /* W20: latch CE stop first; returns at once when W20 never ran */
 	if (wl_w11_attempted) { wl_w11_stop(); }
 	wl5_status(step);
 	(void)wl_smmu_fault(step);
@@ -5207,6 +5655,7 @@ wl5_abort(unsigned step)
 		wl_dma_free(&wl_rxvectors); wl_dma_free(&wl_rddm);
 		for (unsigned i = 0; i < WL_TARGET_MAX; i++) { wl_dma_free(&wl_target[i]); }
 		wl_dma_free(&wl14_regdb); wl_dma_free(&wl14_bdf); wl_dma_free(&wl14_m3);
+		wl_dma_free(&wl_ce_arena);
 		wl_dma_free(&wl_ipcr);
 		wl_dma_free(&wl_contexts); wl_dma_free(&wl_vectors); wl_dma_free(&wl_amss); wl_dma_free(&wl_image);
 		printf("FUXI WLAN: abort buffers freed\n");
@@ -5501,6 +5950,10 @@ fuxi_wlan_init(void)
 	}
 	unsigned limit = (arg == 1 || arg > (int)WL5_STEPS) ? WL5_STEPS : (unsigned)arg;
 	wl_iova_configure();
+	if (wl_w20 && limit != WL5_STEPS) {
+		wl_variant_invalid = true;
+		printf("FUXI WLAN: W20 fuxiwlanqrtr=6 needs all %u steps (fuxiwlan=1 or 28), limit %u; refused\n", WL5_STEPS, limit);
+	}
 #if defined(FUXI_SALAMI)
 	/* Before the thread, any mapping or register access: cyclerails votes
 	 * the shared rails OFF, and a selector that did not parse is refused

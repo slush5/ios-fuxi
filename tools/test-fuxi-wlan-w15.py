@@ -172,12 +172,15 @@ static void check_no_ce(void) {
 int main(void) {
     /* Selector lattice: legacy values never enable W15. Their complete
      * wire/stop/containment behavior is also exercised by W10..W14 suites. */
-    for(int arg=0;arg<=6;arg++) {
+    /* 6 = W20 on top of the W15 chain (test-fuxi-wlan-ce.py); 7 and beyond are refused. */
+    for(int arg=0;arg<=7;arg++) {
         qrtr_arg=arg;wl_probe_configure();
-        assert(wl_w15==(arg==5));assert(wl_w14==(arg==4||arg==5));
-        assert(wl_w13==(arg>=3&&arg<=5));assert(wl_w12==(arg>=2&&arg<=5));
-        assert(wl_qrtr==(arg>=1&&arg<=5));
+        assert(wl_w20==(arg==6));assert(wl_variant_invalid==(arg==7));
+        assert(wl_w15==(arg==5||arg==6));assert(wl_w14==(arg>=4&&arg<=6));
+        assert(wl_w13==(arg>=3&&arg<=6));assert(wl_w12==(arg>=2&&arg<=6));
+        assert(wl_qrtr==(arg>=1&&arg<=6));
     }
+    qrtr_arg=0;wl_probe_configure();
     for(unsigned keep=0;keep<2;keep++) {
         boot15(0,keep);int error=finish_step();if(error)fprintf(stderr,"%s",logbuf);
         assert(!error && wl_w11_ok && wl12_txn==15 && seen15==3);

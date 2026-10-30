@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,5527 @@
+@@ -0,0 +1,5980 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -60,9 +60,14 @@
 + *                 align to 2^n of size, 0x40 read-only PMK8550 gpio3 sleep clock log, 0x80 also
 + *                 enable it, 0x100 decode BHI error words and scan RDDM text
 + *   fuxiwlanqrtr=1  W11 capability-only diagnostic; =2 W12 setup; =3 W13 small-chunk negotiation; =4 W14 downloads; =5 W15 config/mode
-+ *   fuxiwlanw15=1  W15 only: omit WLAN_CFG shadow-v3 TLV (default 0)
-+ *   fuxiwlanw16=N  qrtr=5 only: 1 larger IPCR, 2 doorbell redrive, 3 both,
++ *   fuxiwlanqrtr=6  W20-W22: W15, then copy engines, HTC and WMI init to WMI READY (needs
++ *                 fuxiwlan=28 or 1; not with keep/stop22); any other value outside 0..6 is refused
++ *   fuxiwlanw15=1  W15 only (qrtr 5/6): omit WLAN_CFG shadow-v3 TLV (default 0); W20 then
++ *                 publishes CE pointers to R2 through the window
++ *   fuxiwlanw16=N  qrtr=5/6 only: 1 larger IPCR, 2 doorbell redrive, 3 both,
 + *                 4 diagnostics only; all include MODE context diagnostics
++ *   fuxiwlanw20=N  qrtr=6 only: 0x01 no HTT connect, 0x04 endpoint MRRS 128, 0x40 no
++ *                 PDEV_SET_HW_MODE; other bits refused (docs-lanes/wlan-w20.md)
 + * Salami (FUXI_SALAMI, OnePlus 11, K-W1): the driver runs only when
 + * fuxiwlansalami=1 is present as well; its absence or any other value refuses
 + * before the thread starts, as do fuxiwlanseq with cyclerails and any invalid
@@ -127,6 +132,7 @@
 +#include <vm/pmap.h>
 +#include <arm/caches_internal.h>
 +#include "sweet_spmi_bus.h"
++#include "fuxi_wlan_ce.h" /* W20: pure CE/HTC/WMI code (Linux ath12k v6.19, Clear BSD) */
 +/* osfmk/vm/pmap.h declares these under MACH_KERNEL_PRIVATE only; bsd/ cannot
 + * see them, but they are in the same kernel image (M6k fuxiwlanprobe=nc). */
 +/* pexpert exposes the string-only parser under XNU_KERNEL_PRIVATE. */
@@ -865,6 +871,26 @@
 +static unsigned wl_rails_variant;
 +static bool wl_rails_requested;
 +static bool wl16_large, wl16_redrive;
++/* W20 (fuxiwlanqrtr=6, C1): after this boot's W15 MODE reply, copy engines,
++ * HTC and WMI init to WMI READY, then containment. fuxiwlanw20 bits (0 =
++ * default): 0x01 NOHTT no HTT connect; 0x04 MRRS128 endpoint Device Control
++ * max read request 128 bytes before CE init; 0x40 NOHWMODE no
++ * PDEV_SET_HW_MODE. 0x02 HTTVER, 0x10 BAND24, 0x20 FULLBSSID and 0x80 PDEV0
++ * belong to the scan stage (qrtr 7, C2) and 0x08 ACTIVE transmits: all refused
++ * here, as are qrtr 7/8 until those stages exist (raise WL20_QRTR_MAX and
++ * WL20_BITS with them). */
++#define WL20_NOHTT 0x01u
++#define WL20_HTTVER 0x02u
++#define WL20_MRRS128 0x04u
++#define WL20_ACTIVE 0x08u
++#define WL20_BAND24 0x10u
++#define WL20_FULLBSSID 0x20u
++#define WL20_NOHWMODE 0x40u
++#define WL20_PDEV0 0x80u
++#define WL20_BITS (WL20_NOHTT | WL20_MRRS128 | WL20_NOHWMODE)
++#define WL20_QRTR_MAX 6
++static bool wl_w20;
++static unsigned wl20_bits;
 +/* ---- P17: opt-in WCN7850 MODE-silence probes (fuxiwlanmlo bits >= 4) ----
 + * Low two bits keep the W12 meaning (1 PHY_CAP, 2 omit MLO). Bits:
 + *   0x004 HOSTMEM   HOST_CAP vendor TLV 0x33 (u8 1, "host memory on demand")
@@ -1000,6 +1026,7 @@
 +static unsigned wl_target_n;
 +static uint64_t wl_target_total;
 +static struct wl_dma wl_ipcr;
++static struct wl_dma wl_ce_arena; /* W20: rdp, CE rings, TX slots, RX buffers (fuxi_wlan_ce.h layout) */
 +/* W14 inputs are retained through keep/containment, including partial reads. */
 +static struct wl_dma wl14_regdb, wl14_bdf, wl14_m3;
 +static char wl14_bdf_name[65]; /* one extra byte detects XNU string truncation */
@@ -1158,11 +1185,12 @@
 +		printf("FUXI WLAN: rails variant %d (1 early before WLAN_EN, 2 late before WLAN_MODE) valid %u\n",
 +		    rails, !wl_variant_invalid);
 +	}
-+	int stop22 = 0, keep = 0, qrtr = 0;
++	int stop22 = 0, keep = 0, qrtr = 0, w20 = 0;
 +	(void)PE_parse_boot_argn("fuxiwlanstop22", &stop22, sizeof(stop22));
 +	(void)PE_parse_boot_argn("fuxiwlankeep", &keep, sizeof(keep));
 +	(void)PE_parse_boot_argn("fuxiwlanqrtr", &qrtr, sizeof(qrtr));
-+	wl_w15 = qrtr == 5; wl_w14 = qrtr == 4 || wl_w15; wl_w13 = qrtr == 3 || wl_w14; wl_w12 = qrtr == 2 || wl_w13; wl_qrtr = qrtr == 1 || wl_w12; wl_w11_attempted = wl_w11_ok = false;
++	wl_w20 = qrtr == 6; /* W20 runs on top of the whole W11..W15 chain */
++	wl_w15 = qrtr == 5 || wl_w20; wl_w14 = qrtr == 4 || wl_w15; wl_w13 = qrtr == 3 || wl_w14; wl_w12 = qrtr == 2 || wl_w13; wl_qrtr = qrtr == 1 || wl_w12; wl_w11_attempted = wl_w11_ok = false;
 +	wl12_mlo_variant = 0; wl17_bits = 0;
 +	{
 +		int variant = 0;
@@ -1204,6 +1232,24 @@
 +			printf("FUXI WLAN: W16 variant %d large-IPCR %u doorbell-redrive %u diagnostics %u valid %u\n",
 +			    variant, wl16_large, wl16_redrive, !!wl16_variant, !wl_variant_invalid);
 +		}
++	}
++	/* W20: qrtr outside 0..WL20_QRTR_MAX used to run silently without QRTR;
++	 * it is refused now, like w20 without qrtr 6, unknown w20 bits, and keep
++	 * or stop22 with qrtr 6 (no keep path exists for live copy engines). */
++	wl20_bits = 0;
++	bool w20_given = PE_parse_boot_argn("fuxiwlanw20", &w20, sizeof(w20));
++	if (qrtr < 0 || qrtr > WL20_QRTR_MAX) {
++		wl_variant_invalid = true;
++		printf("FUXI WLAN: W20 fuxiwlanqrtr=%d is not 0..%d in this build; refused\n", qrtr, WL20_QRTR_MAX);
++	}
++	if (wl_w20) {
++		if (w20 < 0 || ((unsigned)w20 & ~WL20_BITS) || stop22 == 1 || keep == 1) { wl_variant_invalid = true; }
++		else { wl20_bits = (unsigned)w20; }
++		printf("FUXI WLAN: W20 selected qrtr=%d (CE/HTC/WMI init to READY) w20 %#x valid %u\n",
++		    qrtr, (unsigned)w20, !wl_variant_invalid);
++	} else if (w20_given && w20) {
++		wl_variant_invalid = true;
++		printf("FUXI WLAN: W20 fuxiwlanw20 %#x needs fuxiwlanqrtr=6; refused\n", (unsigned)w20);
 +	}
 +	wl_stop22 = stop22 == 1; wl_keep = keep == 1;
 +	if (wl_w14) {
@@ -1264,7 +1310,7 @@
 +	if (wl_pre == 5 && retain == 1) { wl_variant_invalid = true; }
 +	printf("FUXI WLAN: W10 continue=%u keep=%u (stop22=1 retains BHI diagnostics; no data channels)\n", !wl_stop22, wl_keep);
 +	printf("FUXI WLAN: W11 qrtr=%u keep=%u (one conversation after AMSS/M0)\n", wl_qrtr, wl_keep);
-+	if (wl_w12) { printf("FUXI WLAN: W12 selected qrtr=%u target memory cap %u bytes\n", wl_w15 ? 5 : wl_w14 ? 4 : wl_w13 ? 3 : 2, WL_TARGET_CAP); }
++	if (wl_w12) { printf("FUXI WLAN: W12 selected qrtr=%u target memory cap %u bytes\n", wl_w20 ? 6 : wl_w15 ? 5 : wl_w14 ? 4 : wl_w13 ? 3 : 2, WL_TARGET_CAP); }
 +	if (wl_w13) { printf("FUXI WLAN: W13 small-chunk policy limit %u bytes; one zero-segment negotiation, aligned IOVAs\n", WL13_CHUNK_LIMIT); }
 +	printf("FUXI WLAN: M6o seq mask %#x valid=%u (selectors default off)\n",
 +	    wl_seq_flags, !wl_variant_invalid);
@@ -2301,7 +2347,7 @@
 +static vm_offset_t
 +wl_owned_alias(uint64_t pa, unsigned bytes, bool tables_only)
 +{
-+	struct wl_dma *bufs[] = { &wl_tables, &wl_image, &wl_vectors, &wl_contexts, &wl_rddm, &wl_rxvectors, &wl_msi_sink, &wl_amss, &wl_ipcr, &wl14_regdb, &wl14_bdf, &wl14_m3 };
++	struct wl_dma *bufs[] = { &wl_tables, &wl_image, &wl_vectors, &wl_contexts, &wl_rddm, &wl_rxvectors, &wl_msi_sink, &wl_amss, &wl_ipcr, &wl14_regdb, &wl14_bdf, &wl14_m3, &wl_ce_arena };
 +	unsigned fixed = sizeof(bufs)/sizeof(bufs[0]);
 +	for (unsigned i = 0; i < (tables_only ? 1u : fixed + WL_TARGET_MAX); i++) {
 +		struct wl_dma *d = i < fixed ? bufs[i] : &wl_target[i-fixed];
@@ -3372,7 +3418,7 @@
 +static unsigned wl_w11_error;
 +enum { WL12_DISCOVERY, WL12_IND, WL12_HOST, WL12_REQUEST, WL12_RESPOND,
 +    WL12_READY, WL12_CAP, WL12_DONE, WL14_REGDB, WL14_BDF, WL14_M3, WL14_READY,
-+    WL15_INI, WL15_CFG, WL15_MODE, WL15_OBSERVE };
++    WL15_INI, WL15_CFG, WL15_MODE, WL15_OBSERVE, WL20_CE, WL21_HTC, WL22_WMI };
 +static unsigned wl12_stage;
 +static uint16_t wl12_txn, wl12_msg;
 +static bool wl12_reply, wl12_requested, wl12_ready;
@@ -3442,7 +3488,8 @@
 +static int
 +wl_w11_fail(const char *reason)
 +{
-+	if (!wl_w11_error) { printf("FUXI WLAN: %s failure: %s; contain, no retry\n", wl_w15 && wl12_stage >= WL15_INI ? "W15" : wl_w12 ? "W12" : "W11", reason); }
++	if (!wl_w11_error) { printf("FUXI WLAN: %s failure: %s; contain, no retry\n", wl12_stage == WL22_WMI ? "W22" :
++	    wl12_stage == WL21_HTC ? "W21" : wl12_stage == WL20_CE ? "W20" : wl_w15 && wl12_stage >= WL15_INI ? "W15" : wl_w12 ? "W12" : "W11", reason); }
 +	wl_w11_error = 1; wl_w11_ok = false;
 +	return 1;
 +}
@@ -4693,6 +4740,402 @@
 +	return 0;
 +}
 +
++/* ---- W20: CE/HTC/WMI to WMI READY (fuxiwlanqrtr=6, C1) ----
++ * Adapted from Linux ath12k core.c, ce.c, htc.c, wmi.c and pci.c
++ * (BSD-3-Clause-Clear), v6.19; the notice and the file list are in
++ * bsd/dev/fuxi_wlan_ce.h, the pure ring/HTC/WMI code. This block is the
++ * kernel glue: the quiet windowed register access, the arena, the poll
++ * loop, logs, the failure snapshot and the containment hook. Reached only
++ * from wl_w14_run
++ * after this boot's WLAN_MODE reply. Register writes: R0/R2 of the 7 CE rings
++ * and DEST_CTRL of CE1/CE2 (wlce_reg_ok; 0x310c saved, selected, verified and
++ * restored around every access), the 7 shadow registers BAR0 0x8fc-0x998 and,
++ * with w20 0x04 only, the endpoint Device Control register. No interrupt,
++ * MSI, GIC, pdev parameter, vdev or RF activity; the W11 conversation and its
++ * device-wake doorbell stay up. L19 order after MODE (core.c:1274-1300,
++ * 868-960): CE init, HTC init, RX post, HTC READY, HTT and WMI connect,
++ * SETUP_COMPLETE_EX, SERVICE_READY (+ EXT, EXT2), INIT, READY, HW mode DBS;
++ * the data path, regulatory and the HTT version request are skipped.
++ * Per-field provenance and every log line: docs-lanes/wlan-w20.md. */
++static struct wlce wl_ce;
++static struct wlhtc wl_htc;
++static struct wlwmi wl_wmi;
++static bool wl_ce_started;
++static unsigned wl_ce_waited, wl_ce_need_eid, wl_ce_need_len, wl_ce_tx_pipe, wl_ce_logged;
++
++/* One CE register access through the dynamic window: the wl_soc_write
++ * discipline without its per-access log line (pci.c:163-182, 1201-1285;
++ * WCN7850 has no static window map, pci.c:1631-1635). */
++static int
++wl_ce_window(uint32_t off, bool wr, uint32_t *value)
++{
++	if (fw_faults || !wlce_reg_ok(off)) { return 1; }
++	uint32_t saved = wl_mrd(0x310c), win = (saved & ~0x3fu) | 0x40000000 | (off >> 19);
++	if (saved == ~0u || fw_faults) { return 1; }
++	wl_mwr(0x310c, win);
++	int e = wl_mrd(0x310c) != win || fw_faults;
++	if (!e) {
++		uint64_t pa = WL_BAR0 + 0x80000ull + (off & 0x7ffff);
++		if (wr) { wl_pwr(pa, *value); } else { *value = wl_prd(pa); }
++		e = fw_faults != 0;
++	}
++	/* Containment writes remain possible after a latched synchronous fault. */
++	if (wl_contain_wr(WL_BAR0 + 0x310c, saved) || wl_mrd(0x310c) != saved) { e = 1; }
++	return e || fw_faults;
++}
++
++static int wl_ce_io_wr(void *ctx, uint32_t off, uint32_t value) { (void)ctx; return wl_ce_window(off, true, &value); }
++static int wl_ce_io_rd(void *ctx, uint32_t off, uint32_t *value) { (void)ctx; *value = ~0u; return wl_ce_window(off, false, value); }
++
++static int
++wl_ce_io_bar_wr(void *ctx, uint32_t off, uint32_t value)
++{
++	(void)ctx;
++	if (fw_faults || off < WLCE_SHADOW_BASE || off >= WLCE_SHADOW_BASE + 4u * WLCE_SHADOW_REGS || (off & 3)) { return 1; }
++	wl_mwr(off, value);
++	return fw_faults ? 1 : 0;
++}
++
++/* dsb sy on both sides: at least L19's dma_rmb after a device pointer and its
++ * wmb/mb before a pointer publish (hal.c:2154-2162, 2194-2215). */
++static void wl_ce_wbarrier(void *ctx) { (void)ctx; __asm__ volatile("dsb sy" ::: "memory"); }
++static void wl_ce_rbarrier(void *ctx) { (void)ctx; __asm__ volatile("dsb sy" ::: "memory"); }
++static const struct wlce_io wl_ce_io = { wl_ce_io_wr, wl_ce_io_rd, wl_ce_io_bar_wr, wl_ce_wbarrier, wl_ce_rbarrier, NULL };
++
++static const char *
++wl_ce_lane(void)
++{
++	return wl12_stage == WL22_WMI ? "W22" : wl12_stage == WL21_HTC ? "W21" : "W20";
++}
++
++/* Failure evidence, RAM only: host ring pointers next to their rdp words,
++ * buffers, HTC credits and the last WMI event; then the six-read diagnostic. */
++static void
++wl_ce_snapshot(const char *stage)
++{
++	printf("FUXI WLAN: W20 snapshot %s: writes %u errors %u stopping %u why %s\n", stage, wl_ce.writes,
++	    wl_ce.errors, wl_ce.stopping, wl_ce.why ? wl_ce.why : "-");
++	for (unsigned i = 0; wl_ce.rdp && i < WLCE_NRING; i++) {
++		const struct wlce_ring *r = wl_ce.ring[i];
++		if (r) { printf("FUXI WLAN: W20 snapshot ring %u hp %u tp %u rdp %u seen %u\n", r->id, r->hp, r->tp, wl_ce.rdp[r->id], r->seen); }
++	}
++	printf("FUXI WLAN: W20 snapshot tx CE0 %u/%u CE3 %u/%u rx CE1 %u/%u CE2 %u/%u (posted/reaped)\n",
++	    wl_ce.pipe[0].posted, wl_ce.pipe[0].reaped, wl_ce.pipe[3].posted, wl_ce.pipe[3].reaped,
++	    wl_ce.pipe[1].posted, wl_ce.pipe[1].reaped, wl_ce.pipe[2].posted, wl_ce.pipe[2].reaped);
++	printf("FUXI WLAN: W20 snapshot htc ready %u size %u count %u eid:svc/credits", wl_htc.ready, wl_htc.credit_size, wl_htc.credit_count);
++	for (unsigned e = 0; e < WLHTC_EPS; e++) {
++		if (wl_htc.ep[e].used) { printf(" %u:%#x/%d", e, wl_htc.ep[e].svc, wl_htc.ep[e].credits); }
++	}
++	printf(" bad-reports %u htt-rx %u why %s\n", wl_htc.bad_reports, wl_htc.htt_rx, wl_htc.why ? wl_htc.why : "-");
++	printf("FUXI WLAN: W20 snapshot wmi events %u unknown %u last %#x bytes %u svc %u avail %u ext %u ext2 %u ready %u why %s\n",
++	    wl_wmi.events, wl_wmi.unknown_events, wl_wmi.last_event, wl_wmi.last_len, wl_wmi.got_svc, wl_wmi.got_avail,
++	    wl_wmi.got_ext, wl_wmi.got_ext2, wl_wmi.got_ready, wl_wmi.why ? wl_wmi.why : "-");
++	wl_wlfw_diagnostics("W20 snapshot");
++}
++
++/* A pure-layer refusal: the most specific reason, the snapshot, contain. */
++static int
++wl_ce_fail(const char *what)
++{
++	const char *why = wl_wmi.why ? wl_wmi.why : wl_htc.why ? wl_htc.why : wl_ce.why ? wl_ce.why : what;
++	printf("FUXI WLAN: %s %s FAILED: %s\n", wl_ce_lane(), what, why);
++	wl_ce_snapshot(what);
++	return wl_w11_fail(why);
++}
++
++/* w20 0x04: endpoint PCIe Device Control MRRS (14:12) = 0, 128 bytes, before
++ * CE init (an observation from UniXNU-sheng 186abef, not Linux). Device
++ * Status (31:16) is W1C, so only the low half is written. */
++static int
++wl_ce_mrrs128(void)
++{
++	unsigned cap = wl_m6o_cap(0x10);
++	uint32_t old = cap ? wl_prd(WL_EPCFG + cap + 8) : ~0u;
++	if (!cap || old == ~0u || fw_faults) { return wl_w11_fail("W20 MRRS128: no PCIe capability"); }
++	wl_pwr(WL_EPCFG + cap + 8, old & 0xffffu & ~0x7000u);
++	uint32_t rb = wl_prd(WL_EPCFG + cap + 8);
++	printf("FUXI WLAN: W20 endpoint devctl cap %#x MRRS 128: old %#x read %#x\n", cap, old & 0xffffu, rb & 0xffffu);
++	return fw_faults || rb == ~0u || (rb & 0x7000u) ? wl_w11_fail("W20 MRRS128 readback") : 0;
++}
++
++/* The 512 KiB arena, aligned to its size like W13/W14 align target segments,
++ * Normal-NC, mapped leaf by leaf with live SMMU readback (wl12_map_target). */
++static int
++wl_ce_alloc(void)
++{
++	uint64_t align = WLCE_ARENA_BYTES;
++	if (wl_ce_arena.va) { return wl_w11_fail("W20 CE arena already allocated"); }
++	wl_iova_next = (wl_iova_next + align - 1) & ~(align - 1);
++	if (wl_dma_alloc(&wl_ce_arena, WLCE_ARENA_BYTES) || wl_dma_nc(&wl_ce_arena) ||
++	    wl12_map_target(&wl_ce_arena)) { return wl_w11_fail("W20 CE arena allocation/NC/map"); }
++	if (wlce_layout(&wl_ce, (uint8_t *)wl_ce_arena.va, wl_ce_arena.iova, (uint32_t)wl_ce_arena.size,
++	    wl15_shadow_v3, wl15_variant ? 0u : 36u, !wl15_variant)) { return wl_ce_fail("CE layout"); }
++	printf("FUXI WLAN: W20 ce arena IOVA %#llx bytes %#x Normal-NC mapped; rdp %#llx\n",
++	    wl_ce_arena.iova, (unsigned)wl_ce_arena.size, wl_ce.rdp_iova);
++	if (wl15_variant) {
++		printf("FUXI WLAN: W20 ce shadow off (fuxiwlanw15=1): pointers go to R2 through the window\n");
++		return 0;
++	}
++	printf("FUXI WLAN: W20 ce shadow");
++	for (unsigned i = 0; i < WLCE_NRING; i++) { printf(" %u", wl_ce.ring[i]->shadow_idx); }
++	printf(" (from WLAN_CFG table)\n");
++	return 0;
++}
++
++/* Seven rings in L19 order (ce.c:912-971): CE0 SRC, CE1 DST + DEST_CTRL, CE1
++ * STATUS, CE2 DST + DEST_CTRL, CE2 STATUS, CE3 SRC, CE4 SRC; BASE_LSB and MISC
++ * read back after each, DEST_CTRL after its write. */
++static int
++wl_ce_init_rings(void)
++{
++	for (unsigned i = 0; i < WLCE_NRING; i++) {
++		struct wlce_ring *r = wl_ce.ring[i];
++		uint32_t base = 0, misc = 0, dctl = 0;
++		if (wlce_ring_init(&wl_ce, &wl_ce_io, r) ||
++		    (r->kind == WLCE_DST && wlce_dest_ctrl(&wl_ce, &wl_ce_io, r, WLCE_BUF, &dctl)) ||
++		    wlce_ring_check(&wl_ce, &wl_ce_io, r, &base, &misc)) {
++			printf("FUXI WLAN: W20 ce ring %u setup after %u writes (base %#x misc %#x dest-ctrl %#x)\n", r->id,
++			    wl_ce.writes, base, misc, dctl);
++			return wl_ce_fail("CE ring setup");
++		}
++		printf("FUXI WLAN: W20 ce ring %u entries %u base %#x misc %#x", r->id, r->entries, base, misc);
++		if (r->kind == WLCE_DST) { printf(" dest-ctrl %#x", dctl); }
++		printf(" readback ok\n");
++	}
++	printf("FUXI WLAN: W20 ce init ok rings %u writes %u window restore checked\n", WLCE_NRING, wl_ce.writes);
++	return wl_w11_guard();
++}
++
++enum { WL20_W_CTL, WL20_W_TX, WL20_W_CREDITS, WL20_W_SVC, WL20_W_AVAIL, WL20_W_EXT, WL20_W_EXT2, WL20_W_READY, WL20_W_NONE };
++
++static bool
++wl_ce_done(unsigned what)
++{
++	switch (what) {
++	case WL20_W_CTL: return wl_htc.ctl_new;
++	case WL20_W_TX: return wlce_tx_idle(&wl_ce.pipe[wl_ce_tx_pipe]);
++	case WL20_W_CREDITS: return wlhtc_has_credits(&wl_htc, wl_ce_need_eid, wl_ce_need_len);
++	case WL20_W_SVC: return wl_wmi.got_svc;
++	case WL20_W_AVAIL: return wl_wmi.got_avail;
++	case WL20_W_EXT: return wl_wmi.got_ext;
++	case WL20_W_EXT2: return wl_wmi.got_ext2;
++	case WL20_W_READY: return wl_wmi.got_ready;
++	default: return false;
++	}
++}
++
++/* WMI events: the handled ones fill wl_wmi; the rest are logged by id and
++ * length (16 lines at most) and never fail the run. */
++static int
++wl_ce_wmi_rx(void *ctx, const uint8_t *msg, uint32_t len)
++{
++	uint32_t id = 0;
++	(void)ctx;
++	if (wlwmi_rx(&wl_wmi, msg, len, &id)) { return 1; }
++	if (!wlwmi_known(id) && wl_ce_logged++ < 16) {
++		printf("FUXI WLAN: %s wmi event %#x bytes %u (logged only)\n", wl_ce_lane(), id, len - 4);
++	}
++	return 0;
++}
++
++static int wl_ce_rx(void *ctx, const uint8_t *buf, uint32_t len) { (void)ctx; return wlhtc_rx(&wl_htc, buf, len, wl_ce_wmi_rx, NULL); }
++
++/* One poll pass: MHI events, QMI indications and the AMSS/M0/SMMU guard
++ * (W11), RX on CE2 then CE1 (one HTC handler for both, ce.c:154-170), TX
++ * completions on CE0/CE3. */
++static int
++wl_ce_poll(void)
++{
++	if (wl_w11_events()) { return 1; }
++	if (wlce_reap_rx(&wl_ce, &wl_ce_io, &wl_ce.pipe[2], wl_ce_rx, NULL) ||
++	    wlce_reap_rx(&wl_ce, &wl_ce_io, &wl_ce.pipe[1], wl_ce_rx, NULL) ||
++	    wlce_reap_tx(&wl_ce, &wl_ce_io, &wl_ce.pipe[0]) ||
++	    wlce_reap_tx(&wl_ce, &wl_ce_io, &wl_ce.pipe[3])) { return wl_ce_fail("CE poll"); }
++	return wl_w11_guard();
++}
++
++/* A reply is due: poll every 1 ms, at most MS ms, then contain. */
++static int
++wl_ce_wait(unsigned what, unsigned ms, const char *stage)
++{
++	for (unsigned t = 0; t <= ms; t++) {
++		if (wl_ce_poll()) { return 1; }
++		if (wl_ce_done(what)) { wl_ce_waited = t; return 0; }
++		if (t < ms) { wl_sleep(1); }
++	}
++	printf("FUXI WLAN: %s timeout %s (%u ms); contain, no retry\n", wl_ce_lane(), stage, ms);
++	wl_ce_snapshot(stage);
++	return wl_w11_fail(stage);
++}
++
++/* Nothing is due: poll every 10 ms for MS ms (early end when WHAT holds). */
++static int
++wl_ce_observe(unsigned what, unsigned ms)
++{
++	for (unsigned t = 0; t < ms; t += 10) {
++		if (wl_ce_poll()) { return 1; }
++		if (wl_ce_done(what)) { return 0; }
++		wl_sleep(10);
++	}
++	return wl_ce_poll();
++}
++
++/* One HTC message at a time, as W11: credits first (3 s, wmi.c:435-456),
++ * frame, slot copy and publish (wlce_send), then the TX drain. */
++static int
++wl_ce_send(uint32_t eid, const uint8_t *payload, uint32_t len, const char *what)
++{
++	static uint8_t frame[WLCE_BUF];
++	uint32_t total = WLHTC_HDR + len;
++	if (eid >= WLHTC_EPS || !wl_htc.ep[eid].used) { return wl_w11_fail("W21 send on an unconnected HTC endpoint"); }
++	if (!wlhtc_has_credits(&wl_htc, eid, total)) {
++		wl_ce_need_eid = eid; wl_ce_need_len = total;
++		printf("FUXI WLAN: %s %s waits for %u HTC credits (has %d)\n", wl_ce_lane(), what,
++		    wlhtc_credits_needed(&wl_htc, total), wl_htc.ep[eid].credits);
++		if (wl_ce_wait(WL20_W_CREDITS, 3000, "HTC credits")) { return 1; }
++	}
++	wl_ce_tx_pipe = wl_htc.ep[eid].ul_pipe;
++	if (wlhtc_frame(&wl_htc, eid, payload, len, frame, sizeof(frame), &total) ||
++	    wlhtc_take_credits(&wl_htc, eid, total) ||
++	    wlce_send(&wl_ce, &wl_ce_io, &wl_ce.pipe[wl_ce_tx_pipe], eid, frame, total)) { return wl_ce_fail(what); }
++	return wl_ce_wait(WL20_W_TX, 1000, "TX drain");
++}
++
++/* HTC connect (htc.c:557-719): WMI control asks for credit flow with
++ * RECV_ALLOC = all credits as a u8 (one WMI endpoint: single-pdev preferred
++ * hw mode, wmi.c:10207-10211, htc.c:446-489, 763-777); every other service
++ * disables credit flow (htc.c:607-613). */
++static int
++wl_ce_connect(uint32_t svc)
++{
++	uint8_t req[WLHTC_CONNECT_BYTES];
++	bool flow = svc == WLHTC_SVC_WMI;
++	uint32_t alloc = flow ? (uint32_t)(uint8_t)wl_htc.credit_count : 0u, eid = 0, status = 0;
++	wlhtc_connect_req(req, svc, flow ? alloc << WLHTC_CONN_RECV_ALLOC_SHIFT : WLHTC_CONN_DISABLE_FLOW);
++	if (wl_ce_send(0, req, sizeof(req), flow ? "HTC connect WMI" : "HTC connect HTT") ||
++	    wl_ce_wait(WL20_W_CTL, 3000, "HTC connect reply")) { return 1; }
++	if (wlhtc_parse_connect(&wl_htc, svc, flow, alloc, &eid, &status)) {
++		printf("FUXI WLAN: W21 htc svc %#x status %u eid %u refused\n", svc, status, eid);
++		return wl_ce_fail("HTC connect");
++	}
++	const struct wlhtc_ep *ep = &wl_htc.ep[eid];
++	printf("FUXI WLAN: W21 htc svc %#x status %u eid %u maxmsg %u pipes %u/%u", svc, status, eid, ep->max_msg,
++	    ep->ul_pipe, ep->dl_pipe);
++	if (flow) { printf(" credits %d", ep->credits); }
++	printf("\n");
++	return 0;
++}
++
++/* W22: INIT, READY, HW mode DBS (core.c:933-953), a 500 ms look for the HW
++ * mode response and unprompted events, then stop. */
++static int
++wl_w22_run(void)
++{
++	static uint8_t cmd[WLWMI_INIT_TOTAL];
++	const uint8_t *rc = cmd + 4 + WLWMI_INIT_BYTES;
++	uint32_t len = 0;
++	wl12_stage = WL22_WMI;
++	if (wlwmi_encode_init(&wl_wmi, cmd, sizeof(cmd), &len)) { return wl_w11_fail("W22 INIT encode bounds"); }
++	if (wl_ce_send(wl_htc.wmi_eid, cmd, len, "WMI INIT")) { return 1; }
++	printf("FUXI WLAN: W22 wmi init sent bytes %u (vdevs %u peers %u chains %#x flag1 %#x flags2 %#x host-svc %#x mem-chunks 0)\n",
++	    len, wlce_get32(rc + 4 * WLWMI_RC_NUM_VDEVS), wlce_get32(rc + 4 * WLWMI_RC_NUM_PEERS),
++	    wlce_get32(rc + 4 * WLWMI_RC_TX_CHAIN_MASK), wlce_get32(rc + 4 * WLWMI_RC_FLAG1),
++	    wlce_get32(rc + 4 * WLWMI_RC_FLAGS2), wlce_get32(rc + 4 * WLWMI_RC_HOST_SERVICE_FLAGS));
++	if (wl_ce_wait(WL20_W_READY, 5000, "WMI READY")) { return 1; }
++	unsigned mac_zero = !(wl_wmi.mac[0] | wl_wmi.mac[1] | wl_wmi.mac[2] | wl_wmi.mac[3] | wl_wmi.mac[4] | wl_wmi.mac[5]);
++	/* L19 stores the status and never acts on it (wmi.c:6910): logged only. */
++	printf("FUXI WLAN: W22 wmi ready status %u mac-zero %u peers %u\n", wl_wmi.ready_status, mac_zero, wl_wmi.num_total_peers);
++	if (wl20_bits & WL20_NOHWMODE) {
++		printf("FUXI WLAN: W22 hw mode skipped (w20 0x40)\n");
++	} else {
++		static uint8_t hw[WLWMI_HW_MODE_TOTAL];
++		if (wlwmi_encode_hw_mode(hw, sizeof(hw), WLWMI_HW_MODE_DBS, &len)) { return wl_w11_fail("W22 HW mode encode bounds"); }
++		if (wl_ce_send(wl_htc.wmi_eid, hw, len, "WMI PDEV_SET_HW_MODE")) { return 1; }
++		printf("FUXI WLAN: W22 hw mode dbs sent\n");
++	}
++	/* L19 does not wait for the response (wmi.c:4186-4216). */
++	if (wl_ce_observe(WL20_W_NONE, 500)) { return 1; }
++	printf("FUXI WLAN: W22 hw mode response %s; wmi events %u unknown %u\n", wl_wmi.got_hw_resp ? "seen" : "not seen",
++	    wl_wmi.events, wl_wmi.unknown_events);
++	printf("FUXI WLAN: W22 complete; stop/contain\n");
++	return 0;
++}
++
++/* W21: connect HTT (unless w20 0x01) and WMI, SETUP_COMPLETE_EX, then the
++ * service-ready set. L19 completes service ready from EXT when the target has
++ * no EXT2 service, else from EXT2 (wmi.c:4940-4941, 5645), so EXT is always
++ * awaited; AVAILABLE (services 128..) is optional and comes first. */
++static int
++wl_w21_run(void)
++{
++	uint8_t msg[WLHTC_SETUP_COMPLETE_BYTES];
++	wl12_stage = WL21_HTC;
++	if (wl20_bits & WL20_NOHTT) { printf("FUXI WLAN: W21 htc HTT connect skipped (w20 0x01)\n"); }
++	else if (wl_ce_connect(WLHTC_SVC_HTT)) { return 1; }
++	if (wl_ce_connect(WLHTC_SVC_WMI)) { return 1; }
++	wlhtc_setup_complete(msg);
++	if (wl_ce_send(0, msg, sizeof(msg), "HTC SETUP_COMPLETE_EX")) { return 1; }
++	printf("FUXI WLAN: W21 htc setup complete sent\n");
++	if (wl_ce_wait(WL20_W_SVC, 5000, "WMI SERVICE_READY")) { return 1; }
++	printf("FUXI WLAN: W21 wmi service ready fw %#x rf-chains %u mem-reqs %u scan-chans %u\n",
++	    wl_wmi.fw_build, wl_wmi.num_rf_chains, wl_wmi.num_mem_reqs, wl_wmi.max_scan_chans);
++	/* L19 never reads num_mem_reqs and never hands host memory chunks to
++	 * WMI_INIT (wmi.c:4230, 4077-4083); stopping here is overnight_plan.md 4.4. */
++	if (wl_wmi.num_mem_reqs) { return wl_w11_fail("W21 SERVICE_READY asks for host memory chunks (plan rule, not L19)"); }
++	if (wl_ce_observe(WL20_W_AVAIL, 1000)) { return 1; }
++	printf("FUXI WLAN: W21 wmi services ext %u ext2 %u reg-cc-ext %u (available event %u)\n",
++	    wlwmi_svc(&wl_wmi, WLWMI_SVC_EXT_MSG), wlwmi_svc(&wl_wmi, WLWMI_SVC_EXT2_MSG),
++	    wlwmi_svc(&wl_wmi, WLWMI_SVC_REG_CC_EXT), wl_wmi.got_avail);
++	if (wl_ce_wait(WL20_W_EXT, 5000, "WMI SERVICE_READY_EXT")) { return 1; }
++	printf("FUXI WLAN: W21 wmi service ready ext hw-modes %u caps %u pdev %u%s\n", wl_wmi.num_hw_modes,
++	    wl_wmi.hw_mode_caps, wl_wmi.pdev_id, wl_wmi.pdev_valid ? "" : " (no MAC/PHY caps)");
++	if (wlwmi_svc(&wl_wmi, WLWMI_SVC_EXT2_MSG)) {
++		if (wl_ce_wait(WL20_W_EXT2, 5000, "WMI SERVICE_READY_EXT2")) { return 1; }
++		printf("FUXI WLAN: W21 wmi service ready ext2 bytes %u\n", wl_wmi.ext2_bytes);
++	}
++	printf("FUXI WLAN: W21 wmi service ready complete\n");
++	return wl_w22_run();
++}
++
++/* W20: optional MRRS, arena, seven rings, HTC init, 62 + 62 RX buffers, HTC
++ * READY (3 s; L19 waits 1 s, services the CEs, waits 1 s more: htc.c:491-515). */
++static int
++wl_w20_run(void)
++{
++	wl12_stage = WL20_CE;
++	wl_ce_started = true; wl_ce_waited = wl_ce_logged = 0;
++	bzero(&wl_htc, sizeof(wl_htc)); bzero(&wl_wmi, sizeof(wl_wmi));
++	if ((wl20_bits & WL20_MRRS128) && wl_ce_mrrs128()) { return 1; }
++	if (wl_ce_alloc() || wl_ce_init_rings()) { return 1; }
++	if (wlhtc_init(&wl_htc, wl15_service_ce, 14) ||
++	    wlce_post_rx(&wl_ce, &wl_ce_io, &wl_ce.pipe[1], WLCE_RX_POST) ||
++	    wlce_post_rx(&wl_ce, &wl_ce_io, &wl_ce.pipe[2], WLCE_RX_POST)) { return wl_ce_fail("HTC init/RX post"); }
++	printf("FUXI WLAN: W20 ce rx posted CE1 %u CE2 %u\n", wl_ce.pipe[1].posted, wl_ce.pipe[2].posted);
++	if (wl_ce_wait(WL20_W_CTL, 3000, "HTC READY")) { return 1; }
++	if (wlhtc_parse_ready(&wl_htc)) { return wl_ce_fail("HTC READY"); }
++	printf("FUXI WLAN: W20 htc ready credits %u size %u max-ep %u after %u ms\n", wl_htc.credit_count,
++	    wl_htc.credit_size, wl_htc.max_ep, wl_ce_waited);
++	return wl_w21_run();
++}
++
++/* First step of wl5_abort: latch "stopping" so the pure layer posts, sends,
++ * consumes and publishes nothing more. The arena is freed with the other
++ * buffers only when MHI reset, bus master off, PERST and the SMMU undo are
++ * proven, else it stays quarantined (wl5_abort). C2's best-effort STOP_SCAN
++ * goes in this function before the latch (the latch refuses every send): one
++ * bounded send and a short TX drain whose failure never fails the abort. */
++static void
++wl_ce_contain(unsigned step)
++{
++	(void)step;
++	if (!wl_ce_started) { return; }
++	wl_ce_started = false;
++	wl_ce.stopping = true;
++	printf("FUXI WLAN: W20 ce contain posted %u reaped %u tx %u\n", wl_ce.pipe[1].posted + wl_ce.pipe[2].posted,
++	    wl_ce.pipe[1].reaped + wl_ce.pipe[2].reaped, wl_ce.pipe[0].posted + wl_ce.pipe[3].posted);
++}
++/* ---- end W20 ---- */
++
 +/* Firmware-start QMI only: no CE allocation, register programming, HTC or WMI.
 + * Adapted from Linux ath12k qmi.c (BSD-3-Clause-Clear), v6.12,
 + * ath12k_qmi_firmware_start: INI -> CFG -> MODE, one reply at a time. */
@@ -4725,13 +5168,14 @@
 +	    wl_rails_on(2, "late before WLAN_MODE") ||
 +	    wl12_send(&e, 0x22, WL15_MODE) || wl12_wait(0, "WLAN_MODE reply") ||
 +	    wl_w11_wait(3, "W15 MODE TX drain") || wl_w11_guard()) { return 1; }
-+	printf("FUXI WLAN: W15 wlan mode normal ok; stop before CE/HTC\n");
++	printf("FUXI WLAN: W15 wlan mode normal ok; %s\n", wl_w20 ? "CE/HTC next" : "stop before CE/HTC");
 +	wl16_snapshot("MODE reply");
 +	wl12_stage = WL15_OBSERVE;
-+	printf("FUXI WLAN: W15 observing indications 2000 ms (reported only)\n");
++	unsigned observe = wl_w20 ? 200 : 2000; /* W20 moves on to the copy engines */
++	printf("FUXI WLAN: W15 observing indications %u ms (reported only)\n", observe);
 +	/* Transport consumes/reposts IPCR RX buffers as usual, but indication
 +	 * contents cannot provision memory or trigger further QMI requests. */
-+	for (unsigned ms = 0; ms < 2000; ms += 10) {
++	for (unsigned ms = 0; ms < observe; ms += 10) {
 +		if (wl_w11_events()) { return 1; }
 +		wl_sleep(10);
 +	}
@@ -4768,6 +5212,7 @@
 +		printf("FUXI WLAN: W15 fw ready; starting WLAN INI/CFG/MODE\n");
 +		wl12_stage = WL15_INI;
 +		int error = wl_w15_run();
++		if (!error && wl_w20) { error = wl_w20_run(); } /* only after this boot's MODE reply */
 +		/* Preserve post-MODE or failure evidence before containment/reset. */
 +		wl_wlfw_diagnostics("W15 WLAN start");
 +		return error || wl_w11_guard();
@@ -4856,7 +5301,9 @@
 +		if (wl_w14_run()) { return 1; }
 +		if (wl_w11_events() || wl_w11_wait(3, "W14 final TX drain") || wl_w11_guard()) { return 1; }
 +		wl_w11_ok = true;
-+		printf("FUXI WLAN: %s complete; %s\n", wl_w15 ? "W15" : "W14", wl_keep ? "keep requested, DMA/channels/wake retained (polling ended)" : "stop/contain");
++		if (!wl_w20) { /* W22 printed its own completion line */
++			printf("FUXI WLAN: %s complete; %s\n", wl_w15 ? "W15" : "W14", wl_keep ? "keep requested, DMA/channels/wake retained (polling ended)" : "stop/contain");
++		}
 +		return 0;
 +	}
 +	wl12_stage = WL12_DONE;
@@ -5203,6 +5650,7 @@
 +static void
 +wl5_abort(unsigned step)
 +{
++	wl_ce_contain(step); /* W20: latch CE stop first; returns at once when W20 never ran */
 +	if (wl_w11_attempted) { wl_w11_stop(); }
 +	wl5_status(step);
 +	(void)wl_smmu_fault(step);
@@ -5239,6 +5687,7 @@
 +		wl_dma_free(&wl_rxvectors); wl_dma_free(&wl_rddm);
 +		for (unsigned i = 0; i < WL_TARGET_MAX; i++) { wl_dma_free(&wl_target[i]); }
 +		wl_dma_free(&wl14_regdb); wl_dma_free(&wl14_bdf); wl_dma_free(&wl14_m3);
++		wl_dma_free(&wl_ce_arena);
 +		wl_dma_free(&wl_ipcr);
 +		wl_dma_free(&wl_contexts); wl_dma_free(&wl_vectors); wl_dma_free(&wl_amss); wl_dma_free(&wl_image);
 +		printf("FUXI WLAN: abort buffers freed\n");
@@ -5533,6 +5982,10 @@
 +	}
 +	unsigned limit = (arg == 1 || arg > (int)WL5_STEPS) ? WL5_STEPS : (unsigned)arg;
 +	wl_iova_configure();
++	if (wl_w20 && limit != WL5_STEPS) {
++		wl_variant_invalid = true;
++		printf("FUXI WLAN: W20 fuxiwlanqrtr=6 needs all %u steps (fuxiwlan=1 or 28), limit %u; refused\n", WL5_STEPS, limit);
++	}
 +#if defined(FUXI_SALAMI)
 +	/* Before the thread, any mapping or register access: cyclerails votes
 +	 * the shared rails OFF, and a selector that did not parse is refused
@@ -5557,6 +6010,1156 @@
 +	}
 +}
 +#endif /* FUXI */
+--- a/bsd/dev/fuxi_wlan_ce.h
++++ b/bsd/dev/fuxi_wlan_ce.h
+@@ -0,0 +1,1147 @@
++/*
++ * FUXI WLAN W20/W21/W22 (fuxiwlanqrtr=6, C1): WCN7850 copy engines on SRNG
++ * rings, HTC and WMI init to WMI READY, polled. Pure C: no XNU or Linux
++ * includes. The includer provides uint8_t..uint64_t, size_t, bool and memcpy
++ * (bsd/dev/fuxi_wlan.c in the kernel, tools/fuxi-wlan-ce-model.c on the host).
++ * Hardware is reached only through struct wlce_io; every length that comes
++ * from the device is bounded by the buffer it arrived in; nothing allocates.
++ * Per-field provenance and the log lines: docs-lanes/wlan-w20.md.
++ *
++ * Derived from Linux ath12k v6.19 (tag v6.19, 05f7e89ab), directory
++ * drivers/net/wireless/ath/ath12k, files and their notices:
++ *   ce.c, ce.h, hal_desc.h:
++ *     Copyright (c) 2018-2021 The Linux Foundation. All rights reserved.
++ *     Copyright (c) 2021-2022, 2024-2025 Qualcomm Innovation Center, Inc. All rights reserved.
++ *   hal.c, hal.h, hw.c, hw.h:
++ *     Copyright (c) 2018-2021 The Linux Foundation. All rights reserved.
++ *     Copyright (c) 2021-2025 Qualcomm Innovation Center, Inc. All rights reserved.
++ *   htc.c:
++ *     Copyright (c) 2018-2021 The Linux Foundation. All rights reserved.
++ *     Copyright (c) 2021-2022, 2024 Qualcomm Innovation Center, Inc. All rights reserved.
++ *   htc.h:
++ *     Copyright (c) 2018-2021 The Linux Foundation. All rights reserved.
++ *     Copyright (c) 2021-2022 Qualcomm Innovation Center, Inc. All rights reserved.
++ *   wmi.c, wmi.h, core.c:
++ *     Copyright (c) 2018-2021 The Linux Foundation. All rights reserved.
++ *     Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ *   pci.c:
++ *     Copyright (c) 2019-2021 The Linux Foundation. All rights reserved.
++ *     Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ * Every SPDX line there is BSD-3-Clause-Clear. This file is an independent
++ * encoding of the wire and register facts; no Linux function, macro or table
++ * is copied. File:line references below are into that tree ("L19").
++ *
++ * The Clear BSD License
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted (subject to the limitations in the disclaimer
++ * below) provided that the following conditions are met:
++ *
++ * - Redistributions of source code must retain the above copyright notice,
++ *   this list of conditions and the following disclaimer.
++ * - Redistributions in binary form must reproduce the above copyright
++ *   notice, this list of conditions and the following disclaimer in the
++ *   documentation and/or other materials provided with the distribution.
++ * - Neither the name of the copyright holder nor the names of its
++ *   contributors may be used to endorse or promote products derived from
++ *   this software without specific prior written permission.
++ *
++ * NO EXPRESS OR IMPLIED LICENSES TO ANY PARTY'S PATENT RIGHTS ARE GRANTED BY
++ * THIS LICENSE. THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
++ * CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT
++ * NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
++ * PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER
++ * OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
++ * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
++ * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
++ * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
++ * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
++ * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
++ * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++#ifndef FUXI_WLAN_CE_H
++#define FUXI_WLAN_CE_H
++
++/* ---- copy engines (SRNG) ----
++ * Adapted from Linux ath12k ce.c, ce.h, hal.c, hal.h, hal_desc.h, hw.c and
++ * pci.c (BSD-3-Clause-Clear), v6.19. Host CE configuration, ath12k_host_ce_config_wcn7850 (ce.c:145-220):
++ * CE0 SRC 16 x 2048 (HTC control), CE1 DST 512 (HTT + HTC control), CE2 DST
++ * 64 (WMI), CE3 SRC 32 x 2048 (WMI), CE4 SRC 2048 x 256 (HTT, idle in C1);
++ * CE5-8 have no host rings. Ring ids: SRC 64+n, DST 81+n, DST_STATUS 100+n
++ * (hal.h:419-468). Entry sizes: SRC 4, DST 2, STATUS 4 dwords (hal_desc.h:
++ * 1543-1547, 1631-1634, 1686-1691; hal.c:85-108 directions). */
++#define WLCE_NPIPE 5u
++#define WLCE_NRING 7u
++#define WLCE_BUF 2048u              /* src_sz_max of CE0..CE3; DEST_CTRL max length */
++#define WLCE_RX_POST 62u            /* per RX pipe; L19 posts nentries-2 (ce.c:948-949) */
++#define WLCE_ID_SRC(n) (64u + (n))
++#define WLCE_ID_DST(n) (81u + (n))
++#define WLCE_ID_STS(n) (100u + (n))
++#define WLCE_RDP_IDS 128u           /* rdp: one u32 per ring id (hal.c:1564-1576) */
++
++/* Register blocks (SoC offsets, BAR0 window 0x37): hw.c:1273-1276 gives CE0
++ * SRC 0x01b80000, CE0 DST 0x01b81000, CE1 SRC 0x01b82000; hal.c:1376-1402
++ * steps by that 0x2000 for every CE. R0 offsets of host-produced rings are
++ * wcn7850_regs hal_tcl1_ring_* minus 0x900 (hw.c:1196-1207, hal.h:68-113);
++ * of the device-produced STATUS ring hal_reo1_ring_* minus 0x4e4
++ * (hw.c:1244-1253, hal.c:252-295). STATUS R0 at DST block + 0x58, DEST_CTRL
++ * at + 0xb0, R2 HP at + 0x400 (STATUS + 0x408), TP 4 above HP
++ * (hal.h:116-122, 172-176, 203-210). */
++#define WLCE_REG_BASE 0x01b80000u
++#define WLCE_REG_END 0x01b8a000u    /* CE0..CE4 SRC and DST blocks */
++#define WLCE_SRC_BLOCK(n) (0x01b80000u + 0x2000u * (n))
++#define WLCE_DST_BLOCK(n) (0x01b81000u + 0x2000u * (n))
++#define WLCE_R0_BASE_LSB 0x00u
++#define WLCE_R0_BASE_MSB 0x04u      /* address 39:32 in 7:0, ring size in dwords 27:8 */
++#define WLCE_R0_ID 0x08u            /* entry size 7:0; STATUS also ring id 15:8 */
++#define WLCE_R0_MISC 0x10u
++#define WLCE_R0_TP_ADDR_LSB 0x1cu   /* host-produced rings */
++#define WLCE_R0_TP_ADDR_MSB 0x20u
++#define WLCE_R0_CONS_IX0 0x30u
++#define WLCE_R0_CONS_IX1 0x34u
++#define WLCE_R0_HP_ADDR_LSB 0x14u   /* STATUS ring */
++#define WLCE_R0_HP_ADDR_MSB 0x18u
++#define WLCE_R0_PROD_INT 0x24u
++#define WLCE_STS_R0 0x58u
++#define WLCE_DEST_CTRL 0xb0u        /* max buffer length 15:0 (hal.h:339) */
++#define WLCE_R2_HP 0x400u
++#define WLCE_STS_R2_HP 0x408u
++#define WLCE_MISC_LOOPCNT_DIS (1u << 1)  /* host-produced only (hal.h:291, hal.c:1798-1799) */
++#define WLCE_MISC_SRNG_ENABLE (1u << 6)  /* hal.h:295, 320 */
++#define WLCE_RING_SIZE_MAX 0xffffu       /* HAL_CE_*_RING_BASE_MSB_RING_SIZE (hal.h:368-370) */
++/* Shadow register i is BAR0 + 0x8fc + 4i, 40 of them (hal.h:38-43): below
++ * 0xFE0, so neither the window nor a wake is needed (pci.c:33-39). */
++#define WLCE_SHADOW_BASE 0x8fcu
++#define WLCE_SHADOW_REGS 40u
++
++/* Arena, one IOVA range of 512 KiB, Normal-NC: rdp, the seven rings, the TX
++ * slots of CE0/CE3 (slot i = SRC entry i) and the RX buffers of CE1/CE2.
++ * Ring bases are 4 KiB aligned (L19 needs 8, CE_DESC_RING_ALIGN ce.h:108). */
++#define WLCE_ARENA_BYTES 0x80000u
++#define WLCE_OFF_RDP 0x00000u
++#define WLCE_OFF_CE0_SRC 0x01000u   /*   16 x 16 B */
++#define WLCE_OFF_CE1_DST 0x02000u   /*  512 x  8 B */
++#define WLCE_OFF_CE1_STS 0x03000u   /*  512 x 16 B */
++#define WLCE_OFF_CE2_DST 0x05000u   /*   64 x  8 B */
++#define WLCE_OFF_CE2_STS 0x06000u   /*   64 x 16 B */
++#define WLCE_OFF_CE3_SRC 0x07000u   /*   32 x 16 B */
++#define WLCE_OFF_CE4_SRC 0x08000u   /* 2048 x 16 B */
++#define WLCE_OFF_CE0_TX 0x10000u    /* 16 x 2 KiB */
++#define WLCE_OFF_CE3_TX 0x18000u    /* 32 x 2 KiB */
++#define WLCE_OFF_CE1_RX 0x28000u    /* 62 x 2 KiB */
++#define WLCE_OFF_CE2_RX 0x47000u    /* 62 x 2 KiB */
++#define WLCE_OFF_END 0x66000u
++_Static_assert(WLCE_RDP_IDS * 4u <= WLCE_OFF_CE0_SRC && WLCE_OFF_CE0_SRC + 16u * 16u <= WLCE_OFF_CE1_DST &&
++    WLCE_OFF_CE1_DST + 512u * 8u <= WLCE_OFF_CE1_STS && WLCE_OFF_CE1_STS + 512u * 16u <= WLCE_OFF_CE2_DST &&
++    WLCE_OFF_CE2_DST + 64u * 8u <= WLCE_OFF_CE2_STS && WLCE_OFF_CE2_STS + 64u * 16u <= WLCE_OFF_CE3_SRC &&
++    WLCE_OFF_CE3_SRC + 32u * 16u <= WLCE_OFF_CE4_SRC && WLCE_OFF_CE4_SRC + 2048u * 16u <= WLCE_OFF_CE0_TX &&
++    WLCE_OFF_CE0_TX + 16u * WLCE_BUF <= WLCE_OFF_CE3_TX && WLCE_OFF_CE3_TX + 32u * WLCE_BUF <= WLCE_OFF_CE1_RX &&
++    WLCE_OFF_CE1_RX + WLCE_RX_POST * WLCE_BUF <= WLCE_OFF_CE2_RX &&
++    WLCE_OFF_CE2_RX + WLCE_RX_POST * WLCE_BUF == WLCE_OFF_END && WLCE_OFF_END <= WLCE_ARENA_BYTES,
++    "W20 arena layout");
++
++/* A device-written rdp word is one 32-bit load; the host model wraps it. */
++#ifndef WLCE_RDP_LOAD
++#define WLCE_RDP_LOAD(ce, id) ((ce)->rdp[(id)])
++#endif
++
++enum { WLCE_SRC, WLCE_DST, WLCE_STS };
++
++struct wlce_ring {                  /* one SRNG */
++	uint16_t id;
++	uint8_t kind;                   /* WLCE_SRC/WLCE_DST host-produced, WLCE_STS device-produced */
++	uint8_t entry_dw;
++	uint32_t entries;               /* power of two */
++	uint32_t r0, r2;                /* SoC offsets of the R0 base and the R2 HP register */
++	uint32_t shadow;                /* BAR0 offset of its shadow register, 0 = R2 through the window */
++	uint32_t shadow_idx;
++	uint32_t hp, tp;                /* host copies in dwords: SRC/DST hp produced, tp reaped; STATUS tp consumed */
++	uint32_t seen;                  /* last device pointer read from rdp */
++	uint8_t *va;                    /* ring memory, Normal-NC */
++	uint64_t iova;
++};
++
++struct wlce_pipe {
++	struct wlce_ring src, dst, sts;
++	bool has_src, has_dst;
++	uint32_t buf_bytes;
++	uint32_t slot0, nslots;         /* TX slot or RX buffer range: arena offset, count */
++	uint32_t posted, reaped;        /* TX: sent/completed messages; RX: posted/returned buffers */
++	uint32_t post_slot, reap_slot;
++};
++
++struct wlce_io {                    /* the only way the pure code touches hardware */
++	int (*soc_wr)(void *ctx, uint32_t soc_off, uint32_t value);   /* windowed, quiet */
++	int (*soc_rd)(void *ctx, uint32_t soc_off, uint32_t *value);
++	int (*bar_wr)(void *ctx, uint32_t bar_off, uint32_t value);   /* shadow registers only */
++	void (*wbarrier)(void *ctx);    /* before a pointer publish (descriptors and buffers visible) */
++	void (*rbarrier)(void *ctx);    /* after a device pointer read (L19 dma_rmb) */
++	void *ctx;
++};
++
++struct wlce {
++	struct wlce_pipe pipe[WLCE_NPIPE];
++	struct wlce_ring *ring[WLCE_NRING];   /* L19 init order (ce.c:921-968) */
++	volatile uint32_t *rdp;
++	uint64_t rdp_iova;
++	uint8_t *base;
++	uint64_t base_iova;
++	uint32_t bytes;
++	bool shadow, stopping;
++	unsigned writes, errors;
++	const char *why;                /* first failure, a string literal */
++};
++
++static inline uint32_t wlce_get16(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8); }
++static inline uint32_t wlce_get32(const uint8_t *p) { return wlce_get16(p) | (wlce_get16(p + 2) << 16); }
++static inline void
++wlce_put32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
++}
++
++static inline int
++wlce_fail(struct wlce *ce, const char *why)
++{
++	if (!ce->why) { ce->why = why; }
++	ce->errors++;
++	return 1;
++}
++
++static inline uint32_t wlce_size(const struct wlce_ring *r) { return r->entries * r->entry_dw; }
++/* Dwords from A forward to B in a ring of SIZE dwords. */
++static inline uint32_t wlce_dist(uint32_t a, uint32_t b, uint32_t size) { return (b + size - a) % size; }
++static inline uint32_t wlce_word(const struct wlce_ring *r, uint32_t dw) { return ((const volatile uint32_t *)(const void *)r->va)[dw]; }
++static inline void wlce_set_word(struct wlce_ring *r, uint32_t dw, uint32_t v) { ((volatile uint32_t *)(void *)r->va)[dw] = v; }
++
++/* The only CE registers C1 writes: R0 setup and R2 HP/TP of the 7 rings and
++ * DEST_CTRL of CE1/CE2. Anything else is refused before the window moves. */
++static inline bool
++wlce_reg_ok(uint32_t off)
++{
++	static const uint8_t host_r0[] = { WLCE_R0_BASE_LSB, WLCE_R0_BASE_MSB, WLCE_R0_ID, WLCE_R0_MISC,
++		WLCE_R0_TP_ADDR_LSB, WLCE_R0_TP_ADDR_MSB, WLCE_R0_CONS_IX0, WLCE_R0_CONS_IX1 };
++	static const uint8_t sts_r0[] = { WLCE_R0_BASE_LSB, WLCE_R0_BASE_MSB, WLCE_R0_ID, WLCE_R0_MISC,
++		WLCE_R0_HP_ADDR_LSB, WLCE_R0_HP_ADDR_MSB, WLCE_R0_PROD_INT };
++	if (off < WLCE_REG_BASE || off >= WLCE_REG_END || (off & 3)) { return false; }
++	uint32_t rel = (off - WLCE_REG_BASE) % 0x2000u, ce = (off - WLCE_REG_BASE) / 0x2000u;
++	bool dst = rel >= 0x1000u;
++	if (dst) { rel -= 0x1000u; }
++	if (dst ? ce != 1 && ce != 2 : ce != 0 && ce != 3 && ce != 4) { return false; }
++	if (rel == WLCE_R2_HP || rel == WLCE_R2_HP + 4u) { return true; }
++	for (unsigned i = 0; i < sizeof(host_r0); i++) { if (rel == host_r0[i]) { return true; } }
++	if (!dst) { return false; }
++	if (rel == WLCE_DEST_CTRL || rel == WLCE_STS_R2_HP || rel == WLCE_STS_R2_HP + 4u) { return true; }
++	for (unsigned i = 0; i < sizeof(sts_r0); i++) { if (rel == WLCE_STS_R0 + sts_r0[i]) { return true; } }
++	return false;
++}
++
++/* Place rdp, rings, TX slots and RX buffers in the arena and look every ring
++ * pointer up in the shadow-v3 table WLAN_CFG sent: a SRC-direction ring
++ * shadows its R2 HP, the STATUS ring its R2 TP (hal.c:2471-2507; order of
++ * ath12k_ce_shadow_config ce.c:874-887). SHADOW false (fuxiwlanw15=1, no
++ * table in CFG) publishes every pointer to R2 through the window. */
++static inline int
++wlce_layout(struct wlce *ce, uint8_t *base, uint64_t iova, uint32_t bytes,
++    const uint32_t *shadow_tbl, unsigned shadow_n, bool shadow)
++{
++	static const struct { uint8_t ce, kind; uint32_t entries, ring, buf, nbuf; } plan[WLCE_NRING] = {
++		{0, WLCE_SRC, 16, WLCE_OFF_CE0_SRC, WLCE_OFF_CE0_TX, 16},
++		{1, WLCE_DST, 512, WLCE_OFF_CE1_DST, WLCE_OFF_CE1_RX, WLCE_RX_POST},
++		{1, WLCE_STS, 512, WLCE_OFF_CE1_STS, 0, 0},
++		{2, WLCE_DST, 64, WLCE_OFF_CE2_DST, WLCE_OFF_CE2_RX, WLCE_RX_POST},
++		{2, WLCE_STS, 64, WLCE_OFF_CE2_STS, 0, 0},
++		{3, WLCE_SRC, 32, WLCE_OFF_CE3_SRC, WLCE_OFF_CE3_TX, 32},
++		{4, WLCE_SRC, 2048, WLCE_OFF_CE4_SRC, 0, 0},
++	};
++	for (size_t i = 0; i < sizeof(*ce); i++) { ((uint8_t *)ce)[i] = 0; }
++	if (!base || (iova & 0xfffu) || bytes < WLCE_ARENA_BYTES || iova + WLCE_ARENA_BYTES > (1ull << 32)) {
++		return wlce_fail(ce, "CE arena bounds/alignment");
++	}
++	ce->base = base; ce->base_iova = iova; ce->bytes = bytes; ce->shadow = shadow;
++	ce->rdp = (volatile uint32_t *)(void *)(base + WLCE_OFF_RDP);
++	ce->rdp_iova = iova + WLCE_OFF_RDP;
++	for (unsigned i = 0; i < WLCE_NRING; i++) {
++		struct wlce_pipe *p = &ce->pipe[plan[i].ce];
++		uint8_t kind = plan[i].kind;
++		struct wlce_ring *r = kind == WLCE_SRC ? &p->src : kind == WLCE_DST ? &p->dst : &p->sts;
++		uint32_t block = kind == WLCE_SRC ? WLCE_SRC_BLOCK(plan[i].ce) : WLCE_DST_BLOCK(plan[i].ce);
++		r->kind = kind;
++		r->entry_dw = kind == WLCE_DST ? 2 : 4;
++		r->entries = plan[i].entries;
++		r->id = (uint16_t)(kind == WLCE_SRC ? WLCE_ID_SRC(plan[i].ce) : kind == WLCE_DST ?
++		    WLCE_ID_DST(plan[i].ce) : WLCE_ID_STS(plan[i].ce));
++		r->r0 = block + (kind == WLCE_STS ? WLCE_STS_R0 : 0u);
++		r->r2 = block + (kind == WLCE_STS ? WLCE_STS_R2_HP : WLCE_R2_HP);
++		r->va = base + plan[i].ring;
++		r->iova = iova + plan[i].ring;
++		if (plan[i].nbuf) { p->slot0 = plan[i].buf; p->nslots = plan[i].nbuf; p->buf_bytes = WLCE_BUF; }
++		if (kind == WLCE_SRC) { p->has_src = true; }
++		if (kind == WLCE_DST) { p->has_dst = true; }
++		ce->ring[i] = r;
++		uint32_t target = r->r2 + (kind == WLCE_STS ? 4u : 0u);
++		unsigned found = 0;
++		for (unsigned j = 0; j < shadow_n; j++) {
++			if (shadow_tbl[j] != target) { continue; }
++			if (found++ || j >= WLCE_SHADOW_REGS) { return wlce_fail(ce, "CE shadow-v3 entry repeated or past register 39"); }
++			r->shadow_idx = j;
++			r->shadow = WLCE_SHADOW_BASE + 4u * j;
++		}
++		if (!shadow) { r->shadow = 0; }
++		else if (!found) { return wlce_fail(ce, "CE ring pointer missing from the WLAN_CFG shadow-v3 table"); }
++	}
++	return 0;
++}
++
++static inline int
++wlce_wr(struct wlce *ce, const struct wlce_io *io, uint32_t off, uint32_t v)
++{
++	if (ce->stopping) { return wlce_fail(ce, "CE stopping: register write refused"); }
++	if (!wlce_reg_ok(off) || io->soc_wr(io->ctx, off, v)) { return wlce_fail(ce, "CE register write refused or failed"); }
++	ce->writes++;
++	return 0;
++}
++
++static inline int
++wlce_rd(struct wlce *ce, const struct wlce_io *io, uint32_t off, uint32_t *v)
++{
++	*v = ~0u;
++	if (!wlce_reg_ok(off) || io->soc_rd(io->ctx, off, v)) { return wlce_fail(ce, "CE register read refused or failed"); }
++	return 0;
++}
++
++/* Polled ring setup in the L19 order: memory and rdp word zeroed
++ * (hal.c:2369-2370, 1699, 1787), then for host-produced rings BASE, size,
++ * entry size, consumer thresholds 0, TP_ADDR = rdp + 4 * id, R2 HP = TP = 0,
++ * MISC (hal.c:1714-1807); for the STATUS ring BASE, size, id << 8 | entry
++ * size, producer thresholds 0, HP_ADDR, R2 HP = TP = 0, MISC (hal.c:
++ * 1638-1712). No MSI address and no interrupt threshold: L19 writes them only
++ * with HAL_SRNG_FLAGS_MSI_INTR / non-DIS_INTR CEs (ce.c:578-614). */
++static inline int
++wlce_ring_init(struct wlce *ce, const struct wlce_io *io, struct wlce_ring *r)
++{
++	uint32_t size = wlce_size(r);
++	uint64_t ptr = ce->rdp_iova + 4ull * r->id;
++	uint32_t lo = (uint32_t)r->iova, msb = (uint32_t)(r->iova >> 32) & 0xffu;
++	if (!r->entries || (r->entries & (r->entries - 1)) || size > WLCE_RING_SIZE_MAX || r->id >= WLCE_RDP_IDS) {
++		return wlce_fail(ce, "CE ring geometry");
++	}
++	for (uint32_t i = 0; i < size; i++) { wlce_set_word(r, i, 0); }
++	ce->rdp[r->id] = 0;
++	r->hp = r->tp = r->seen = 0;
++	if (r->kind != WLCE_STS) {
++		return wlce_wr(ce, io, r->r0 + WLCE_R0_BASE_LSB, lo) ||
++		    wlce_wr(ce, io, r->r0 + WLCE_R0_BASE_MSB, msb | (size << 8)) ||
++		    wlce_wr(ce, io, r->r0 + WLCE_R0_ID, r->entry_dw) ||
++		    wlce_wr(ce, io, r->r0 + WLCE_R0_CONS_IX0, 0) ||
++		    wlce_wr(ce, io, r->r0 + WLCE_R0_CONS_IX1, 0) ||
++		    wlce_wr(ce, io, r->r0 + WLCE_R0_TP_ADDR_LSB, (uint32_t)ptr) ||
++		    wlce_wr(ce, io, r->r0 + WLCE_R0_TP_ADDR_MSB, (uint32_t)(ptr >> 32)) ||
++		    wlce_wr(ce, io, r->r2, 0) || wlce_wr(ce, io, r->r2 + 4u, 0) ||
++		    wlce_wr(ce, io, r->r0 + WLCE_R0_MISC, WLCE_MISC_LOOPCNT_DIS | WLCE_MISC_SRNG_ENABLE);
++	}
++	return wlce_wr(ce, io, r->r0 + WLCE_R0_BASE_LSB, lo) ||
++	    wlce_wr(ce, io, r->r0 + WLCE_R0_BASE_MSB, msb | (size << 8)) ||
++	    wlce_wr(ce, io, r->r0 + WLCE_R0_ID, ((uint32_t)r->id << 8) | r->entry_dw) ||
++	    wlce_wr(ce, io, r->r0 + WLCE_R0_PROD_INT, 0) ||
++	    wlce_wr(ce, io, r->r0 + WLCE_R0_HP_ADDR_LSB, (uint32_t)ptr) ||
++	    wlce_wr(ce, io, r->r0 + WLCE_R0_HP_ADDR_MSB, (uint32_t)(ptr >> 32)) ||
++	    wlce_wr(ce, io, r->r2, 0) || wlce_wr(ce, io, r->r2 + 4u, 0) ||
++	    wlce_wr(ce, io, r->r0 + WLCE_R0_MISC, WLCE_MISC_SRNG_ENABLE);
++}
++
++/* DEST_CTRL max length, read-modify-write of 15:0, after the DST ring setup
++ * (hal.c:1620-1636, 2439-2442; max_buffer_len = src_sz_max ce.c:597-598),
++ * then read back (L19 does not): it is the only bound on what the engine
++ * writes into one RX buffer, so a value that did not take stops the run
++ * before any buffer is posted. */
++static inline int
++wlce_dest_ctrl(struct wlce *ce, const struct wlce_io *io, const struct wlce_ring *r, uint32_t max_len, uint32_t *readback)
++{
++	uint32_t v = 0;
++	*readback = ~0u;
++	if (r->kind != WLCE_DST || !max_len || max_len > 0xffffu) { return wlce_fail(ce, "CE DEST_CTRL target"); }
++	if (wlce_rd(ce, io, r->r0 + WLCE_DEST_CTRL, &v) || wlce_wr(ce, io, r->r0 + WLCE_DEST_CTRL, (v & ~0xffffu) | max_len) ||
++	    wlce_rd(ce, io, r->r0 + WLCE_DEST_CTRL, readback)) { return 1; }
++	return (*readback & 0xffffu) == max_len ? 0 : wlce_fail(ce, "CE DEST_CTRL readback");
++}
++
++/* Readback after setup: BASE_LSB exact, MISC with SRNG_ENABLE. */
++static inline int
++wlce_ring_check(struct wlce *ce, const struct wlce_io *io, const struct wlce_ring *r, uint32_t *base, uint32_t *misc)
++{
++	if (wlce_rd(ce, io, r->r0 + WLCE_R0_BASE_LSB, base) || wlce_rd(ce, io, r->r0 + WLCE_R0_MISC, misc)) { return 1; }
++	if (*base != (uint32_t)r->iova || !(*misc & WLCE_MISC_SRNG_ENABLE)) { return wlce_fail(ce, "CE ring BASE_LSB/MISC readback"); }
++	return 0;
++}
++
++/* Publish the host pointer (HP of host-produced rings, TP of STATUS) with a
++ * write barrier first: L19 relies on the MMIO accessor's wmb for HP and uses
++ * mb() before a STATUS TP (hal.c:2194-2215). Shadow register or R2. */
++static inline int
++wlce_publish(struct wlce *ce, const struct wlce_io *io, struct wlce_ring *r)
++{
++	uint32_t v = r->kind == WLCE_STS ? r->tp : r->hp;
++	if (ce->stopping) { return wlce_fail(ce, "CE stopping: pointer publish refused"); }
++	io->wbarrier(io->ctx);
++	if (!r->shadow) { return wlce_wr(ce, io, r->r2 + (r->kind == WLCE_STS ? 4u : 0u), v); }
++	if (io->bar_wr(io->ctx, r->shadow, v)) { return wlce_fail(ce, "CE shadow register write failed"); }
++	ce->writes++;
++	return 0;
++}
++
++/* Device pointer from rdp (TP of host-produced rings, HP of STATUS), then a
++ * read barrier before any descriptor or payload it covers (hal.c:2144-2164). */
++static inline int
++wlce_device_ptr(struct wlce *ce, const struct wlce_io *io, const struct wlce_ring *r, uint32_t *out)
++{
++	uint32_t v = WLCE_RDP_LOAD(ce, r->id);
++	io->rbarrier(io->ctx);
++	if (v >= wlce_size(r) || v % r->entry_dw) { return wlce_fail(ce, "CE device ring pointer outside the ring"); }
++	*out = v;
++	return 0;
++}
++
++/* RX post: one DST descriptor (buffer address, hi 8 bits; hal.c:1941-1947)
++ * per buffer at HP, then one HP publish. At most nslots buffers are out. */
++static inline int
++wlce_post_rx(struct wlce *ce, const struct wlce_io *io, struct wlce_pipe *p, uint32_t n)
++{
++	struct wlce_ring *d = &p->dst;
++	uint32_t size = wlce_size(d);
++	if (ce->stopping) { return wlce_fail(ce, "CE stopping: RX post refused"); }
++	if (!p->has_dst || !p->nslots) { return wlce_fail(ce, "CE RX post on a pipe without buffers"); }
++	for (uint32_t k = 0; k < n; k++) {
++		if (p->posted - p->reaped >= p->nslots || (d->hp + d->entry_dw) % size == d->tp) {
++			return wlce_fail(ce, "CE RX post beyond the buffers");
++		}
++		uint64_t a = ce->base_iova + p->slot0 + (uint64_t)p->post_slot * p->buf_bytes;
++		wlce_set_word(d, d->hp, (uint32_t)a);
++		wlce_set_word(d, d->hp + 1, (uint32_t)(a >> 32) & 0xffu);
++		d->hp = (d->hp + d->entry_dw) % size;
++		p->post_slot = (p->post_slot + 1) % p->nslots;
++		p->posted++;
++	}
++	return n ? wlce_publish(ce, io, d) : 0;
++}
++
++typedef int (*wlce_rx_fn)(void *ctx, const uint8_t *buf, uint32_t len);
++
++/* RX reap (ce.c:410-494): device STATUS HP from rdp; for every new STATUS
++ * entry the length is w0 31:16 (0 or above the buffer is an error here; L19
++ * warns and drops), the buffer is the next DST entry in posting order, the
++ * length field is cleared (hal.c:1949-1957), the payload goes to FN in place,
++ * the buffer is posted again; one TP publish at the end. The new entries
++ * may not outnumber the buffers out. A STATUS HP that moved back k entries
++ * reads as a forward move of (entries - k): that bound stops it only when
++ * (entries - k) exceeds the buffers out (on CE2, k = 1); otherwise the length
++ * of the first entry, already consumed (cleared) or never written (zero),
++ * stops it as a STATUS length 0. */
++static inline int
++wlce_reap_rx(struct wlce *ce, const struct wlce_io *io, struct wlce_pipe *p, wlce_rx_fn fn, void *ctx)
++{
++	struct wlce_ring *s = &p->sts, *d = &p->dst;
++	uint32_t ssize = wlce_size(s), dsize = wlce_size(d), hp = 0, n = 0;
++	if (ce->stopping) { return 0; }
++	if (!p->has_dst) { return wlce_fail(ce, "CE RX reap on a pipe without rings"); }
++	if (wlce_device_ptr(ce, io, s, &hp)) { return 1; }
++	uint32_t avail = wlce_dist(s->tp, hp, ssize);
++	if (avail / s->entry_dw > p->posted - p->reaped) { return wlce_fail(ce, "CE STATUS entries beyond the posted buffers"); }
++	s->seen = hp;
++	while (s->tp != hp && n < s->entries) {
++		uint32_t w0 = wlce_word(s, s->tp), len = w0 >> 16;
++		uint64_t want = ce->base_iova + p->slot0 + (uint64_t)p->reap_slot * p->buf_bytes;
++		const uint8_t *buf = ce->base + p->slot0 + p->reap_slot * p->buf_bytes;
++		if (!len || len > p->buf_bytes) { return wlce_fail(ce, "CE STATUS length 0 or above the RX buffer"); }
++		if (wlce_word(d, d->tp) != (uint32_t)want || (wlce_word(d, d->tp + 1) & 0xffu) != ((uint32_t)(want >> 32) & 0xffu)) {
++			return wlce_fail(ce, "CE DST descriptor changed under the device");
++		}
++		wlce_set_word(s, s->tp, w0 & 0xffffu);
++		s->tp = (s->tp + s->entry_dw) % ssize;
++		d->tp = (d->tp + d->entry_dw) % dsize;
++		p->reap_slot = (p->reap_slot + 1) % p->nslots;
++		p->reaped++; n++;
++		if (fn(ctx, buf, len)) { return wlce_fail(ce, "CE RX message rejected by HTC/WMI"); }
++		if (wlce_post_rx(ce, io, p, 1)) { return 1; }
++	}
++	return n ? wlce_publish(ce, io, s) : 0;
++}
++
++/* TX completions (ce.c:496-550): the device TP (rdp) may only advance and
++ * never pass the host HP. */
++static inline int
++wlce_reap_tx(struct wlce *ce, const struct wlce_io *io, struct wlce_pipe *p)
++{
++	struct wlce_ring *r = &p->src;
++	uint32_t size = wlce_size(r), t = 0;
++	if (ce->stopping) { return 0; }
++	if (!p->has_src) { return wlce_fail(ce, "CE TX reap on a pipe without a SRC ring"); }
++	if (wlce_device_ptr(ce, io, r, &t)) { return 1; }
++	uint32_t done = wlce_dist(r->tp, t, size);
++	if (done > wlce_dist(r->tp, r->hp, size)) { return wlce_fail(ce, "CE device TP passed the host HP or went backwards"); }
++	r->seen = t;
++	r->tp = t;
++	p->reaped += done / r->entry_dw;
++	return 0;
++}
++
++static inline bool wlce_tx_idle(const struct wlce_pipe *p) { return p->src.tp == p->src.hp; }
++
++/* TX (ce.c:725-804, hal.c:1927-1939): copy into the slot of the SRC entry at
++ * HP, descriptor = address, hi 8 bits, byte swap 0 (bit 9), gather 0
++ * (bit 11), length 31:16, meta 15:0 = HTC endpoint id; w3 belongs to the
++ * hardware. A free entry needs next HP != device TP (hal.c:2077-2080). */
++static inline int
++wlce_send(struct wlce *ce, const struct wlce_io *io, struct wlce_pipe *p, uint32_t eid, const uint8_t *msg, uint32_t len)
++{
++	struct wlce_ring *r = &p->src;
++	uint32_t size = wlce_size(r);
++	if (ce->stopping) { return wlce_fail(ce, "CE stopping: send refused"); }
++	if (!p->has_src || !p->nslots || !len || len > p->buf_bytes || eid > 0xffffu) { return wlce_fail(ce, "CE TX pipe/length"); }
++	if (wlce_reap_tx(ce, io, p)) { return 1; }
++	uint32_t next = (r->hp + r->entry_dw) % size, slot = (r->hp / r->entry_dw) % p->nslots;
++	if (next == r->tp) { return wlce_fail(ce, "CE SRC ring full"); }
++	uint64_t a = ce->base_iova + p->slot0 + (uint64_t)slot * p->buf_bytes;
++	memcpy(ce->base + p->slot0 + slot * p->buf_bytes, msg, len);
++	wlce_set_word(r, r->hp, (uint32_t)a);
++	wlce_set_word(r, r->hp + 1, ((uint32_t)(a >> 32) & 0xffu) | (len << 16));
++	wlce_set_word(r, r->hp + 2, eid);
++	r->hp = next;
++	p->posted++;
++	return wlce_publish(ce, io, r);
++}
++
++/* ---- HTC (htc.h, htc.c) ----
++ * Adapted from Linux ath12k htc.c and htc.h (BSD-3-Clause-Clear), v6.19.
++ * Header 8 bytes: endpoint 7:0, flags 15:8, payload length 31:16; then
++ * control byte 0 (RX trailer length) 7:0 and control byte 1 (sequence) 15:8
++ * (htc.h:18-23, 58-61; htc.c:53-72). */
++#define WLHTC_HDR 8u
++#define WLHTC_EPS 9u                    /* ATH12K_HTC_EP_COUNT (htc.h:219-231) */
++#define WLHTC_MAX_LEN 4096u             /* htc.h:256 */
++#define WLHTC_CTL_MAX 256u              /* htc.h:257 */
++#define WLHTC_FLAG_NEED_CREDIT 0x01u    /* htc.h:48-51 */
++#define WLHTC_FLAG_TRAILER 0x02u        /* htc.h:53-56 */
++#define WLHTC_MSG_READY 1u              /* htc.h:63-72 */
++#define WLHTC_MSG_CONNECT 2u
++#define WLHTC_MSG_CONNECT_RESP 3u
++#define WLHTC_MSG_SETUP_COMPLETE_EX 5u
++#define WLHTC_READY_BYTES 8u            /* struct ath12k_htc_ready (htc.h:99-102) */
++#define WLHTC_CONNECT_BYTES 8u          /* struct ath12k_htc_conn_svc (htc.h:109-112) */
++#define WLHTC_CONNECT_RESP_BYTES 12u    /* struct ath12k_htc_conn_svc_resp (htc.h:114-118) */
++#define WLHTC_SETUP_COMPLETE_BYTES 12u  /* struct ath12k_htc_setup_complete_extended (htc.h:120-124) */
++#define WLHTC_CONN_DISABLE_FLOW (1u << 3)   /* htc.h:88 */
++#define WLHTC_CONN_RECV_ALLOC_SHIFT 8u      /* htc.h:89, 15:8 */
++#define WLHTC_SVC_RSVD_CTRL 0x0001u     /* htc.h:188-215 */
++#define WLHTC_SVC_WMI 0x0100u
++#define WLHTC_SVC_HTT 0x0300u
++#define WLHTC_RECORD_CREDITS 1u         /* htc.h:131-148 */
++#define WLHTC_PIPEDIR_IN 1u             /* ce.h:35-39 */
++#define WLHTC_PIPEDIR_OUT 2u
++#define WLHTC_PIPEDIR_INOUT 3u
++_Static_assert(WLHTC_READY_BYTES == 8 && WLHTC_CONNECT_RESP_BYTES == 12, "HTC wire sizes");
++
++struct wlhtc_ep {
++	uint16_t svc, max_msg;
++	uint8_t ul_pipe, dl_pipe, seq;
++	bool used, flow;
++	int credits;
++};
++
++struct wlhtc {
++	uint16_t credit_size, credit_count;
++	uint8_t max_ep;
++	struct wlhtc_ep ep[WLHTC_EPS];
++	uint8_t ctl[WLHTC_CTL_MAX];
++	unsigned ctl_len;
++	bool ctl_new, ready;
++	uint8_t wmi_eid, htt_eid;
++	unsigned bad_reports, ignored, htt_rx, credit_records;
++	const uint32_t (*map)[3];       /* the WLAN_CFG service map: service, direction, pipe */
++	unsigned map_n;
++	const char *why;
++};
++
++typedef int (*wlhtc_msg_fn)(void *ctx, const uint8_t *msg, uint32_t len);
++
++static inline int
++wlhtc_fail(struct wlhtc *htc, const char *why)
++{
++	if (!htc->why) { htc->why = why; }
++	return 1;
++}
++
++/* Pipes of a service from the service map (pci.c:1006-1046): IN = downlink,
++ * OUT = uplink, INOUT both; each at most once. */
++static inline int
++wlhtc_pipes(const uint32_t (*map)[3], unsigned n, uint32_t svc, uint8_t *ul, uint8_t *dl)
++{
++	bool ul_set = false, dl_set = false;
++	for (unsigned i = 0; i < n; i++) {
++		if (map[i][0] != svc) { continue; }
++		uint32_t dir = map[i][1], pipe = map[i][2];
++		if (pipe >= WLCE_NPIPE) { return 1; }
++		if (dir == WLHTC_PIPEDIR_IN || dir == WLHTC_PIPEDIR_INOUT) {
++			if (dl_set) { return 1; }
++			*dl = (uint8_t)pipe; dl_set = true;
++		}
++		if (dir == WLHTC_PIPEDIR_OUT || dir == WLHTC_PIPEDIR_INOUT) {
++			if (ul_set) { return 1; }
++			*ul = (uint8_t)pipe; ul_set = true;
++		}
++	}
++	return ul_set && dl_set ? 0 : 1;
++}
++
++/* Endpoint 0 is the pseudo-connected RSVD_CTRL service: no request on the
++ * wire, credit flow off, 256-byte messages (htc.c:430-444, 575-582, 750-795). */
++static inline int
++wlhtc_init(struct wlhtc *htc, const uint32_t (*map)[3], unsigned n)
++{
++	for (size_t i = 0; i < sizeof(*htc); i++) { ((uint8_t *)htc)[i] = 0; }
++	htc->map = map; htc->map_n = n;
++	struct wlhtc_ep *ep = &htc->ep[0];
++	if (wlhtc_pipes(map, n, WLHTC_SVC_RSVD_CTRL, &ep->ul_pipe, &ep->dl_pipe)) {
++		return wlhtc_fail(htc, "HTC control service missing from the service map");
++	}
++	ep->used = true; ep->svc = WLHTC_SVC_RSVD_CTRL; ep->max_msg = WLHTC_CTL_MAX; ep->flow = false;
++	return 0;
++}
++
++/* Trailer records {id, len, pad, pad} + body; record 1 = credit reports
++ * {eid, credits, pad, pad} (htc.c:144-233). A record longer than what is left
++ * is an error (L19 compares against the length before its header); a report
++ * for an endpoint >= 9 ends that record as in L19; credits for an endpoint
++ * that is not a connected credit-flow endpoint are counted and dropped. */
++static inline int
++wlhtc_trailer(struct wlhtc *htc, const uint8_t *p, uint32_t len)
++{
++	while (len) {
++		if (len < 4) { return wlhtc_fail(htc, "HTC trailer record header truncated"); }
++		uint32_t id = p[0], rlen = p[1];
++		if (rlen > len - 4) { return wlhtc_fail(htc, "HTC trailer record longer than the trailer"); }
++		if (id == WLHTC_RECORD_CREDITS) {
++			if (rlen < 4) { return wlhtc_fail(htc, "HTC credit record shorter than one report"); }
++			htc->credit_records++;
++			for (uint32_t i = 0; i + 4 <= rlen; i += 4) {
++				uint32_t e = p[4 + i], c = p[5 + i];
++				if (e >= WLHTC_EPS) { htc->bad_reports++; break; }
++				if (htc->ep[e].used && htc->ep[e].flow) { htc->ep[e].credits += (int)c; }
++				else { htc->bad_reports++; }
++			}
++		}
++		p += 4 + rlen; len -= 4 + rlen;
++	}
++	return 0;
++}
++
++/* One received HTC message (htc.c:252-378): endpoint < 9, header + payload
++ * within the CE transfer and 4096, trailer 4..payload; a message with no
++ * payload left (trailer only, or empty) is dropped on every endpoint as in
++ * L19 (htc.c:321-323). EP0 READY/CONNECT_RESP are copied (256 bytes at
++ * most) for the waiting step; another unread control message is an error.
++ * WMI messages go to FN; HTT messages are counted (no HTT parsing in C1). */
++static inline int
++wlhtc_rx(struct wlhtc *htc, const uint8_t *msg, uint32_t len, wlhtc_msg_fn fn, void *ctx)
++{
++	if (len < WLHTC_HDR) { return wlhtc_fail(htc, "HTC message shorter than its header"); }
++	uint32_t w0 = wlce_get32(msg), w1 = wlce_get32(msg + 4);
++	uint32_t eid = w0 & 0xffu, flags = (w0 >> 8) & 0xffu, plen = w0 >> 16;
++	const uint8_t *pl = msg + WLHTC_HDR;
++	if (eid >= WLHTC_EPS) { return wlhtc_fail(htc, "HTC endpoint id out of range"); }
++	if (plen + WLHTC_HDR > WLHTC_MAX_LEN) { return wlhtc_fail(htc, "HTC payload above 4096 bytes"); }
++	if (plen > len - WLHTC_HDR) { return wlhtc_fail(htc, "HTC payload longer than the CE transfer"); }
++	if (flags & WLHTC_FLAG_TRAILER) {
++		uint32_t tlen = w1 & 0xffu;
++		if (tlen < 4 || tlen > plen) { return wlhtc_fail(htc, "HTC trailer length outside 4..payload"); }
++		if (wlhtc_trailer(htc, pl + plen - tlen, tlen)) { return 1; }
++		plen -= tlen;
++	}
++	if (!plen) { return 0; }
++	if (!htc->ep[eid].used) { return wlhtc_fail(htc, "HTC message on an unconnected endpoint"); }
++	if (eid == 0) {
++		if (plen < 4) { return wlhtc_fail(htc, "HTC control message shorter than 4 bytes"); }
++		uint32_t id = wlce_get16(pl);
++		if (id != WLHTC_MSG_READY && id != WLHTC_MSG_CONNECT_RESP) { htc->ignored++; return 0; }
++		if (htc->ctl_new) { return wlhtc_fail(htc, "HTC control message while the previous one is unread"); }
++		htc->ctl_len = plen < WLHTC_CTL_MAX ? plen : WLHTC_CTL_MAX;
++		memcpy(htc->ctl, pl, htc->ctl_len);
++		htc->ctl_new = true;
++		return 0;
++	}
++	if (eid == htc->wmi_eid) { return fn(ctx, pl, plen); }
++	htc->htt_rx++;
++	return 0;
++}
++
++/* READY on EP0: message id 15:0, credit count 31:16; credit size 15:0, max
++ * endpoints 23:16; both counts non-zero (htc.c:491-555, htc.h:28-30). */
++static inline int
++wlhtc_parse_ready(struct wlhtc *htc)
++{
++	if (!htc->ctl_new) { return wlhtc_fail(htc, "HTC READY not received"); }
++	htc->ctl_new = false;
++	if (htc->ctl_len < WLHTC_READY_BYTES) { return wlhtc_fail(htc, "HTC READY shorter than 8 bytes"); }
++	uint32_t w0 = wlce_get32(htc->ctl), w1 = wlce_get32(htc->ctl + 4);
++	if ((w0 & 0xffffu) != WLHTC_MSG_READY) { return wlhtc_fail(htc, "HTC READY message id"); }
++	htc->credit_count = (uint16_t)(w0 >> 16);
++	htc->credit_size = (uint16_t)(w1 & 0xffffu);
++	htc->max_ep = (uint8_t)(w1 >> 16);
++	if (!htc->credit_count || !htc->credit_size) { return wlhtc_fail(htc, "HTC READY without credits"); }
++	htc->ready = true;
++	return 0;
++}
++
++/* CONNECT request: message 2 | service << 16, connection flags 15:0
++ * (htc.c:597-617, htc.h:25-26). */
++static inline void
++wlhtc_connect_req(uint8_t *p, uint32_t svc, uint32_t flags)
++{
++	wlce_put32(p, WLHTC_MSG_CONNECT | (svc << 16));
++	wlce_put32(p + 4, flags & 0xffffu);
++}
++
++/* CONNECT reply: message 3 | service << 16; status 7:0, endpoint 15:8, max
++ * message 31:16 (htc.c:635-719, htc.h:35-39). The service must be the one
++ * asked for (L19 does not check). The endpoint gets the credits we asked for
++ * (htc.c:694) and the pipes of the service map. */
++static inline int
++wlhtc_parse_connect(struct wlhtc *htc, uint32_t svc, bool flow, uint32_t alloc, uint32_t *eid, uint32_t *status)
++{
++	*eid = WLHTC_EPS; *status = ~0u;
++	if (!htc->ctl_new) { return wlhtc_fail(htc, "HTC connect reply not received"); }
++	htc->ctl_new = false;
++	if (htc->ctl_len < WLHTC_CONNECT_RESP_BYTES) { return wlhtc_fail(htc, "HTC connect reply shorter than 12 bytes"); }
++	uint32_t w0 = wlce_get32(htc->ctl), w1 = wlce_get32(htc->ctl + 4);
++	if ((w0 & 0xffffu) != WLHTC_MSG_CONNECT_RESP) { return wlhtc_fail(htc, "HTC connect reply message id"); }
++	if ((w0 >> 16) != svc) { return wlhtc_fail(htc, "HTC connect reply for another service"); }
++	*status = w1 & 0xffu; *eid = (w1 >> 8) & 0xffu;
++	uint32_t max_msg = w1 >> 16;
++	if (*status) { return wlhtc_fail(htc, "HTC service connect refused by the target"); }
++	if (*eid >= WLHTC_EPS || !max_msg) { return wlhtc_fail(htc, "HTC connect reply endpoint/max message"); }
++	struct wlhtc_ep *ep = &htc->ep[*eid];
++	if (ep->used) { return wlhtc_fail(htc, "HTC endpoint already in use"); }
++	if (wlhtc_pipes(htc->map, htc->map_n, svc, &ep->ul_pipe, &ep->dl_pipe)) {
++		return wlhtc_fail(htc, "HTC service missing from the service map");
++	}
++	ep->used = true; ep->svc = (uint16_t)svc; ep->max_msg = (uint16_t)max_msg;
++	ep->flow = flow; ep->credits = flow ? (int)alloc : 0;
++	if (svc == WLHTC_SVC_WMI) { htc->wmi_eid = (uint8_t)*eid; }
++	if (svc == WLHTC_SVC_HTT) { htc->htt_eid = (uint8_t)*eid; }
++	return 0;
++}
++
++/* SETUP_COMPLETE_EX: message 5, flags 0, max bundled 0 (htc.c:721-748). */
++static inline void
++wlhtc_setup_complete(uint8_t *p)
++{
++	wlce_put32(p, WLHTC_MSG_SETUP_COMPLETE_EX); wlce_put32(p + 4, 0); wlce_put32(p + 8, 0);
++}
++
++/* Header + payload for endpoint EID; NEED_CREDIT_UPDATE on credit-flow
++ * endpoints only, sequence per endpoint (htc.c:53-72). */
++static inline int
++wlhtc_frame(struct wlhtc *htc, uint32_t eid, const uint8_t *payload, uint32_t plen, uint8_t *out, uint32_t room, uint32_t *total)
++{
++	if (eid >= WLHTC_EPS || !htc->ep[eid].used) { return wlhtc_fail(htc, "HTC send on an unconnected endpoint"); }
++	struct wlhtc_ep *ep = &htc->ep[eid];
++	uint32_t t = WLHTC_HDR + plen;
++	if (t > room || t > WLHTC_MAX_LEN || plen > 0xffffu) { return wlhtc_fail(htc, "HTC frame too long"); }
++	wlce_put32(out, eid | ((ep->flow ? WLHTC_FLAG_NEED_CREDIT : 0u) << 8) | (plen << 16));
++	wlce_put32(out + 4, (uint32_t)ep->seq++ << 8);
++	memcpy(out + WLHTC_HDR, payload, plen);
++	*total = t;
++	return 0;
++}
++
++/* A message costs ceil(total length with header / credit size) (htc.c:90-103). */
++static inline uint32_t
++wlhtc_credits_needed(const struct wlhtc *htc, uint32_t total)
++{
++	return htc->credit_size ? (total + htc->credit_size - 1u) / htc->credit_size : ~0u;
++}
++
++static inline bool
++wlhtc_has_credits(const struct wlhtc *htc, uint32_t eid, uint32_t total)
++{
++	const struct wlhtc_ep *ep = &htc->ep[eid];
++	return eid < WLHTC_EPS && (!ep->flow || (ep->credits >= 0 && (uint32_t)ep->credits >= wlhtc_credits_needed(htc, total)));
++}
++
++static inline int
++wlhtc_take_credits(struct wlhtc *htc, uint32_t eid, uint32_t total)
++{
++	if (!wlhtc_has_credits(htc, eid, total)) { return wlhtc_fail(htc, "HTC send without credits"); }
++	if (htc->ep[eid].flow) { htc->ep[eid].credits -= (int)wlhtc_credits_needed(htc, total); }
++	return 0;
++}
++
++/* ---- WMI (wmi.h, wmi.c) ----
++ * Adapted from Linux ath12k wmi.c, wmi.h, hw.h and core.c
++ * (BSD-3-Clause-Clear), v6.19. Command/event header u32, id 23:0 (wmi.h:69-82); TLV header u32, tag 31:16,
++ * length 15:0 excluding the header (wmi.h:73-80, wmi.c:198-207). Ids and tags
++ * resolved from the wmi.h enums (the host test re-derives them). */
++#define WLWMI_CMD_INIT 0x1u
++#define WLWMI_CMD_PDEV_SET_HW_MODE 0x401eu
++#define WLWMI_EV_SERVICE_READY 0x1u
++#define WLWMI_EV_READY 0x2u
++#define WLWMI_EV_SERVICE_AVAILABLE 0x3u
++#define WLWMI_EV_SERVICE_READY_EXT 0x4009u
++#define WLWMI_EV_PDEV_SET_HW_MODE_RESP 0x4010u
++#define WLWMI_EV_SERVICE_READY_EXT2 0x4022u
++#define WLWMI_EV_REG_CHAN_LIST_CC_EXT 0x3a003u
++#define WLWMI_TAG_ARRAY_UINT32 0x10u
++#define WLWMI_TAG_ARRAY_STRUCT 0x12u
++#define WLWMI_TAG_SERVICE_READY_EVENT 0x20u
++#define WLWMI_TAG_READY_EVENT 0x23u
++#define WLWMI_TAG_INIT_CMD 0x4au
++#define WLWMI_TAG_RESOURCE_CONFIG 0x4bu
++#define WLWMI_TAG_SERVICE_READY_EXT_EVENT 0x1acu
++#define WLWMI_TAG_PDEV_SET_HW_MODE_CMD 0x203u
++#define WLWMI_TAG_MAC_PHY_CAPABILITIES 0x210u
++#define WLWMI_TAG_HW_MODE_CAPABILITIES 0x211u
++#define WLWMI_TAG_SOC_MAC_PHY_HW_MODE_CAPS 0x212u
++#define WLWMI_TAG_SERVICE_AVAILABLE_EVENT 0x22fu
++#define WLWMI_TAG_SERVICE_READY_EXT2_EVENT 0x334u
++#define WLWMI_SVC_EXT_MSG 77u           /* wmi.h:2103 */
++#define WLWMI_SVC_EXT2_MSG 220u         /* wmi.h:2244 */
++#define WLWMI_SVC_REG_CC_EXT 281u       /* wmi.h:2252 */
++#define WLWMI_SVC_READY_BYTES 128u      /* struct wmi_service_ready_event (wmi.h:2607-2637) */
++#define WLWMI_SVC_BM_WORDS 32u          /* WMI_SERVICE_BM_SIZE, 4 services per word (wmi.h:2639-2644) */
++#define WLWMI_SVC_AVAIL_BYTES 20u       /* struct wmi_service_available_event (wmi.h:2855-2858) */
++#define WLWMI_READY_MIN_BYTES 52u       /* struct ath12k_wmi_ready_event_min_params (wmi.h:2839-2847) */
++#define WLWMI_INIT_BYTES 32u            /* struct wmi_init_cmd (wmi.h:2512-2525) */
++#define WLWMI_RSRC_BYTES 292u           /* struct ath12k_wmi_resource_config_params (wmi.h:2534-2605) */
++#define WLWMI_HW_MODE_BYTES 16u         /* struct ath12k_wmi_pdev_set_hw_mode_cmd (wmi.h:2497-2502) */
++#define WLWMI_INIT_TOTAL (4u + WLWMI_INIT_BYTES + WLWMI_RSRC_BYTES + 4u)
++#define WLWMI_HW_MODE_TOTAL (4u + WLWMI_HW_MODE_BYTES)
++#define WLWMI_HW_MODE_DBS 1u            /* wmi.h:192-194 */
++#define WLWMI_PDEV_ID_SOC 0u            /* wmi.h:3163 */
++#define WLWMI_FLAG1_BSS_CHANNEL_INFO_64 (1u << 5)       /* wmi.h:2530 */
++#define WLWMI_FLAG1_ACK_RSSI (1u << 18)                 /* wmi.h:2532 */
++#define WLWMI_FLAGS2_CALC_NEXT_DTIM_COUNT_SET (1u << 9) /* wmi.h:2531 */
++#define WLWMI_HOST_SVC_REG_CC_EXT_BIT 4u                /* wmi.h:2527 */
++#define WLWMI_EXT2_WORDS 8u             /* services 256..511 */
++_Static_assert(WLWMI_INIT_BYTES == 32 && WLWMI_RSRC_BYTES == 292 && WLWMI_INIT_TOTAL == 332, "WMI INIT wire sizes");
++
++/* struct ath12k_wmi_resource_config_params word index (0 = TLV header). */
++enum {
++	WLWMI_RC_NUM_VDEVS = 1, WLWMI_RC_NUM_PEERS, WLWMI_RC_NUM_OFFLOAD_PEERS, WLWMI_RC_NUM_OFFLOAD_REORDER_BUFFS,
++	WLWMI_RC_NUM_PEER_KEYS, WLWMI_RC_NUM_TIDS, WLWMI_RC_AST_SKID_LIMIT, WLWMI_RC_TX_CHAIN_MASK,
++	WLWMI_RC_RX_CHAIN_MASK, WLWMI_RC_RX_TIMEOUT_PRI, WLWMI_RC_RX_DECAP_MODE = WLWMI_RC_RX_TIMEOUT_PRI + 4,
++	WLWMI_RC_SCAN_MAX_PENDING_REQ, WLWMI_RC_BMISS_OFFLOAD_MAX_VDEV, WLWMI_RC_ROAM_OFFLOAD_MAX_VDEV,
++	WLWMI_RC_ROAM_OFFLOAD_MAX_AP_PROFILES, WLWMI_RC_NUM_MCAST_GROUPS, WLWMI_RC_NUM_MCAST_TABLE_ELEMS,
++	WLWMI_RC_MCAST2UCAST_MODE, WLWMI_RC_TX_DBG_LOG_SIZE, WLWMI_RC_NUM_WDS_ENTRIES, WLWMI_RC_DMA_BURST_SIZE,
++	WLWMI_RC_MAC_AGGR_DELIM, WLWMI_RC_RX_SKIP_DEFRAG, WLWMI_RC_VOW_CONFIG, WLWMI_RC_GTK_OFFLOAD_MAX_VDEV,
++	WLWMI_RC_NUM_MSDU_DESC, WLWMI_RC_MAX_FRAG_ENTRIES, WLWMI_RC_NUM_TDLS_VDEVS, WLWMI_RC_NUM_TDLS_CONN_TABLE_ENTRIES,
++	WLWMI_RC_BEACON_TX_OFFLOAD_MAX_VDEV, WLWMI_RC_NUM_MULTICAST_FILTER_ENTRIES, WLWMI_RC_NUM_WOW_FILTERS,
++	WLWMI_RC_NUM_KEEP_ALIVE_PATTERN, WLWMI_RC_KEEP_ALIVE_PATTERN_SIZE, WLWMI_RC_MAX_TDLS_SLEEP_STA,
++	WLWMI_RC_MAX_TDLS_BUFFER_STA, WLWMI_RC_WMI_SEND_SEPARATE, WLWMI_RC_NUM_OCB_VDEVS, WLWMI_RC_NUM_OCB_CHANNELS,
++	WLWMI_RC_NUM_OCB_SCHEDULES, WLWMI_RC_FLAG1, WLWMI_RC_SMART_ANT_CAP, WLWMI_RC_BK_MINFREE, WLWMI_RC_BE_MINFREE,
++	WLWMI_RC_VI_MINFREE, WLWMI_RC_VO_MINFREE, WLWMI_RC_ALLOC_FRAG_DESC, WLWMI_RC_NUM_NS_EXT_TUPLES,
++	WLWMI_RC_BPF_INSTRUCTION_SIZE, WLWMI_RC_MAX_BSSID_RX_FILTERS, WLWMI_RC_USE_PDEV_ID, WLWMI_RC_MAX_DBS_SCAN_DUTY,
++	WLWMI_RC_MAX_GROUP_KEYS, WLWMI_RC_PEER_MAP_UNMAP_VERSION, WLWMI_RC_SCHED_PARAMS, WLWMI_RC_TWT_AP_PDEV_COUNT,
++	WLWMI_RC_TWT_AP_STA_COUNT, WLWMI_RC_MAX_NLO_SSIDS, WLWMI_RC_NUM_PKT_FILTERS, WLWMI_RC_NUM_MAX_STA_VDEVS,
++	WLWMI_RC_MAX_BSSID_INDICATOR, WLWMI_RC_UL_RESP_CONFIG, WLWMI_RC_MSDU_FLOW_OVERRIDE0, WLWMI_RC_MSDU_FLOW_OVERRIDE1,
++	WLWMI_RC_FLAGS2, WLWMI_RC_HOST_SERVICE_FLAGS, WLWMI_RC_MAX_RNR_NEIGHBOURS, WLWMI_RC_EMA_MAX_VAP_CNT,
++	WLWMI_RC_EMA_MAX_PROFILE_PERIOD, WLWMI_RC_WORDS
++};
++_Static_assert(WLWMI_RC_WORDS * 4 == WLWMI_RSRC_BYTES && WLWMI_RC_FLAG1 == 44 && WLWMI_RC_USE_PDEV_ID == 54 &&
++    WLWMI_RC_PEER_MAP_UNMAP_VERSION == 57 && WLWMI_RC_FLAGS2 == 68 && WLWMI_RC_HOST_SERVICE_FLAGS == 69,
++    "WMI resource config word order (wmi.h:2534-2605)");
++
++struct wlwmi {
++	uint32_t svc_base[WLWMI_SVC_BM_WORDS], svc_seg[4], svc_ext2[WLWMI_EXT2_WORDS];
++	bool got_svc, got_avail, got_ext, got_ext2, got_ready, got_hw_resp;
++	uint32_t fw_build, phy_capability, num_rf_chains, num_mem_reqs, max_scan_chans, txrx_chainmask;
++	uint32_t num_hw_modes, hw_mode_caps, tot_phy, mac_phy_caps, pdev_id;
++	bool pdev_valid;
++	uint32_t ready_status, num_extra_mac, num_total_peers;
++	uint8_t mac[6];
++	uint32_t ext2_bytes, events, unknown_events, last_event, last_len;
++	const char *why;
++};
++
++static inline int
++wlwmi_fail(struct wlwmi *wmi, const char *why)
++{
++	if (!wmi->why) { wmi->why = why; }
++	return 1;
++}
++
++struct wlwmi_it {
++	const uint8_t *p, *v;
++	uint32_t len, off, tag, tlen;
++};
++
++static inline void wlwmi_it_init(struct wlwmi_it *it, const uint8_t *p, uint32_t len) { it->p = p; it->len = len; it->off = 0; it->v = 0; it->tag = it->tlen = 0; }
++
++/* Strict iterator (wmi.c:320-368): 1 = one TLV in it->tag/tlen/v, 0 = end,
++ * -1 = a header or a value past the buffer. */
++static inline int
++wlwmi_next(struct wlwmi_it *it)
++{
++	if (it->off >= it->len) { return 0; }
++	if (it->len - it->off < 4) { return -1; }
++	uint32_t h = wlce_get32(it->p + it->off);
++	it->tag = h >> 16; it->tlen = h & 0xffffu; it->off += 4;
++	if (it->tlen > it->len - it->off) { return -1; }
++	it->v = it->p + it->off;
++	it->off += it->tlen;
++	return 1;
++}
++
++static inline void wlwmi_put_tlv(uint8_t *p, uint32_t tag, uint32_t len) { wlce_put32(p, (tag << 16) | (len & 0xffffu)); }
++
++static inline bool
++wlwmi_svc(const struct wlwmi *wmi, uint32_t bit)
++{
++	if (bit < 128u) { return (wmi->svc_base[bit / 4u] >> (bit % 4u)) & 1u; }
++	if (bit < 256u) { return (wmi->svc_seg[(bit - 128u) / 32u] >> ((bit - 128u) % 32u)) & 1u; }
++	if (bit < 256u + 32u * WLWMI_EXT2_WORDS) { return (wmi->svc_ext2[(bit - 256u) / 32u] >> ((bit - 256u) % 32u)) & 1u; }
++	return false;
++}
++
++/* SERVICE_READY (wmi.c:662-760): fixed TLV 0x20 (min length = the struct,
++ * wmi.c:132-133), the first ARRAY_UINT32 of at least 32 words is the base
++ * bitmap, 4 services per word (wmi.c:695-737). */
++static inline int
++wlwmi_parse_service_ready(struct wlwmi *wmi, const uint8_t *p, uint32_t len)
++{
++	struct wlwmi_it it; int r; bool fixed = false, bm = false;
++	wlwmi_it_init(&it, p, len);
++	while ((r = wlwmi_next(&it)) > 0) {
++		if (it.tag == WLWMI_TAG_SERVICE_READY_EVENT) {
++			if (it.tlen < WLWMI_SVC_READY_BYTES) { return wlwmi_fail(wmi, "WMI SERVICE_READY fixed TLV shorter than 128 bytes"); }
++			wmi->fw_build = wlce_get32(it.v);
++			wmi->phy_capability = wlce_get32(it.v + 7 * 4);
++			wmi->num_rf_chains = wlce_get32(it.v + 9 * 4);
++			wmi->num_mem_reqs = wlce_get32(it.v + 18 * 4);
++			wmi->max_scan_chans = wlce_get32(it.v + 19 * 4);
++			wmi->txrx_chainmask = wlce_get32(it.v + 29 * 4);
++			fixed = true;
++		} else if (it.tag == WLWMI_TAG_ARRAY_UINT32 && !bm) {
++			if (it.tlen < WLWMI_SVC_BM_WORDS * 4u) { return wlwmi_fail(wmi, "WMI service bitmap shorter than 32 words"); }
++			for (unsigned i = 0; i < WLWMI_SVC_BM_WORDS; i++) { wmi->svc_base[i] = wlce_get32(it.v + 4 * i) & 0xfu; }
++			bm = true;
++		}
++	}
++	if (r < 0) { return wlwmi_fail(wmi, "WMI SERVICE_READY TLV past the buffer"); }
++	if (!fixed) { return wlwmi_fail(wmi, "WMI SERVICE_READY without its fixed TLV"); }
++	wmi->got_svc = true;
++	return 0;
++}
++
++/* SERVICE_AVAILABLE (wmi.c:7677-7744): every TLV at least 16 bytes as in
++ * L19; fixed TLV = segment offset + 4 words for services 128..255 (32 per
++ * word); an ARRAY_UINT32 carries services 256.. . */
++static inline int
++wlwmi_parse_available(struct wlwmi *wmi, const uint8_t *p, uint32_t len)
++{
++	struct wlwmi_it it; int r;
++	wlwmi_it_init(&it, p, len);
++	while ((r = wlwmi_next(&it)) > 0) {
++		if (it.tlen < 16) { return wlwmi_fail(wmi, "WMI SERVICE_AVAILABLE TLV shorter than 16 bytes"); }
++		if (it.tag == WLWMI_TAG_SERVICE_AVAILABLE_EVENT) {
++			if (it.tlen < WLWMI_SVC_AVAIL_BYTES) { return wlwmi_fail(wmi, "WMI SERVICE_AVAILABLE fixed TLV shorter than 20 bytes"); }
++			for (unsigned i = 0; i < 4; i++) { wmi->svc_seg[i] = wlce_get32(it.v + 4 + 4 * i); }
++		} else if (it.tag == WLWMI_TAG_ARRAY_UINT32) {
++			for (unsigned i = 0; i < WLWMI_EXT2_WORDS && 4 * i + 4 <= it.tlen; i++) { wmi->svc_ext2[i] = wlce_get32(it.v + 4 * i); }
++		}
++	}
++	if (r < 0) { return wlwmi_fail(wmi, "WMI SERVICE_AVAILABLE TLV past the buffer"); }
++	wmi->got_avail = true;
++	return 0;
++}
++
++static inline uint32_t
++wlwmi_fls(uint32_t v)
++{
++	uint32_t n = 0;
++	while (v) { n++; v >>= 1; }
++	return n;
++}
++
++/* SERVICE_READY_EXT (wmi.c:4847-4949): fixed TLV 0x1ac; 0x212 num_hw_modes
++ * (8 bytes min, wmi.c:136-137); the first ARRAY_STRUCT holds only 0x211
++ * entries, at most num_hw_modes (wmi.c:4494-4516), each adding fls(phy map)
++ * PHYs; the second holds only 0x210 MAC/PHY caps, at most that many PHYs;
++ * pdev id = 15:0 of word 1 of the first (wmi.h:2681-2691). Later arrays are
++ * not needed in C1. Nested TLVs are bounded by their array. */
++static inline int
++wlwmi_parse_ext(struct wlwmi *wmi, const uint8_t *p, uint32_t len)
++{
++	struct wlwmi_it it, in; int r, q; bool fixed = false, caps = false; unsigned arrays = 0;
++	wlwmi_it_init(&it, p, len);
++	while ((r = wlwmi_next(&it)) > 0) {
++		if (it.tag == WLWMI_TAG_SERVICE_READY_EXT_EVENT) { fixed = true; continue; }
++		if (it.tag == WLWMI_TAG_SOC_MAC_PHY_HW_MODE_CAPS) {
++			if (it.tlen < 8) { return wlwmi_fail(wmi, "WMI SOC_MAC_PHY_HW_MODE_CAPS shorter than 8 bytes"); }
++			wmi->num_hw_modes = wlce_get32(it.v);
++			caps = true;
++			continue;
++		}
++		if (it.tag != WLWMI_TAG_ARRAY_STRUCT || ++arrays > 2) { continue; }
++		wlwmi_it_init(&in, it.v, it.tlen);
++		while ((q = wlwmi_next(&in)) > 0) {
++			if (arrays == 1) {
++				if (!caps || in.tag != WLWMI_TAG_HW_MODE_CAPABILITIES || wmi->hw_mode_caps >= wmi->num_hw_modes || in.tlen < 12) {
++					return wlwmi_fail(wmi, "WMI EXT hw mode caps: tag, count or length");
++				}
++				wmi->hw_mode_caps++;
++				wmi->tot_phy += wlwmi_fls(wlce_get32(in.v + 4));
++			} else {
++				if (in.tag != WLWMI_TAG_MAC_PHY_CAPABILITIES || wmi->mac_phy_caps >= wmi->tot_phy || in.tlen < 8) {
++					return wlwmi_fail(wmi, "WMI EXT mac/phy caps: tag, count or length");
++				}
++				if (!wmi->mac_phy_caps++) { wmi->pdev_id = wlce_get32(in.v + 4) & 0xffffu; wmi->pdev_valid = true; }
++			}
++		}
++		if (q < 0) { return wlwmi_fail(wmi, "WMI EXT nested TLV past its array"); }
++	}
++	if (r < 0) { return wlwmi_fail(wmi, "WMI SERVICE_READY_EXT TLV past the buffer"); }
++	if (!fixed) { return wlwmi_fail(wmi, "WMI SERVICE_READY_EXT without its fixed TLV"); }
++	wmi->got_ext = true;
++	return 0;
++}
++
++/* SERVICE_READY_EXT2 (wmi.c:5560-5650): only well-formedness and the fixed
++ * TLV 0x334 matter here; its arrays serve the data path. */
++static inline int
++wlwmi_parse_ext2(struct wlwmi *wmi, const uint8_t *p, uint32_t len)
++{
++	struct wlwmi_it it; int r; bool fixed = false;
++	wlwmi_it_init(&it, p, len);
++	while ((r = wlwmi_next(&it)) > 0) {
++		if (it.tag == WLWMI_TAG_SERVICE_READY_EXT2_EVENT) { fixed = true; }
++	}
++	if (r < 0) { return wlwmi_fail(wmi, "WMI SERVICE_READY_EXT2 TLV past the buffer"); }
++	if (!fixed) { return wlwmi_fail(wmi, "WMI SERVICE_READY_EXT2 without its fixed TLV"); }
++	wmi->ext2_bytes = len;
++	wmi->got_ext2 = true;
++	return 0;
++}
++
++/* READY (wmi.c:6895-6953): fixed TLV 0x23, at least 52 bytes (wmi.c:166-167):
++ * fw abi 0..23, MAC 24..29, status 32, num_dscp_table 36, num_extra_mac_addr
++ * 40, num_total_peers 44 (wmi.h:2839-2847). L19 completes unified_ready even
++ * without the TLV; here it is required. */
++static inline int
++wlwmi_parse_ready(struct wlwmi *wmi, const uint8_t *p, uint32_t len)
++{
++	struct wlwmi_it it; int r; bool fixed = false;
++	wlwmi_it_init(&it, p, len);
++	while ((r = wlwmi_next(&it)) > 0) {
++		if (it.tag != WLWMI_TAG_READY_EVENT || fixed) { continue; }
++		if (it.tlen < WLWMI_READY_MIN_BYTES) { return wlwmi_fail(wmi, "WMI READY fixed TLV shorter than 52 bytes"); }
++		memcpy(wmi->mac, it.v + 24, 6);
++		wmi->ready_status = wlce_get32(it.v + 32);
++		wmi->num_extra_mac = wlce_get32(it.v + 40);
++		wmi->num_total_peers = wlce_get32(it.v + 44);
++		fixed = true;
++	}
++	if (r < 0) { return wlwmi_fail(wmi, "WMI READY TLV past the buffer"); }
++	if (!fixed) { return wlwmi_fail(wmi, "WMI READY without its fixed TLV"); }
++	wmi->got_ready = true;
++	return 0;
++}
++
++/* Events handled in C1; everything else is counted and logged by id/length,
++ * never parsed and never fatal (L19 ignores unknown ids, wmi.c:9953-9955). */
++static inline bool
++wlwmi_known(uint32_t id)
++{
++	return id == WLWMI_EV_SERVICE_READY || id == WLWMI_EV_SERVICE_AVAILABLE || id == WLWMI_EV_SERVICE_READY_EXT ||
++	    id == WLWMI_EV_SERVICE_READY_EXT2 || id == WLWMI_EV_READY;
++}
++
++/* One WMI event (wmi.c:9798-9960). */
++static inline int
++wlwmi_rx(struct wlwmi *wmi, const uint8_t *msg, uint32_t len, uint32_t *id)
++{
++	*id = 0;
++	if (len < 4) { return wlwmi_fail(wmi, "WMI event shorter than its header"); }
++	*id = wlce_get32(msg) & 0xffffffu;
++	wmi->events++; wmi->last_event = *id; wmi->last_len = len - 4;
++	const uint8_t *p = msg + 4;
++	switch (*id) {
++	case WLWMI_EV_SERVICE_READY: return wlwmi_parse_service_ready(wmi, p, len - 4);
++	case WLWMI_EV_SERVICE_AVAILABLE: return wlwmi_parse_available(wmi, p, len - 4);
++	case WLWMI_EV_SERVICE_READY_EXT: return wlwmi_parse_ext(wmi, p, len - 4);
++	case WLWMI_EV_SERVICE_READY_EXT2: return wlwmi_parse_ext2(wmi, p, len - 4);
++	case WLWMI_EV_READY: return wlwmi_parse_ready(wmi, p, len - 4);
++	case WLWMI_EV_PDEV_SET_HW_MODE_RESP: wmi->got_hw_resp = true; return 0;
++	default: wmi->unknown_events++; return 0;
++	}
++}
++
++static inline uint32_t
++wlwmi_chain_mask(uint32_t chains)
++{
++	return chains >= 32u ? ~0u : (1u << chains) - 1u;
++}
++
++/* WMI_INIT for WCN7850 (wmi.c:4018-4124, 4218-4243): command id 1; TLV 0x4a
++ * {host abi 6 x 0, num_host_mem_chunks 0}; TLV 0x4b resource config with the
++ * ath12k_wmi_init_wcn7850 values (wmi.c:260-304, hw.h:33-65) as
++ * ath12k_wmi_copy_resource_config puts them on the wire (wmi.c:3941-4016:
++ * rx_batchmode is not copied; vow_config, atf, twt and ema are copied but
++ * are 0 for WCN7850, wmi.c:3974, 3999-4005, 4013-4014, hw.h:58); then
++ * ARRAY_STRUCT of length 0 (no host memory chunks, wmi.c:4080-4083). No
++ * hw-mode TLV: a single-pdev chip sends hw_mode_id MAX (wmi.c:4034, 4234-4235).
++ * flag1 = BSS_CHANNEL_INFO_64 | ACK_RSSI; flags2 = CALC_NEXT_DTIM_COUNT_SET
++ * with RX_PEER_METADATA_VERSION 0; host_service_flags REG_CC_EXT when service
++ * 281 is set (wmi.c:4223-4225, 4008-4009); no REO_QREF (reoq_lut_support
++ * false, hw.c:1450). */
++static inline int
++wlwmi_encode_init(const struct wlwmi *wmi, uint8_t *out, uint32_t room, uint32_t *len)
++{
++	static const uint8_t fixed[][2] = {
++		{WLWMI_RC_NUM_VDEVS, 4}, {WLWMI_RC_NUM_PEERS, 16}, {WLWMI_RC_NUM_OFFLOAD_PEERS, 3},
++		{WLWMI_RC_NUM_OFFLOAD_REORDER_BUFFS, 3}, {WLWMI_RC_NUM_PEER_KEYS, 2}, {WLWMI_RC_NUM_TIDS, 32},
++		{WLWMI_RC_AST_SKID_LIMIT, 16}, {WLWMI_RC_RX_TIMEOUT_PRI, 100}, {WLWMI_RC_RX_TIMEOUT_PRI + 1, 100},
++		{WLWMI_RC_RX_TIMEOUT_PRI + 2, 100}, {WLWMI_RC_RX_TIMEOUT_PRI + 3, 40}, {WLWMI_RC_RX_DECAP_MODE, 1},
++		{WLWMI_RC_SCAN_MAX_PENDING_REQ, 4}, {WLWMI_RC_BMISS_OFFLOAD_MAX_VDEV, 3},
++		{WLWMI_RC_ROAM_OFFLOAD_MAX_VDEV, 3}, {WLWMI_RC_ROAM_OFFLOAD_MAX_AP_PROFILES, 8},
++		{WLWMI_RC_GTK_OFFLOAD_MAX_VDEV, 2}, {WLWMI_RC_MAX_FRAG_ENTRIES, 0xa}, {WLWMI_RC_NUM_TDLS_VDEVS, 1},
++		{WLWMI_RC_NUM_TDLS_CONN_TABLE_ENTRIES, 8}, {WLWMI_RC_BEACON_TX_OFFLOAD_MAX_VDEV, 2},
++		{WLWMI_RC_NUM_MULTICAST_FILTER_ENTRIES, 0x20}, {WLWMI_RC_NUM_WOW_FILTERS, 0x16},
++		{WLWMI_RC_USE_PDEV_ID, 1}, {WLWMI_RC_PEER_MAP_UNMAP_VERSION, 1},
++	};
++	if (room < WLWMI_INIT_TOTAL) { return 1; }
++	for (uint32_t i = 0; i < WLWMI_INIT_TOTAL; i++) { out[i] = 0; }
++	uint8_t *c = out + 4, *rc = c + WLWMI_INIT_BYTES;
++	uint32_t mask = wlwmi_chain_mask(wmi->num_rf_chains);
++	wlce_put32(out, WLWMI_CMD_INIT);
++	wlwmi_put_tlv(c, WLWMI_TAG_INIT_CMD, WLWMI_INIT_BYTES - 4u);
++	wlwmi_put_tlv(rc, WLWMI_TAG_RESOURCE_CONFIG, WLWMI_RSRC_BYTES - 4u);
++	for (unsigned i = 0; i < sizeof(fixed) / sizeof(fixed[0]); i++) { wlce_put32(rc + 4u * fixed[i][0], fixed[i][1]); }
++	wlce_put32(rc + 4u * WLWMI_RC_TX_CHAIN_MASK, mask);
++	wlce_put32(rc + 4u * WLWMI_RC_RX_CHAIN_MASK, mask);
++	wlce_put32(rc + 4u * WLWMI_RC_TX_DBG_LOG_SIZE, 1024);
++	wlce_put32(rc + 4u * WLWMI_RC_NUM_MSDU_DESC, 0x400);
++	wlce_put32(rc + 4u * WLWMI_RC_FLAG1, WLWMI_FLAG1_BSS_CHANNEL_INFO_64 | WLWMI_FLAG1_ACK_RSSI);
++	wlce_put32(rc + 4u * WLWMI_RC_FLAGS2, WLWMI_FLAGS2_CALC_NEXT_DTIM_COUNT_SET);
++	wlce_put32(rc + 4u * WLWMI_RC_HOST_SERVICE_FLAGS,
++	    wlwmi_svc(wmi, WLWMI_SVC_REG_CC_EXT) ? 1u << WLWMI_HOST_SVC_REG_CC_EXT_BIT : 0u);
++	wlwmi_put_tlv(rc + WLWMI_RSRC_BYTES, WLWMI_TAG_ARRAY_STRUCT, 0);
++	*len = WLWMI_INIT_TOTAL;
++	return 0;
++}
++
++/* PDEV_SET_HW_MODE (wmi.c:4186-4216): TLV 0x203 {pdev_id SOC 0, hw mode
++ * index, num_band_to_mac 0}; core.c:946-953 asks DBS for single-pdev chips. */
++static inline int
++wlwmi_encode_hw_mode(uint8_t *out, uint32_t room, uint32_t mode, uint32_t *len)
++{
++	if (room < WLWMI_HW_MODE_TOTAL) { return 1; }
++	wlce_put32(out, WLWMI_CMD_PDEV_SET_HW_MODE);
++	wlwmi_put_tlv(out + 4, WLWMI_TAG_PDEV_SET_HW_MODE_CMD, WLWMI_HW_MODE_BYTES - 4u);
++	wlce_put32(out + 8, WLWMI_PDEV_ID_SOC);
++	wlce_put32(out + 12, mode);
++	wlce_put32(out + 16, 0);
++	*len = WLWMI_HW_MODE_TOTAL;
++	return 0;
++}
++
++#endif /* FUXI_WLAN_CE_H */
 --- a/bsd/dev/wlan.c
 +++ b/bsd/dev/wlan.c
 @@ -0,0 +1,571 @@

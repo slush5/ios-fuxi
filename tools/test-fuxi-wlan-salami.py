@@ -3,7 +3,7 @@
 
 Host-only, synthetic cmd-db and RSC registers, fake boot-args and a fake ADT
 /defaults. No device, firmware, kernel build or network. Checks:
-  - patch 0099 embeds the exact fuxi_wlan.c and wlan.c;
+  - patch 0099 embeds the exact fuxi_wlan.c, fuxi_wlan_ce.h (W20) and wlan.c;
   - step 1 expects the salami cmd-db (ldob15 0x40b00), refuses 0x40a00
     (salami ldob12) with reason 5 and any other mismatch with reason 2;
   - steps 2 and 4 send exactly the salami rails ON at the salami live-DT mV;
@@ -26,7 +26,10 @@ Host-only, synthetic cmd-db and RSC registers, fake boot-args and a fake ADT
     the driver reads it, refuses what the kernel could not read, and reports
     the exact bytes each property adds;
   - the Fuxi build (no FUXI_SALAMI) keeps its defaults, ignores /defaults and
-    starts as before.
+    starts as before;
+  - W20 (fuxiwlanqrtr=6) starts only with all 28 steps; qrtr outside 0..6,
+    keep/stop22 with qrtr 6, fuxiwlanw20 without qrtr 6 and unimplemented w20
+    bits are refused before any access; the init lines print qrtr 6.
 """
 from pathlib import Path
 import importlib.util
@@ -38,6 +41,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 DRIVER = (ROOT / 'xnu/fuxi-wlan/fuxi_wlan.c').read_text()
+CE_HEADER = (ROOT / 'xnu/fuxi-wlan/fuxi_wlan_ce.h').read_text()
 SHIM = (ROOT / 'shim/fuxi-probe/wlan.c').read_text()
 CC = [os.environ.get('CC', 'cc'), '-std=c11', '-D_DEFAULT_SOURCE', '-g',
       '-fsanitize=address,undefined', '-fno-omit-frame-pointer']
@@ -62,12 +66,20 @@ def load_mkadt():
 
 def check_patch():
     patch = (ROOT / 'xnu/patches/0099-fuxi-wlan.patch').read_text()
-    for dest, source in (('fuxi_wlan.c', DRIVER), ('wlan.c', SHIM)):
+    for dest, source in (('fuxi_wlan.c', DRIVER), ('fuxi_wlan_ce.h', CE_HEADER), ('wlan.c', SHIM)):
         added = patch.split(f'+++ b/bsd/dev/{dest}\n', 1)[1].split('\n--- a/', 1)[0]
         count = re.match(r'@@ -0,0 \+1,(\d+) @@\n', added)
         assert count and int(count[1]) == len(source.splitlines()), dest
         body = '\n'.join(l[1:] for l in added.splitlines() if l.startswith('+')) + '\n'
         assert body == source, f'0099 {dest} differs from its canonical source'
+    # W20 (C1): the header is a new file of its own, after fuxi_wlan.c and before wlan.c (the m6 tests
+    # read wlan.c to the end of the patch); header only, so bsd/conf/files is unchanged.
+    order = [m for m in re.findall(r'^\+\+\+ b/(\S+)$', patch, re.M)]
+    assert order == ['bsd/conf/files', 'bsd/dev/sweet_ufs.c', 'bsd/dev/fuxi_wlan.c', 'bsd/dev/fuxi_wlan_ce.h',
+                     'bsd/dev/wlan.c'], order
+    assert '--- a/bsd/dev/fuxi_wlan_ce.h\n+++ b/bsd/dev/fuxi_wlan_ce.h\n@@ -0,0 +1,' in patch
+    assert DRIVER.count('#include "fuxi_wlan_ce.h"') == 1 and 'fuxi_wlan_ce' not in patch.split('--- a/bsd/dev/fuxi_wlan.c', 1)[0]
+    assert 'The Clear BSD License' in CE_HEADER and '#include' not in CE_HEADER
     # The Fuxi branch keeps its literals; salami-only code is all under FUXI_SALAMI.
     assert 'static const uint32_t expect[8] = {0x40a00, 0x40200, 0x40400, 0x40500, 0x44000, 0x40600, 0x43900, 0x43a00};' in SHIM
     assert 'static const uint16_t mv[6] = {1000, 1800, 980, 952, 1350, 1900};' in SHIM
@@ -94,7 +106,7 @@ def check_patch():
     assert '#define PE_parse_boot_argn(name, buf, size) wl_arg((name), (buf), (size))' in block
     assert '#define PE_parse_boot_arg_str(name, buf, size) wl_arg_str((name), (buf), (size))' in block
     assert 'PE_parse_boot' not in SHIM and 'PE_get_default' not in SHIM
-    print('0099 embeds both sources; Fuxi literals, salami guards and the knob source are where expected')
+    print('0099 embeds fuxi_wlan.c, fuxi_wlan_ce.h and wlan.c; Fuxi literals, salami guards and the knob source are where expected')
 
 
 RPMH_PRE = r'''
@@ -483,6 +495,33 @@ def gate_suite(tmp, mk):
         ('fuxiwlan=11 fuxiwlansalami=1 fuxiwlanprobe=civac fuxiwlanseq=cycle', 1, 11, None),
         (f'fuxiwlan=1 fuxiwlansalami=1 {SET} {W14}', 1, 28, 'salami K-W1 gate open'),
         ('fuxiwlan=1 fuxiwlansalami=1 fuxiwlanw16=9 fuxiwlanqrtr=5', 0, 0, 'invalid selector 1'),
+        # W20 (C1): qrtr 6 needs all 28 steps; 7/8 (C2/C3) and anything outside 0..6 are refused, as are
+        # keep/stop22 with qrtr 6, w20 without qrtr 6 and every w20 bit but 0x01/0x04/0x40.
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6', 1, 28, 'W20 selected qrtr=6 (CE/HTC/WMI init to READY) w20 0 valid 1'),
+        ('fuxiwlan=1 fuxiwlansalami=1 fuxiwlanqrtr=6', 1, 28, 'W12 selected qrtr=6 target memory cap'),
+        ('fuxiwlan=99 fuxiwlansalami=1 fuxiwlanqrtr=6', 1, 28, 'W15 variant 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw20=0x45', 1, 28, 'w20 0x45 valid 1'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw20=1', 1, 28, 'w20 0x1 valid 1'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw15=1 fuxiwlanw16=3', 1, 28, 'W16 variant 3'),
+        ('fuxiwlan=27 fuxiwlansalami=1 fuxiwlanqrtr=6', 0, 0, 'needs all 28 steps (fuxiwlan=1 or 28), limit 27; refused'),
+        ('fuxiwlan=11 fuxiwlansalami=1 fuxiwlanqrtr=6', 0, 0, 'invalid selector 1'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7', 0, 0, 'W20 fuxiwlanqrtr=7 is not 0..6 in this build; refused'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=8', 0, 0, 'W20 fuxiwlanqrtr=8 is not 0..6'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=9', 0, 0, 'W20 fuxiwlanqrtr=9 is not 0..6'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=-1', 0, 0, 'W20 fuxiwlanqrtr=-1 is not 0..6'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlankeep=1', 0, 0, 'w20 0 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanstop22=1', 0, 0, 'w20 0 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw20=8', 0, 0, 'w20 0x8 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw20=2', 0, 0, 'w20 0x2 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw20=0x10', 0, 0, 'w20 0x10 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw20=0x20', 0, 0, 'w20 0x20 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw20=0x80', 0, 0, 'w20 0x80 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw20=0x100', 0, 0, 'w20 0x100 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw20=-1', 0, 0, 'w20 0xffffffff valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=5 fuxiwlanw20=1', 0, 0, 'W20 fuxiwlanw20 0x1 needs fuxiwlanqrtr=6; refused'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanw20=4', 0, 0, 'needs fuxiwlanqrtr=6'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=5 fuxiwlanw20=0', 1, 28, None),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=5', 1, 28, 'W12 selected qrtr=5 target memory cap'),
     ]
     for args, starts, limit, text in cases:
         s, lim, names, out, reads = run(salami, args)
@@ -496,6 +535,8 @@ def gate_suite(tmp, mk):
             assert 'M6g IOVA' not in out  # refused before any configuration
         if 'fuxiwlanrails' not in args:
             assert 'rails variant' not in out, (args, out)
+        if not re.search(r'fuxiwlanqrtr=([6-9]|-)|fuxiwlanw20=[^0]', args):
+            assert 'W20' not in out, (args, out)  # every other boot logs exactly as before W20
     # Firmware names: salami Android defaults, boot-arg overrides, bad names refused.
     s, _, names, out, _ = run(salami, f'fuxiwlan=1 fuxiwlansalami=1 {W14}')
     assert s == 1 and names == {'bdf': 'bdwlan.b0e', 'regdb': 'regdb.bin', 'm3': 'phy_ucode20.elf', 'amss': ''}, names
@@ -539,6 +580,9 @@ def gate_suite(tmp, mk):
         'fuxiwlan=0 fuxiwlansalami=1',
         'fuxiwlan=1 fuxiwlansalami=1 fuxiwlanamss=amss20.bin fuxiwlanfw=stock',
         'fuxiwlan=1 fuxiwlansalami=1 fuxiwlanw16=9 fuxiwlanqrtr=5',
+        'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw20=0x45 fuxiwlanmlo=0x17d',
+        'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7',
+        'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=5 fuxiwlanw20=4',
     ]
     for args in equal:
         want = run(salami, args)
@@ -592,6 +636,11 @@ def gate_suite(tmp, mk):
             assert out == run(fuxi, args)[3]
     s, _, names, _, _ = run(fuxi, f'fuxiwlan=1 {W14} fuxiwlanregdb=x.bin fuxiwlanamss=y.bin')
     assert s == 1 and names == {'bdf': 'bd_m3gl.elf', 'regdb': 'regdb_xiaomi.bin', 'm3': 'm3.bin', 'amss': '-'}, names
+    # W20 on the Fuxi build: same parsing; an invalid selector stops there at step 17 (wl5_step 0x6c).
+    s, lim, _, out, _ = run(fuxi, 'fuxiwlan=28 fuxiwlanqrtr=6 fuxiwlanw20=0x40')
+    assert (s, lim) == (1, 28) and 'W20 selected qrtr=6 (CE/HTC/WMI init to READY) w20 0x40 valid 1' in out, out
+    s, _, _, out, _ = run(fuxi, 'fuxiwlan=28 fuxiwlanqrtr=7')
+    assert s == 1 and 'W20 fuxiwlanqrtr=7 is not 0..6 in this build; refused' in out, out
     print(f'K-W1 gate: {len(cases)} salami boot-arg cases, firmware names/overrides/refusals, Fuxi control passed')
     print(f'K-W1b /defaults: {len(equal)} knob sets equal from ADT alone and split cmdline/ADT; boot-arg wins; '
           'absent from both is off; oversize/unterminated properties; Fuxi ignores /defaults')

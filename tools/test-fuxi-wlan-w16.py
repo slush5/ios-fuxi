@@ -109,11 +109,12 @@ static void notifications16(unsigned variant) {
     contain();
 }
 int main(void) {
+    /* qrtr 6 (W20) carries the W15 knobs as well. */
     for(int q=0;q<=6;q++)for(int v=-1;v<=5;v++) {
         qrtr_arg=q;w16_arg=v;wl_probe_configure();
-        assert(wl_variant_invalid==(q==5 && (v<0 || v>4)));
-        assert(wl16_variant==(q==5 && v>=0 && v<=4?(unsigned)v:0));
-        if(q!=5)assert(!wl16_large && !wl16_redrive);
+        assert(wl_variant_invalid==((q==5||q==6) && (v<0 || v>4)));
+        assert(wl16_variant==((q==5||q==6) && v>=0 && v<=4?(unsigned)v:0));
+        if(q!=5&&q!=6)assert(!wl16_large && !wl16_redrive);
     }
     for(unsigned v=0;v<=4;v++)for(unsigned keep=0;keep<2;keep++) {
         boot16(v,0,keep);int e=finish_step();if(e)fprintf(stderr,"%s",logbuf);
