@@ -11,13 +11,14 @@ SOURCE = ROOT / 'xnu/fuxi-wifi-ios'
 PATCH = ROOT / 'xnu/patches/0104-fuxi-wifi-ios.patch'
 INTEGRATION = '''--- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -113,3 +113,9 @@
+@@ -113,3 +113,10 @@
  bsd/dev/fuxi_wlan.c\t\t\tstandard
 +bsd/dev/fuxi_wifi_ios.c\t\t\tstandard
 +bsd/dev/fuxi_wifi_net.c\t\t\tstandard
 +bsd/dev/fuxi_wifi_sta.c\t\t\tstandard
 +bsd/dev/fuxi_wifi_apple80211.c\t\tstandard
 +bsd/dev/fuxi_wifi_radio.c\t\tstandard
++bsd/dev/fuxi_wifi_data.c\t\tstandard
 +bsd/dev/fuxi_wifi_wpa.c\t\t\tstandard
  bsd/dev/sweet_rpmh.c\t\t\tstandard
  bsd/dev/sweet_spmi.c\t\t\tstandard

@@ -300,10 +300,26 @@ static bool said_since(size_t from,const char *what) { return strstr(logbuf+from
 int main(void) {
  assert(sizeof(struct apple80211req)==40 && offsetof(struct apple80211req,req_data)==32);
  fuxi_wifi_ios_init(); assert(!attached && !registry && !fuxi_wifi_sta_present());
- opt=5; fuxi_wifi_ios_init(); assert(!attached);
+ opt=6; fuxi_wifi_ios_init(); assert(!attached);
  opt=-1; fuxi_wifi_ios_init(); assert(!attached);
+ /* the data handoff without fuxiwifiios=5: the radio lane's calls drop everything, store only ready()'s word */
+ {
+  static const uint8_t ap[6]={0x02,0x10,0x20,0x30,0x40,0x01};
+  uint8_t mpdu[64]={0x08,0x02}, out[1532]; uint32_t id=7; struct fuxi_wifi_data_request rq; struct fuxi_wifi_data_counts c;
+  struct fuxi_wifi_data_link l; size_t n=9;
+  fuxi_wifi_data_ready(true); fuxi_wifi_data_link_up(1,ap,2412); fuxi_wifi_data_link_down(1,0);
+  assert(fuxi_wifi_data_rx(mpdu,sizeof(mpdu),-40)==FUXI_WIFI_DATA_DROP_DOWN && !fuxi_wifi_data_take(&rq));
+  assert(!fuxi_wifi_data_tx_take(out,sizeof(out),&id) && !id); fuxi_wifi_data_tx_done(1,0);
+  assert(!fuxi_wifi_data_present() && fuxi_wifi_data_send(out,60)==FUXI_WIFI_DATA_DROP_DOWN);
+  assert(!fuxi_wifi_data_pull(out,sizeof(out),&n) && !n && !fuxi_wifi_data_eapol_pull(out,sizeof(out),&n));
+  fuxi_wifi_data_counts(&c); fuxi_wifi_data_link(&l); fuxi_wifi_data_leave();
+  for (unsigned i=0;i<sizeof(c);i++) assert(!((uint8_t *)&c)[i]);
+  assert(l.state==FUXI_WIFI_DATA_IDLE && !l.epoch && !l.seq && data_ready_word && !data_used && !data_store);
+  fuxi_wifi_data_ready(false);
+ }
  /* without fuxiwifiios=1 (or 2, route U: tools/test-fuxi-usbnet.py; 3 and 4, the radio backends:
-    tools/test-fuxi-wifi-radio.py): nothing is made, nothing said, no timer, nothing allocated */
+    tools/test-fuxi-wifi-radio.py; 5, the radio data backend: tools/test-fuxi-wifi-data.py): nothing is made,
+    nothing said, no timer, nothing allocated */
  assert(loglen==0 && !calls_made && !calls_armed && !atomic_load(&kallocs) && !other_call.func);
  opt=1; fuxi_wifi_ios_init(); assert(attached==1 && registry==1);
  fuxi_wifi_ios_init(); assert(attached==1);
@@ -508,6 +524,8 @@ int main(void) {
  /* nothing a network carries was said: its name, its passphrase; nothing of the radio backends either */
  assert(!strstr(logbuf,"Fuxi Loopback") && !strstr(logbuf,"password"));
  assert(!strstr(logbuf,"radio:") && !strstr(logbuf,"SCAN_RESULT room") && !other_call.func);
+ /* nor of the data handoff: fuxiwifiios=1 never uses it */
+ assert(!strstr(logbuf,"data:") && !data_used && fuxi_wifi_data_rx(frame,60,-40)==FUXI_WIFI_DATA_DROP_DOWN);
  puts("PASS: production station, ioctl layouts/events, fake frame callbacks and gates");
 #if defined(FUXI_SALAMI)
  puts("PASS: salami summary timer 20 s, 60 s, then every 10 min, a tenth of each wait as leeway");
@@ -524,10 +542,12 @@ def stripped(name, src=SRC):
 
 
 # The kernel units in one translation unit on the model, in an order that declares before use (K2 added the
-# radio handoff, which fuxi_wifi_apple80211.c and fuxi_wifi_ios.c call). test-fuxi-usbnet.py and
-# test-fuxi-wifi-radio.py build theirs with this too.
-HEADERS = ('fuxi_wifi_sta.h', 'fuxi_wifi_net.h', 'fuxi_wifi_ios.h', 'fuxi_wifi_apple80211.h', 'fuxi_wifi_radio.h')
-UNITS = ('fuxi_wifi_sta.c', 'fuxi_wifi_apple80211.c', 'fuxi_wifi_radio.c', 'fuxi_usbnet_ring.h', 'fuxi_wifi_ios.c')
+# radio handoff, which fuxi_wifi_apple80211.c and fuxi_wifi_ios.c call; the data handoff and its fuxiwifiios=5
+# backend follow it). test-fuxi-usbnet.py, test-fuxi-wifi-radio.py and test-fuxi-wifi-data.py build theirs with this too.
+HEADERS = ('fuxi_wifi_sta.h', 'fuxi_wifi_net.h', 'fuxi_wifi_ios.h', 'fuxi_wifi_apple80211.h', 'fuxi_wifi_radio.h',
+           'fuxi_wifi_data.h')
+UNITS = ('fuxi_wifi_sta.c', 'fuxi_wifi_apple80211.c', 'fuxi_wifi_radio.c', 'fuxi_wifi_data.c', 'fuxi_usbnet_ring.h',
+         'fuxi_wifi_ios.c')
 
 
 def unit_source(model=MODEL, src=SRC):

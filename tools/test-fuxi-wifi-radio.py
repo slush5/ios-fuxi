@@ -22,9 +22,11 @@ salami build. Each scenario is a process of its own (the radio state is one word
      nochannel    ready() names no listed channel: Wi-Fi off with code 0x7000n, not on with an empty list
   T7 canned       fuxiwifiios=4: four canned networks (one hidden, WPA2, DFS), the radio lane ignored
   T8 default      no fuxiwifiios: producer calls only store the state word; nothing allocated or said
+     scan5        fuxiwifiios=5 (the radio data backend, tools/test-fuxi-wifi-data.py) scans as =3: the same
+                  request, scan line and GET 11 records; a join with no data producer refused as =3 refuses it
   T6 static       the leaf lock rule, the producer never sleeps, no wl_ symbol on the iOS side, and any
                   fuxi_wlan.c prototype of the producer API equals the header (none yet: 0099 hooks deferred)
-  T9 mutants      17 source mutations, each must fail a scenario or a static rule
+  T9 mutants      18 source mutations, each must fail a scenario or a static rule
 """
 import importlib.util
 import os
@@ -43,7 +45,7 @@ FLAGS = ['-std=gnu11', '-g', '-O1', '-Wall', '-Wextra', '-Werror', '-Wno-unused-
          '-pthread']
 SAN = ['-fsanitize=address,undefined', '-fno-sanitize-recover=all']
 SCENARIOS = ('parse', 'fuzz', 'table', 'radio', 'stop', 'cancel', 'early', 'silent-scan', 'silent-state', 'backstop',
-             'rearm', 'nochannel', 'canned', 'default')
+             'rearm', 'nochannel', 'canned', 'default', 'scan5')
 RESULTS = []
 
 spec = importlib.util.spec_from_file_location('test_wifi_ios', ROOT / 'tools/test-fuxi-wifi-ios.py')
@@ -54,7 +56,7 @@ TEST = r'''
 extern unsigned int alarm(unsigned int seconds);   /* (not <unistd.h>: its link() would meet fuxi_wifi_ios.c's) */
 /* ---- what every scenario uses ---------------------------------------------------------------------- */
 bool fuxi_wifi_net_attach(const struct fuxi_wifi_net_link *p) {
- assert(p->wireless && !p->up && p->address[0]==2 && !strcmp(p->name,"radio-scan")); attached++; return true;
+ assert(p->wireless && !p->up && p->address[0]==2 && !strcmp(p->name,opt==5 ? "radio-data" : "radio-scan")); attached++; return true;
 }
 static void settle(void) {
  struct timespec pause = { .tv_nsec=1000000 };
@@ -800,6 +802,44 @@ static void scenario_canned(void) {
  puts("canned: PASS");
 }
 
+/* ---- fuxiwifiios=5: the radio data backend scans as =3 ----------------------------------------------- */
+static void scenario_scan5(void) {
+ int v; char name[256];
+ fill_all(); lane_frames_make();
+ opt=5; fuxi_wifi_ios_init();
+ assert(said_times("FUXI WIFI IOS: enabled, radio data backend (radio scans, open joins, en0 frames through the data handoff); "
+  "Apple80211 16.7 ABI unverified\n")==1);
+ assert(attached==1 && registry==1 && fuxi_wifi_sta_present() && atomic_load(&kallocs)>=5);
+ other_settle(); assert(other_armed()==30*NSEC_PER_SEC);
+ radio_ready_now(); lane_start(LANE_ANSWER);
+ assert(!scan_ask(3,0,0)); settle();
+ pthread_mutex_lock(&lane_lock); struct fuxi_wifi_radio_request seen=lane_last; pthread_mutex_unlock(&lane_lock);
+ assert(seen.seq && seen.freq_count==38 && seen.passive && seen.dwell_ms==150 && !memcmp(seen.freqs,all38,sizeof(all38)));
+ assert(said("FUXI WIFI IOS: radio: scan 1: 38 channels passive, 4 heard (2 at 2.4 GHz, 2 at 5 GHz, 3 RSN, 1 hidden), 0 ms, status 0\n"));
+ assert(!result_get(1024) && !memcmp(res.bssid,NA,6) && res.channel.channel==6 && res.rssi==-48 && res.noise==-95);
+ assert(res.ssid_length==8 && !memcmp(res.ssid,"zqA-wpa2",8) && res.elements_length==ies_a.n && !memcmp(res.elements,ies_a.b,ies_a.n));
+ assert(!result_get(1024) && !memcmp(res.bssid,NB,6) && res.channel.channel==36 && res.channel.flags==0x12);
+ assert(!result_get(1024) && !memcmp(res.bssid,NC,6) && !res.ssid_length);
+ assert(!result_get(1024) && !memcmp(res.bssid,ND,6) && res.channel.flags==0x112 && result_get(1024)==EIO);
+ assert(!scan_ask(1,36,CHANNEL_5GHZ)); settle();
+ pthread_mutex_lock(&lane_lock); seen=lane_last; pthread_mutex_unlock(&lane_lock);
+ assert(seen.freq_count==1 && seen.freqs[0]==5180 && !result_get(1024) && !memcmp(res.bssid,NB,6) && result_get(1024)==EIO);
+ /* no data producer: a join refused at once (result 2, event 9, no link), as =3 refuses it */
+ struct apple80211_assoc join={.version=1,.ssid_length=8}; memcpy(join.ssid,"zqB-open",8);
+ assert(!request(true,20,&join,sizeof(join),NULL)); settle();
+ assert(!request(false,21,NULL,0,&v) && v==2 && atomic_load(&events[9])==1 && !atomic_load(&events[4]) && !link_up);
+ assert(said(SAY("FUXI WIFI IOS: data: join refused (no radio data producer), no radio access, status %d\n",EOPNOTSUPP)));
+ memset(name,1,sizeof(name));
+ assert(!request(false,43,name,sizeof(name),NULL) && !strcmp(name,"Fuxi Wi-Fi iOS shim (radio data backend)"));
+ /* the radio lane stops: Wi-Fi off for the boot, as =3 */
+ fuxi_wifi_radio_stopped(FUXI_WIFI_RADIO_EXITED | 2);
+ wait_said("FUXI WIFI IOS: radio: the radio lane stopped (code 0x40002); Wi-Fi reported off, no retry this boot\n");
+ other_settle();
+ assert(!power_now() && scan_ask(3,0,0)==ENETDOWN && said_times("Wi-Fi reported off")==1);
+ lane_end(); other_settle(); clean_log();
+ puts("scan5: PASS");
+}
+
 /* ---- T8: no fuxiwifiios ----------------------------------------------------------------------------- */
 static void scenario_default(void) {
  static uint8_t f[200]; struct ies l; memset(&l,0,sizeof(l)); put(&l,0,"zqA",3);
@@ -811,7 +851,7 @@ static void scenario_default(void) {
  assert(!fuxi_wifi_radio_take(&r) && !fuxi_wifi_radio_take(NULL) && fuxi_wifi_radio_cancelled(1) && fuxi_wifi_radio_cancelled(0));
  assert(fuxi_wifi_radio_frame(1,f,n,2412,-40,-95)==FUXI_WIFI_RADIO_DROP_STALE && fuxi_wifi_radio_bss(1,b)==FUXI_WIFI_RADIO_DROP_STALE);
  fuxi_wifi_radio_done(1,0); fuxi_wifi_radio_stopped(FUXI_WIFI_RADIO_EXITED | 3); fuxi_wifi_radio_stopped(FUXI_WIFI_RADIO_EXITED | 4);
- opt=0; fuxi_wifi_ios_init(); opt=5; fuxi_wifi_ios_init();
+ opt=0; fuxi_wifi_ios_init(); opt=6; fuxi_wifi_ios_init();
  assert(radio_state==FUXI_WIFI_RADIO_STOPPED && radio_code==(FUXI_WIFI_RADIO_EXITED | 3));
  assert(!atomic_load(&kallocs) && !loglen && !other_call.func && !attached && !registry);
  assert(fuxi_wifi_radio_results(collect,NULL)==0);
@@ -836,6 +876,7 @@ int main(int argc,char **argv) {
  else if (!strcmp(s,"nochannel")) scenario_nochannel();
  else if (!strcmp(s,"canned")) scenario_canned();
  else if (!strcmp(s,"default")) scenario_default();
+ else if (!strcmp(s,"scan5")) scenario_scan5();
  else return 2;
  return 0;
 }
@@ -945,7 +986,7 @@ def static_rules(src=SRC):
     if re.search(r'\bfuxi_wifi_(sta|apple80211|net)_\w+\s*\(', code):
         problems.append('fuxi_wifi_radio.c calls the station, Apple80211 or en0 directly')
     # the iOS side never names the radio lane or MMIO/DMA
-    for name in ('fuxi_wifi_radio.c', 'fuxi_wifi_ios.c', 'fuxi_wifi_apple80211.c', 'fuxi_wifi_sta.c'):
+    for name in ('fuxi_wifi_radio.c', 'fuxi_wifi_ios.c', 'fuxi_wifi_apple80211.c', 'fuxi_wifi_sta.c', 'fuxi_wifi_data.c'):
         text = uncomment((Path(src) / name).read_text())
         bad = re.findall(r'\b(wl_\w+|wl\d+\w*|fw_\w+|ml_phys\w*|IOMemoryDescriptor|pmap_\w+)\b', text)
         if bad:
@@ -996,6 +1037,7 @@ MUTANTS = [
     ('no entry after the backstop re-arm', 'fuxi_wifi_radio.c', 'again = radio_state != FUXI_WIFI_RADIO_ABSENT;',
      'again = false;'),
     ('READY with no usable channel', 'fuxi_wifi_radio.c', 'if (n == 0) {', 'if (false) {'),
+    ('=5 without the radio handoff', 'fuxi_wifi_data.c', 'if (!fuxi_wifi_radio_use(false, rdata_changed) ||', 'if ('),
 ]
 
 

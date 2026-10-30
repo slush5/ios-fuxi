@@ -1,6 +1,7 @@
 /* Fuxi Wi-Fi iOS shim entry and synthetic Ethernet link. No radio access.
  * fuxiwifiios=2 (route U) carries that link's frames over the loader's USB monitor.
- * fuxiwifiios=3/4 (K2) list real scan results from the handoff of sys/fuxi_wifi_radio.h, scan only. */
+ * fuxiwifiios=3/4 (K2) list real scan results from the handoff of sys/fuxi_wifi_radio.h, scan only.
+ * fuxiwifiios=5 adds joins and en0's frames through sys/fuxi_wifi_data.h (bsd/dev/fuxi_wifi_data.c). */
 #if defined(FUXI)
 #include <sys/param.h>
 #include <sys/systm.h>
@@ -8,6 +9,7 @@
 #include <sys/fuxi_wifi_ios.h>
 #include <sys/fuxi_wifi_net.h>
 #include <sys/fuxi_wifi_radio.h>
+#include <sys/fuxi_wifi_data.h>
 #include <sys/fuxi_usbnet_ring.h>
 #include <kern/clock.h>
 #include <kern/locks.h>
@@ -468,10 +470,15 @@ fuxi_wifi_ios_init(void)
 	thread_t thread;
 	int on = 0;
 	PE_parse_boot_argn("fuxiwifiios", &on, sizeof(on));
-	if (on < 1 || on > 4 || enabled) {
+	if (on < 1 || on > 5 || enabled) {
 		return;
 	}
 	enabled = true;
+	if (on == 5) {
+		link.name = "radio-data";
+		fuxi_wifi_data_init(&rscan_backend);
+		return;
+	}
 	if (on >= 3) {
 		rscan_init(on == 4);
 		return;

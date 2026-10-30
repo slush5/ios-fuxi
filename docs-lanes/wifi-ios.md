@@ -10,7 +10,8 @@ Host tests and local arm64 syntax checks pass; no device result is claimed.
 
 `fuxiwifiios=1` enables the shim; `fuxiwifiios=2` enables it with route U
 (below); `fuxiwifiios=3` and `=4` enable the scan-only radio backends (K2,
-below). Missing, zero or other values do nothing:
+below); `fuxiwifiios=5` enables the radio data backend (open joins and en0
+frames through the data handoff, below). Missing, zero or other values do nothing:
 no interface, station thread or discovery services are created. Preserve all
 other caller boot arguments. No `fuxiwlan` argument is required for the fake
 backend. The existing USB Ethernet interface is `ue0`; it is not renamed.
@@ -386,6 +387,94 @@ never sees MMIO or DMA. The tables (about 140 KB) are allocated only with
   `scan EMPTY` (exit 1); a scan that never began (radio not ready, Wi-Fi off)
   or never ended is `FAIL`.
 
+## Radio data backend: joins and en0 frames (fuxiwifiios=5)
+
+Plan: `docs-lanes/wlan-join-plan.md` 4 (branch `study/rung3-join`). The iOS
+half of the radio data path, ready for the radio lane to plug in.
+`bsd/dev/fuxi_wifi_data.c` (`bsd/sys/fuxi_wifi_data.h`) is the data handoff
+between the radio lane and en0, built like the scan handoff: one leaf lock
+(`data_lock`), every shared byte owned there, frames copied in and out (no
+pointer crosses), bounded queues, and producer calls that never sleep, never
+touch hardware and never call the iOS side. Its store (three rings, about
+100 KB) is allocated only with `fuxiwifiios=5`. The same file ends with the
+`fuxiwifiios=5` backend; `fuxi_wifi_ios.c` only routes `=5` to it.
+
+- Scans are the `fuxiwifiios=3` backend's, unchanged: the same handoff, the
+  same 38 passive channels, the same results, Wi-Fi off for the boot when the
+  radio lane stops or never reports. GET 43/44 say `Fuxi Wi-Fi iOS shim (radio
+  data backend)`.
+- A join (open networks only) picks the strongest record of the last scan
+  with the name (and the BSSID, if wifid gives one), posts a join request for
+  the radio lane and waits for its `link_up` at most 10 s. Then ASSOCIATE_RESULT
+  1, event 9 and the link event, en0's link up, GET 13 RUN, GET 1/9/103 the
+  network. The producer's refusal gives its errno (ASSOCIATE_RESULT 2); a
+  timeout ETIMEDOUT (9) and the producer is told to leave.
+- Refused at once, without any radio access, with `EOPNOTSUPP` (ASSOCIATE_RESULT
+  2, never "wrong password"), as `=3` refuses every join: no data producer has
+  said `ready(true)`; WPA2 asked for (no supplicant yet); an open join to a
+  network with the privacy bit. A network the last scan did not hear: `ENOENT`.
+- Received data goes to en0 as Ethernet from the thread `wifi-data-rx` (route
+  U's cadence: 1 ms polls while frames moved in the last second, else 20 ms).
+  EAPOL (0x888e) goes to its own queue for a future supplicant
+  (`fuxi_wifi_data_eapol_pull`), never to en0; EAPOL received while joining is
+  kept (the 4-way handshake comes before the link). en0's frames go out
+  through the TX queue; EAPOL from en0 is refused.
+- The link lost by the radio (`link_down` while up): en0 down, the station's
+  loss event (Apple80211 link down, involuntary) with the producer's errno
+  (ECONNRESET if none). A leave or power-off asked by iOS: the producer is
+  told to leave, en0 down, no loss reported. The radio lane stopping while
+  joined: the link lost (ENETDOWN), then Wi-Fi off for the boot.
+- Logs carry counts, MHz and errno only: `data: join done, 2437 MHz, open, T ms,
+  status 0`, `data: join refused (<why>), no radio access, status N`, `data:
+  link lost, status N; rx R frames, K kept (E EAPOL), D dropped; tx ...`,
+  `data: left, status 0; ...`. Never an SSID, a MAC address or a frame byte.
+- `fuxiwifiios` absent, `1`, `2`, `3` and `4` are unchanged: the same log
+  lines and the same answers as salami (tools/test-fuxi-wifi-data.py D8 builds
+  one transcript against both trees).
+
+**Conversion** (pure, host tested): IEEE 802.11-2020 9.2.4.1 and 9.3.2.1, RFC
+1042, IEEE 802.1H.
+
+- Received: Data or QoS Data (version 0), To DS 0 and From DS 1, not
+  Protected (the radio lane hands over plaintext), no More Fragments and
+  fragment number 0, no A-MSDU. Header 24 bytes, 26 for QoS Data, 30 for QoS
+  Data with the Order bit (HT Control). Address 2 must be the BSS joined,
+  Address 1 this station or a group, Address 3 neither a group nor this
+  station (our own broadcast reflected). The body starts with `AA AA 03 00 00
+  00` (RFC 1042, but not for 0x80f3 or 0x8137) or `AA AA 03 00 00 F8` (bridge
+  tunnel), then a type of at least 0x0600. Out: DA = Address 1, SA = Address
+  3, the type, the payload; 14 to 1514 bytes.
+- Sent: an 802.3 frame of 14 to 1514 bytes from this station's address with a
+  type (not an 802.3 length) becomes Data, To DS, duration and sequence 0 (the
+  firmware's), Address 1 the BSSID, 2 this station, 3 the destination, then
+  RFC 1042 (bridge tunnel for 0x80f3 and 0x8137), the type and the payload: at
+  most 1532 bytes (`FUXI_WIFI_DATA_MPDU_MOST`).
+- Drop reasons (`FUXI_WIFI_DATA_DROP_*`): LENGTH, KIND, PROTECTED, FRAGMENT,
+  AMSDU, DS, BSSID, DEST, SOURCE, LLC, EAPOL (from en0), DOWN (no link, data
+  while joining, or no consumer), FULL. Each is counted
+  (`fuxi_wifi_data_counts`).
+
+**Producer API, for the radio lane** (`sys/fuxi_wifi_data.h`, one thread at a
+time; none of these sleeps, and none calls the iOS side):
+
+| Call | When |
+| --- | --- |
+| `fuxi_wifi_data_ready(bool)` | true once the lane can take joins; false when it no longer can (a link or join then ends with ENETDOWN). Stored even before the consumer exists. |
+| `fuxi_wifi_data_take(&request)` | poll it: a request copied out. `request.leave` true: leave whatever was joined. Else join `ssid`, `bssid` (never zero) on `mhz`, `security` OPEN; a join also means leaving any other network first. `seq` is never 0. |
+| `fuxi_wifi_data_link_up(seq, bssid, mhz)` | the join `seq` succeeded (associated, port open). Ignored unless `seq` is the join in flight, the lane took it, and `bssid` is the one asked for. |
+| `fuxi_wifi_data_link_down(seq, errno)` | the join `seq` failed, or its link is lost (deauth, beacon loss, firmware). 0 means ECONNREFUSED for a join, ECONNRESET for a link. Ignored for any other `seq`. |
+| `fuxi_wifi_data_rx(mpdu, length, dBm)` | one received data MPDU, decrypted, 802.11 header first, no FCS. Converted and copied during the call; 0 or the drop reason. |
+| `fuxi_wifi_data_tx_take(mpdu, room, &id)` | poll it: the next frame to send as an MPDU (room at least 1532 bytes), or 0. At most 32 in flight. |
+| `fuxi_wifi_data_tx_done(id, errno)` | that frame went (0) or failed. Ids from a link that ended are counted stale. |
+
+Bounds: 32 received frames for en0, 8 EAPOL frames, 32 frames to send, 32 in
+flight; a full queue drops the newest frame and counts it. Every link change
+(a new join, a loss, a leave, `ready(false)`) empties the queues and moves the
+epoch, so nothing of one link reaches the next; from JOINING to UP the queued
+EAPOL stays. The consumer side (`use`, `present`, `join`, `leave`, `send`,
+`pull`, `eapol_pull`, `link`, `counts`) is the `=5` backend's, and a future
+supplicant's for the EAPOL queue.
+
 ## Provenance and exclusions
 
 HackiOS kernel checkout `8e61187098f2c26c5daee8f9f72b6416aa64b9ab`,
@@ -427,6 +516,7 @@ does not supply retransmissions or a working radio supplicant.
 python3 tools/sync-fuxi-wifi-ios.py --check
 python3 tools/test-fuxi-wifi-ios.py
 CC=cc python3 -B tools/test-fuxi-wifi-radio.py
+CC=cc python3 -B tools/test-fuxi-wifi-data.py
 CC=cc python3 -B tools/test-fuxi-usbnet.py
 python3 tools/check-fuxi-wifi-ios.py "$XNU_BUILDTREE"
 ```
@@ -437,9 +527,24 @@ reason, 20000 fuzzed frames), the table, a fake radio lane (passive forced,
 GET 11 field by field, timeouts, a stop or a power-off mid-scan, no producer,
 READY while the backstop re-arms, a `ready()` with no usable channel), the
 canned producer, a default boot that allocates nothing, static rules for the
-leaf lock and the producer, and 17 mutants. The model's radio thread call
+leaf lock and the producer, `fuxiwifiios=5` scanning as `=3` (scan5), and 18
+mutants. The model's radio thread call
 follows XNU's ONCE rule: entered while it runs, it runs once more, when the
 last entry says.
+
+`test-fuxi-wifi-data.py` runs the data handoff and the `fuxiwifiios=5`
+backend on the same model: conversion vectors both ways (every drop reason,
+QoS and HT Control headers, EAPOL, the 802.1H tunnel, 14 and 1514 byte edges),
+2000 encapsulation round trips and 30000 fuzzed MPDUs; queue bounds, order and
+wrap (the 32-bit counts past 2^32), the in-flight bound and completions; link
+races (stale, untaken or foreign `link_up`/`link_down`, EAPOL while joining,
+timeouts before and after the lane took the join, give-up, loss with frames
+queued and in flight, `ready(false)`); a stress run with a pthread producer
+flapping the link; `=5` end to end with a pthread fake radio lane (scan, join,
+RX to en0, TX to the AP, loss, rejoin, leave, refusals, timeout, power-off,
+the radio stopping); no producer at all; the default boot; the salami
+transcript for `fuxiwifiios` absent/1/2/3/4; static rules for both leaf locks
+and the producer; and 32 mutants.
 
 The tests compile production C with ASan/UBSan and a pthread station adapter;
 cover missing/invalid/enabled gates, one-time attachment, malformed requests,
