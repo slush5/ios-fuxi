@@ -5,7 +5,11 @@
  * MGMT_RX parsing and a BSS table; nothing is transmitted on the air. C2b:
  * the CHAN_INFO words and the pdev stats answer after the scan. C2c (W26,
  * w20 0x100/0x200/0x400): host RX rings, the WBM idle link-descriptor list
- * and the pdev chain masks, with the watch, content and guard counts.
+ * and the pdev chain masks, with the watch, content and guard counts. C2d
+ * (W27, w20 0x800/0x1000): HTT RX_RING_SELECTION_CFG for the two MAC rings,
+ * and the UMAC RX path (REO destination and exception rings, the WBM release
+ * ring for RX, the REO setup) with every returned buffer posted again to the
+ * refill ring.
  * Pure C: no XNU or Linux includes. The includer provides uint8_t..uint64_t,
  * size_t, bool and memcpy (bsd/dev/fuxi_wlan.c in the kernel,
  * tools/fuxi-wlan-ce-model.c on the host).
@@ -39,6 +43,9 @@
  *   pci.c:
  *     Copyright (c) 2019-2021 The Linux Foundation. All rights reserved.
  *     Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ *   rx_desc.h:
+ *     Copyright (c) 2018-2021 The Linux Foundation. All rights reserved.
+ *     Copyright (c) 2021-2025 Qualcomm Innovation Center, Inc. All rights reserved.
  * Every SPDX line there is BSD-3-Clause-Clear. This file is an independent
  * encoding of the wire and register facts; no Linux function, macro or table
  * is copied. File:line references below are into that tree ("L19").
@@ -2725,6 +2732,507 @@ wlrx_next(const struct wlrx *rx, uint32_t bits)
 		    "1.2 rows L3/L4 (rx-frame 0 on every channel: H3 dead)";
 	}
 	return "none matched: owner review (rx_path_plan.md 2.11)";
+}
+
+/* ---- C2d (fuxiwlanqrtr=7): W27, RX ring selection and the REO/WBM buffer return path ----
+ * Adapted from Linux ath12k dp.c, dp.h, dp_rx.c, dp_tx.c, hal.c, hal.h,
+ * hal_desc.h, hal_rx.c, hw.c and rx_desc.h (BSD-3-Clause-Clear), v6.19. Two
+ * more w20 bits, each needing 0x100: 0x800 RXSEL, one HTT RX_RING_SELECTION_CFG
+ * per MAC ring with L19's WCN7850 words (ath12k_dp_rxdma_ring_sel_config_wcn7850
+ * dp_rx.c:4567-4605, encoder dp_tx.c:1363-1510), sent right after the
+ * SRING_SETUPs as dp_rx.c:4670 does; 0x1000 REORX, the UMAC RX path of
+ * ath12k_dp_srng_common_setup (dp.c:491-595: the WBM2SW3 release ring for RX,
+ * the REO exception ring REO2SW0, ath12k_hal_reo_hw_setup hal_rx.c:896-929) at
+ * dp_alloc time and the eight REO destination rings of
+ * ath12k_dp_rx_pdev_reo_setup (dp_rx.c:539-560) after service ready
+ * (core.c:925), each through ath12k_hal_srng_dst_hw_init (hal.c:1638-1707)
+ * without its MSI writes. Left out: the TX rings, REO reinject, the REO command
+ * and status rings (L19 sends REO commands only for peer queues, which a
+ * passive scan has none of), cookie conversion (dp.c:1330-1380: the REO and WBM
+ * entries then carry our cookie in buffer word 1, as L19's manual lookup reads
+ * it, dp_rx.c:2990-2999) and the SW2WBM release ring (L19 returns REO
+ * exception link descriptors there; here they are counted and held until
+ * containment). Polled: each pass reads the device HP of the ten rings from
+ * this section's own rdp page, takes every entry, gives each returned buffer
+ * back to refill ring 160 with a fresh sentinel and publishes the ring's TP
+ * (shadow register, or R2 TP with fuxiwlanw15=1). Every entry is checked
+ * against the slot table: a buffer address that is not the start of one of our
+ * posted slots, or a slot that is not out with the device, stops the run.
+ * Nothing read from a frame is printed: counts only. */
+#define WLRX_W20_RXSEL 0x800u
+#define WLRX_W20_REORX 0x1000u
+/* HTT RX_RING_SELECTION_CFG (msg 0xc, struct htt_rx_ring_selection_cfg_cmd 17
+ * words; dp.h:473, 840-884, 971, 1001-1007, 1194-1219). WCN7850: rx_filter
+ * HTT_RX_TLV_FLAGS_RXDMA_RING (MPDU_START | RX_PACKET | MSDU_END), flags2 BAR,
+ * flags3 MCAST | UCAST | NULL_DATA (FP data), offsets valid, packet offset =
+ * sizeof(struct hal_rx_desc_wcn7850) 400, header offset = its pkt_hdr_tlv 272,
+ * mpdu_start 144, msdu_end 0 (rx_desc.h:1521-1529, hal.c:1242-1250, 1505-1508),
+ * buffer size DP_RXDMA_REFILL_RING_SIZE 2048 (dp.h:191, dp_rx.c:4600-4602), EN_RXMON
+ * set (rxmon_disable 0), pdev = mac + 1 (SW_TO_HW ring, dp_tx.c:1392-1400), ring
+ * id RXDMA_HOST_BUF 0. Management frames are in no filter flag: they stay with
+ * the firmware and come back as WMI MGMT_RX. */
+#define WLRD_HTT_RX_RING_SEL 0xcu
+#define WLRD_SEL_WORDS 17u
+#define WLRD_SEL_OFFSET_VALID (1u << 26)
+#define WLRD_SEL_EN_RXMON (1u << 28)
+#define WLRD_SEL_BUF_SIZE 2048u
+#define WLRD_SEL_FLAGS2 (1u << 24)
+#define WLRD_SEL_FLAGS3 ((1u << 18) | (1u << 21) | (1u << 24))
+#define WLRD_SEL_TLV ((1u << 0) | (1u << 2) | (1u << 3))
+#define WLRD_DESC_BYTES 400u
+#define WLRD_OFF_PKT_HDR 272u
+#define WLRD_OFF_MPDU_START 144u
+#define WLRD_OFF_MSDU_END 0u
+/* UMAC rings (hal.c:13-132, 1327-1420; hal.h:139-183, 255-263, 313-322; hw.c:1194-1270):
+ * ids REO2SW0 0 (exception), REO2SW1..8 1..8, WBM2SW3_RELEASE 128 + 3; entries of
+ * 8 words (hal_reo_dest_ring, hal_wbm_release_ring); sizes DP_REO_DST_RING_SIZE
+ * 2048, DP_REO_EXCEPTION_RING_SIZE 128, DP_RX_RELEASE_RING_SIZE 1024 (dp.h:183-186).
+ * R0 at the REO block 0x00a38000 + hal_reo1_ring_base_lsb 0x4e4 + 0x78 n
+ * (hal_reo2_ring_base 0x55c), REO2SW0 + 0x8a4; WBM2SW n at the WBM block +
+ * 0xe08 + 0x78 n. The R0 field offsets of every DST ring are the REO1 ones
+ * (BASE_MSB 4, ID 8, MISC 0x10, HP_ADDR 0x14/0x18, PRODUCER_INT 0x24, as the CE
+ * STATUS ring). R2 HP at REO + 0x3048 + 8 n, REO2SW0 + 0x3088, WBM + 0x30c8 + 8
+ * n; TP 4 above. Thresholds of ath12k_dp_srng_setup (dp.c:290-340, hal.h:762-769):
+ * REO_DST batch 128, timer 500 us; REO_EXCEPTION and WBM2SW3 (not a WCN7850 TX
+ * completion ring, hw.c:76-82) batch 1, timer 256 us. */
+#define WLRD_ENTRY_DW 8u
+#define WLRD_NDST 8u
+#define WLRD_DST_ENTRIES 2048u
+#define WLRD_EXC_ENTRIES 128u
+#define WLRD_REL_ENTRIES 1024u
+#define WLRD_RING_EXC 0u
+#define WLRD_RING_DST0 1u
+#define WLRD_REL_NUM 3u
+#define WLRD_RING_REL (128u + WLRD_REL_NUM)
+#define WLRD_REO_REG 0x00a38000u
+#define WLRD_DST_R0(n) (WLRD_REO_REG + 0x4e4u + 0x78u * (n))
+#define WLRD_DST_R2(n) (WLRD_REO_REG + 0x3048u + 8u * (n))
+#define WLRD_EXC_R0 (WLRD_REO_REG + 0x8a4u)
+#define WLRD_EXC_R2 (WLRD_REO_REG + 0x3088u)
+#define WLRD_REL_R0 (WLRX_WBM_REG + 0xe08u + 0x78u * WLRD_REL_NUM)
+#define WLRD_REL_R2 (WLRX_WBM_REG + 0x30c8u + 8u * WLRD_REL_NUM)
+#define WLRD_BATCH_DST 128u
+#define WLRD_TIMER_DST_US 500u
+/* REO setup (hal_rx.c:896-929, dp.c:570-587, hal.h:139-145, 325-328, 559-560,
+ * 915-918; hw.c:1239, 1254-1257): GEN_ENABLE |= AGING_LIST_ENABLE (2) |
+ * AGING_FLUSH_ENABLE (3); MISC_CTRL FRAG_DST_RING 20:17 and BAR_DST_RING 24:21 =
+ * REO2SW0; aging thresholds 100000 us x 3, 40000 us; DEST_RING_CTRL_IX_2 and _3
+ * = the hash map SW1..SW4 twice. */
+#define WLRD_REO_GEN_ENABLE (WLRD_REO_REG + 0x0u)
+#define WLRD_REO_DEST_IX2 (WLRD_REO_REG + 0xcu)
+#define WLRD_REO_DEST_IX3 (WLRD_REO_REG + 0x10u)
+#define WLRD_REO_AGING(i) (WLRD_REO_REG + 0xb08u + 4u * (i))
+#define WLRD_REO_MISC_CTRL (WLRD_REO_REG + 0xb7cu)
+#define WLRD_GEN_AGING ((1u << 2) | (1u << 3))
+#define WLRD_MISC_DST_MASK ((0xfu << 17) | (0xfu << 21))
+#define WLRD_AGING_BE_BK_VI 100000u
+#define WLRD_AGING_VO 40000u
+#define WLRD_HASH (1u | 2u << 4 | 3u << 8 | 4u << 12 | 1u << 16 | 2u << 20 | 3u << 24 | 4u << 28)
+#define WLRD_RING_REGS 9u
+#define WLRD_HW_REGS 8u
+/* Entry fields (hal_desc.h:11-20, 590-625, 692-707, 816-869, 1805-2025, 2335-2363):
+ * REO entry word 4 rx_msdu_desc (continuation bit 2), word 7 info0 (buffer type
+ * 0 MSDU / 1 link descriptor, push reason 2:1, error code 7:3); release entry
+ * word 2 info0 (source module 2:0: RXDMA 1, REO 2; descriptor type 8:6, REL_MSDU
+ * 0; RXDMA push 18:17, error 23:19; REO push 25:24, error 30:26). A release entry
+ * for RX names RBM SW3 (8), which ath12k_hal_wbm_desc_parse_err requires
+ * (hal_rx.c:376-381); a REO exception link descriptor's first MSDU RBM must be
+ * the idle-link RBM, SW3 or SW1 (dp_rx.c:3910-3919). The MSDU link descriptor
+ * (struct hal_rx_msdu_link, 32 words) lists up to 6 MSDUs from word 8, 4 words
+ * each, ended by a zero address (hal_rx.c:291-318). */
+#define WLRD_RBM_SW3 8u
+#define WLRD_PUSH_ROUTING 1u
+#define WLRD_LINK_MSDUS 6u
+#define WLRD_LINK_MSDU_W0 8u
+/* REO arena (0x1000): its own rdp page (only words 0..8 and 131 are given to the
+ * device as HP words), the eight destination rings of 64 KiB, the exception ring,
+ * the release ring, a tail; the gaps and the tail are never given to the device. */
+#define WLRD_ARENA_BYTES 0x100000u
+#define WLRD_OFF_RDP 0x00000u
+#define WLRD_OFF_DST(n) (0x10000u + 0x10000u * (n))
+#define WLRD_OFF_EXC 0x90000u
+#define WLRD_OFF_REL 0x92000u
+#define WLRD_OFF_TAIL 0x9a000u
+_Static_assert(4u * WLRX_RDP_WORDS <= 0x1000u && WLRD_OFF_DST(7) + 4u * WLRD_ENTRY_DW * WLRD_DST_ENTRIES <= WLRD_OFF_EXC &&
+    WLRD_OFF_EXC + 4u * WLRD_ENTRY_DW * WLRD_EXC_ENTRIES <= WLRD_OFF_REL &&
+    WLRD_OFF_REL + 4u * WLRD_ENTRY_DW * WLRD_REL_ENTRIES == WLRD_OFF_TAIL && WLRD_OFF_TAIL < WLRD_ARENA_BYTES &&
+    WLRD_HASH == 0x43214321u && WLRD_REL_R0 == 0x00a34f70u && WLRD_REL_R2 == 0x00a370e0u &&
+    WLRD_REO_REG >> 19 == 0x14u && (WLRD_EXC_R2 + 4u) >> 19 == 0x14u && WLRD_REO_MISC_CTRL >> 19 == 0x14u, "W27 REO arena and one window");
+
+/* The device-written words of the REO arena; the refill HP publish of W27. The
+ * host model wraps both. */
+#ifndef WLRD_LOAD
+#define WLRD_LOAD(p) (*(p))
+#endif
+#ifndef WLRD_PUBLISH
+#define WLRD_PUBLISH(p, v) (*(p) = (v))
+#endif
+
+/* ring order: L19's setup order (release, exception, then destination 1..8) */
+enum { WLRD_R_REL, WLRD_R_EXC, WLRD_R_DST, WLRD_NRING = WLRD_R_DST + WLRD_NDST };
+#define WLRD_PRE_N (3u * WLRD_NRING + 8u)
+/* the pre-reads' reading; anything but FREE: no REO or release-ring write at all */
+enum { WLRD_FREE, WLRD_SRNG, WLRD_BASE, WLRD_APPLIED, WLRD_UNREADABLE };
+enum { WLRD_SLOT_OUT, WLRD_SLOT_HELD, WLRD_SLOT_NEVER };
+
+struct wlrd_ring {
+	uint16_t id;
+	uint8_t kind;                   /* WLRD_R_REL, WLRD_R_EXC or WLRD_R_DST */
+	uint32_t entries, off, r0, r2, batch, timer_us;
+	volatile uint32_t *va;
+	uint64_t iova, hp_iova;
+	uint32_t tp;                    /* host TP in words */
+	uint32_t reaped;
+	bool on;
+};
+struct wlrd {
+	uint8_t *base; uint64_t iova; uint32_t bytes;
+	volatile uint32_t *rdp; uint64_t rdp_iova;
+	struct wlrd_ring ring[WLRD_NRING];
+	uint32_t pre[WLRD_PRE_N]; unsigned own;
+	uint8_t slot[WLRX_SLOTS];
+	uint16_t pend[WLRX_SLOTS]; uint32_t pend_head, pend_n, pend_max;
+	uint32_t refill_hp;             /* host HP of ring 160 in words, as published */
+	uint32_t returned, reposted, publishes, refill_bad;
+	uint32_t routing, reo_error, msdu, link, cont, links_held, link_msdus, link_skipped, link_unowned;
+	uint32_t rel_src[3], desc_other, rbm_other, cookie_other;   /* release: rxdma, reo, other source */
+	uint32_t reo_code[32], rxdma_code[32];
+	uint32_t sel_sent;
+	bool sel_on, reo_on, dst_on, stopping;
+	const char *why;                /* the entry that stopped the run, a string literal */
+};
+
+/* The 17 words of RX_RING_SELECTION_CFG for MAC ring MAC (dp_tx.c:1392-1497). */
+static inline void
+wlrd_sel_words(unsigned mac, uint32_t *w)
+{
+	for (unsigned k = 0; k < WLRD_SEL_WORDS; k++) { w[k] = 0; }
+	w[0] = WLRD_HTT_RX_RING_SEL | ((mac + 1u) & 0xffu) << 8 | (WLRX_HTT_RING_RXDMA_HOST_BUF & 0xffu) << 16 |
+	    WLRD_SEL_OFFSET_VALID | WLRD_SEL_EN_RXMON;
+	w[1] = WLRD_SEL_BUF_SIZE & 0xffffu;
+	w[4] = WLRD_SEL_FLAGS2;
+	w[5] = WLRD_SEL_FLAGS3;
+	w[6] = WLRD_SEL_TLV;
+	w[7] = (WLRD_DESC_BYTES & 0xffffu) | (WLRD_OFF_PKT_HDR & 0xffffu) << 16;
+	w[8] = (WLRD_OFF_MPDU_START & 0xffffu) << 16;   /* mpdu_end offset 0 */
+	w[9] = WLRD_OFF_MSDU_END & 0xffffu;               /* msdu_start offset 0 */
+}
+
+/* Lay out and zero the REO arena; the rings' R0/R2 addresses, sizes and
+ * thresholds in L19's setup order. */
+static inline int
+wlrd_layout(struct wlrd *rd, uint8_t *base, uint64_t iova, uint32_t bytes)
+{
+	if (!base || (iova & 0xfffu) || bytes < WLRD_ARENA_BYTES || iova + WLRD_ARENA_BYTES > (1ull << 32)) { return 1; }
+	rd->base = base; rd->iova = iova; rd->bytes = WLRD_ARENA_BYTES;
+	rd->rdp = (volatile uint32_t *)(void *)(base + WLRD_OFF_RDP); rd->rdp_iova = iova + WLRD_OFF_RDP;
+	for (unsigned i = 0; i < WLRD_NRING; i++) {
+		struct wlrd_ring *r = &rd->ring[i];
+		const unsigned n = i - WLRD_R_DST;
+		r->kind = (uint8_t)(i < WLRD_R_DST ? i : WLRD_R_DST);
+		r->id = (uint16_t)(i == WLRD_R_REL ? WLRD_RING_REL : i == WLRD_R_EXC ? WLRD_RING_EXC : WLRD_RING_DST0 + n);
+		r->entries = i == WLRD_R_REL ? WLRD_REL_ENTRIES : i == WLRD_R_EXC ? WLRD_EXC_ENTRIES : WLRD_DST_ENTRIES;
+		r->off = i == WLRD_R_REL ? WLRD_OFF_REL : i == WLRD_R_EXC ? WLRD_OFF_EXC : WLRD_OFF_DST(n);
+		r->r0 = i == WLRD_R_REL ? WLRD_REL_R0 : i == WLRD_R_EXC ? WLRD_EXC_R0 : WLRD_DST_R0(n);
+		r->r2 = i == WLRD_R_REL ? WLRD_REL_R2 : i == WLRD_R_EXC ? WLRD_EXC_R2 : WLRD_DST_R2(n);
+		r->batch = i >= WLRD_R_DST ? WLRD_BATCH_DST : WLRX_BATCH_OTHER;
+		r->timer_us = i >= WLRD_R_DST ? WLRD_TIMER_DST_US : WLRX_TIMER_OTHER_US;
+		r->va = (volatile uint32_t *)(void *)(base + r->off);
+		r->iova = iova + r->off;
+		r->hp_iova = rd->rdp_iova + 4ull * r->id;
+		r->tp = r->reaped = 0; r->on = false;
+	}
+	for (uint32_t i = 0; i < WLRD_ARENA_BYTES / 4u; i++) { ((volatile uint32_t *)(void *)base)[i] = 0; }
+	return 0;
+}
+
+/* The pre-reads, in this order, before any REO or release-ring write: BASE_LSB,
+ * BASE_MSB and MISC of the ten rings, then GEN_ENABLE, MISC_CTRL, the four aging
+ * thresholds and DEST_RING_CTRL_IX_2/_3. */
+static inline uint32_t
+wlrd_pre_addr(unsigned i)
+{
+	static const uint8_t f[3] = { WLCE_R0_BASE_LSB, WLCE_R0_BASE_MSB, WLCE_R0_MISC };
+	static const uint32_t hw[8] = { WLRD_REO_GEN_ENABLE, WLRD_REO_MISC_CTRL, WLRD_REO_AGING(0), WLRD_REO_AGING(1),
+		WLRD_REO_AGING(2), WLRD_REO_AGING(3), WLRD_REO_DEST_IX2, WLRD_REO_DEST_IX3 };
+	const unsigned k = i / 3u, n = k - WLRD_R_DST;
+	if (i >= WLRD_PRE_N) { return 0u; }
+	if (i >= 3u * WLRD_NRING) { return hw[i - 3u * WLRD_NRING]; }
+	return (k == WLRD_R_REL ? WLRD_REL_R0 : k == WLRD_R_EXC ? WLRD_EXC_R0 : WLRD_DST_R0(n)) + f[i % 3u];
+}
+
+/* Their reading: any ~0u = unreadable; a ring with SRNG_ENABLE or a base = the
+ * firmware (or an earlier host) owns it; the hash map already in IX_2 or IX_3 =
+ * the REO setup was applied before. Anything but FREE: nothing is written. */
+static inline unsigned
+wlrd_owned(const uint32_t *pre)
+{
+	for (unsigned i = 0; i < WLRD_PRE_N; i++) { if (pre[i] == ~0u) { return WLRD_UNREADABLE; } }
+	for (unsigned k = 0; k < WLRD_NRING; k++) { if (pre[3u * k + 2u] & WLCE_MISC_SRNG_ENABLE) { return WLRD_SRNG; } }
+	for (unsigned k = 0; k < WLRD_NRING; k++) { if (pre[3u * k] || (pre[3u * k + 1u] & 0xffu)) { return WLRD_BASE; } }
+	if (pre[3u * WLRD_NRING + 6u] == WLRD_HASH || pre[3u * WLRD_NRING + 7u] == WLRD_HASH) { return WLRD_APPLIED; }
+	return WLRD_FREE;
+}
+
+static inline const char *
+wlrd_why(unsigned own)
+{
+	switch (own) {
+	case WLRD_SRNG: return "a ring has SRNG_ENABLE set (already owned)";
+	case WLRD_BASE: return "a ring base is non-zero (already owned)";
+	case WLRD_APPLIED: return "the REO hash map is already in DEST_RING_CTRL (setup applied before)";
+	case WLRD_UNREADABLE: return "a pre-read is ~0 (unreadable, ownership not established)";
+	default: return "free";
+	}
+}
+
+/* Ring I's nine writes in ath12k_hal_srng_dst_hw_init's order without the MSI
+ * ones (hal.c:1664-1706): BASE_LSB, BASE_MSB (address 39:32, size in words
+ * 27:8), ID (ring id 15:8, entry words 7:0), PRODUCER_INT (timer >> 3 31:16,
+ * batch x entry words 14:0), HP_ADDR LSB/MSB (rdp + 4 x id), R2 HP 0, R2 TP 0,
+ * MISC SRNG_ENABLE. */
+static inline void
+wlrd_ring_regs(const struct wlrd *rd, unsigned i, uint32_t regs[WLRD_RING_REGS][2])
+{
+	const struct wlrd_ring *r = &rd->ring[i < WLRD_NRING ? i : 0];
+	const uint32_t words = r->entries * WLRD_ENTRY_DW;
+	const uint32_t v[WLRD_RING_REGS][2] = {
+		{ r->r0 + WLCE_R0_BASE_LSB, (uint32_t)r->iova },
+		{ r->r0 + WLCE_R0_BASE_MSB, ((uint32_t)(r->iova >> 32) & 0xffu) | (words & 0xfffffu) << 8 },
+		{ r->r0 + WLCE_R0_ID, ((uint32_t)r->id & 0xffu) << 8 | WLRD_ENTRY_DW },
+		{ r->r0 + WLCE_R0_PROD_INT, ((r->timer_us >> 3) & 0xffffu) << 16 | ((r->batch * WLRD_ENTRY_DW) & 0x7fffu) },
+		{ r->r0 + WLCE_R0_HP_ADDR_LSB, (uint32_t)r->hp_iova },
+		{ r->r0 + WLCE_R0_HP_ADDR_MSB, (uint32_t)(r->hp_iova >> 32) },
+		{ r->r2, 0u },
+		{ r->r2 + 4u, 0u },
+		{ r->r0 + WLCE_R0_MISC, WLCE_MISC_SRNG_ENABLE },
+	};
+	for (unsigned k = 0; k < WLRD_RING_REGS; k++) { regs[k][0] = v[k][0]; regs[k][1] = v[k][1]; }
+}
+
+/* ath12k_hal_reo_hw_setup's writes (hal_rx.c:896-929) from the two values read
+ * right before (GEN, MISC). */
+static inline void
+wlrd_hw_regs(uint32_t gen, uint32_t misc, uint32_t regs[WLRD_HW_REGS][2])
+{
+	const uint32_t v[WLRD_HW_REGS][2] = {
+		{ WLRD_REO_GEN_ENABLE, gen | WLRD_GEN_AGING },
+		{ WLRD_REO_MISC_CTRL, (misc & ~WLRD_MISC_DST_MASK) | WLRD_RING_EXC << 17 | WLRD_RING_EXC << 21 },
+		{ WLRD_REO_AGING(0), WLRD_AGING_BE_BK_VI }, { WLRD_REO_AGING(1), WLRD_AGING_BE_BK_VI },
+		{ WLRD_REO_AGING(2), WLRD_AGING_BE_BK_VI }, { WLRD_REO_AGING(3), WLRD_AGING_VO },
+		{ WLRD_REO_DEST_IX2, WLRD_HASH }, { WLRD_REO_DEST_IX3, WLRD_HASH },
+	};
+	for (unsigned k = 0; k < WLRD_HW_REGS; k++) { regs[k][0] = v[k][0]; regs[k][1] = v[k][1]; }
+}
+
+/* The REO accessor's allowlist: reads of the 38 pre-read addresses (the
+ * readbacks and the setup's two read-modify-writes are among them); writes of
+ * the ten rings' nine registers each and the eight REO setup registers. Nothing
+ * else in the REO, WBM or TCL blocks. */
+static inline bool
+wlrd_reg_ok(uint32_t off, bool wr)
+{
+	static const uint8_t f[7] = { WLCE_R0_BASE_LSB, WLCE_R0_BASE_MSB, WLCE_R0_ID, WLCE_R0_PROD_INT, WLCE_R0_HP_ADDR_LSB,
+		WLCE_R0_HP_ADDR_MSB, WLCE_R0_MISC };
+	if (!wr) {
+		for (unsigned i = 0; i < WLRD_PRE_N; i++) { if (off == wlrd_pre_addr(i)) { return true; } }
+		return false;
+	}
+	for (unsigned i = 3u * WLRD_NRING; i < WLRD_PRE_N; i++) { if (off == wlrd_pre_addr(i)) { return true; } }
+	for (unsigned k = 0; k < WLRD_NRING; k++) {
+		const uint32_t r0 = wlrd_pre_addr(3u * k), n = k - WLRD_R_DST;
+		const uint32_t r2 = k == WLRD_R_REL ? WLRD_REL_R2 : k == WLRD_R_EXC ? WLRD_EXC_R2 : WLRD_DST_R2(n);
+		if (off == r2 || off == r2 + 4u) { return true; }
+		for (unsigned j = 0; j < 7; j++) { if (off == r0 + f[j]) { return true; } }
+	}
+	return false;
+}
+
+/* After the C2c fill and publish: slots 0..4094 out with the device, 4095 never
+ * posted; the refill HP as published. */
+static inline void
+wlrd_slots_init(struct wlrd *rd)
+{
+	for (uint32_t k = 0; k < WLRX_SLOTS; k++) { rd->slot[k] = k < WLRX_NBUF ? WLRD_SLOT_OUT : WLRD_SLOT_NEVER; }
+	rd->pend_head = rd->pend_n = rd->pend_max = 0;
+	rd->refill_hp = WLRX_NBUF * WLRX_BUF_DW;
+}
+
+static inline int
+wlrd_stop(struct wlrd *rd, const char *why)
+{
+	if (!rd->why) { rd->why = why; }
+	return 1;
+}
+
+/* A buffer the device handed back (address 39:0 in W0/W1): it must be the start
+ * of a posted slot that is out with the device; then it is held, its posted half
+ * zeroed and its sentinel written again, and queued for the refill ring. The
+ * cookie is ours (the slot); another one is counted, the address decides. */
+static inline int
+wlrd_recycle(struct wlrd *rd, struct wlrx *rx, uint32_t w0, uint32_t w1)
+{
+	const uint64_t a = w0 | (uint64_t)(w1 & 0xffu) << 32;
+	uint32_t k;
+	if (rd->stopping || rx->stopping) { return wlrd_stop(rd, "W27 buffer return after the containment latch"); }
+	if (a < rx->bufs_iova || (a - rx->bufs_iova) % WLRX_SLOT_BYTES || (a - rx->bufs_iova) / WLRX_SLOT_BYTES >= WLRX_NBUF) {
+		return wlrd_stop(rd, "W27 returned entry is not one of our posted buffers");
+	}
+	k = (uint32_t)((a - rx->bufs_iova) / WLRX_SLOT_BYTES);
+	if (rd->slot[k] != WLRD_SLOT_OUT) { return wlrd_stop(rd, "W27 buffer returned twice (not out with the device)"); }
+	if ((w1 >> 12) != k) { rd->cookie_other++; }
+	rd->slot[k] = WLRD_SLOT_HELD;
+	{
+		volatile uint32_t *s = (volatile uint32_t *)(void *)(rx->bufs + (size_t)k * WLRX_SLOT_BYTES);
+		for (uint32_t j = 0; j < WLRX_BUF_BYTES / 4u; j++) { s[j] = 0; }
+		for (uint32_t j = 0; j < WLRX_SENTINEL_BYTES / 4u; j++) { s[j] = 0xa5a5a5a5u; }
+	}
+	rd->pend[(rd->pend_head + rd->pend_n) % WLRX_SLOTS] = (uint16_t)k;
+	rd->pend_n++;
+	if (rd->pend_n > rd->pend_max) { rd->pend_max = rd->pend_n; }
+	rd->returned++;
+	return 0;
+}
+
+/* A REO exception link descriptor: a listed slot of our link arena, its MSDUs
+ * (zero address ends the list, at most 6) returned when the first one's RBM is
+ * one L19 accepts; the descriptor itself is held (no SW2WBM ring here). Without
+ * our idle list a link address is not ours to read: counted only. */
+static inline int
+wlrd_link(struct wlrd *rd, struct wlrx *rx, const struct wlce_io *io, uint32_t w0, uint32_t w1)
+{
+	const uint64_t a = w0 | (uint64_t)(w1 & 0xffu) << 32, d0 = rx->link_iova + WLRX_LINK_OFF_DESC;
+	const volatile uint32_t *l;
+	uint32_t rbm;
+	rd->link++;
+	if (!rx->idle_on || !rx->link) { rd->link_unowned++; return 0; }
+	if (a < d0 || (a - d0) % WLRX_LINK_DESC_BYTES || (a - d0) / WLRX_LINK_DESC_BYTES >= WLRX_NDESC) {
+		return wlrd_stop(rd, "W27 link descriptor is not one of our listed descriptors");
+	}
+	l = (const volatile uint32_t *)(const void *)(rx->link + WLRX_LINK_OFF_DESC + (size_t)(a - d0));
+	io->rbarrier(io->ctx);
+	rd->links_held++;
+	rbm = (l[WLRD_LINK_MSDU_W0 + 1u] >> 8) & 0xfu;
+	if (rbm != WLRX_RBM_IDLE_DESC && rbm != WLRD_RBM_SW3 && rbm != WLRX_RBM_SW1) { rd->rbm_other++; rd->link_skipped++; return 0; }
+	for (unsigned j = 0; j < WLRD_LINK_MSDUS; j++) {
+		const uint32_t m0 = l[WLRD_LINK_MSDU_W0 + 4u * j], m1 = l[WLRD_LINK_MSDU_W0 + 4u * j + 1u];
+		if (!m0) { break; }
+		if (wlrd_recycle(rd, rx, m0, m1)) { return 1; }
+		rd->link_msdus++;
+	}
+	return 0;
+}
+
+/* One entry of ring R (8 words, read after the read barrier), as L19 sorts it:
+ * REO destination and exception entries (dp_rx.c:2963-3021, 3854-3880) by buffer
+ * type, push reason and error code; release entries (hal_rx.c:347-411,
+ * dp_rx.c:4247-4261) by descriptor type, source module and RBM, where L19 skips
+ * the entry (and loses the buffer) on anything but REL_MSDU from RXDMA or REO
+ * with RBM SW3. */
+static inline int
+wlrd_entry(struct wlrd *rd, struct wlrx *rx, const struct wlce_io *io, const struct wlrd_ring *r, const uint32_t *e)
+{
+	if (r->kind == WLRD_R_REL) {
+		const uint32_t src = e[2] & 7u, type = (e[2] >> 6) & 7u;
+		rd->rel_src[src == 1u ? 0 : src == 2u ? 1 : 2]++;
+		if (type) { rd->desc_other++; return 0; }
+		if (src != 1u && src != 2u) { return 0; }
+		if (((e[1] >> 8) & 0xfu) != WLRD_RBM_SW3) { rd->rbm_other++; return 0; }
+		if (src == 2u) { rd->reo_code[(e[2] >> 26) & 0x1fu]++; } else { rd->rxdma_code[(e[2] >> 19) & 0x1fu]++; }
+		return wlrd_recycle(rd, rx, e[0], e[1]);
+	}
+	if (((e[7] >> 1) & 3u) == WLRD_PUSH_ROUTING && r->kind == WLRD_R_DST) { rd->routing++; }
+	else { rd->reo_error++; rd->reo_code[(e[7] >> 3) & 0x1fu]++; }
+	if (e[7] & 1u) { return wlrd_link(rd, rx, io, e[0], e[1]); }
+	rd->msdu++;
+	if (e[4] & (1u << 2)) { rd->cont++; }
+	if (((e[1] >> 8) & 0xfu) != WLRX_RBM_SW1) { rd->rbm_other++; }
+	return wlrd_recycle(rd, rx, e[0], e[1]);
+}
+
+/* Take every entry ring I's device HP shows (rdp word, then the read barrier);
+ * *MOVED = entries taken (the glue publishes the TP). A HP outside the ring or
+ * not on an entry stops the run, as does any entry wlrd_recycle refuses. */
+static inline int
+wlrd_reap(struct wlrd *rd, struct wlrx *rx, const struct wlce_io *io, unsigned i, uint32_t *moved)
+{
+	struct wlrd_ring *r = &rd->ring[i < WLRD_NRING ? i : 0];
+	const uint32_t size = r->entries * WLRD_ENTRY_DW;
+	uint32_t hp;
+	*moved = 0;
+	if (rd->stopping || !r->on) { return 0; }
+	hp = WLRD_LOAD(&rd->rdp[r->id]); io->rbarrier(io->ctx);
+	if (hp >= size || hp % WLRD_ENTRY_DW) { return wlrd_stop(rd, "W27 REO/release ring HP outside the ring"); }
+	while (r->tp != hp) {
+		uint32_t e[WLRD_ENTRY_DW];
+		for (uint32_t k = 0; k < WLRD_ENTRY_DW; k++) { e[k] = r->va[r->tp + k]; }
+		if (wlrd_entry(rd, rx, io, r, e)) { return 1; }
+		r->tp = (r->tp + WLRD_ENTRY_DW) % size;
+		r->reaped++;
+		(*moved)++;
+	}
+	return 0;
+}
+
+/* Post held buffers to refill ring 160 while the firmware's TP leaves room
+ * (L19's replenish, dp_rx.c:308-408: slot start, RBM SW1, cookie = slot), then
+ * the write barrier and one wrp[0] publish. A refill TP word that is not usable
+ * posts nothing (counted). Returns the buffers posted. */
+static inline uint32_t
+wlrd_replenish(struct wlrd *rd, struct wlrx *rx, const struct wlce_io *io)
+{
+	struct wlrx_ring *f = &rx->ring[WLRX_R_REFILL];
+	const uint32_t size = WLRX_REFILL_ENTRIES * WLRX_BUF_DW;
+	uint32_t tp, n = 0;
+	if (rd->stopping || rx->stopping || !rd->pend_n) { return 0; }
+	tp = WLRX_LOAD(&rx->rdp[WLRX_RING_REFILL]); io->rbarrier(io->ctx);
+	if (tp >= size || tp % WLRX_BUF_DW) { rd->refill_bad++; return 0; }
+	while (rd->pend_n && (tp + size - rd->refill_hp - WLRX_BUF_DW) % size >= WLRX_BUF_DW) {
+		const uint32_t k = rd->pend[rd->pend_head];
+		rd->pend_head = (rd->pend_head + 1u) % WLRX_SLOTS; rd->pend_n--;
+		wlrx_addr_entry(&f->va[rd->refill_hp], rx->bufs_iova + (uint64_t)k * WLRX_SLOT_BYTES, WLRX_RBM_SW1, k);
+		rd->slot[k] = WLRD_SLOT_OUT;
+		rd->refill_hp = (rd->refill_hp + WLRX_BUF_DW) % size;
+		n++;
+	}
+	if (n) {
+		io->wbarrier(io->ctx);
+		WLRD_PUBLISH(&rx->wrp[WLRX_RING_REFILL - WLRX_DMAC_START], rd->refill_hp);
+		rd->reposted += n; rd->publishes++;
+	}
+	return n;
+}
+
+/* Non-zero dwords where the REO arena gave the device no address: the rdp page
+ * but words 0..8 and 131, the gaps between the rings, the tail. Counts only. */
+static inline void
+wlrd_guard_count(const struct wlrd *rd, uint32_t *gap, uint32_t *tail)
+{
+	const volatile uint32_t *a = (const volatile uint32_t *)(const void *)rd->base;
+	const uint32_t end = (WLRD_OFF_EXC + 4u * WLRD_ENTRY_DW * WLRD_EXC_ENTRIES) / 4u;
+	*gap = *tail = 0;
+	for (uint32_t i = 0; i < WLRD_OFF_DST(0) / 4u; i++) {
+		*gap += !(i <= WLRD_RING_DST0 + WLRD_NDST - 1u || i == WLRD_RING_REL) && a[i] != 0;
+	}
+	for (uint32_t i = end; i < WLRD_OFF_REL / 4u; i++) { *gap += a[i] != 0; }
+	for (uint32_t i = WLRD_OFF_TAIL / 4u; i < WLRD_ARENA_BYTES / 4u; i++) { *tail += a[i] != 0; }
+}
+
+/* D5 for a C2d kit that heard no beacon: the next step. */
+static inline const char *
+wlrd_next(const struct wlrd *rd, uint32_t bits, uint32_t frames_written)
+{
+	uint32_t reaped = 0;
+	for (unsigned i = 0; i < WLRD_NRING; i++) { reaped += rd->ring[i].reaped; }
+	if (rd->why) { return "none: stop, owner review before any further kit (a returned entry was refused)"; }
+	if ((bits & WLRX_W20_REORX) && !rd->reo_on) {
+		return rd->own == WLRD_UNREADABLE || rd->own == WLRD_APPLIED ? "none: owner review (REO pre-read unreadable or already applied)" :
+		    "0x902 (2306): ring selection alone (the firmware owns the REO rings)";
+	}
+	if (reaped && rd->returned) { return "C3 management forwarding: frames reach the host rings, WMI MGMT_RX stays silent"; }
+	if (frames_written) { return "owner review: buffers written, nothing returned on the REO/release rings"; }
+	return (bits & WLRX_W20_RXSEL) && (bits & WLRX_W20_REORX) ? "owner review: RX path complete, RXDMA wrote nothing" :
+	    "0x1902 (6402): ring selection and the REO path together";
 }
 
 #endif /* FUXI_WLAN_CE_H */

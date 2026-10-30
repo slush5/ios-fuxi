@@ -3,12 +3,14 @@
 Status: C1 (c742af3) passed on the phone; C2 (39c80e5) ran clean on the phone (kit r1c2: 38 channels
 tuned, CHAN_INFO on all of them, no MGMT_RX at all); C2b (7caf3ed: CHAN_INFO detail and a pdev stats
 request per PHY pdev on top of C2) is committed, its readout boot is next; C2c (W26: host RX rings, the
-WBM idle link-descriptor list and the pdev chain masks, w20 0x100/0x200/0x400, all default off) is
-host-tested only (tools/test-fuxi-wlan-ce.py). Every line below that says what the target does is what
+WBM idle link-descriptor list and the pdev chain masks, w20 0x100/0x200/0x400, all default off) ran on the
+phone (r1c2c-all: the RX engine woke, nothing landed, the scan wedged); C2d (W27: RX ring selection and the
+REO/WBM buffer return path, w20 0x800/0x1000, default off) is host-tested only (tools/test-fuxi-wlan-ce.py). Every line below that says what the target does is what
 the model does, built from Linux ath12k v6.19. C2, C2b and C2c are described in their own sections below
 ([C2: W23/W24](#c2-w23w24-one-passive-scan-fuxiwlanqrtr7),
 [C2b](#c2b-chan_info-detail-and-the-pdev-stats-requests-fuxiwlanqrtr7-diagnostic),
-[C2c: W26](#c2c-w26-host-rx-rings-the-wbm-idle-list-and-the-chain-masks-fuxiwlanqrtr7-w20-0x100-0x200-0x400)).
+[C2c: W26](#c2c-w26-host-rx-rings-the-wbm-idle-list-and-the-chain-masks-fuxiwlanqrtr7-w20-0x100-0x200-0x400),
+[C2d: W27](#c2d-w27-rx-ring-selection-and-the-reowbm-buffer-return-path-fuxiwlanqrtr7-w20-0x800-0x1000)).
 
 After this boot's W15 WLAN_MODE reply, the radio lane programs the host side of copy engines CE0..CE4 on
 SRNG rings, posts RX buffers, completes HTC (READY, HTT and WMI connect, SETUP_COMPLETE_EX) and WMI init
@@ -31,7 +33,7 @@ file:line below is into that tree. UniXNU-sheng was not used for any line of cod
 | `fuxiwlanqrtr=6` | | W11..W15 as `=5`, then W20..W22. Needs all 28 steps (`fuxiwlan=1` or `28`); refused with `fuxiwlankeep=1` or `fuxiwlanstop22=1`. The W15 knobs (`fuxiwlanw15`, `fuxiwlanw16`) apply. |
 | `fuxiwlanqrtr=7` | | C2: all of `=6`, then W23/W24 (one passive scan). Same gate and refusals as `=6`; on salami also `fuxiwlansalami=1`. |
 | `fuxiwlanqrtr` outside 0..7 | 8 (C3), negative, 9+ | refused (`W20 fuxiwlanqrtr=N is not 0..7 in this build; refused`). Before C1 these ran silently with no QRTR. |
-| `fuxiwlanw20=N` | 0 default | With qrtr 6 or 7: 0x01 NOHTT (no HTT connect; WMI then gets the next endpoint), 0x04 MRRS128 (endpoint PCIe Device Control max read request 128 bytes before CE init, low half only), 0x40 NOHWMODE (no PDEV_SET_HW_MODE). With qrtr 7 only: 0x02 HTTVER (HTT version request after HW mode), 0x10 BAND24 (the 13 2.4 GHz channels only), 0x80 PDEVCAP (the EXT MAC/PHY pdev id instead of 0), and C2c's 0x100 RXRING (host RX rings with 4095 buffers and their 4 HTT SRING_SETUP; only with 0x02), 0x200 IDLELINK (the WBM idle link-descriptor list), 0x400 CHAINMASK (PDEV_SET_PARAM TX/RX chain mask). Refused: 0x08 ACTIVE (would transmit probe requests) and 0x20 FULLBSSID (would log whole BSSIDs; the owner masks every BSSID) at every qrtr, the qrtr-7 bits with qrtr 6, 0x01 together with 0x02, 0x100 without 0x02, any other bit. |
+| `fuxiwlanw20=N` | 0 default | With qrtr 6 or 7: 0x01 NOHTT (no HTT connect; WMI then gets the next endpoint), 0x04 MRRS128 (endpoint PCIe Device Control max read request 128 bytes before CE init, low half only), 0x40 NOHWMODE (no PDEV_SET_HW_MODE). With qrtr 7 only: 0x02 HTTVER (HTT version request after HW mode), 0x10 BAND24 (the 13 2.4 GHz channels only), 0x80 PDEVCAP (the EXT MAC/PHY pdev id instead of 0), and C2c's 0x100 RXRING (host RX rings with 4095 buffers and their 4 HTT SRING_SETUP; only with 0x02), 0x200 IDLELINK (the WBM idle link-descriptor list), 0x400 CHAINMASK (PDEV_SET_PARAM TX/RX chain mask), and C2d's 0x800 RXSEL (RX_RING_SELECTION_CFG per MAC ring) and 0x1000 REORX (REO/release rings, buffers back to ring 160), each only with 0x100. Refused: 0x08 ACTIVE (would transmit probe requests) and 0x20 FULLBSSID (would log whole BSSIDs; the owner masks every BSSID) at every qrtr, the qrtr-7 bits with qrtr 6, 0x01 together with 0x02, 0x100 without 0x02, 0x800 or 0x1000 without 0x100, any other bit. |
 
 Refusals set `wl_variant_invalid`; salami refuses at init before any access, the Fuxi build at step 17.
 Every boot without `fuxiwlanqrtr=6` or `7` logs and behaves as before C1, and every boot with qrtr absent
@@ -837,6 +839,267 @@ the Fuxi build, byte for byte; 7caf3ed's model with all its C1, C2 and C2b scena
 7caf3ed's and C2c's production code, byte for byte; and C2c's model + code against 7caf3ed's model + code:
 the 88 shared scenario logs byte for byte, C2c only adds scenarios after them.
 
+## C2d: W27, RX ring selection and the REO/WBM buffer return path (`fuxiwlanqrtr=7`, w20 0x800, 0x1000)
+
+Why: on the phone r1c2c-all (w20 0x702) woke the RX engine (CHAN_INFO rx-clear became a real per-channel CCA) and the
+firmware took all 4095 refill buffers into its MAC rings (mac0 2047 valid, mac1 2016 valid, 32 kept, refill left 0),
+but RXDMA wrote nothing (0 of 4095 sentinels changed, error ring 0, link descriptors written 0), the scan stopped
+after about 15 channels (no more CHAN_INFO, COMPLETED timeout at 8750 ms, the BHI ERRDBG words changed), and no WMI
+MGMT_RX came. 0x402 and 0x200 alone changed nothing. Reading: the rings plus SRING_SETUP turn RX on, but L19 never
+scans without two more things: (1) RX_RING_SELECTION_CFG on each MAC ring (buffer size, TLV offsets, filters;
+dp_rx.c:4567-4605, dp_tx.c:1363-1510), sent right after the SRING_SETUPs (dp_rx.c:4670); (2) the UMAC RX path and the
+buffer return: the WBM2SW3 release ring, the REO exception ring and the REO setup in dp_alloc (dp.c:491-595), the
+eight REO destination rings after service ready (core.c:925), and host replenish of refill ring 160 as buffers come
+back. In L19 STA mode management frames are in no filter flag: they reach the firmware and come back as WMI MGMT_RX;
+the host rings only have to keep the RX pipeline moving. C2d gives each half behind its own w20 bit, in L19's words
+and order, and returns every buffer the device hands back.
+
+Code: the C2d section of `fuxi_wlan_ce.h` (`WLRD_*`, `struct wlrd`, `wlrd_sel_words`, `wlrd_layout`,
+`wlrd_pre_addr/owned/why`, `wlrd_ring_regs`, `wlrd_hw_regs`, `wlrd_reg_ok`, `wlrd_slots_init`, `wlrd_recycle`,
+`wlrd_link`, `wlrd_entry`, `wlrd_reap`, `wlrd_replenish`, `wlrd_guard_count`, `wlrd_next`; pure, bounded, no
+allocation) and the W27 part of the W20 block of `fuxi_wlan.c` (`wl27_reo`, `wl27_reo_rd`, `wl27_shadow`, `wl27_tp`,
+`wl27_ring`, `wl27_setup`, `wl27_dest`, `wl27_sel`, `wl27_poll`, `wl27_watch`, `wl27_report`; the REO arena
+`wl_reo_arena` is in `wl_owned_alias` and is allocated, counted, zeroed and freed with the W26 arenas).
+
+### Gate and kits
+
+`WL23_BITS` gains `WL27_BITS` (0x800 RXSEL, 0x1000 REORX); `WL20_BITS` (qrtr 6) does not, so qrtr 6 refuses both.
+Each needs 0x100 (refused without it, which with C2c's rule also means 0x02); 0x200 and 0x400 are optional;
+keep/stop22, 0x08, 0x20 and unknown bits stay refused. A valid boot with a W27 bit prints, after the W26 selected line:
+`W27 selected: ring selection mac0/mac1 2048 B, mpdu-start/packet/msdu-end tlvs, data filters (w20 0x800)|no; reo rx
+path rings 131/0/1-8, buffers back to ring 160 (w20 0x1000)|no; nothing transmitted`.
+
+| Kit | w20 | Decimal | Adds to C2 + C2b |
+|---|---|---|---|
+| r1c2d | 0x1902 | 6402 | HTT version, RX rings (0x100), ring selection, the REO path |
+| r1c2d-l | 0x1b02 | 6914 | as r1c2d, with the WBM idle list (0x200): REO exception link descriptors |
+| r1c2d-s | 0x902 | 2306 | fallback: ring selection alone (when the REO pre-reads refuse) |
+| r1c2d-r | 0x1102 | 4354 | diagnostic: the REO path alone |
+
+Route as C2c: r1c2's cmdline byte for byte (`fuxiwlan=28 fuxiwlanclk=1 fuxiwlanqrtr=7`, no w20) and
+`fuxiwlanw20=<decimal>` in ADT /defaults (`--wlan-defaults`); `wl_arg` logs `salami fuxiwlanw20 from ADT /defaults`.
+r1c2d first; r1c2d-l next whatever r1c2d shows (L19 always has the idle list); the two halves only to tell them apart.
+
+### Sequence (L19 order)
+
+1. W20, inside `wl26_setup`: the REO arena (1 MiB, 2 MiB aligned, Normal-NC, live SMMU readback) right after the RX
+   arena, so an allocation failure leaves every WBM and REO register untouched. After the idle list (0x200) and before
+   the refill fill (dp_alloc: idle ring, common setup, RX alloc):
+   - 38 allowlisted pre-reads, one line: BASE_LSB, BASE_MSB, MISC of the ten rings, GEN_ENABLE, MISC_CTRL, the four
+     aging thresholds, DEST_RING_CTRL_IX_2/_3. Refusal, with no REO or release-ring write at all (`w20 0x1000 dropped
+     for this boot`, the run goes on, 0x800 still runs): any ~0u, a ring with SRNG_ENABLE, a ring base, or the hash
+     map already in IX_2/IX_3.
+   - The WBM2SW3 release ring (131), then the REO2SW0 exception ring (0): nine writes each in
+     `ath12k_hal_srng_dst_hw_init`'s order without its MSI writes (BASE_LSB, BASE_MSB, ID, PRODUCER_INT, HP_ADDR
+     LSB/MSB, R2 HP 0, R2 TP 0, MISC SRNG_ENABLE), BASE_LSB and MISC read back (a mismatch stops the run).
+   - `ath12k_hal_reo_hw_setup`: GEN_ENABLE read and written with the two aging bits, MISC_CTRL read and written with
+     the FRAG and BAR destination fields = REO2SW0, the four aging thresholds, the hash map into IX_2 and IX_3.
+   - After the refill publish: slots 0..4094 are out with the device, slot 4095 is never posted.
+2. W21, after `W21 wmi service ready complete` and before INIT (core.c:925 between service ready and cmd_init): the
+   eight destination rings REO2SW1..8, each read again first (a ring found enabled or based now stops the run: the
+   release and exception rings are already live), nine writes, two readbacks.
+3. W23, right after the four SRING_SETUP and before the 100 ms look: two RX_RING_SELECTION_CFG (mac0 then mac1)
+   through `wl_ce_send` on the HTT endpoint, no reply asked (L19 asks none).
+4. Every poll pass (`wl_ce_poll`, after the CE reaps, before the W11 guard), from the first ring on: for each live
+   ring in setup order, the device HP from the REO arena's rdp page (read barrier), every entry checked and sorted as
+   L19 sorts it, the ring's TP published (write barrier, then the shadow register WLAN_CFG gave its R2 TP, or R2 TP
+   through the window with fuxiwlanw15=1); then the replenish: held buffers posted at the refill HP while the
+   firmware's TP leaves room, one write barrier, one wrp[0] publish.
+5. Returned buffers: the address must be the start of a posted slot that is out with the device, or the run stops
+   (`W27 reo RING entry refused: WHY; contain`); the cookie is ours, another one is counted. The slot is held, its
+   2048 posted bytes zeroed, its 0xa5 sentinel written again, then queued for ring 160. REO exception link
+   descriptors (buffer type 1) must be one of our listed descriptors (0x200), their MSDUs (up to 6) are returned and
+   the descriptor is held (no SW2WBM ring here); without our idle list a link entry is counted as `not ours` and not
+   read. Release entries other than REL_MSDU from RXDMA or REO with RBM SW3 are skipped as L19 skips them (the buffer
+   stays lost, counted).
+6. Watches as C2c (setup, started, mid, completed) plus one `W27 reo watch` line each; after the W26 report lines the
+   W27 report, then (D5) the no-beacon hint with `wlrd_next`'s next step.
+7. Containment: `wl26_contain` latches `wl_rd.stopping` first (no reap, return, replenish or REO access from then on);
+   the REO arena is recounted (D3), zeroed and freed with the W26 arenas only in `wl5_abort`'s proven branch, else
+   quarantined.
+
+Register accesses, nothing else: the 38 pre-reads, the 9 x 10 ring writes, 2 x 10 readbacks, 3 x 8 W21 re-reads, the
+two read-modify-writes and six writes of the REO setup, and TP publishes, all through `wl27_reo` (allowlist
+`wlrd_reg_ok`, refused after the latch) and `wl_win`, or to the ten shadow registers. No interrupt, MSI, GIC, power
+or PMIC access, no REO command, no TCL, nothing transmitted.
+
+### Wire, register and memory facts (all re-derived from L19 by the host test)
+
+RX_RING_SELECTION_CFG (msg 0xc, 17 words, struct htt_rx_ring_selection_cfg_cmd dp.h:1202-1219):
+
+| Word | mac0 / mac1 | L19 |
+|---|---|---|
+| 0 info0 | 0x1400010c / 0x1400020c: msg 0xc, pdev mac + 1 (SW_TO_HW ring), ring id RXDMA_HOST_BUF 0, OFFSET_VALID 26, EN_RXMON 28 (rxmon_disable 0) | dp_tx.c:1392-1415, 1102-1130; dp.h:840-847 |
+| 1 info1 | 0x800: buffer size DP_RXDMA_REFILL_RING_SIZE 2048 (what L19 passes), conf lengths 0 | dp_rx.c:4600-4602; dp.h:191, 849-852 |
+| 2, 3 | 0, 0 (no management or control flag: mgmt stays with the firmware) | dp_rx.c:4578-4582 |
+| 4 | 0x01000000: FP control BAR | dp.h:971 |
+| 5 | 0x01240000: FP data MCAST 18, UCAST 21, NULL_DATA 24 | dp.h:1001-1007 |
+| 6 | 0xd: MPDU_START 0, RX_PACKET 2, MSDU_END 3 (HTT_RX_TLV_FLAGS_RXDMA_RING) | dp.h:876-884, 1194-1197 |
+| 7 | 0x01100190: packet offset 400 = sizeof(hal_rx_desc_wcn7850), header 272 = its pkt_hdr_tlv | rx_desc.h:1521-1529; hal.c:1505-1508 |
+| 8 | 0x00900000: mpdu_end 0, mpdu_start 144 | hal.c:1242-1245 |
+| 9 | 0: msdu_end 0 (hal.c:1247-1250), msdu_start 0 | dp_tx.c:1467-1473 |
+| 10..16 | 0 (no word masks on WCN7850) | dp_tx.c:1475-1505 |
+
+UMAC rings (entries of 8 words; the REO arena at A):
+
+| Ring | id | Entries | R0 | R2 HP / TP | Base | PRODUCER_INT | TP shadow |
+|---|---|---|---|---|---|---|---|
+| WBM2SW3 release | 131 | 1024 | 0x00a34f70 | 0x00a370e0 / e4 | A + 0x92000 | 0x00200008 | 24 (0x95c) |
+| REO2SW0 exception | 0 | 128 | 0x00a388a4 | 0x00a3b088 / 8c | A + 0x90000 | 0x00200008 | 8 (0x91c) |
+| REO2SW1..8 destination | 1..8 | 2048 | 0x00a384e4 + 0x78 n | 0x00a3b048 + 8 n / + 4 | A + 0x10000 (n + 1) | 0x003e0400 | n (0x8fc + 4 n) |
+
+BASE_MSB = entries x 8 << 8, ID = id << 8 | 8, HP_ADDR = A + 4 x id, MISC = 0x40. REO setup: GEN_ENABLE |= 0xc;
+MISC_CTRL &= ~0x01fe0000 (FRAG and BAR destination REO2SW0); aging 0x00a38b08..b14 = 100000, 100000, 100000, 40000;
+DEST_RING_CTRL_IX_2 0x00a3800c and IX_3 0x00a38010 = 0x43214321. All in window 0x14.
+
+REO arena (0x100000): rdp page (only words 0..8 and 131 are HP words), destination rings at 0x10000..0x90000, exception
+0x90000, release 0x92000, tail from 0x9a000. Its gaps and tail are counted like C2c's (`W27 reo guard`, again after
+containment); non-zero is a SPILL.
+
+### Lines
+
+```
+FUXI WLAN: W27 reo arena IOVA I bytes 0x100000 Normal-NC mapped; rdp I
+FUXI WLAN: W27 reo before: rings 10 enabled N based N unreadable N gen-enable X misc-ctrl X aging X/X/X/X dest-ctrl X/X; not owned|refused
+FUXI WLAN: W27 reo not programmed: REASON; w20 0x1000 dropped for this boot                            (refused)
+FUXI WLAN: W27 reo ring ID NAME entries N base B misc 0x40 readback ok; tp via shadow S (0x...)|R2 0x... (fuxiwlanw15=1)
+FUXI WLAN: W27 reo setup gen-enable X -> X misc-ctrl X -> X aging 100000/100000/100000/40000 hash 0x43214321; writes 26 window restore checked
+FUXI WLAN: W27 htt rx ring selection macM ID info0 X buf 2048 flags 0/0/0x1000000/0x1240000 tlv 0xd offsets 0x01100190/0x00900000/0 sent
+FUXI WLAN: W27 reo watch POINT reaped rel N exc N dst N; returned N reposted N pending N (max N) refill hp H
+FUXI WLAN: W27 rx ring selection sent N of 2
+FUXI WLAN: W27 reo reaped rel N exc N dst N N N N N N N N
+FUXI WLAN: W27 reo entries msdu N link N (held N, msdus N, skipped N, not ours N) push routing N error N continuation N
+FUXI WLAN: W27 reo error codes 0xC:N ...                                                       (non-zero only, wrapped)
+FUXI WLAN: W27 release src rxdma N reo N other N desc-other N rbm-other N cookie-other N
+FUXI WLAN: W27 release rxdma codes 0xC:N ...                                                   (non-zero only)
+FUXI WLAN: W27 buffers returned N reposted N pending N (max N) publishes N refill hp H refill-bad N
+FUXI WLAN: W27 reo guard [SPILL ]nonzero dwords: gaps N, tail N[; stop; owner review before any further kit]
+FUXI WLAN: W27 reo RING entry refused: WHY; contain                                             (then the W23 failure line)
+FUXI WLAN: W27 reo guard after containment nonzero dwords: gaps N, tail N[; SPILL: owner review before any further kit]
+```
+
+Every W27 line is at most 254 bytes with every field at its widest (the host test computes the worst case; the
+model fails any longer line). Nothing read from a frame is printed: counts, codes and our own ring words only.
+
+### Expected log, r1c2d (w20 0x1902; the model's happy path, values from the model)
+
+```
+FUXI WLAN: salami fuxiwlanw20 from ADT /defaults
+FUXI WLAN: W20 selected qrtr=7 (CE/HTC/WMI init, then W23 passive scan) w20 0x1902 valid 1
+FUXI WLAN: W23 selected passive scan of 38 channels, dwell 150 ms, nothing transmitted; BSSIDs OUI only, pdev 0, htt version asked
+FUXI WLAN: W26 selected: rx rings 4095 buffers, rings 160/161/169/186 (w20 0x100); wbm idle list no; chain mask no; nothing selected to host rings
+FUXI WLAN: W27 selected: ring selection mac0/mac1 2048 B, mpdu-start/packet/msdu-end tlvs, data filters (w20 0x800); reo rx path rings 131/0/1-8, buffers back to ring 160 (w20 0x1000); nothing transmitted
+  ... W15 and W20 lines through `W20 ce init ok rings 7 writes 70 window restore checked` ...
+FUXI WLAN: W26 rx arena IOVA 0x... bytes 0x1040000 Normal-NC mapped; rdp 0x... wrp 0x...
+FUXI WLAN: W27 reo arena IOVA 0x... bytes 0x100000 Normal-NC mapped; rdp 0x...
+FUXI WLAN: W27 reo before: rings 10 enabled 0 based 0 unreadable 0 gen-enable G misc-ctrl M aging X/X/X/X dest-ctrl X/X; not owned
+FUXI WLAN: W27 reo ring 131 rel entries 1024 base 0x... misc 0x40 readback ok; tp via shadow 24 (0x95c)
+FUXI WLAN: W27 reo ring 0 exc entries 128 base 0x... misc 0x40 readback ok; tp via shadow 8 (0x91c)
+FUXI WLAN: W27 reo setup gen-enable G -> G|0xc misc-ctrl M -> M&~0x1fe0000 aging 100000/100000/100000/40000 hash 0x43214321; writes 26 window restore checked
+FUXI WLAN: W26 refill ring 160 filled 4095 buffers (rbm 6, 2048 B at a 4096 B stride, sentinel 0xa5 x64, slots 0x...-0x...) hp 8190 in wrp[0]
+FUXI WLAN: W20 ce rx posted CE1 62 CE2 62
+  ... W20 htc ready, W21 lines through `W21 wmi service ready complete` ...
+FUXI WLAN: W27 reo ring 1 dst1 entries 2048 base 0x... misc 0x40 readback ok; tp via shadow 0 (0x8fc)
+  ... dst2 .. dst8 (shadow 1 .. 7) ...
+  ... W22 lines as C2 ...
+FUXI WLAN: W23 htt version 3.M (w20 0x02)
+  ... the four `W26 htt sring setup` lines as C2c ...
+FUXI WLAN: W27 htt rx ring selection mac0 161 info0 0x1400010c buf 2048 flags 0/0/0x1000000/0x1240000 tlv 0xd offsets 0x01100190/0x00900000/0 sent
+FUXI WLAN: W27 htt rx ring selection mac1 169 info0 0x1400020c buf 2048 flags 0/0/0x1000000/0x1240000 tlv 0xd offsets 0x01100190/0x00900000/0 sent
+FUXI WLAN: W26 rx watch setup+100ms ...
+FUXI WLAN: W27 reo watch setup+100ms reaped rel 0 exc 0 dst 0; returned 0 reposted 0 pending 0 (max 0) refill hp 8190
+  ... C2 lines: chan list, vdev, nss/ps, scan start, `W23 scan started after T ms` ...
+FUXI WLAN: W27 reo watch started reaped rel 0 exc 0 dst 0; returned 0 reposted 0 pending 0 (max 0) refill hp 8190
+  ... foreign-channel and chan-info lines, all 38 channels ...
+FUXI WLAN: W27 reo watch mid (foreign 19) reaped rel 270 exc 540 dst 1350; returned 2160 reposted 2160 pending 0 (max 120) refill hp 4318
+FUXI WLAN: W23 scan completed reason 0 after T ms (foreign 38 chan-info 38)
+FUXI WLAN: W27 reo watch completed reaped rel 570 exc 1140 dst 2850; returned 4560 reposted 4560 pending 0 (max 120) refill hp 926
+FUXI WLAN: W24 bss aa:bb:cc:xx:xx:xx ... ssid "NAME"                                              (one per BSSID)
+FUXI WLAN: W24 scan summary frames 12 bss 9 ssids 5
+  ... C2b stats lines, the W26 content, guard, err and counter lines ...
+FUXI WLAN: W27 rx ring selection sent 2 of 2
+FUXI WLAN: W27 reo reaped rel 570 exc 1140 dst 570 1140 570 570 0 0 0 0
+FUXI WLAN: W27 reo entries msdu 3990 link 0 (held 0, msdus 0, skipped 0, not ours 0) push routing 2850 error 1140 continuation 0
+FUXI WLAN: W27 reo error codes 0x5:1140 0x9:570
+FUXI WLAN: W27 release src rxdma 0 reo 570 other 0 desc-other 0 rbm-other 0 cookie-other 0
+FUXI WLAN: W27 buffers returned 4560 reposted 4560 pending 0 (max 120) publishes 38 refill hp 926 refill-bad 0
+FUXI WLAN: W27 reo guard nonzero dwords: gaps 0, tail 0
+FUXI WLAN: W23 complete; stop/contain
+FUXI WLAN: W26 rx contain: host writes off; arenas held until bus master off, PERST and SMMU undo
+FUXI WLAN: W23 contain: scan over, no STOP_SCAN
+FUXI WLAN: W20 ce contain posted P reaped R tx T
+FUXI WLAN: W11 QRTR BYE sent before containment
+FUXI WLAN: abort step 28 MHI reset done, bus master off yes, PERST asserted yes
+FUXI WLAN: W26 rx guard after containment nonzero dwords: slot-upper 0 (slots 0), slot 4095 0, tail 0, gaps 0
+FUXI WLAN: W27 reo guard after containment nonzero dwords: gaps 0, tail 0
+FUXI WLAN: W26 arenas zeroed 0x1140000 bytes before free
+FUXI WLAN: abort buffers freed
+```
+
+The model sends five frames in eight to destination rings 1..4 (by its own hash), two to the exception ring (code 5)
+and one to the release ring (REO source, code 9); on the phone the split, the codes and the
+counts are the firmware's. Before association almost nothing should be routed to a destination ring (no peer): expect
+most returns on the exception and release rings. The 0x1b02 log is the same plus C2c's link arena, idle list and idle
+watch lines, `W26 link content descriptors written D`, and link entries on the exception ring:
+`W27 reo entries msdu 3420 link 570 (held 570, msdus 570, ...)`, `W27 reo error codes 0x3:570 0x5:570 0x9:570`,
+`W26 arenas zeroed 0x1580000 bytes before free`.
+
+With 0x1000 the refill HP moves, so C2c's watch and content fields that assume the fixed HP 8190 (`refill ... taken
+N left L`, `exhausted refill`, `refill-empty`, `refill taken T kept K`, `buffers written`) are ring positions after a
+wrap, not counts: read the W27 lines for the refill (`refill hp`, `returned`, `reposted`, `pending`). The MAC ring,
+error ring, guard and idle-list lines keep their meaning.
+
+### Reading the next boot
+
+| Pattern | Conclusion | Next |
+|---|---|---|
+| W24 frames > 0 | C2 PASS: the RX pipeline moves and the firmware forwards beacons | C3 |
+| all 38 channels tuned (foreign 38), returned > 0 and reposted = returned, frames 0 | the pipeline moves, nothing is forwarded to WMI | C3 management forwarding (`wlrd_next`'s hint) |
+| the scan still stops after about 15 channels, reaped 0 everywhere | the path is not what the firmware waits for | owner review: the REO command/status rings and cookie conversion (open questions) |
+| `W27 reo not programmed: ... already owned` | the firmware programmed the REO rings itself | r1c2d-s (0x902, 2306) |
+| `not programmed: ... unreadable` or `... already applied` | ownership unknown | owner review |
+| `W27 reo RING entry refused` | the device returned a buffer we do not own, or one twice | stop, owner review before any further kit |
+| `SPILL` on either guard line | a device write where no address was given | stop, owner review |
+| `rbm-other` > 0 on release entries | WBM returned with another manager: those buffers are lost (as L19) | read `W27 release src`, owner review if large |
+| `pending` > 0 at the end, `refill-bad` > 0 | the refill TP word was not usable, buffers held | owner review |
+| `link ... not ours` > 0 | link descriptors from a list we did not give (no 0x200, or the firmware's own) | r1c2d-l (0x1b02) |
+| any D4 line | the passive rule is broken | stop the radio lane |
+
+### Deviations from L19, all deliberate
+
+- No MSI registers (MSI1 base/data) on any of the ten rings; the PRODUCER_INT thresholds are L19's (they only shape
+  interrupts, which nothing enables).
+- No REO command or status ring: L19 sets them up in the same common setup, but sends REO commands only for peer
+  queues (TID setup, delete, flush), which a passive scan without a peer never needs. Open question if the firmware
+  waits for them.
+- No cookie conversion (`ath12k_dp_cc_config`, CMEM tables): the entries carry our cookie in buffer word 1 and the
+  host returns by address (the cookie only counted); L19's own manual lookup path reads the same cookie.
+- No REO reinject, TCL, TX completion or SW2WBM release ring: REO exception link descriptors are held until
+  containment instead of going back to the idle list (L19 returns them on SW2WBM).
+- Returned buffers are the same 4095 slots posted again with a fresh sentinel (L19 posts fresh buffers); a foreign or
+  twice-returned buffer stops the run (L19 warns).
+- The destination rings are read again right before their writes at W21; one found configured stops the run.
+
+### What the host tests cover, and what only the device can answer
+
+Host-tested: every word, register, address, value and order above against L19, the refusals, the latch, the free,
+the line widths, the wedge without the path (the model reproduces the phone's r1c2c-all readout), landing with it,
+exhaustion and replenish, foreign and twice-returned buffers, an unknown return manager, spills, containment while
+the device still pushes, and a mutant run per rule. Only the phone can say: whether the firmware needs the REO
+command/status rings or cookie conversion before it moves frames, which rings it routes to without a peer, whether it
+then forwards MGMT_RX, and whether WBM returns on WBM2SW3 with RBM SW3.
+
+### Proof that boots without a W27 bit are unchanged
+
+Three differentials against c18f99d, each tree built from its own sources (scripts in this session's scratchpad,
+recorded in the commit body): the W15, W11 and W16 harness logs (every line the harnesses print through their
+test_printf, 14819, 14016 and 17011 lines) byte for byte; the init/configure gate (salami and Fuxi builds, cmdline
+and ADT /defaults) over 6176 boot-arg sets with qrtr absent, 0, 4..8 or -1, 32 w20 values without a W27 bit (the
+C2c kit values included), mlo, w15/w16, keep, stop22, clk and limits 1/11/27/28: 24704 runs per tree, byte for byte,
+plus the 207 gate runs both trees' salami tests share; and c18f99d's model with all its C1, C2, C2b and C2c scenarios
+(17611 lines) equal byte for byte to the first part of the C2d model's log, the C2d scenarios only adding lines after
+them.
+
 ## Host tests
 
 `CC=cc python3 tools/test-fuxi-wlan-ce.py` (also in tools/ci/build.sh): the model in
@@ -985,6 +1248,40 @@ PDEV_SET_PARAM ids and order, then every word of the model's dump. test-fuxi-wla
 gate for the W26 bits (salami and Fuxi builds, cmdline and ADT /defaults, the kit route with r1c2's
 cmdline and a decimal w20 in /defaults). Mutants (c2c-impl/mutants.py: the plan's 2.13 list, D1..D5, the
 gate, the allowlist and the HTT handler) are all caught.
+
+C2d in the same model: the REO arena with the device's permission per region (the HP words of the ten rings and the
+rings; anything else, or any access with bus mastering off, fails the test except the injected spills), the REO
+register conversation written down again from L19 (the 38 pre-reads in order, the release and exception rings and
+the REO setup before any CE RX buffer is posted, the eight destination rings after service ready and before INIT,
+each ring's nine writes with L19's values, the readbacks, nothing after a refusal or a latched fault or
+`wl26_contain`), TP publishes that must follow the write barrier, take the route the shadow mode says and never pass
+the device HP, RX_RING_SELECTION_CFG checked word by word after the four SRING_SETUPs and before the channel list, and
+a REO/WBM device that, with the whole path live, writes each received frame (the 400-byte descriptor and 128 bytes of
+MSDU, inside the buffer's 2048 bytes) and returns the buffer on a destination, exception (MSDU or link descriptor)
+or release ring; the firmware refills its MAC rings from the host's refill ring and each host republish is checked
+(write barrier, only returned slots, RBM 6 and the slot as cookie, posted half zero but the sentinel, not past the
+firmware's TP). Without the path (C.wedge) it plays the phone's r1c2c-all readout. Scenarios: 0x1902 with shadow and
+with fuxiwlanw15=1, 0x1b02 (link descriptors held, their MSDUs returned): 4560 frames through 4095 buffers; the wedge
+for 0x702, 0x902, 0x1102 and 0x1302 (15 channels, COMPLETED timeout 8750 ms, mac0 2047 / mac1 2016 valid, kept 32,
+nothing written, no MGMT_RX); a 4000-frame burst (929 without a buffer, 3071 returned and re-posted at once, later
+channels land again); a foreign address, a buffer returned twice and a REO HP off its entries (stop, contain); release
+entries with RBM SW1 (counted, skipped as L19) and destination entries with RBM 4 (counted, returned by address); D5
+with frames returned and no forward; spills in the REO arena's gaps and tail; frames pushed during the containment
+drain (never reaped or re-posted); unproven containment (REO arena kept); the four pre-read refusals; a readback
+mismatch; a destination ring based at W21; a fault latched mid-setup; the REO arena allocation failure; every W27 line
+at its widest. Pure checks: the selection words, every ring and REO setup write equal to the model's conversation, the
+allowlist equal to its address set and apart from the WBM and CE sets, the pre-read readings, the recycle and
+replenish rules, the guard counts. Static (`static_c2d`): the gate, W27's place in L19's order, the one REO accessor
+through `wl_win`, the shadow TP path, no REO write before the pre-reads or after a refusal, returns refused after the
+latch and zeroed before their sentinel, one barriered republish, the free, no arena word in any W27 print, every W27
+line within 254 bytes. L19 (`l19_c2d`): the ring selection enum, masks, struct, encoder and WCN7850 filter, rx_desc.h
+compiled for the 400/272/144/0 offsets, ring ids, sizes, entry structs (compiled), entry fields and RBMs, the WCN7850
+REO and WBM registers, dst_hw_init's order, thresholds, dp_alloc and core placement, reo_hw_setup's order and values
+with the hash map; the model's dump word by word. Mutants (`C2D_MUTANTS`, 34 rules broken once each in the production
+code: selection words, write order, thresholds, the REO setup values, the refusals, the slot checks, the sentinel and
+zeroing, barriers, bounds, RBM checks, link returns, the shadow index, the W21 re-read, the latch, the gate, the
+zeroing before free, the TP publish) are all caught. test-fuxi-wlan-salami.py covers the gate for the W27 bits
+(salami and Fuxi builds, cmdline and ADT /defaults, the kit route with r1c2's cmdline and 6402 / 6914 in /defaults).
 
 What only the device can answer: whether the firmware fetches from the rings at all with zero interrupt
 thresholds, which pipe carries HTC READY (both are polled), the credit numbers, the real pdev id, whether

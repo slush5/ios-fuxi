@@ -49,6 +49,16 @@
  *   short, empty, twice, late, at its widest, after a credit drought or
  *   behind a stuck TX descriptor. Every FUXI WLAN line must fit the
  *   console's 254 bytes (model_line).
+ *   C2d: RX_RING_SELECTION_CFG checked word by word after the SRING_SETUPs; the
+ *   REO arena with the device's permission per region; the REO register
+ *   conversation (38 pre-reads, the release and exception rings and the REO
+ *   setup before the CE RX post, the eight destination rings before INIT, L19's
+ *   write order and values, readbacks) and TP publishes that never pass the
+ *   device HP; a REO/WBM device that returns every buffer RXDMA filled (with
+ *   ring selection: descriptor and MSDU inside its 2048 bytes) on a destination,
+ *   exception (MSDU or link descriptor) or release ring; each re-post of the
+ *   host checked at its publish (barrier, a returned slot, fresh sentinel, not
+ *   past the firmware's TP); the phone's wedge (C.wedge) without the whole path.
  * No device, no network. L19 = Linux ath12k v6.19 (BSD-3-Clause-Clear).
  */
 #include <assert.h>
@@ -89,6 +99,10 @@ static void model_event(char kind);
 #define WLRX_LOAD(p) (model_event('L'), *(p))
 static void model_rx_publish(volatile uint32_t *p, uint32_t v);
 #define WLRX_PUBLISH(p, v) model_rx_publish((p), (v))
+/* C2d: the REO arena's device-written words, and the refill HP republish of the buffer return path */
+#define WLRD_LOAD(p) (model_event('L'), *(p))
+static void model_rd_publish(volatile uint32_t *p, uint32_t v);
+#define WLRD_PUBLISH(p, v) model_rd_publish((p), (v))
 #include "fuxi_wlan_ce.h"
 
 /* ---- what the production excerpts expect from fuxi_wlan.c ---- */
@@ -104,7 +118,7 @@ static unsigned wl15_variant, wl12_stage, wl_w11_error, wl_seq_flags;
 static bool wl_w15, wl_w12, wl_w11_ok, wl_w11_attempted, wl_mhi_valid;
 static uint64_t wl_iova_next, wl_iova_base = 0xa0000000ull, wl_iova_end = 0xb0000000ull;
 static struct wl_dma wl_ce_arena, wl_msi_sink, wl_tables, wl_rxvectors, wl_rddm, wl_target[WL_TARGET_MAX];
-static struct wl_dma wl_rx_arena, wl_link_arena;  /* C2c */
+static struct wl_dma wl_rx_arena, wl_link_arena, wl_reo_arena;  /* C2c, C2d */
 static struct wl_dma wl14_regdb, wl14_bdf, wl14_m3, wl_ipcr, wl_contexts, wl_vectors, wl_amss, wl_image;
 static uint32_t wl_mrd(uint32_t off);
 static void wl_mwr(uint32_t off, uint32_t v);
@@ -219,6 +233,21 @@ struct cfg {
 	uint32_t rdp_err_raw;               /* rdp[186] written raw (bad) at channel 5 */
 	uint32_t refill_tp_raw[2];          /* rdp[160] rewritten raw at channel 3 and channel 30 (backwards / past hp) */
 	unsigned take_more;                 /* refill entries taken during the scan and kept (kept rises) */
+	/* C2d */
+	bool wedge;                         /* the phone's r1c2c-all: without ring selection and the REO path the scan stops */
+	uint32_t reo_pre[38];               /* what the 38 REO pre-reads return */
+	unsigned reo_rb_bad;                /* ring index + 1 whose BASE_LSB reads back wrong */
+	unsigned reo_w21;                   /* destination ring index (2..9) found based at W21 */
+	unsigned reo_fault_after;           /* fw_faults latched after that many REO accesses */
+	bool reo_alloc_fail;                /* the REO arena allocation fails */
+	unsigned d_frames;                  /* C2d frames per channel (mac0 on 2.4 GHz, mac1 on 5 GHz) */
+	unsigned d_burst;                   /* extra C2d frames on channel 0 */
+	const char *d_mix;                  /* frame kinds in turn: D destination, E exception, L exception link, W release */
+	uint32_t d_rbm, rel_rbm;            /* RBM in destination/exception entries (0 = 6), in release entries (0 = 8) */
+	unsigned d_foreign, d_dup;          /* the Nth C2d frame's entry 64 bytes into its slot / pushed twice */
+	unsigned reo_spill;                 /* bit 0 a REO rdp gap word, bit 1 between the rings, bit 2 the tail */
+	unsigned d_late;                    /* 20 C2d frames this many ms after START_SCAN (during containment) */
+	uint32_t reo_hp_raw;                /* rdp[1] (dst1 HP) written raw at channel 6 */
 };
 static struct cfg C;
 static unsigned restores;
@@ -658,12 +687,14 @@ static unsigned fw_sring_n, fw_pset_n, fw_frames_written, fw_nobuf, fw_links, fw
 static uint32_t m_idle_hp, m_idle_tp, fw_refill_tp, fw_mac_hp[2], fw_mac_tp[2], fw_err_hp, fw_pset_w[2][4];
 static uint32_t fw_taken[4096][2];
 static uint8_t slot_listed[4096];
+static uint8_t dslot[4096];        /* C2d: 0 listed by the host, 1 with the firmware, 2 returned on a REO/WBM ring, 3 never */
+static uint32_t rd_hp;             /* C2d: the refill HP the host published last */
 static uint32_t wbm_log[64][3];
 static unsigned wbm_log_n;
 struct dact { uint64_t due; unsigned kind; uint32_t a, b; };
 static struct dact acts[256];
 static unsigned n_acts, acts_done;
-enum { A_FRAMES, A_ERR, A_SPILL, A_RDP, A_TAKE, A_SETUP };
+enum { A_FRAMES, A_ERR, A_SPILL, A_RDP, A_TAKE, A_SETUP, A_D2, A_RSPILL, A_RHP };
 /* What RXDMA writes from a received frame (into buffers, link descriptors, error-entry frame fields): no log line may
  * show any of it (the owner rule: counts only). The error entry's frame fields (L19 hal_desc.h:1033, 1039, 1044):
  * MPDU byte count 0x2bad in w5 21:8, fragment 0xb in w6 10:7, sequence 0x5ee in w6 30:19. */
@@ -736,6 +767,7 @@ model_rx_publish(volatile uint32_t *p, uint32_t v)
 	for (uint32_t o = 0x1020000u; o < RXA; o++) { CHECK(!rx_host[o], "tail not zero at the wrp[0] publish"); }
 	*p = v;
 	rx_pub = true;
+	rd_hp = v;  /* C2d: the HP the buffer return path republishes from */
 }
 
 static bool
@@ -842,6 +874,7 @@ fw_take(unsigned n)
 		    !(w1 & 0xffu), "refill entry is not the start of a posted slot");
 		CHECK(((w1 >> 8) & 0xfu) == 6u && (w1 >> 12) == slot, "refill entry RBM or cookie");
 		CHECK(!slot_listed[slot]++, "a slot listed twice");
+		dslot[slot] = 1;  /* C2d */
 		fw_taken[fw_taken_n][0] = w0; fw_taken[fw_taken_n][1] = w1; fw_taken_n++;
 		fw_refill_tp += 2u;
 	}
@@ -951,6 +984,303 @@ fw_err_push(void)
 	p32(rxd(4u * 186u, 4, true, "rdp[186]"), fw_err_hp);
 }
 
+/* ---- C2d device: ring selection, the REO register file, REO/WBM rings, buffer returns and the wedge ----
+ * Written down here again from L19 (not taken from the header): the 17 RX_RING_SELECTION_CFG words for WCN7850
+ * (dp_rx.c:4567-4605, dp_tx.c:1363-1510, dp.h:840-884, 971, 1001-1007, 1194-1219, rx_desc.h:1521-1529), the ten
+ * UMAC rings (ids, R0, R2, sizes, thresholds: hal.c:1327-1420, hw.c:1194-1270, dp.c:290-340, 491-595, dp_rx.c:539-560)
+ * with ath12k_hal_srng_dst_hw_init's write order (hal.c:1638-1707) and ath12k_hal_reo_hw_setup's (hal_rx.c:896-929),
+ * the REO arena layout and the device's permission per region. The REO device writes entries into the rings and its
+ * HP into the arena's rdp page; the host publishes TPs (shadow, or R2 with fuxiwlanw15=1) and re-posts returned
+ * buffers to the refill ring, each checked when it happens. C.wedge plays the phone's r1c2c-all readout: without ring
+ * selection and the REO path the firmware takes all 4095 refill buffers (2047 + 2016 to the MAC rings, 32 kept),
+ * RXDMA writes nothing and the scan stops after 15 channels without COMPLETED. */
+#define REOA 0x100000u
+struct mreo { uint32_t id, r0, r2, entries, off, thr; bool on; uint32_t host_tp, dev_hp; };
+static const struct mreo mreo_plan[10] = {
+	{ 131u, 0x00a34f70u, 0x00a370e0u, 1024u, 0x92000u, 0x00200008u, false, 0, 0 },
+	{ 0u, 0x00a388a4u, 0x00a3b088u, 128u, 0x90000u, 0x00200008u, false, 0, 0 },
+	{ 1u, 0x00a384e4u, 0x00a3b048u, 2048u, 0x10000u, 0x003e0400u, false, 0, 0 },
+	{ 2u, 0x00a3855cu, 0x00a3b050u, 2048u, 0x20000u, 0x003e0400u, false, 0, 0 },
+	{ 3u, 0x00a385d4u, 0x00a3b058u, 2048u, 0x30000u, 0x003e0400u, false, 0, 0 },
+	{ 4u, 0x00a3864cu, 0x00a3b060u, 2048u, 0x40000u, 0x003e0400u, false, 0, 0 },
+	{ 5u, 0x00a386c4u, 0x00a3b068u, 2048u, 0x50000u, 0x003e0400u, false, 0, 0 },
+	{ 6u, 0x00a3873cu, 0x00a3b070u, 2048u, 0x60000u, 0x003e0400u, false, 0, 0 },
+	{ 7u, 0x00a387b4u, 0x00a3b078u, 2048u, 0x70000u, 0x003e0400u, false, 0, 0 },
+	{ 8u, 0x00a3882cu, 0x00a3b080u, 2048u, 0x80000u, 0x003e0400u, false, 0, 0 },
+};
+static struct mreo mr[10];
+static uint8_t *reo_host;
+static uint64_t reo_iova;
+static bool reo_mapped, reo_inject;
+static unsigned reo_allocs, reo_frees, fw_sel_n, rs_n, rs_i, rs_built, reo_tp_pubs, rd_pubs, rd_posted, fw_d_seq, fw_d_lost;
+static uint32_t fw_sel_w[2][17];
+struct rop { uint8_t wr; uint32_t addr, val; };
+static struct rop rscript[300];
+
+/* the 17 words, rx_path_plan C2d / L19 */
+static void
+m_sel_want(unsigned mac, uint32_t *w)
+{
+	memset(w, 0, 17 * 4);
+	w[0] = 0xcu | (mac + 1u) << 8 | 1u << 26 | 1u << 28;
+	w[1] = 2048u; w[4] = 0x01000000u; w[5] = 0x01240000u; w[6] = 0xdu; w[7] = 400u | 272u << 16; w[8] = 144u << 16;
+}
+
+static void
+fw_rxsel(const uint8_t *pl, uint32_t plen)
+{
+	uint32_t want[17];
+	CHECK(wl20_bits & WL20_RXSEL, "RX_RING_SELECTION_CFG without w20 0x800");
+	CHECK(plen == 68 && fw_sel_n < 2, "RX_RING_SELECTION_CFG length, or more than two");
+	CHECK(fw_sring_n == 4 && fw_c2_step == 0 && !fw_chan_cmds && !fw_pset_n,
+	    "RX_RING_SELECTION_CFG before the four SRING_SETUP, or after the channel list or the chain masks");
+	m_sel_want(fw_sel_n, want);
+	for (unsigned k = 0; k < 17; k++) {
+		fw_sel_w[fw_sel_n][k] = g32(pl + 4 * k);
+		if (g32(pl + 4 * k) != want[k]) {
+			fprintf(stderr, "RX_RING_SELECTION_CFG %u word %u = %#x, want %#x\n", fw_sel_n, k, g32(pl + 4 * k), want[k]);
+			fail("RX_RING_SELECTION_CFG word");
+		}
+	}
+	fw_sel_n++;
+}
+
+/* A device access to the REO arena: the HP words of the ten rings (rdp 0..8, 131) and the rings, nothing else. */
+static uint8_t *
+reod(uint32_t off, uint32_t len, const char *what)
+{
+	bool ok = false;
+	CHECK(reo_host && reo_mapped && (epcmd & 4u), "REO arena DMA unmapped or with bus mastering off");
+	CHECK(len && off + len <= REOA, what);
+	if (off < 0x1000u) { ok = len == 4 && !(off & 3u) && (off / 4u <= 8u || off / 4u == 131u); }
+	for (unsigned k = 0; k < 10; k++) { ok |= off >= mr[k].off && off + len <= mr[k].off + 32u * mr[k].entries; }
+	CHECK(ok || reo_inject, what);
+	return reo_host + off;
+}
+
+static bool
+m_reo_refused(void)
+{
+	for (unsigned i = 0; i < 38; i++) { if (C.reo_pre[i] == ~0u) { return true; } }
+	for (unsigned k = 0; k < 10; k++) {
+		if ((C.reo_pre[3 * k + 2] & 0x40u) || C.reo_pre[3 * k] || (C.reo_pre[3 * k + 1] & 0xffu)) { return true; }
+	}
+	return C.reo_pre[36] == 0x43214321u || C.reo_pre[37] == 0x43214321u;
+}
+
+static void
+rs_add(uint8_t wr, uint32_t addr, uint32_t val)
+{
+	CHECK(rs_n < sizeof(rscript) / sizeof(rscript[0]), "model REO script");
+	rscript[rs_n++] = (struct rop){ wr, addr, val };
+}
+
+static void
+rs_ring(unsigned k)
+{
+	const struct mreo *r = &mr[k];
+	const uint64_t base = reo_iova + r->off, hp = reo_iova + 4ull * r->id;
+	rs_add(1, r->r0, (uint32_t)base); rs_add(1, r->r0 + 4u, (uint32_t)(base >> 32) | (r->entries * 8u) << 8);
+	rs_add(1, r->r0 + 8u, r->id << 8 | 8u); rs_add(1, r->r0 + 0x24u, r->thr);
+	rs_add(1, r->r0 + 0x14u, (uint32_t)hp); rs_add(1, r->r0 + 0x18u, (uint32_t)(hp >> 32));
+	rs_add(1, r->r2, 0); rs_add(1, r->r2 + 4u, 0); rs_add(1, r->r0 + 0x10u, 0x40u);
+	rs_add(0, r->r0, C.reo_rb_bad == k + 1u ? (uint32_t)base ^ 0x1000u : (uint32_t)base); rs_add(0, r->r0 + 0x10u, 0x40u);
+}
+
+/* The whole REO register conversation the host must hold, in L19's order (built once the arena's IOVA is known). */
+static void
+rs_build(void)
+{
+	static const uint32_t hw[8] = { 0x00a38000u, 0x00a38b7cu, 0x00a38b08u, 0x00a38b0cu, 0x00a38b10u, 0x00a38b14u, 0x00a3800cu,
+		0x00a38010u };
+	rs_n = rs_i = 0; rs_built = 1;
+	for (unsigned k = 0; k < 10; k++) {
+		rs_add(0, mr[k].r0, C.reo_pre[3 * k]); rs_add(0, mr[k].r0 + 4u, C.reo_pre[3 * k + 1]); rs_add(0, mr[k].r0 + 0x10u, C.reo_pre[3 * k + 2]);
+	}
+	for (unsigned i = 0; i < 8; i++) { rs_add(0, hw[i], C.reo_pre[30 + i]); }
+	if (m_reo_refused()) { return; }
+	rs_ring(0); rs_ring(1);
+	rs_add(0, hw[0], C.reo_pre[30]); rs_add(1, hw[0], C.reo_pre[30] | 0xcu);
+	rs_add(0, hw[1], C.reo_pre[31]); rs_add(1, hw[1], C.reo_pre[31] & ~0x01fe0000u);
+	rs_add(1, hw[2], 100000u); rs_add(1, hw[3], 100000u); rs_add(1, hw[4], 100000u); rs_add(1, hw[5], 40000u);
+	rs_add(1, hw[6], 0x43214321u); rs_add(1, hw[7], 0x43214321u);
+	for (unsigned k = 2; k < 10; k++) {
+		const uint32_t b = C.reo_w21 == k ? 0x1000u : 0u;
+		rs_add(0, mr[k].r0, b); rs_add(0, mr[k].r0 + 4u, 0); rs_add(0, mr[k].r0 + 0x10u, 0);
+		if (b) { return; }
+		rs_ring(k);
+	}
+}
+
+static bool
+m_reo_addr(uint32_t off)
+{
+	return (off >= 0x00a38000u && off < 0x00a3c000u) || (off >= 0x00a34f70u && off < 0x00a34f98u) || off == 0x00a370e0u ||
+	    off == 0x00a370e4u;
+}
+
+static void
+reo_access(uint32_t off, bool wr, uint32_t *v, bool shadow)
+{
+	CHECK(!wl_rd.stopping, "a REO access after wl26_contain");
+	CHECK(wl20_bits & WL20_REORX, "a REO access without w20 0x1000");
+	CHECK(reo_host, "a REO access before the REO arena");
+	if (!rs_built) { rs_build(); }
+	for (unsigned k = 0; wr && k < 10; k++) {
+		struct mreo *r = &mr[k];
+		const uint32_t size = r->entries * 8u;
+		if (!r->on || off != r->r2 + 4u) { continue; }
+		model_event('P');
+		CHECK(shadow == !wl15_variant, "REO TP published by the wrong route for the shadow mode");
+		CHECK(*v < size && !(*v % 8u) && (*v + size - r->host_tp) % size <= (r->dev_hp + size - r->host_tp) % size,
+		    "REO TP outside the ring, misaligned or past the device HP");
+		r->host_tp = *v; reo_tp_pubs++;
+		return;
+	}
+	CHECK(!shadow, "a shadow write to a REO register other than a live ring's TP");
+	if (rs_i >= rs_n || rscript[rs_i].wr != wr || rscript[rs_i].addr != off || (wr && rscript[rs_i].val != *v)) {
+		fprintf(stderr, "REO access %u: %s %#x = %#x, want %s %#x = %#x\n", rs_i, wr ? "W" : "R", off, wr ? *v : 0,
+		    rs_i < rs_n && rscript[rs_i].wr ? "W" : "R", rs_i < rs_n ? rscript[rs_i].addr : 0, rs_i < rs_n ? rscript[rs_i].val : 0);
+		fail("REO register order or value is not L19's (or outside the allowlist, or after a refusal)");
+	}
+	if (!wr) { *v = rscript[rs_i].val; }
+	if (wr && C.reo_fault_after && rs_i >= C.reo_fault_after) { fail("a REO write after the latched fault"); }
+	rs_i++;
+	if (wr && C.reo_fault_after && rs_i == C.reo_fault_after) { fw_faults++; }
+	for (unsigned k = 0; wr && k < 10; k++) {
+		if (off == mr[k].r0 + 0x10u) {  /* MISC: the ring goes live, empty, its HP word zero; L19's places (dp_alloc before the
+		                                 * CE RX post, core.c:1285-1300; REO2SW1..8 after service ready and before INIT, 925-933) */
+			CHECK(k >= 2 ? fw_setup_done && fw_ext_q != ~0u && !fw_init_ok : !wl_ce.pipe[1].posted && !rx_pub,
+			    "a REO ring set up out of L19's order");
+			CHECK(!g32(reod(4u * mr[k].id, 4, "rdp")), "REO rdp word not zero at enable");
+			for (uint32_t i = 0; i < mr[k].entries * 32u; i += 4) { CHECK(!g32(reo_host + mr[k].off + i), "REO ring memory not zeroed"); }
+			mr[k].on = true;
+		}
+	}
+}
+
+/* One entry pushed by the REO/WBM device to ring K, its HP written to the rdp page. */
+static void
+m_reo_push(unsigned k, const uint32_t *w)
+{
+	struct mreo *r = &mr[k];
+	const uint32_t size = r->entries * 8u, next = (r->dev_hp + 8u) % size;
+	CHECK(r->on, "model: a push to a ring that is not live");
+	CHECK(next != r->host_tp, "model: REO ring full");
+	uint8_t *e = reod(r->off + 4u * r->dev_hp, 32, "REO entry");
+	for (unsigned i = 0; i < 8; i++) { p32(e + 4 * i, w[i]); }
+	r->dev_hp = next;
+	p32(reod(4u * r->id, 4, "REO rdp"), r->dev_hp);
+}
+
+static bool
+m_rx_live(void)
+{
+	for (unsigned k = 0; k < 10; k++) { if (!mr[k].on) { return false; } }
+	return fw_sel_n == 2;
+}
+
+/* The firmware's own refill: entries from its refill TP up to the host's wrp[0], into MAC ring M while it has room;
+ * each the start of a slot the host listed (and did not list again before it came back), RBM 6, cookie = slot. */
+static void
+fw_d_refill(unsigned m)
+{
+	const uint32_t hp = g32(rxd(0x400u, 4, false, "wrp[0]"));
+	unsigned n = 0;
+	while (fw_refill_tp != hp && (fw_mac_hp[m] + 2u) % 4096u != fw_mac_tp[m]) {
+		const uint8_t *e = rxd(0x4000u + 4u * fw_refill_tp, 8, false, "refill entry");
+		const uint32_t w0 = g32(e), w1 = g32(e + 4), slot = (w0 - (uint32_t)rx_iova - 0x20000u) / 0x1000u;
+		CHECK(w0 >= (uint32_t)rx_iova + 0x20000u && !((w0 - (uint32_t)rx_iova - 0x20000u) % 0x1000u) && slot < 4095u &&
+		    ((w1 >> 8) & 0xfu) == 6u && (w1 >> 12) == slot && !(w1 & 0xffu), "refill entry is not a listed slot with RBM 6 and its cookie");
+		CHECK(dslot[slot] == 0, "a refill entry for a slot that is not the host's to list");
+		dslot[slot] = 1;
+		fw_refill_tp = (fw_refill_tp + 2u) % 8192u;
+		fw_mac_post(m, (const uint32_t[2]){ w0, w1 });
+		n++;
+	}
+	if (n) { p32(rxd(4u * 160u, 4, true, "rdp[160]"), fw_refill_tp); }
+}
+
+/* One frame of kind K (D destination, E exception MSDU, L exception link, W release) RXDMA receives for MAC M with ring
+ * selection: the 400-byte RX descriptor and 128 bytes of MSDU into the next MAC ring buffer (inside its 2048 bytes),
+ * then the entry REO or WBM gives back. Without a buffer: counted, nothing written. */
+static void
+fw_d_frame(unsigned m, char kind)
+{
+	uint32_t w[8] = { 0 }, slot, a, w1;
+	if (fw_mac_tp[m] == fw_mac_hp[m]) { fw_d_refill(m); }
+	if (fw_mac_tp[m] == fw_mac_hp[m]) { fw_nobuf++; return; }
+	const uint8_t *e = rxd(m_mac_off[m] + 4u * fw_mac_tp[m], 8, false, "MAC ring entry");
+	a = g32(e); w1 = g32(e + 4); slot = (a - (uint32_t)rx_iova - 0x20000u) / 0x1000u;
+	CHECK(slot < 4095u && dslot[slot] == 1, "model: a MAC ring buffer not with the firmware");
+	uint8_t *f = rxd(0x20000u + 0x1000u * slot, 400u + 128u, true, "frame");
+	for (unsigned k = 0; k < 528u; k += 4u) { p32(f + k, M_FRAME_WORD); }
+	fw_mac_tp[m] = (fw_mac_tp[m] + 2u) % 4096u;
+	p32(rxd(4u * m_mac_id[m], 4, true, "rdp of a MAC ring"), fw_mac_tp[m]);
+	fw_frames_written++;
+	dslot[slot] = 2;
+	fw_d_seq++;
+	if (C.d_foreign && fw_d_seq == C.d_foreign) { a += 64u; }
+	w[0] = a;
+	w[1] = (w1 & ~0xf00u) | (C.d_rbm ? C.d_rbm : 6u) << 8;
+	if (kind == 'L' && idle_pub && m_idle_tp != m_idle_hp) {
+		const uint8_t *ie = lnd(4u * m_idle_tp, 8, "idle entry");
+		const uint32_t la = g32(ie), lw1 = g32(ie + 4), d = (la - (uint32_t)ln_iova - 0x40000u) / 128u;
+		uint8_t *ld = lnd(0x40000u + 128u * d, 128, "link descriptor");
+		memset(ld, 0, 128);
+		p32(ld + 16, M_FRAME_WORD);           /* a PN word: frame data, never printed */
+		p32(ld + 32, a); p32(ld + 36, 6u << 8 | slot << 12); p32(ld + 40, 3u);
+		m_idle_tp = (m_idle_tp + 2u) % 65536u;
+		fw_links++;
+		w[0] = la; w[1] = lw1; w[7] = 1u | 0u << 1 | 3u << 3;
+		m_reo_push(1, w);
+		return;
+	}
+	if (kind == 'W') {
+		w[1] = (w1 & ~0xf00u) | (C.rel_rbm ? C.rel_rbm : 8u) << 8;
+		w[2] = 2u | 0u << 6 | 0u << 24 | 9u << 26;
+		w[5] = 3u;
+		m_reo_push(0, w);
+		return;
+	}
+	if (kind == 'E' || kind == 'L') { w[7] = 0u | 0u << 1 | 5u << 3; m_reo_push(1, w); return; }
+	w[2] = 1u; w[4] = 3u | 128u << 3; w[7] = 1u << 1 | (1u + fw_d_seq % 4u) << 20;
+	m_reo_push(2 + fw_d_seq % 4u, w);
+	if (C.d_dup && fw_d_seq == C.d_dup) { m_reo_push(2 + fw_d_seq % 4u, w); }
+}
+
+static void
+fw_d_frames(unsigned m, unsigned n)
+{
+	const char *mix = C.d_mix ? C.d_mix : "DDDDDEWL";
+	for (unsigned i = 0; i < n; i++) { fw_d_frame(m, mix[i % strlen(mix)]); }
+}
+
+/* The host's refill HP publishes after wrp[0]=8190: right after the write barrier, every new entry a slot that came
+ * back on a REO/WBM ring, RBM 6, its cookie, its posted half zero but the 0xa5 sentinel, the HP not past the
+ * firmware's TP. */
+static void
+model_rd_publish(volatile uint32_t *p, uint32_t v)
+{
+	CHECK(rx_host && (uintptr_t)p == (uintptr_t)(rx_host + 0x400u) && rx_pub, "a W27 publish other than wrp[0], or before the first");
+	CHECK(last_ev == 'W', "wrp[0] republished without the write barrier right before it");
+	CHECK(!wl_rx.stopping && !wl_rd.stopping && (wl20_bits & WL20_REORX), "wrp[0] republished after the latch or without 0x1000");
+	CHECK(v < 8192u && !(v & 1u) && (v + 8192u - rd_hp) % 8192u <= (fw_refill_tp + 8192u - 2u - rd_hp) % 8192u,
+	    "refill HP republished past the firmware's TP");
+	for (uint32_t h = rd_hp; h != v; h = (h + 2u) % 8192u) {
+		const uint8_t *e = rx_host + 0x4000u + 4u * h;
+		const uint32_t w0 = g32(e), slot = (w0 - (uint32_t)rx_iova - 0x20000u) / 0x1000u;
+		CHECK(slot < 4095u && w0 == (uint32_t)rx_iova + 0x20000u + 0x1000u * slot && g32(e + 4) == (6u << 8 | slot << 12),
+		    "a re-posted refill entry is not a slot start with RBM 6 and its cookie");
+		CHECK(dslot[slot] == 2, "a buffer re-posted that the device had not returned");
+		for (unsigned j = 0; j < 2048u; j++) { CHECK(rx_host[0x20000u + 0x1000u * slot + j] == (j < 64u ? 0xa5u : 0u), "a re-posted buffer not fresh"); }
+		dslot[slot] = 0;
+		rd_posted++;
+	}
+	*p = v;
+	rd_hp = v; rd_pubs++;
+}
+
 static void
 dev_acts(void)
 {
@@ -972,6 +1302,15 @@ dev_acts(void)
 			break;
 		case A_RDP: rx_inject = true; p32(rxd(4u * x->a, 4, true, "raw rdp"), x->b); rx_inject = false; break;
 		case A_SETUP: fw_rx_setup(); break;
+		case A_D2: fw_d_frames(x->a, x->b); break;
+		case A_RSPILL:  /* C2d: the REO device writes where it was given no address */
+			reo_inject = true;
+			if (C.reo_spill & 1u) { p32(reod(4u * 20u, 4, "spill"), 0x33u); }
+			if (C.reo_spill & 2u) { p32(reod(0x91800u, 4, "spill"), 0x33u); }
+			if (C.reo_spill & 4u) { p32(reod(0xfff00u, 4, "spill"), 0x33u); }
+			reo_inject = false;
+			break;
+		case A_RHP: reo_inject = true; p32(reod(4u * mr[x->a].id, 4, "raw REO HP"), x->b); reo_inject = false; break;
 		default: fw_take(x->a); break;
 		}
 	}
@@ -1075,8 +1414,9 @@ fw_scan_script(unsigned n)
 	if (C.scan_mode == 4) { fw_scan_event(1u << 1, 0, 0, 0, t); return; }
 	fw_scan_event(1u << 0, 0, 0, 0, t);
 	if (C.wrong_vdev) { fw_scan_event(1u << 3, 0, 2412, 3, t); }
-	const bool deliver_mgmt = fw_rule_ok();  /* C2c: MGMT_RX only with what the scenario's firmware needs */
-	for (unsigned i = 0; i < n; i++) {
+	const bool deliver_mgmt = C.rx_rule == 6 ? m_rx_live() : fw_rule_ok();  /* C2c; C2d rule 6: the whole RX path */
+	const bool wedged = C.wedge && !m_rx_live();  /* C2d: the phone's r1c2c-all readout */
+	for (unsigned i = 0; i < n && !(wedged && i >= 15u); i++) {
 		uint32_t t0 = 5 + 150 * i, k = 0, heard = 0;
 		for (unsigned j = 0; j < n_beacons; j++) { heard += beacons[j].idx == i; }
 		/* C2c device actions on this channel (RXDMA frames, error entries, spills, raw pointer words, takes) */
@@ -1088,6 +1428,10 @@ fw_scan_script(unsigned n)
 		if (i == 4 && C.spill) { act(now + t0 + 4, A_SPILL, 0, 0); }
 		if (i == 5 && C.rdp_err_raw) { act(now + t0 + 4, A_RDP, 186, C.rdp_err_raw); }
 		if (i == 30 && C.refill_tp_raw[1]) { act(now + t0 + 4, A_RDP, 160, C.refill_tp_raw[1]); }
+		if (C.d_frames && m_rx_live()) { act(now + t0 + 3, A_D2, i < 13 ? 0u : 1u, C.d_frames); }  /* C2d */
+		if (i == 0 && C.d_burst && m_rx_live()) { act(now + t0 + 4, A_D2, 0, C.d_burst); }
+		if (i == 4 && C.reo_spill) { act(now + t0 + 4, A_RSPILL, 0, 0); }
+		if (i == 6 && C.reo_hp_raw) { act(now + t0 + 4, A_RHP, 2, C.reo_hp_raw); }
 		fw_scan_event(1u << 3, 0, m_chan(i), 0, t0);
 		for (unsigned r = 0; r <= C.ci_repeat; r++) { fw_chan_info(0, m_chan(i), -96 - (int32_t)(i % 5), i, heard, t0 + 1); }
 		if (C.ci_repeat && i == 0) { fw_chan_info(2, m_chan(i), -96, i, heard, t0 + 1); }  /* C2b: flags neither START nor END */
@@ -1099,7 +1443,8 @@ fw_scan_script(unsigned n)
 		}
 		fw_chan_info(1, m_chan(i), 0, i, 0, t0 + 148);
 	}
-	if (C.scan_mode != 3) { fw_scan_event(1u << 1, 0, 0, 0, 5 + 150 * n + 1); }
+	if (C.scan_mode != 3 && !wedged) { fw_scan_event(1u << 1, 0, 0, 0, 5 + 150 * n + 1); }
+	if (C.d_late && m_rx_live()) { act(now + C.d_late, A_D2, 0, 20); }  /* C2d: frames while the host contains */
 }
 
 static void
@@ -1348,6 +1693,7 @@ fw_rx(unsigned ce, uint32_t eid, const uint8_t *d, uint32_t len)
 	}
 	if (eid != C.wmi_eid && eid == C.htt_eid) {  /* C2 w20 0x02: HTT VERSION_REQ (dp_tx.c:1277-1305) on CE4 */
 		if (ce == 4 && flags == 0 && plen >= 4 && (g32(pl) & 0xffu) == 0xbu) { fw_sring(pl, plen); return; }  /* C2c */
+		if (ce == 4 && flags == 0 && plen >= 4 && (g32(pl) & 0xffu) == 0xcu) { fw_rxsel(pl, plen); return; }  /* C2d */
 		CHECK(ce == 4 && flags == 0 && plen == 8 && g32(pl) == 0 && g32(pl + 4) == (5u | 4u << 8 | 2u << 16),
 		    "HTT VERSION_REQ is not {msg 0, TCL metadata option tag 5 len 4 value 2} on CE4");
 		CHECK(fw_init_ok == 1 && fw_c2_step == 0, "HTT VERSION_REQ out of order");
@@ -1441,6 +1787,7 @@ wl_mwr(uint32_t off, uint32_t v)
 	CHECK(i < 36, "shadow register beyond the WLAN_CFG table");
 	shadow_writes++;
 	if (wl15_shadow_v3[i] == M_IDLE_HP) { wbm_access(M_IDLE_HP, true, &v, true); return; }  /* C2c: ring 120's HP */
+	if (m_reo_addr(wl15_shadow_v3[i])) { reo_access(wl15_shadow_v3[i], true, &v, true); return; }  /* C2d: a REO/release TP */
 	ce_access(wl15_shadow_v3[i], true, &v, true);
 }
 
@@ -1450,7 +1797,10 @@ win_access(uint64_t pa, bool wr, uint32_t *v)
 {
 	uint32_t off = (bar_win & 0x3fu) << 19 | (uint32_t)(pa - WL_BAR0 - 0x80000ull);
 	CHECK(bar_win & 0x40000000u, "window access with the window disabled");
-	if (off >= 0x00a30000u && off < 0x00a40000u) { wbm_access(off, wr, v, false); return; }
+	if (off >= 0x00a30000u && off < 0x00a40000u) {
+		if (m_reo_addr(off)) { reo_access(off, wr, v, false); } else { wbm_access(off, wr, v, false); }  /* C2d / C2c */
+		return;
+	}
 	ce_access(off, wr, v, false);
 }
 
@@ -1501,6 +1851,19 @@ static int
 w26_alloc(struct wl_dma *d, vm_size_t bytes)
 {
 	const bool rx = d == &wl_rx_arena;
+	if (d == &wl_reo_arena) {  /* C2d: after the other two, 2 MiB aligned, 0xa5 everywhere */
+		CHECK(!d->va && bytes == REOA && (wl20_bits & WL20_REORX) && rx_host && (!(wl20_bits & WL20_IDLELINK) || ln_host),
+		    "unexpected W27 allocation, or before the RX and link arenas");
+		CHECK(!(wl_iova_next & 0x1fffffu) && wl_iova_next + bytes <= wl_iova_end, "W27 arena IOVA not 2 MiB aligned inside the pool");
+		if (C.reo_alloc_fail) { return 1; }
+		void *q = aligned_alloc(16384, bytes);
+		CHECK(q != NULL, "host allocation");
+		memset(q, 0xa5, bytes);
+		d->va = (vm_offset_t)q; d->size = bytes; d->iova = wl_iova_next; d->pa = 0x8a0000000ull;
+		wl_iova_next += bytes;
+		reo_host = q; reo_iova = d->iova; reo_allocs++;
+		return 0;
+	}
 	CHECK(!d->va && bytes == (rx ? RXA : LNA) && (wl20_bits & (rx ? WL20_RXRING : WL20_IDLELINK)), "unexpected W26 allocation");
 	CHECK(!(wl_iova_next & 0x1fffffu) && wl_iova_next + bytes <= wl_iova_end, "W26 arena IOVA not 2 MiB aligned inside the pool");
 	CHECK(!rx || !(wl20_bits & WL20_IDLELINK) || ln_host, "RX arena allocated before the link arena");
@@ -1517,7 +1880,7 @@ w26_alloc(struct wl_dma *d, vm_size_t bytes)
 static int
 wl_dma_alloc(struct wl_dma *d, vm_size_t bytes)
 {
-	if (d == &wl_rx_arena || d == &wl_link_arena) { return w26_alloc(d, bytes); }
+	if (d == &wl_rx_arena || d == &wl_link_arena || d == &wl_reo_arena) { return w26_alloc(d, bytes); }
 	CHECK(d == &wl_ce_arena && bytes == ARENA && !d->va, "unexpected DMA allocation");
 	CHECK(!(wl_iova_next & (ARENA - 1)) && wl_iova_next >= wl_iova_base && wl_iova_next + ARENA <= wl_iova_end,
 	    "arena IOVA not aligned to its size inside the pool");
@@ -1532,7 +1895,7 @@ wl_dma_alloc(struct wl_dma *d, vm_size_t bytes)
 static int
 wl_dma_nc(struct wl_dma *d)
 {
-	CHECK(d == &wl_ce_arena || d == &wl_rx_arena || d == &wl_link_arena, "NC conversion of another buffer");
+	CHECK(d == &wl_ce_arena || d == &wl_rx_arena || d == &wl_link_arena || d == &wl_reo_arena, "NC conversion of another buffer");
 	d->nc = true;
 	return 0;
 }
@@ -1540,12 +1903,14 @@ static void
 wl_dma_free(struct wl_dma *d)
 {
 	if (!d->va) { return; }
-	if (d == &wl_rx_arena || d == &wl_link_arena) {  /* C2c: only after bus master off, PERST and the SMMU undo, zeroed */
+	if (d == &wl_rx_arena || d == &wl_link_arena || d == &wl_reo_arena) {  /* C2c, C2d: only after bus master off, PERST and the SMMU undo, zeroed */
 		const uint8_t *p = (const uint8_t *)d->va;
 		CHECK(!(epcmd & 4u) && !(perst_io & 2u) && smmu_undone, "W26 arena freed before bus master off, PERST and the SMMU undo");
 		for (vm_size_t i = 0; i < d->size; i++) { CHECK(!p[i], "W26 arena not zeroed before its free"); }
 		free((void *)d->va);
-		if (d == &wl_rx_arena) { rx_host = NULL; rx_mapped = false; rx_frees++; } else { ln_host = NULL; ln_mapped = false; ln_frees++; }
+		if (d == &wl_rx_arena) { rx_host = NULL; rx_mapped = false; rx_frees++; }
+		else if (d == &wl_reo_arena) { reo_host = NULL; reo_mapped = false; reo_frees++; }
+		else { ln_host = NULL; ln_mapped = false; ln_frees++; }
 		memset(d, 0, sizeof(*d));
 		return;
 	}
@@ -1557,9 +1922,10 @@ wl_dma_free(struct wl_dma *d)
 static int
 wl12_map_target(struct wl_dma *d)
 {
-	CHECK((d == &wl_ce_arena || d == &wl_rx_arena || d == &wl_link_arena) && d->nc, "map of an unconverted buffer");
+	CHECK((d == &wl_ce_arena || d == &wl_rx_arena || d == &wl_link_arena || d == &wl_reo_arena) && d->nc, "map of an unconverted buffer");
 	if (d == &wl_link_arena && C.link_map_fail) { return wl_w11_fail("target DMA leaf readback"); }
-	if (d == &wl_rx_arena) { rx_mapped = true; } else if (d == &wl_link_arena) { ln_mapped = true; } else { arena_mapped = true; }
+	if (d == &wl_rx_arena) { rx_mapped = true; } else if (d == &wl_link_arena) { ln_mapped = true; }
+	else if (d == &wl_reo_arena) { reo_mapped = true; } else { arena_mapped = true; }
 	return 0;
 }
 static int wl_w11_guard(void) { return fw_faults || guard_bad ? wl_w11_fail("AMSS/M0, ownership, discovery or access/SMMU fault") : 0; }
@@ -1591,6 +1957,12 @@ reset(void)
 	/* C2c: arenas a quarantined or failed scenario left, and the W26 model state */
 	if (wl_rx_arena.va) { free((void *)wl_rx_arena.va); memset(&wl_rx_arena, 0, sizeof(wl_rx_arena)); }
 	if (wl_link_arena.va) { free((void *)wl_link_arena.va); memset(&wl_link_arena, 0, sizeof(wl_link_arena)); }
+	if (wl_reo_arena.va) { free((void *)wl_reo_arena.va); memset(&wl_reo_arena, 0, sizeof(wl_reo_arena)); }
+	reo_host = NULL; reo_iova = 0; reo_mapped = reo_inject = false;  /* C2d */
+	reo_allocs = reo_frees = fw_sel_n = rs_n = rs_i = rs_built = reo_tp_pubs = rd_pubs = rd_posted = fw_d_seq = fw_d_lost = 0;
+	memcpy(mr, mreo_plan, sizeof(mr)); memset(fw_sel_w, 0, sizeof(fw_sel_w)); rd_hp = 0;
+	memset(dslot, 0, sizeof(dslot)); dslot[4095] = 3;
+	memset(&wl_rd, 0, sizeof(wl_rd)); wl27_reo_writes = 0;
 	rx_host = ln_host = NULL; rx_iova = ln_iova = 0;
 	rx_mapped = ln_mapped = rx_pub = smmu_undone = fw_rx_ready = idle_live = idle_pub = rx_inject = false;
 	rx_allocs = rx_frees = ln_allocs = ln_frees = wbm_reads = wbm_writes = wbm_rbs = wbm_watch_reads = wbm_pubs = 0;
@@ -1604,6 +1976,7 @@ reset(void)
 	C.credits = 4; C.credit_size = 2048; C.ready_ce = 2; C.htt_eid = 1; C.wmi_eid = 2; C.max_msg = 2048; C.ready_stslen = -1;
 	C.phy_bands = 3; C.phy_mask = 3; C.htt_major = 3; C.htt_minor = 4; C.exp_n = 38; C.exp_pdev = 0;
 	C.dbs_pdev = 1;
+	C.reo_pre[30] = 0x1u; C.reo_pre[31] = 0x01fe0001u;  /* C2d: GEN_ENABLE and MISC_CTRL as found (both destinations 0xf) */
 	loglen = 0; logbuf[0] = 0;
 	memcpy(dr, ring_plan, sizeof(dr));
 	for (unsigned i = 0; i < 7; i++) {
@@ -2876,10 +3249,10 @@ no_frame_text(void)
 static void
 c2c_contained(void)
 {
-	const unsigned rx = rx_allocs, ln = ln_allocs;
+	const unsigned rx = rx_allocs, ln = ln_allocs, ro = reo_allocs;
 	/* the host-owned words the device reads stayed as published: wrp[0] (refill HP), wrp[26] (error ring TP, never
 	 * reaped), every refill entry; nothing but the device moved after the publish (2.8) */
-	if (rx_pub && rx_host) {
+	if (rx_pub && rx_host && !(wl20_bits & WL20_REORX)) {  /* C2d republishes wrp[0]: checked at each publish instead */
 		CHECK(g32(rx_host + 0x400u) == 8190u && !g32(rx_host + 0x400u + 4u * 26u), "a host write to wrp[0] or wrp[26] after the publish");
 		for (uint32_t k = 0; k < 4096u; k++) {
 			uint64_t a = rx_iova + 0x20000u + 0x1000ull * k;
@@ -2889,7 +3262,8 @@ c2c_contained(void)
 	}
 	contained_and_freed();
 	no_frame_text();
-	CHECK(rx_frees == rx && ln_frees == ln && !wl_rx_arena.va && !wl_link_arena.va, "W26 arenas not freed after proven containment");
+	CHECK(rx_frees == rx && ln_frees == ln && reo_frees == ro && !wl_rx_arena.va && !wl_link_arena.va && !wl_reo_arena.va,
+	    "W26/W27 arenas not freed after proven containment");
 	if (rx || ln) {
 		static const char *const order[] = {
 			"FUXI WLAN: W26 rx contain: host writes off; arenas held until bus master off, PERST and SMMU undo\n",
@@ -3616,6 +3990,410 @@ s_c2c_none(void)
 	puts("C2c off: qrtr 7 with w20 0, 0x2, 0x10, 0x80, 0x92, 0x42: no W26 line, arena, WBM access, ring message or HTT handler");
 }
 
+/* ---- C2d scenarios (fuxiwlanqrtr=7, w20 0x800 RXSEL, 0x1000 REORX) ---- */
+static void c2d_reset(unsigned bits) { c2c_reset(bits); C.rx_rule = 6; C.wedge = true; }
+
+/* The phone's r1c2c-all readout (C.wedge, rule 6) for kits without the whole RX path: all 4095 refill buffers taken,
+ * 2047 + 2016 posted to the MAC rings and 32 kept, RXDMA writes nothing, the scan stops after 15 channels. */
+static void
+c2d_phone(void)
+{
+	C.rx_take = 4095; C.rx_post[0] = 2047; C.rx_post[1] = 2016;
+}
+
+static void
+c2d_happy_run(unsigned bits, unsigned w15)
+{
+	c2d_reset(bits); wl15_variant = w15;
+	C.links_used = false; C.d_frames = 120;  /* 38 x 120 = 4560 frames: more than the 4095 buffers, so they come back */
+	happy_frames();
+	CHECK(run() == 0, "C2d happy path failed");
+}
+
+/* Every C2d run that reaches a returned buffer: what came back was posted again, nothing else (the model checked each
+ * publish); slots never posted stay so. */
+static void
+c2d_balance(void)
+{
+	unsigned out = 0, back = 0;
+	for (unsigned k = 0; k < 4095u; k++) { out += dslot[k] == 1u; back += dslot[k] == 2u; }
+	CHECK(rd_posted == wl_rd.reposted && wl_rd.reposted + wl_rd.pend_n == wl_rd.returned && dslot[4095] == 3u,
+	    "C2d: returned, re-posted and pending do not add up");
+	(void)out; (void)back;
+}
+
+static void
+s_c2d_happy(void)
+{
+	for (unsigned v = 0; v < 2; v++) {
+		c2d_happy_run(0x1902, v);
+		show(v ? "0x1902 w15=1" : "0x1902");
+		static const char *const lines[] = {
+			"FUXI WLAN: W26 rx arena IOVA 0xa1400000 bytes 0x1040000 Normal-NC mapped; rdp 0xa1400000 wrp 0xa1400400\n",
+			"FUXI WLAN: W27 reo arena IOVA 0xa2600000 bytes 0x100000 Normal-NC mapped; rdp 0xa2600000\n",
+			("FUXI WLAN: W27 reo before: rings 10 enabled 0 based 0 unreadable 0 gen-enable 0x1 misc-ctrl 0x1fe0001 aging 0/0/0/0 "
+			 "dest-ctrl 0/0; not owned\n"),
+			"FUXI WLAN: W27 reo ring 131 rel entries 1024 base 0xa2692000 misc 0x40 readback ok; tp via ",
+			"FUXI WLAN: W27 reo ring 0 exc entries 128 base 0xa2690000 misc 0x40 readback ok; tp via ",
+			("FUXI WLAN: W27 reo setup gen-enable 0x1 -> 0xd misc-ctrl 0x1fe0001 -> 0x1 aging 100000/100000/100000/40000 hash "
+			 "0x43214321; writes 26 window restore checked\n"),
+			"FUXI WLAN: W26 refill ring 160 filled 4095 buffers",
+			"FUXI WLAN: W20 ce rx posted CE1 62 CE2 62\n",
+			"FUXI WLAN: W21 wmi service ready complete\n",
+			"FUXI WLAN: W27 reo ring 1 dst1 entries 2048 base 0xa2610000 misc 0x40 readback ok; tp via ",
+			"FUXI WLAN: W27 reo ring 8 dst8 entries 2048 base 0xa2680000 misc 0x40 readback ok; tp via ",
+			"FUXI WLAN: W22 wmi init sent bytes 332",
+			"FUXI WLAN: W23 htt version 3.4 (w20 0x02)\n",
+			"FUXI WLAN: W26 htt sring setup rxdma-err 186 info0 0x0007010b info1 0x00082000 intr 0x00200008 low 0\n",
+			("FUXI WLAN: W27 htt rx ring selection mac0 161 info0 0x1400010c buf 2048 flags 0/0/0x1000000/0x1240000 tlv 0xd offsets "
+			 "0x01100190/0x00900000/0 sent\n"),
+			("FUXI WLAN: W27 htt rx ring selection mac1 169 info0 0x1400020c buf 2048 flags 0/0/0x1000000/0x1240000 tlv 0xd offsets "
+			 "0x01100190/0x00900000/0 sent\n"),
+			"FUXI WLAN: W26 rx watch setup+100ms ",
+			"FUXI WLAN: W27 reo watch setup+100ms reaped rel 0 exc 0 dst 0; returned 0 reposted 0 pending 0 (max 0) refill hp 8190\n",
+			"FUXI WLAN: W23 chan list 38 passive",
+			"FUXI WLAN: W27 reo watch started reaped rel 0 exc 0 dst 0;",
+			"FUXI WLAN: W27 reo watch mid (foreign 19) reaped rel 270 exc 540 dst 1350; returned 2160 reposted 2160 pending 0",
+			"FUXI WLAN: W23 scan completed reason 0 after ",
+			"FUXI WLAN: W27 reo watch completed reaped rel 570 exc 1140 dst 2850; returned 4560 reposted 4560 pending 0 (max 120)",
+			"FUXI WLAN: W24 scan summary frames 12 bss 9 ssids 5\n",
+			"FUXI WLAN: W23 stats after-scan wmi ",
+			"FUXI WLAN: W26 counters ",
+			"FUXI WLAN: W27 rx ring selection sent 2 of 2\n",
+			"FUXI WLAN: W27 reo reaped rel 570 exc 1140 dst 570 1140 570 570 0 0 0 0\n",
+			("FUXI WLAN: W27 reo entries msdu 3990 link 0 (held 0, msdus 0, skipped 0, not ours 0) push routing 2850 error 1140 "
+			 "continuation 0\n"),
+			"FUXI WLAN: W27 reo error codes 0x5:1140 0x9:570\n",
+			"FUXI WLAN: W27 release src rxdma 0 reo 570 other 0 desc-other 0 rbm-other 0 cookie-other 0\n",
+			"FUXI WLAN: W27 buffers returned 4560 reposted 4560 pending 0 (max 120) publishes 38 refill hp 926 refill-bad 0\n",
+			"FUXI WLAN: W27 reo guard nonzero dwords: gaps 0, tail 0\n",
+			"FUXI WLAN: W23 complete; stop/contain\n",
+		};
+		expect_order(lines, sizeof(lines) / sizeof(lines[0]));
+		expect(v ? "tp via R2 0xa3b04c (fuxiwlanw15=1)\n" : "dst1 entries 2048 base 0xa2610000 misc 0x40 readback ok; tp via shadow 0 (0x8fc)\n");
+		expect(v ? "rel entries 1024 base 0xa2692000 misc 0x40 readback ok; tp via R2 0xa370e4 (fuxiwlanw15=1)\n" :
+		    "rel entries 1024 base 0xa2692000 misc 0x40 readback ok; tp via shadow 24 (0x95c)\n");
+		expect_not("W24 no beacon"); expect_not("SPILL"); expect_not("TX COUNTERS"); expect_not("W27 release rxdma codes");
+		CHECK(fw_sel_n == 2 && wl_scan.frames == 12 && fw_frames_written == 4560 && !fw_nobuf && rd_pubs == 38 && reo_tp_pubs > 38,
+		    "C2d firmware view");
+		CHECK(rs_i == rs_n && rs_n == 38 + 2 * 11 + 10 + 8 * 14, "C2d REO conversation not complete");
+		c2d_balance();
+		c2c_contained();
+		static const char *const tail[] = {
+			"FUXI WLAN: W26 rx contain: host writes off; arenas held until bus master off, PERST and SMMU undo\n",
+			"FUXI WLAN: abort step 28 MHI reset done, bus master off yes, PERST asserted yes\n",
+			"FUXI WLAN: W27 reo guard after containment nonzero dwords: gaps 0, tail 0\n",
+			"FUXI WLAN: W26 arenas zeroed 0x1140000 bytes before free\n",
+			"FUXI WLAN: abort buffers freed\n",
+		};
+		expect_order(tail, sizeof(tail) / sizeof(tail[0]));
+	}
+	/* 0x1b02: with the idle list, REO exception entries of link descriptors (their MSDUs returned, the links held) */
+	c2d_reset(0x1b02); C.d_frames = 120; happy_frames();
+	CHECK(run() == 0, "C2d 0x1b02 failed");
+	show("0x1b02");
+	expect("FUXI WLAN: W26 wbm idle ring 120 base ");
+	expect("FUXI WLAN: W27 reo entries msdu 3420 link 570 (held 570, msdus 570, skipped 0, not ours 0) push routing 2850 error 1140 "
+	    "continuation 0\n");
+	expect("FUXI WLAN: W27 reo error codes 0x3:570 0x5:570 0x9:570\n");
+	expect("FUXI WLAN: W27 buffers returned 4560 reposted 4560 pending 0");
+	expect("FUXI WLAN: W26 link content descriptors written 570 of 32767, unlisted slot clean; idle ring entries changed 0\n");
+	CHECK(fw_links == 570 && wl_scan.frames == 12, "C2d link path");
+	c2d_balance();
+	c2c_contained();
+	expect("FUXI WLAN: W26 arenas zeroed 0x1580000 bytes before free\n");
+	puts("C2d 0x1902 (shadow, then fuxiwlanw15=1 R2 TPs) and 0x1b02: REO arena, 38 pre-reads, release and exception rings and "
+	     "the REO setup in L19's order at W20, the eight destination rings after service ready, two RX_RING_SELECTION_CFG word "
+	     "by word after the SRING_SETUPs, 4560 frames landed through 4095 buffers (each returned on a destination, exception "
+	     "or release ring, re-posted fresh to ring 160, every publish checked), 0x1b02 link descriptors held and their MSDUs "
+	     "returned, WMI MGMT_RX forwarded, W27 watch and report lines, contained, recounted, zeroed and freed");
+}
+
+/* The phone (r1c2c-all, w20 0x702) and the half kits: without ring selection and the REO path the scan wedges. */
+static void
+s_c2d_wedge(void)
+{
+	static const unsigned bits[] = { 0x702, 0x902, 0x1102, 0x1302 };
+	for (unsigned i = 0; i < sizeof(bits) / sizeof(bits[0]); i++) {
+		c2d_reset(bits[i]); c2d_phone(); C.d_frames = 120; happy_frames();
+		CHECK(run() == 1, "a C2d kit without the whole RX path did not wedge");
+		show("wedge");
+		static const char *const lines[] = {
+			"FUXI WLAN: W23 scan foreign freq 5200\n",
+			"FUXI WLAN: W23 timeout scan COMPLETED (8750 ms); report, contain, no retry\n",
+			("FUXI WLAN: W26 rx watch completed refill tp 8190 taken 4095 left 0 mac0 hp 4094 tp 0 avail 2047 mac1 hp 4032 tp 0 avail "
+			 "2016 err hp 0 fill 0; exhausted none; refill-empty\n"),
+			"FUXI WLAN: W24 scan summary frames 0 bss 0 ssids 0\n",
+			"FUXI WLAN: W26 rx content mac0 entries 2047 valid 2047 foreign 0 rbm-other 0 cookie-other 0\n",
+			"FUXI WLAN: W26 rx content mac1 entries 2016 valid 2016 foreign 0 rbm-other 0 cookie-other 0\n",
+			"FUXI WLAN: W26 rx content refill taken 4095 kept 32; buffers written 0 of 4095\n",
+			"FUXI WLAN: W26 rxdma err entries 0 (hp 0) push err 0 routing 0 flush 0 other 0; rbm link 0 buf 0 other 0\n",
+			"FUXI WLAN: W20 snapshot scan COMPLETED: ",
+			"FUXI WLAN: W23 failure: scan COMPLETED; contain, no retry\n",
+		};
+		expect_order(lines, sizeof(lines) / sizeof(lines[0]));
+		CHECK(wl_scan.foreign == 15 && wl_scan.ci_start == 15 && !wl_scan.mgmt && !fw_frames_written, "the wedge is not the phone's");
+		expect_not("FUXI WLAN: W23 scan foreign freq 5220");
+		if (bits[i] & 0x200) { expect("FUXI WLAN: W26 link content descriptors written 0 of 32767"); }
+		if (bits[i] & 0x800) { expect("FUXI WLAN: W27 rx ring selection sent 2 of 2\n"); }
+		if (bits[i] & 0x1000) { expect("FUXI WLAN: W27 reo reaped rel 0 exc 0 dst 0 0 0 0 0 0 0 0\n"); }
+		if (!(bits[i] & 0x1800)) { expect_not("W27"); }
+		c2c_contained();
+	}
+	puts("C2d wedge (the phone's r1c2c-all, and 0x902, 0x1102, 0x1302): 4095 buffers taken, mac0 2047 and mac1 2016 valid, 32 "
+	     "kept, refill left 0, nothing written, no error entry, the scan stops after 15 channels and COMPLETED times out at "
+	     "8750 ms, no MGMT_RX; contained and freed");
+}
+
+/* Exhaustion and replenish: a 4000-frame burst on channel 0 drains mac0 and the refill ring (929 frames without a
+ * buffer), the host returns and re-posts everything, the next channels land again. */
+static void
+s_c2d_exhaust(void)
+{
+	c2d_reset(0x1902); C.d_frames = 10; C.d_burst = 4000; C.d_mix = "D"; happy_frames();
+	CHECK(run() == 0, "C2d exhaustion run");
+	show("exhaust");
+	CHECK(fw_nobuf == 929 && fw_frames_written == 3071 + 380 && wl_scan.frames == 12, "exhaustion counts");
+	expect("FUXI WLAN: W27 buffers returned 3451 reposted 3451 pending 0 (max 3071)");
+	c2d_balance();
+	c2c_contained();
+	puts("C2d exhaustion: a 4000-frame burst finds 3071 buffers (mac0 and the rest of the refill ring), 929 dropped by the "
+	     "firmware, all 3071 returned and re-posted in one publish, the next 37 channels land 370 more");
+}
+
+/* Refusals of returned entries (the run stops at once and contains) and counted oddities. */
+static void
+s_c2d_entries(void)
+{
+	c2d_reset(0x1902); C.d_frames = 120; C.d_foreign = 50; happy_frames();
+	CHECK(run() == 1, "a foreign REO entry passed");
+	expect("FUXI WLAN: W27 reo dst3 entry refused: W27 returned entry is not one of our posted buffers; contain\n");
+	expect("FUXI WLAN: W23 failure: W27 returned entry is not one of our posted buffers; contain, no retry\n");
+	c2c_contained();
+	c2d_reset(0x1902); C.d_frames = 120; C.d_dup = 50; happy_frames();
+	CHECK(run() == 1, "a buffer returned twice passed");
+	expect("FUXI WLAN: W27 reo dst3 entry refused: W27 buffer returned twice (not out with the device); contain\n");
+	c2c_contained();
+	c2d_reset(0x1902); C.d_frames = 120; C.reo_hp_raw = 7; happy_frames();
+	CHECK(run() == 1, "a REO HP off its entries passed");
+	expect("FUXI WLAN: W27 reo dst1 entry refused: W27 REO/release ring HP outside the ring; contain\n");
+	c2c_contained();
+	/* release entries with RBM SW1 instead of SW3: L19 skips them (the buffer stays lost), counted; destination entries
+	 * with RBM 4 are counted and returned by address */
+	c2d_reset(0x1902); C.d_frames = 120; C.rel_rbm = 6; happy_frames();
+	CHECK(run() == 0, "unknown release RBM");
+	expect("FUXI WLAN: W27 release src rxdma 0 reo 570 other 0 desc-other 0 rbm-other 570 cookie-other 0\n");
+	expect("FUXI WLAN: W27 buffers returned 3990 reposted 3990 pending 0");
+	c2d_balance();
+	c2c_contained();
+	c2d_reset(0x1902); C.d_frames = 120; C.d_rbm = 4; C.d_mix = "D"; happy_frames();
+	CHECK(run() == 0, "unknown destination RBM");
+	expect("FUXI WLAN: W27 release src rxdma 0 reo 0 other 0 desc-other 0 rbm-other 4560 cookie-other 0\n");
+	expect("FUXI WLAN: W27 buffers returned 4560 reposted 4560 pending 0");
+	c2c_contained();
+	/* D5: frames came back, the firmware forwards no MGMT_RX (rule 5): the next rung is management forwarding */
+	c2d_reset(0x1902); C.d_frames = 10; C.rx_rule = 5; happy_frames();
+	CHECK(run() == 0, "C2d no forward");
+	expect("FUXI WLAN: W24 no beacon or probe response heard (chan-info 38); next rung C3 management forwarding: frames reach the "
+	    "host rings, WMI MGMT_RX stays silent\n");
+	c2c_contained();
+	no_frame_text();
+	puts("C2d entries: a foreign address and a buffer returned twice stop the run and contain, so does a REO HP off its "
+	     "entries; release entries with an unknown return manager are counted and skipped as L19, destination entries with "
+	     "RBM 4 counted and returned by address");
+}
+
+/* Spill into the REO arena's unnamed regions; containment with the REO device still pushing. */
+static void
+s_c2d_contain(void)
+{
+	c2d_reset(0x1902); C.d_frames = 120; C.reo_spill = 7; happy_frames();
+	CHECK(run() == 0, "REO spill run");
+	expect("FUXI WLAN: W27 reo guard SPILL nonzero dwords: gaps 2, tail 1; stop; owner review before any further kit\n");
+	c2c_contained();
+	expect("FUXI WLAN: W27 reo guard after containment nonzero dwords: gaps 2, tail 1; SPILL: owner review before any further kit\n");
+	/* no COMPLETED, the STOP_SCAN descriptor never drains: 20 frames land and come back on the REO rings during the
+	 * 100 ms drain, after wl26_contain; the host reaps, publishes and re-posts nothing (reo_access and the publish
+	 * check refuse it), then zeroes and frees */
+	c2d_reset(0x1902); C.d_frames = 120; C.scan_mode = 3; C.stop_tx_stuck = true; C.d_late = 8790; happy_frames();
+	CHECK(run() == 1, "no COMPLETED");
+	{
+		const unsigned reaped = wl_rd.ring[2].reaped + wl_rd.ring[3].reaped, posted = rd_posted, pubs = reo_tp_pubs;
+		c2c_contained();
+		CHECK(fw_frames_written == 4580 && posted == rd_posted && pubs == reo_tp_pubs && reaped == 2850 * 0 + reaped,
+		    "a host action after the latch");
+	}
+	expect("FUXI WLAN: W23 contain: STOP_SCAN sent (best effort), tx drained 0 after 100 ms\n");
+	/* unproven containment: the REO arena stays (not zeroed, not freed) */
+	c2d_reset(0x1902); C.d_frames = 10; C.fail_bm = true; happy_frames();
+	CHECK(run() == 0, "fail_bm run");
+	contain();
+	expect("FUXI WLAN: abort buffers quarantined until reboot");
+	CHECK(wl_reo_arena.va && !reo_frees, "REO arena freed although bus master off is unproven");
+	puts("C2d containment: REO spills in the rdp gap, between the rings and in the tail (SPILL, recounted after containment); "
+	     "REO entries pushed during the containment drain are never reaped or re-posted; unproven containment keeps the "
+	     "REO arena");
+}
+
+/* Pre-read refusals, readback, W21 re-read, a latched fault and the arena allocation. */
+static void
+s_c2d_failures(void)
+{
+	static const struct { unsigned i; uint32_t v; const char *why; } pre[] = {
+		{ 3 * 4 + 2, 0x40u, "a ring has SRNG_ENABLE set (already owned)" },
+		{ 3 * 0, 0x1000u, "a ring base is non-zero (already owned)" },
+		{ 36, 0x43214321u, "the REO hash map is already in DEST_RING_CTRL (setup applied before)" },
+		{ 33, ~0u, "a pre-read is ~0 (unreadable, ownership not established)" },
+	};
+	for (unsigned k = 0; k < 4; k++) {
+		c2d_reset(0x1902); C.d_frames = 10; C.reo_pre[pre[k].i] = pre[k].v; happy_frames();
+		CHECK(run() == 1, "a refused REO path did not wedge");
+		{
+			char l[200];
+			snprintf(l, sizeof(l), "FUXI WLAN: W27 reo not programmed: %s; w20 0x1000 dropped for this boot\n", pre[k].why);
+			expect(l);
+		}
+		CHECK(rs_i == 38 && !mr[0].on && fw_sel_n == 2, "a REO write after a refusal, or ring selection lost");
+		expect_not("W27 reo ring"); expect_not("W27 reo watch"); expect_not("W27 reo reaped");
+		c2c_contained();
+	}
+	c2d_reset(0x1902); C.reo_rb_bad = 1; happy_frames();
+	CHECK(run() == 1 && rs_i == 38 + 11, "readback mismatch");
+	expect("FUXI WLAN: W27 reo ring 131 readback mismatch base 0xa2693000 misc 0x40\n");
+	c2c_contained();
+	c2d_reset(0x1902); C.reo_w21 = 5; happy_frames();
+	CHECK(run() == 1, "a destination ring based at W21 passed");
+	expect("FUXI WLAN: W27 reo dst4 not free at W21 (base 0x1000/0 misc 0); contain\n");
+	CHECK(fw_init_ok == 0 && mr[4].on && !mr[5].on, "INIT or the ring written after the W21 refusal");
+	c2c_contained();
+	c2d_reset(0x1902); C.reo_fault_after = 45; happy_frames();
+	CHECK(run() == 1 && rs_i == 45, "a REO write after the latched fault");
+	c2c_contained();
+	c2d_reset(0x1902); C.reo_alloc_fail = true; happy_frames();
+	CHECK(run() == 1 && !rs_i && !fw_sring_n && !wbm_reads, "REO arena allocation failure touched hardware");
+	expect("FUXI WLAN: W20 failure: W27 reo arena allocation/NC/map; contain, no retry\n");
+	c2c_contained();
+	puts("C2d failures: pre-reads with SRNG_ENABLE, a base, the hash map already applied, a ~0 read: 38 reads, no REO write, "
+	     "0x1000 dropped, ring selection still sent, the scan wedges; a BASE_LSB readback mismatch stops before the next "
+	     "write; a destination ring based at W21 stops before INIT; a fault latched after 45 REO accesses: no later one; the "
+	     "REO arena allocation failure: no WBM or REO access, no ring message; every run contained and freed");
+}
+
+static void
+s_c2d_pure(void)
+{
+	static struct wlrd rd;
+	static struct wlrx rx;
+	static const struct wlce_io io = { io_never_wr, io_never_rd, io_never_wr, io_model_w, io_model_r, NULL };
+	uint8_t *ra = aligned_alloc(16384, RXA), *ro = aligned_alloc(16384, REOA);
+	uint32_t w[17], want[17], regs[WLRD_RING_REGS][2], hw[WLRD_HW_REGS][2], pre[38];
+	reset();
+	CHECK(ra && ro, "alloc");
+	for (unsigned m = 0; m < 2; m++) { wlrd_sel_words(m, w); m_sel_want(m, want); CHECK(!memcmp(w, want, sizeof(w)), "RX_RING_SELECTION_CFG words"); }
+	CHECK(wlrd_layout(&rd, ro, 0xa2600800ull, REOA) == 1 && wlrd_layout(&rd, ro, 0xa2600000ull, REOA - 4) == 1, "REO layout bounds");
+	CHECK(wlrd_layout(&rd, ro, 0xa2600000ull, REOA) == 0, "REO layout");
+	reo_iova = 0xa2600000ull; memcpy(mr, mreo_plan, sizeof(mr)); rs_build();
+	/* the ring writes and the REO setup writes equal the model's script, the allowlist the model's address set */
+	{
+		unsigned s = 38;
+		for (unsigned k = 0; k < 10; k++) {
+			if (k == 2) { s += 10; }
+			if (k >= 2) { s += 3; }
+			wlrd_ring_regs(&rd, k, regs);
+			for (unsigned j = 0; j < 9; j++) { CHECK(rscript[s + j].wr && rscript[s + j].addr == regs[j][0] && rscript[s + j].val == regs[j][1], "ring writes"); }
+			s += 11;
+		}
+		wlrd_hw_regs(0x1u, 0x01fe0001u, hw);
+		CHECK(hw[0][1] == rscript[38 + 22 + 1].val && hw[1][1] == rscript[38 + 22 + 3].val, "REO setup read-modify-writes");
+		for (unsigned j = 2; j < 8; j++) { CHECK(rscript[38 + 22 + 2 + j].addr == hw[j][0] && rscript[38 + 22 + 2 + j].val == hw[j][1], "REO setup writes"); }
+		for (unsigned i = 0; i < 38; i++) { CHECK(rscript[i].addr == wlrd_pre_addr(i) && !rscript[i].wr, "pre-read order"); }
+	}
+	for (uint32_t off = 0x00a30000u; off < 0x00a40000u; off += 4) {
+		bool r = false, wr = false;
+		for (unsigned i = 0; i < rs_n; i++) { if (rscript[i].addr == off) { if (rscript[i].wr) { wr = true; } else { r = true; } } }
+		CHECK(wlrd_reg_ok(off, false) == r && wlrd_reg_ok(off, true) == wr, "REO allowlist differs from the model's conversation");
+		CHECK(!(wr || r) || !wlrx_wbm_ok(off, false), "REO and WBM allowlists meet");
+	}
+	for (uint32_t off = CE_BASE; off < CE_END; off += 4) { CHECK(!wlrd_reg_ok(off, false) && !wlrd_reg_ok(off, true), "REO allowlist has a CE register"); }
+	/* the pre-read reading */
+	memset(pre, 0, sizeof(pre));
+	CHECK(wlrd_owned(pre) == WLRD_FREE, "zero pre-reads not free");
+	pre[29] = 0x40; CHECK(wlrd_owned(pre) == WLRD_SRNG, "dst8 SRNG_ENABLE"); pre[29] = 0x3;
+	CHECK(wlrd_owned(pre) == WLRD_FREE, "MISC without SRNG_ENABLE refused");
+	pre[4] = 0x01; CHECK(wlrd_owned(pre) == WLRD_BASE, "base msb 7:0"); pre[4] = 0x00040000;
+	CHECK(wlrd_owned(pre) == WLRD_FREE, "a size field alone refused");
+	pre[37] = 0x43214321u; CHECK(wlrd_owned(pre) == WLRD_APPLIED, "hash map in IX_3"); pre[37] = 0;
+	pre[30] = ~0u; CHECK(wlrd_owned(pre) == WLRD_UNREADABLE, "a ~0 GEN_ENABLE"); pre[30] = 0xd;
+	CHECK(wlrd_owned(pre) == WLRD_FREE, "GEN_ENABLE with the aging bits alone refused");
+	/* recycle and replenish on a fresh RX layout */
+	CHECK(wlrx_layout(&rx, ra, 0xa1400000ull, RXA) == 0 && wlrx_fill_refill(&rx) == 0, "RX layout");
+	rx_host = ra; rx_iova = 0xa1400000ull; rx_pub = true; rd_hp = 8190;
+	memset(&rd.slot, 0, sizeof(rd.slot)); wlrd_slots_init(&rd);
+	CHECK(wlrd_recycle(&rd, &rx, 0xa1420000u + 64u, 6u << 8) == 1 && !strcmp(rd.why, "W27 returned entry is not one of our posted buffers"), "64 bytes in");
+	rd.why = NULL;
+	CHECK(wlrd_recycle(&rd, &rx, 0xa1420000u + 4095u * 4096u, 6u << 8 | 4095u << 12) == 1, "slot 4095 returned"); rd.why = NULL;
+	CHECK(wlrd_recycle(&rd, &rx, 0xa1420000u, 1u | 6u << 8) == 1, "address bits 39:32 set"); rd.why = NULL;
+	ra[0x20000 + 7 * 4096 + 100] = 0x77;
+	CHECK(wlrd_recycle(&rd, &rx, 0xa1420000u + 7u * 4096u, 6u << 8 | 9u << 12) == 0 && rd.cookie_other == 1 && rd.pend_n == 1 &&
+	    ra[0x20000 + 7 * 4096] == 0xa5 && !ra[0x20000 + 7 * 4096 + 100], "a return: held, fresh, cookie-other counted");
+	CHECK(wlrd_recycle(&rd, &rx, 0xa1420000u + 7u * 4096u, 6u << 8 | 7u << 12) == 1 && !strcmp(rd.why, "W27 buffer returned twice (not out with the device)"),
+	    "a second return of a held buffer");
+	rd.why = NULL;
+	/* the refill ring is full (TP 0, HP 8190): nothing posted; TP 4: two entries' room, one held buffer posted */
+	((volatile uint32_t *)(void *)ra)[160] = 0;
+	CHECK(wlrd_replenish(&rd, &rx, &io) == 0 && rd.pend_n == 1, "posted into a full refill ring");
+	((volatile uint32_t *)(void *)ra)[160] = 5;
+	CHECK(wlrd_replenish(&rd, &rx, &io) == 0 && rd.refill_bad == 1, "a bad refill TP");
+	((volatile uint32_t *)(void *)ra)[160] = 4;
+	dslot[7] = 2; fw_refill_tp = 4; wl20_bits = 0x1902;
+	last_ev = 0;
+	CHECK(wlrd_replenish(&rd, &rx, &io) == 1 && rd.refill_hp == 0 && rd.slot[7] == WLRD_SLOT_OUT && g32(ra + 0x400) == 0 &&
+	    g32(ra + 0x4000 + 4 * 8190) == 0xa1420000u + 7u * 4096u, "one buffer re-posted at 8190, wrap to 0");
+	rd.stopping = true;
+	CHECK(wlrd_recycle(&rd, &rx, 0xa1420000u + 8u * 4096u, 6u << 8 | 8u << 12) == 1, "a return after the latch");
+	/* guard counts */
+	{
+		uint32_t g, tl;
+		memset(ro, 0, REOA);
+		ro[4 * 8] = 1; ro[4 * 131] = 1; ro[0x10000] = 1; ro[0x90ffc] = 1;   /* named HP words and a ring: not counted */
+		wlrd_guard_count(&rd, &g, &tl);
+		CHECK(!g && !tl, "named words counted");
+		ro[4 * 9] = 1; ro[4 * 130] = 1; ro[0xfffc] = 1; ro[0x91ffc] = 1; ro[0x9a000] = 1; ro[0xffffc] = 1;
+		wlrd_guard_count(&rd, &g, &tl);
+		CHECK(g == 4 && tl == 2, "a gap or the tail missed");
+	}
+	free(ra); free(ro);
+	reset();
+	puts("C2d pure: the 17 ring selection words, the REO layout bounds, every ring and REO setup write equal to the model's "
+	     "conversation, the REO allowlist equal to its address set and apart from the WBM and CE ones, the pre-read readings, "
+	     "a foreign, slot-4095, high-address and twice-returned buffer refused, cookie-other counted, a returned buffer "
+	     "zeroed with its sentinel, a full refill ring and a bad TP post nothing, the HP wraps, nothing after the latch, the "
+	     "guard counts");
+}
+
+/* Every W27 line at its widest within the console's 254 bytes (model_line fails any longer). */
+static void
+s_c2d_widest(void)
+{
+	c2d_reset(0x1902); C.d_frames = 1; happy_frames();
+	CHECK(run() == 0, "C2d widest run");
+	for (unsigned i = 0; i < WLRD_NRING; i++) { wl_rd.ring[i].reaped = 0xffffffffu; }
+	wl_rd.returned = wl_rd.reposted = wl_rd.pend_n = wl_rd.pend_max = wl_rd.refill_hp = wl_rd.publishes = wl_rd.refill_bad = 0xffffffffu;
+	wl_rd.msdu = wl_rd.link = wl_rd.links_held = wl_rd.link_msdus = wl_rd.link_skipped = wl_rd.link_unowned = 0xffffffffu;
+	wl_rd.routing = wl_rd.reo_error = wl_rd.cont = wl_rd.desc_other = wl_rd.rbm_other = wl_rd.cookie_other = 0xffffffffu;
+	for (unsigned i = 0; i < 3; i++) { wl_rd.rel_src[i] = 0xffffffffu; }
+	for (unsigned i = 0; i < 32; i++) { wl_rd.reo_code[i] = wl_rd.rxdma_code[i] = 0xffffffffu; }
+	wl_rd.sel_sent = 0xffffffffu;
+	wl27_watch("mid (foreign 4294967295)");
+	wl27_report();
+	CHECK(count_text("FUXI WLAN: W27 reo error codes") >= 3, "error code list not wrapped");
+	wl_rd.pend_n = 0;
+	for (unsigned i = 0; i < WLRD_PRE_N; i++) { wl_rd.pre[i] = 0xffffffffu; }
+	c2c_contained();
+	puts("C2d line widths: the watch and report lines with every counter at 0xffffffff, 32 error codes per list over several "
+	     "lines: every FUXI WLAN line within 254 bytes");
+}
+
 /* For the L19 re-derivation in tools/test-fuxi-wlan-ce.py: the four SRING_SETUP, the two PDEV_SET_PARAM, the first and
  * last refill and idle entries and the ring 120 register list, for an RX arena at 0xa1a00000 and links at 0xa1400000. */
 static void
@@ -3645,6 +4423,31 @@ dump_c2c(void)
 	fprintf(stdout, "hp 0 %u\n", WLRX_NDESC * WLRX_IDLE_DW);
 	fflush(stdout);
 	free(ra); free(la);
+}
+
+/* For the L19 re-derivation: the two RX_RING_SELECTION_CFG, every ring's nine writes, the REO setup writes from GEN 0x1 and
+ * MISC 0x01fe0001, the pre-read addresses and the TP shadow indices, for a REO arena at 0xa2600000. */
+static void
+dump_c2d(void)
+{
+	static struct wlrd rd;
+	uint8_t *ro = aligned_alloc(16384, REOA);
+	uint32_t w[17], regs[WLRD_RING_REGS][2], hw[WLRD_HW_REGS][2];
+	CHECK(ro && !wlrd_layout(&rd, ro, 0xa2600000ull, REOA), "dump layout");
+	for (unsigned m = 0; m < 2; m++) {
+		wlrd_sel_words(m, w);
+		for (unsigned k = 0; k < 17; k++) { fprintf(stdout, "sel%u %u %u\n", m, k, w[k]); }
+	}
+	for (unsigned i = 0; i < WLRD_NRING; i++) {
+		wlrd_ring_regs(&rd, i, regs);
+		for (unsigned k = 0; k < WLRD_RING_REGS; k++) { fprintf(stdout, "ring%u %u %u %u\n", rd.ring[i].id, k, regs[k][0], regs[k][1]); }
+		for (unsigned j = 0; j < 36; j++) { if (wl15_shadow_v3[j] == rd.ring[i].r2 + 4u) { fprintf(stdout, "shadow%u 0 %u\n", rd.ring[i].id, j); } }
+	}
+	wlrd_hw_regs(0x1u, 0x01fe0001u, hw);
+	for (unsigned k = 0; k < WLRD_HW_REGS; k++) { fprintf(stdout, "hw %u %u %u\n", k, hw[k][0], hw[k][1]); }
+	for (unsigned i = 0; i < WLRD_PRE_N; i++) { fprintf(stdout, "pre %u %u\n", i, wlrd_pre_addr(i)); }
+	fflush(stdout);
+	free(ro);
 }
 
 static void
@@ -3701,6 +4504,13 @@ main(int argc, char **argv)
 	if (argc == 2 && !strcmp(argv[1], "dump-init")) { dump_init(); return 0; }
 	if (argc == 2 && !strcmp(argv[1], "dump-c2")) { dump_c2(); return 0; }
 	if (argc == 2 && !strcmp(argv[1], "dump-c2c")) { dump_c2c(); return 0; }
+	if (argc == 2 && !strcmp(argv[1], "dump-c2d")) { dump_c2d(); return 0; }
+	if (argc == 2 && !strcmp(argv[1], "c2d")) {  /* the C2d scenarios alone (the mutant runs of tools/test-fuxi-wlan-ce.py) */
+		s_c2d_pure(); s_c2d_happy(); s_c2d_wedge(); s_c2d_exhaust(); s_c2d_entries(); s_c2d_contain(); s_c2d_failures(); s_c2d_widest();
+		reset();
+		puts("C2d model: all scenarios passed");
+		return 0;
+	}
 	s_pure();
 	s_no_w20();
 	s_happy_shadow();
@@ -3735,6 +4545,14 @@ main(int argc, char **argv)
 	s_c2c_failures();
 	s_c2c_contain();
 	s_c2c_widest();
+	s_c2d_pure();
+	s_c2d_happy();
+	s_c2d_wedge();
+	s_c2d_exhaust();
+	s_c2d_entries();
+	s_c2d_contain();
+	s_c2d_failures();
+	s_c2d_widest();
 	reset();
 	puts("W20 model: all scenarios passed");
 	return 0;
