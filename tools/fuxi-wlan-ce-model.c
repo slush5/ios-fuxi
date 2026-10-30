@@ -26,6 +26,18 @@
  *   field.
  *   Order: every rdp load is followed by the read barrier, every pointer
  *   publish of a live ring is preceded by the write barrier.
+ *   C2 (fuxiwlanqrtr=7): CE4 TX slots and the HTT version exchange; the
+ *   channel list (every word, the APPEND split, the array header L19 sends
+ *   4 short), VDEV_CREATE, NSS, three STA power-save parameters and power
+ *   save off in L19 order, START_SCAN word by word (passive, no SSID, no IE,
+ *   no probe), then a scripted scan: STARTED, per channel FOREIGN_CHAN and
+ *   CHAN_INFO, MGMT_RX beacons and probe responses (malformed IEs, truncated
+ *   frames, zero-length and all-zero SSIDs, duplicate BSSIDs, more than 64
+ *   BSSIDs, dropped statuses and channels), COMPLETED; STOP_SCAN checked
+ *   field by field and only before the containment latch. SERVICE_READY_EXT
+ *   lists SINGLE and DBS with the MAC/PHY caps of both (L19's preferred-mode
+ *   PHYs feed the streams); a guard failure after START_SCAN and a STOP_SCAN
+ *   whose TX never completes are scripted too.
  * No device, no network. L19 = Linux ath12k v6.19 (BSD-3-Clause-Clear).
  */
 #include <assert.h>
@@ -135,6 +147,14 @@ struct cfg {
 	uint32_t mem_reqs, ready_status, mrrs_old, ext_delay;
 	unsigned rdp_glitch, win_mismatch_at, fault_after, restore_lie_at;
 	int sts_rdp_delta;                  /* one CE2 STATUS rdp write, relative to the host TP, after 3 messages */
+	/* C2 */
+	unsigned scan_mode;                 /* 0 normal, 1 START_FAILED, 2 no STARTED, 3 no COMPLETED, 4 COMPLETED first */
+	bool no_start_refund, htt_silent, bad_scan_tlv, wrong_vdev;
+	bool ext_single_last;               /* EXT lists DBS first, SINGLE (1x1) last */
+	bool guard_after_start;             /* the W11 guard fails once the firmware took START_SCAN */
+	bool stop_tx_stuck;                 /* CE3 never consumes the STOP_SCAN descriptor */
+	unsigned extra_unknown;             /* unknown WMI events after READY (the 16-line budget) */
+	uint32_t phy_bands, phy_mask, htt_major, htt_minor, exp_n, exp_pdev;
 };
 static struct cfg C;
 static unsigned restores;
@@ -149,6 +169,11 @@ static int fw_credits;
 static unsigned fw_seq[9], fw_eid_used, fw_wmi_msgs, fw_init_ok, fw_hw_mode_ok, fw_echoes, fw_tx_msgs, fw_ext_q, fw_ext2_q;
 static bool fw_svc281, guard_bad;
 static uint32_t fw_chains = 2;
+/* C2 firmware: command order step, channels seen, counters */
+static unsigned fw_c2_step, fw_chan_seen, fw_chan_cmds, fw_scan_cmds, fw_stop_cmds, fw_htt_req, fw_stop_pdev;
+struct mbeacon { unsigned idx; uint32_t rx_channel, snr, status, chan_freq, mode, len; uint8_t f[400]; };
+static struct mbeacon beacons[96];
+static unsigned n_beacons;
 
 static void
 fail(const char *why)
@@ -226,21 +251,24 @@ dev_publish(struct dring *r, uint32_t v)
 {
 	CHECK(v < r->size && v % r->edw == 0, "published pointer outside the ring or misaligned");
 	if (r->kind == K_SRC) {
-		uint32_t pipe_lo = r->ce == 0 ? 0x10000u : 0x18000u, pipe_hi = r->ce == 0 ? 0x18000u : 0x28000u;
-		CHECK(r->ce == 0 || r->ce == 3, "TX on a pipe without TX slots");
+		/* TX slots: CE0 16 x 2 KiB, CE3 32 x 2 KiB, CE4 16 x 256 B (C2 HTT only) */
+		uint32_t pipe_lo = r->ce == 0 ? 0x10000u : r->ce == 3 ? 0x18000u : 0x66000u;
+		uint32_t pipe_hi = r->ce == 0 ? 0x18000u : r->ce == 3 ? 0x28000u : 0x67000u, bsz = r->ce == 4 ? 256u : WLCE_BUF;
+		CHECK(r->ce == 0 || r->ce == 3 || r->ce == 4, "TX on a pipe without TX slots");
 		while (r->dev != v) {
 			uint8_t *e = dev_mem(r->base + 4ull * r->dev, 16, 0x1000, 0x10000, "SRC descriptor outside the rings");
 			uint32_t w0 = g32(e), w1 = g32(e + 4), w2 = g32(e + 8), len = w1 >> 16;
 			uint64_t a = w0 | (uint64_t)(w1 & 0xff) << 32;
 			CHECK((w1 & 0xff00u) == 0, "SRC descriptor byte swap/gather/hash bits set");
-			CHECK(len && len <= WLCE_BUF, "SRC length 0 or above 2048");
-			CHECK(a == arena_iova + pipe_lo + (uint64_t)(r->dev / 4 % ((pipe_hi - pipe_lo) / WLCE_BUF)) * WLCE_BUF,
+			CHECK(len && len <= bsz, "SRC length 0 or above the pipe's buffer size");
+			CHECK(a == arena_iova + pipe_lo + (uint64_t)(r->dev / 4 % ((pipe_hi - pipe_lo) / bsz)) * bsz,
 			    "SRC buffer is not the TX slot of its entry");
 			uint8_t *buf = dev_mem(a, len, pipe_lo, pipe_hi, "TX read outside the pipe's TX slots");
 			uint8_t copy[WLCE_BUF];
 			memcpy(copy, buf, len);
 			r->dev = (r->dev + 4) % r->size;
-			write_rdp(r, r->dev);
+			/* stop_tx_stuck: the STOP_SCAN descriptor's completion never shows in the rdp TP word */
+			if (!(C.stop_tx_stuck && r->ce == 3 && len >= 12 && (g32(copy + 8) & 0xffffffu) == 0x3002u)) { write_rdp(r, r->dev); }
 			fw_tx_msgs++;
 			fw_rx(r->ce, w2 & 0xffffu, copy, len);
 		}
@@ -414,6 +442,15 @@ fw_rings_ready(void)
 	q_push(C.ready_ce, 3, d, 16, C.ready_stslen);
 }
 
+/* One MAC/PHY capability TLV (108 bytes): hw mode, pdev 1, phy id, supported_bands (word 4), the 2 GHz
+ * (12/13) and 5 GHz (20/21) tx/rx chain masks, the rest 0 (wmi.h ath12k_wmi_mac_phy_caps_params). */
+static void
+m_mac_phy(uint32_t hw_mode, uint32_t phy, uint32_t bands, uint32_t mask)
+{
+	m_tlv(0x210, 108); m_u32(hw_mode); m_u32(1); m_u32(phy); m_u32(0); m_u32(bands); m_zero(7 * 4);
+	m_u32(mask); m_u32(mask); m_zero(6 * 4); m_u32(mask); m_u32(mask); m_zero(5 * 4);
+}
+
 static void
 fw_service_ready_set(void)
 {
@@ -446,14 +483,27 @@ fw_service_ready_set(void)
 	m_tlv(0x10, 16); m_u32(1u << 25); m_u32(0); m_u32(0); m_u32(0);
 	fw_svc281 = true;
 	wmi_out(0x3, 0, 3);
-	m_reset();  /* SERVICE_READY_EXT: fixed, 2 hw modes, 2 hw mode caps, 1 MAC/PHY cap with pdev 1 */
+	/* SERVICE_READY_EXT: fixed, 2 hw modes, SINGLE (PHY map 0x1) then DBS (0x3), and the 3 MAC/PHY caps that
+	 * follow from them, pdev 1 in each. SINGLE: both bands, 1x1. DBS PHY 0: 2 GHz (of C.phy_bands), mask
+	 * C.phy_mask & 1; DBS PHY 1: 5 GHz (of C.phy_bands), mask C.phy_mask. ext_single_last lists DBS first. */
+	m_reset();
 	m_tlv(0x1ac, 76); m_zero(76);
 	m_tlv(0x212, 8); m_u32(2); m_u32(0);
 	m_tlv(0x12, 2 * 16);
-	for (unsigned i = 0; i < 2; i++) { m_tlv(0x211, 12); m_u32(i); m_u32(1); m_u32(i); }
-	m_tlv(0x12, C.ext_nested_overrun ? 40u : 4u + 108u);
-	m_tlv(0x210, C.ext_nested_overrun ? 108u : 108u); m_u32(0); m_u32(1);
-	m_zero(C.ext_nested_overrun ? 28u : 100u);
+	for (unsigned i = 0; i < 2; i++) {
+		unsigned mode = C.ext_single_last ? 1 - i : i;  /* 0 SINGLE, 1 DBS */
+		m_tlv(0x211, 12); m_u32(mode); m_u32(mode ? 3u : 1u); m_u32(mode);
+	}
+	if (C.ext_nested_overrun) {
+		m_tlv(0x12, 40u); m_tlv(0x210, 108u); m_u32(0); m_u32(1); m_zero(28u);
+	} else {
+		m_tlv(0x12, 3u * (4u + 108u));
+		for (unsigned i = 0; i < 3; i++) {
+			bool single = C.ext_single_last ? i == 2 : i == 0;
+			unsigned phy = single ? 0u : C.ext_single_last ? i : i - 1;
+			m_mac_phy(single ? 0u : 1u, phy, single ? 3u : C.phy_bands & (phy ? 2u : 1u), single ? 1u : phy ? C.phy_mask : C.phy_mask & 1u);
+		}
+	}
 	fw_ext_q = q_tail;  /* queue position: delivered once q_head passed it */
 	wmi_out(0x4009, 0, C.ext_delay ? C.ext_delay : 4);
 	if (!C.no_ext2_service) {
@@ -484,6 +534,212 @@ fw_check_init(const uint8_t *p, uint32_t len)
 	}
 	CHECK(g32(rc + 292) == (0x12u << 16), "INIT trailing ARRAY_STRUCT not empty");
 	fw_init_ok++;
+}
+
+/* ---- C2 firmware: values written down here again from L19 and the owner's channel list ---- */
+static uint32_t
+m_chan(unsigned i)  /* 2.4 GHz 1-13, then 36-48, 52-64, 100-144, 149-165 */
+{
+	static const uint32_t five[25] = {5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320, 5500, 5520, 5540, 5560, 5580,
+	                                  5600, 5620, 5640, 5660, 5680, 5700, 5720, 5745, 5765, 5785, 5805, 5825};
+	return i < 13 ? 2412u + 5u * i : five[i - 13];
+}
+static uint32_t m_chan_no(uint32_t mhz) { return mhz < 3000 ? (mhz - 2407) / 5 : (mhz - 5000) / 5; }
+
+/* a credit report in a trailer-only HTC message, DELAY ms later */
+static void
+fw_refund(unsigned need, uint32_t delay)
+{
+	uint8_t d[16] = {0, 0, 0, 0, 8, 0, 0, 0, 1, 4, 0, 0, (uint8_t)C.wmi_eid, (uint8_t)need, 0, 0};
+	p32(d, C.wmi_eid | 2u << 8 | 8u << 16);
+	fw_credits += (int)need;
+	q_push(2, delay, d, 16, -1);
+}
+
+static void
+fw_scan_event(uint32_t type, uint32_t reason, uint32_t freq, uint32_t vdev, uint32_t at)
+{
+	m_reset(); m_tlv(0x24, 28); m_u32(type); m_u32(reason); m_u32(freq); m_u32(1); m_u32(0xa000); m_u32(vdev); m_u32(at);
+	if (C.bad_scan_tlv && type == 8 && freq == 2437) { mb[0] = 0x40; }  /* TLV length 64: past the event */
+	wmi_out(0x3001, 0, at);
+}
+
+static void
+fw_chan_info(uint32_t flags, uint32_t freq, int32_t nf, uint32_t at)
+{
+	m_reset(); m_tlv(0x26, 56); m_u32(0); m_u32(freq); m_u32(flags); m_u32((uint32_t)nf); m_u32(1200); m_u32(40000);
+	m_zero(7 * 4); m_u32(0);
+	wmi_out(0x4002, 0, at);
+}
+
+/* MGMT_RX: TLV 0x2c (68 bytes) + the frame in an ARRAY_BYTE padded to 4. Modes: 1 no frame TLV, 2 buf_len
+ * past the byte array, 3 header TLV of 64 bytes. */
+static void
+fw_mgmt_rx(const struct mbeacon *b, uint32_t at)
+{
+	m_reset();
+	m_tlv(0x2c, b->mode == 3 ? 64u : 68u);
+	m_u32(b->rx_channel); m_u32(b->snr); m_u32(6000); m_u32(b->rx_channel <= 14 ? 1u : 0u);
+	m_u32(b->mode == 2 ? b->len + 8 : b->len); m_u32(b->status); m_zero(16); m_u32(0); m_u32(b->snr - 95); m_zero(12);
+	m_u32(1);
+	if (b->mode != 3) { m_u32(b->chan_freq); }
+	if (b->mode != 1) {
+		uint32_t pad = (b->len + 3) & ~3u;
+		m_tlv(0x11, pad); memcpy(mb + ml, b->f, b->len); ml += pad;
+	}
+	wmi_out(0x7001, 0, at);
+}
+
+/* An 802.11 management frame: subtype 8 beacon, 5 probe response, 4 probe request. SSID_LEN < 0: no SSID
+ * element; SSID NULL with a length: that many zero bytes. */
+static uint32_t
+mk_frame(uint8_t *f, unsigned sub, const uint8_t *bssid, uint16_t cap, const char *ssid, int ssid_len, unsigned ds,
+    unsigned ht, bool rsn)
+{
+	static const uint8_t rsn_ie[20] = {1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 2, 0, 0};
+	uint32_t o = 36;
+	memset(f, 0, 400);
+	f[0] = (uint8_t)(sub << 4);
+	memset(f + 4, 0xff, 6); memcpy(f + 10, bssid, 6); memcpy(f + 16, bssid, 6);
+	f[32] = 100; f[34] = (uint8_t)cap; f[35] = (uint8_t)(cap >> 8);
+	if (ssid_len >= 0) { f[o++] = 0; f[o++] = (uint8_t)ssid_len; if (ssid) { memcpy(f + o, ssid, (size_t)ssid_len); } o += (uint32_t)ssid_len; }
+	f[o++] = 1; f[o++] = 4; f[o++] = 0x82; f[o++] = 0x84; f[o++] = 0x8b; f[o++] = 0x96;
+	if (ds) { f[o++] = 3; f[o++] = 1; f[o++] = (uint8_t)ds; }
+	if (rsn) { f[o++] = 48; f[o++] = 20; memcpy(f + o, rsn_ie, 20); o += 20; }
+	if (ht) { f[o++] = 61; f[o++] = 22; f[o++] = (uint8_t)ht; o += 21; }
+	return o;
+}
+
+static struct mbeacon *
+add_frame(unsigned idx, uint32_t snr, unsigned sub, const uint8_t *bssid, uint16_t cap, const char *ssid, int ssid_len,
+    unsigned ds, unsigned ht, bool rsn)
+{
+	CHECK(n_beacons < sizeof(beacons) / sizeof(beacons[0]), "model beacon table");
+	struct mbeacon *b = &beacons[n_beacons++];
+	memset(b, 0, sizeof(*b));
+	b->idx = idx; b->snr = snr; b->chan_freq = m_chan(idx); b->rx_channel = m_chan_no(b->chan_freq);
+	b->len = mk_frame(b->f, sub, bssid, cap, ssid, ssid_len, ds, ht, rsn);
+	return b;
+}
+
+/* START_SCAN accepted: the scan as a script in time order. Per channel I (150 ms): FOREIGN_CHAN at t0,
+ * CHAN_INFO START at t0 + 1, the frames heard there from t0 + 2, CHAN_INFO END at t0 + 148. */
+static void
+fw_scan_script(unsigned n)
+{
+	uint32_t t = 2;
+	if (C.scan_mode == 1) { fw_scan_event(1u << 6, 4, 0, 0, t); return; }
+	if (C.scan_mode == 2) { return; }
+	if (C.scan_mode == 4) { fw_scan_event(1u << 1, 0, 0, 0, t); return; }
+	fw_scan_event(1u << 0, 0, 0, 0, t);
+	if (C.wrong_vdev) { fw_scan_event(1u << 3, 0, 2412, 3, t); }
+	for (unsigned i = 0; i < n; i++) {
+		uint32_t t0 = 5 + 150 * i, k = 0;
+		fw_scan_event(1u << 3, 0, m_chan(i), 0, t0);
+		fw_chan_info(0, m_chan(i), -96 - (int32_t)(i % 5), t0 + 1);
+		if (i == 2) {  /* an unprompted event mid-scan: logged by id only */
+			m_reset(); m_tlv(0x400, 12); m_zero(12); wmi_out(0x402b, 0, t0 + 1);
+		}
+		for (unsigned j = 0; j < n_beacons; j++) {
+			if (beacons[j].idx == i) { fw_mgmt_rx(&beacons[j], t0 + 2 + k++); }
+		}
+		fw_chan_info(1, m_chan(i), 0, t0 + 148);
+	}
+	if (C.scan_mode != 3) { fw_scan_event(1u << 1, 0, 0, 0, 5 + 150 * n + 1); }
+}
+
+static void
+fw_c2_cmd(uint32_t id, const uint8_t *pl, uint32_t plen, unsigned need)
+{
+	const uint8_t *v = pl + 8;   /* the fixed TLV's value */
+	uint32_t exp_n = C.exp_n, pdev = C.exp_pdev;
+	if (id == 0x3003) {  /* SCAN_CHAN_LIST (wmi.c:2880-2997, reg.c:183-238) */
+		CHECK(fw_init_ok == 1 && (fw_hw_mode_ok == 1 || (wl20_bits & WL20_NOHWMODE)), "channel list before INIT/HW mode");
+		CHECK(!(wl20_bits & WL20_HTTVER) || fw_htt_req == 1, "channel list before the HTT version exchange");
+		CHECK(fw_c2_step == 0, "channel list out of order");
+		uint32_t k = g32(v), flags = g32(v + 4);
+		CHECK(g32(pl + 4) == (0x4fu << 16 | 12u) && k && fw_chan_seen + k <= exp_n && g32(v + 8) == pdev,
+		    "SCAN_CHAN_LIST fixed TLV (tag, count, pdev)");
+		CHECK(flags == (fw_chan_cmds ? 1u : 0u), "SCAN_CHAN_LIST APPEND flag only after the first command");
+		CHECK(plen == 20 + 4 + 28 * k && g32(pl + 20) == (0x12u << 16 | (28 * k - 4)), "SCAN_CHAN_LIST array header (L19: 4 short)");
+		for (uint32_t i = 0; i < k; i++) {
+			const uint8_t *c = pl + 24 + 28 * i;
+			uint32_t mhz = m_chan(fw_chan_seen + i);
+			bool dfs = (mhz >= 5260 && mhz <= 5320) || (mhz >= 5500 && mhz <= 5720);
+			uint32_t info = (mhz < 3000 ? 1u : 0u) | 1u << 7 | 1u << 17 | (dfs ? 1u << 10 : 0u);
+			CHECK(g32(c) == (0x50u << 16 | 24u) && g32(c + 4) == mhz && g32(c + 8) == mhz && g32(c + 12) == 0, "channel TLV/mhz/cfreq");
+			CHECK(g32(c + 16) == info, "channel info is not MODE | PASSIVE | ALLOW_HE (| DFS)");
+			CHECK(g32(c + 20) == (40u << 8 | 40u << 16) && g32(c + 24) == 40u << 8, "channel reg_info");
+		}
+		fw_chan_seen += k; fw_chan_cmds++;
+		if (fw_chan_seen == exp_n) { fw_c2_step = 1; }
+	} else if (id == 0x5001) {  /* VDEV_CREATE (wmi.c:923-1010, mac.c:9727-9780) */
+		static const uint8_t mac[8] = {0x02, 0x46, 0x55, 0x58, 0x49, 0x01, 0, 0};
+		uint32_t tx = (uint32_t)__builtin_popcount(C.phy_mask), want_tx[2];
+		if (!C.phy_bands || !tx) { tx = fw_chains; }
+		uint32_t bands = C.phy_bands && C.phy_mask ? C.phy_bands : 3u;
+		want_tx[0] = bands & 1 ? tx : 0; want_tx[1] = bands & 2 ? tx : 0;
+		CHECK(fw_c2_step == 1, "VDEV_CREATE before the whole channel list");
+		CHECK(plen == 88 && g32(pl + 4) == (0x56u << 16 | 44u) && g32(v) == 0 && g32(v + 4) == 2 && g32(v + 8) == 0,
+		    "VDEV_CREATE length/tag/vdev 0/type STA/subtype 0");
+		CHECK(!memcmp(v + 12, mac, 8), "VDEV_CREATE MAC is not the K-W2 address + 2 pad");
+		CHECK(g32(v + 20) == 2 && g32(v + 24) == pdev && g32(v + 28) == 1 && g32(v + 32) == 0 && g32(v + 36) == 1 &&
+		    g32(v + 40) == 0, "VDEV_CREATE streams/pdev/mbssid/stats id");
+		CHECK(g32(pl + 52) == (0x12u << 16 | 32u), "VDEV_CREATE txrx streams array header");
+		for (unsigned b = 0; b < 2; b++) {
+			const uint8_t *s = pl + 56 + 16 * b;
+			CHECK(g32(s) == (0x19bu << 16 | 12u) && g32(s + 4) == b && g32(s + 8) == want_tx[b] && g32(s + 12) == want_tx[b],
+			    "VDEV_TXRX_STREAMS");
+		}
+		fw_c2_step = 2;
+	} else if (id == 0x5008) {  /* VDEV_SET_PARAM NSS (mac.c:10091-10093) */
+		uint32_t nss = C.phy_bands && C.phy_mask ? (uint32_t)__builtin_popcount(C.phy_mask) : fw_chains;
+		CHECK(fw_c2_step == 2 && plen == 20 && g32(pl + 4) == (0x5fu << 16 | 12u) && g32(v) == 0 && g32(v + 4) == 0x22 &&
+		    g32(v + 8) == nss, "VDEV_SET_PARAM is not NSS after VDEV_CREATE");
+		fw_c2_step = 3;
+	} else if (id == 0x9002) {  /* STA_POWERSAVE_PARAM: RX wake WAKE, TX wake ALWAYS, PS-Poll NO_MAX (mac.c:10121-10149) */
+		static const uint32_t want[3][2] = {{0, 0}, {1, 1}, {2, 0}};
+		unsigned i = fw_c2_step - 3;
+		CHECK(fw_c2_step >= 3 && fw_c2_step <= 5 && plen == 20 && g32(pl + 4) == (0x6du << 16 | 12u) && g32(v) == 0 &&
+		    g32(v + 4) == want[i][0] && g32(v + 8) == want[i][1], "STA_POWERSAVE_PARAM order/values");
+		fw_c2_step++;
+	} else if (id == 0x9001) {  /* STA_POWERSAVE_MODE disabled (mac.c:10151) */
+		CHECK(fw_c2_step == 6 && plen == 16 && g32(pl + 4) == (0x6cu << 16 | 8u) && g32(v) == 0 && g32(v + 4) == 0,
+		    "STA_POWERSAVE_MODE is not off after the three parameters");
+		fw_c2_step = 7;
+	} else if (id == 0x3001) {  /* START_SCAN (wmi.c:2541-2830, mac.c:5335-5366) */
+		uint32_t want[40] = {0};
+		want[0] = 0x4du << 16 | 156u; want[1] = 0xa000; want[2] = 1; want[3] = 0; want[4] = 0; want[5] = 0x5f;
+		want[6] = 50; want[7] = 150; want[8] = 50; want[9] = 500; want[13] = exp_n * 150 * 3 / 2; want[14] = 5;
+		want[15] = 0x11; want[17] = exp_n; want[18] = 1; want[36] = 0; want[37] = 70; want[38] = 70;
+		CHECK(fw_c2_step == 7, "START_SCAN before the vdev was set up");
+		CHECK(plen == 4 + 160 + 4 + 4 * exp_n + 4 + 4 + 8 + 4, "START_SCAN length");
+		for (unsigned i = 0; i < 40; i++) {
+			if (g32(pl + 4 + 4 * i) != want[i]) { fprintf(stderr, "START_SCAN word %u = %#x, want %#x\n", i, g32(pl + 4 + 4 * i), want[i]); fail("START_SCAN"); }
+		}
+		const uint8_t *p = pl + 164;
+		CHECK(g32(p) == (0x10u << 16 | 4 * exp_n), "START_SCAN channel array header");
+		for (unsigned i = 0; i < exp_n; i++) { CHECK(g32(p + 4 + 4 * i) == m_chan(i), "START_SCAN channel"); }
+		p += 4 + 4 * exp_n;
+		CHECK(g32(p) == (0x13u << 16), "START_SCAN SSID array is not empty");
+		CHECK(g32(p + 4) == (0x13u << 16 | 8u) && !memcmp(p + 8, "\xff\xff\xff\xff\xff\xff\0\0", 8), "START_SCAN BSSID array");
+		CHECK(g32(p + 16) == (0x11u << 16), "START_SCAN IE array is not empty");
+		fw_scan_cmds++; fw_c2_step = 8;
+		if (C.guard_after_start) { guard_bad = true; }  /* e.g. AMSS left EE 2 or an SMMU CB fault */
+		if (!C.no_start_refund) { fw_refund(need, 1); }
+		fw_scan_script(exp_n);
+		return;
+	} else if (id == 0x3002) {  /* STOP_SCAN (mac.c:4883-4896, wmi.c:2832-2878) */
+		CHECK(fw_c2_step == 8 && !wl_ce.stopping, "STOP_SCAN without a scan, or after the latch");
+		CHECK(plen == 28 && g32(pl + 4) == (0x4eu << 16 | 20u) && g32(v) == 0 && g32(v + 4) == 0xa000 && g32(v + 8) == 0 &&
+		    g32(v + 12) == 0, "STOP_SCAN requester/scan id/STOP_ONE/vdev");
+		fw_stop_pdev = g32(v + 16);
+		fw_stop_cmds++;
+		return;
+	} else {
+		fail("unexpected C2 WMI command");
+	}
+	fw_refund(need, 1);
 }
 
 static void
@@ -520,6 +776,18 @@ fw_rx(unsigned ce, uint32_t eid, const uint8_t *d, uint32_t len)
 		}
 		return;
 	}
+	if (eid != C.wmi_eid && eid == C.htt_eid) {  /* C2 w20 0x02: HTT VERSION_REQ (dp_tx.c:1277-1305) on CE4 */
+		CHECK(ce == 4 && flags == 0 && plen == 8 && g32(pl) == 0 && g32(pl + 4) == (5u | 4u << 8 | 2u << 16),
+		    "HTT VERSION_REQ is not {msg 0, TCL metadata option tag 5 len 4 value 2} on CE4");
+		CHECK(fw_init_ok == 1 && fw_c2_step == 0, "HTT VERSION_REQ out of order");
+		fw_htt_req++;
+		if (!C.htt_silent) {
+			uint8_t r[4];
+			p32(r, 0u | C.htt_minor << 8 | C.htt_major << 16);
+			htc_out(1, C.htt_eid, r, 4, -1, 0, 2);
+		}
+		return;
+	}
 	CHECK(eid == C.wmi_eid && ce == 3 && flags == 1, "WMI message off its endpoint/pipe or without NEED_CREDIT_UPDATE");
 	int need = (int)((len + C.credit_size - 1) / C.credit_size);
 	CHECK(fw_credits >= need, "the host sent WMI without credits");
@@ -543,6 +811,10 @@ fw_rx(unsigned ce, uint32_t eid, const uint8_t *d, uint32_t len)
 			m_reset(); m_zero(2048u - 8u - 4u);
 			wmi_out(0x7ff2, 0, 5);
 		}
+		for (unsigned i = 0; i < C.extra_unknown; i++) {  /* unknown events that use up the 16-line budget */
+			m_reset(); m_tlv(0x400, 4); m_zero(4);
+			wmi_out(0x7ff3, 0, 5);
+		}
 		if (C.refund_later) {  /* trailer-only HTC message 50 ms later: credits, no payload */
 			uint8_t d2[16] = {0, 0, 0, 0, 8, 0, 0, 0, 1, 4, 0, 0, (uint8_t)C.wmi_eid, (uint8_t)need, 0, 0};
 			p32(d2, C.wmi_eid | 2u << 8 | 8u << 16);
@@ -555,6 +827,9 @@ fw_rx(unsigned ce, uint32_t eid, const uint8_t *d, uint32_t len)
 		fw_hw_mode_ok++;
 		m_reset(); m_tlv(0x206, 8); m_zero(8);
 		wmi_out(0x4010, (unsigned)need, 3);
+	} else if (id == 0x3001 || id == 0x3002 || id == 0x3003 || id == 0x5001 || id == 0x5008 || id == 0x9001 || id == 0x9002) {
+		CHECK(wl_w23, "a C2 command with qrtr 6");
+		fw_c2_cmd(id, pl, plen, (unsigned)need);
 	} else {
 		CHECK(id == 0x7ff0, "unexpected WMI command");
 		fw_echoes++;
@@ -672,6 +947,10 @@ static int wl_smmu_undo(void) { return 0; }
 static int io_never_wr(void *ctx, uint32_t off, uint32_t v) { (void)ctx; (void)off; (void)v; fail("pure code reached hardware"); return 1; }
 static int io_never_rd(void *ctx, uint32_t off, uint32_t *v) { (void)ctx; (void)off; *v = ~0u; fail("pure code reached hardware"); return 1; }
 static void io_never_barrier(void *ctx) { (void)ctx; fail("pure code reached a barrier"); }
+/* C2 pure CE4 test: shadow publishes accepted and counted nowhere, barriers in the model's order check */
+static int io_sink_bar(void *ctx, uint32_t off, uint32_t v) { (void)ctx; (void)off; (void)v; return 0; }
+static void io_model_w(void *ctx) { (void)ctx; model_barrier('W'); }
+static void io_model_r(void *ctx) { (void)ctx; model_barrier('R'); }
 
 /* ---- scenarios ---- */
 static void
@@ -680,6 +959,7 @@ reset(void)
 	if (wl_ce_arena.va) { free((void *)wl_ce_arena.va); memset(&wl_ce_arena, 0, sizeof(wl_ce_arena)); }
 	memset(&C, 0, sizeof(C));
 	C.credits = 4; C.credit_size = 2048; C.ready_ce = 2; C.htt_eid = 1; C.wmi_eid = 2; C.max_msg = 2048; C.ready_stslen = -1;
+	C.phy_bands = 3; C.phy_mask = 3; C.htt_major = 3; C.htt_minor = 4; C.exp_n = 38; C.exp_pdev = 0;
 	loglen = 0; logbuf[0] = 0;
 	memcpy(dr, ring_plan, sizeof(dr));
 	for (unsigned i = 0; i < 7; i++) {
@@ -700,6 +980,10 @@ reset(void)
 	wl_w15 = wl_w12 = wl_w20 = true; wl_w11_ok = false; wl_w11_attempted = true; wl_mhi_valid = true;
 	wl12_stage = WL15_OBSERVE; wl_iova_next = 0xa1234000ull;
 	memset(&wl_ce, 0, sizeof(wl_ce)); wl_ce_started = false;
+	wl_w23 = false; memset(&wl_scan, 0, sizeof(wl_scan)); wl23_scan_sent = wl23_htt_seen = false;
+	wl23_lines = wl23_pdev = wl23_htt_major = wl23_htt_minor = wl23_rssi_conv = 0; wl23_guard_bad = false;
+	fw_c2_step = fw_chan_seen = fw_chan_cmds = fw_scan_cmds = fw_stop_cmds = fw_htt_req = 0; fw_stop_pdev = ~0u;
+	n_beacons = 0;
 }
 
 static void
@@ -748,9 +1032,9 @@ contained_and_freed(void)
 }
 
 static void
-happy_lines(void)
+happy_lines(bool c2)
 {
-	static const char *const lines[] = {
+	const char *const lines[] = {
 		"FUXI WLAN: W20 ce arena IOVA 0xa1280000 bytes 0x80000 Normal-NC mapped; rdp 0xa1280000",
 		"FUXI WLAN: W20 ce ring 64 entries 16 base 0xa1281000 misc 0x42 readback ok",
 		"FUXI WLAN: W20 ce ring 82 entries 512 base 0xa1282000 misc 0x42 dest-ctrl 0x800 readback ok",
@@ -776,7 +1060,7 @@ happy_lines(void)
 		"FUXI WLAN: W22 wmi event 0x3a003 bytes 44 (logged only)",
 		"FUXI WLAN: W22 wmi event 0x4010 bytes 12 (logged only)",
 		"FUXI WLAN: W22 hw mode response seen; wmi events 7 unknown 1",
-		"FUXI WLAN: W22 complete; stop/contain",
+		c2 ? "FUXI WLAN: W22 complete; W23 scan next" : "FUXI WLAN: W22 complete; stop/contain",
 	};
 	expect_order(lines, sizeof(lines) / sizeof(lines[0]));
 	CHECK(fw_init_ok == 1 && fw_hw_mode_ok == 1, "INIT / HW mode not seen by the firmware");
@@ -787,7 +1071,7 @@ s_happy_shadow(void)
 {
 	reset();
 	CHECK(run() == 0, "happy path (shadow) failed");
-	happy_lines();
+	happy_lines(false);
 	expect("FUXI WLAN: W20 ce shadow 29 30 31 32 33 34 35 (from WLAN_CFG table)");
 	/* services 256..: only the 4 words of the AVAILABLE array, nothing of the RX buffer behind it */
 	CHECK(!wl_wmi.svc_ext2[4] && !wl_wmi.svc_ext2[5] && !wl_wmi.svc_ext2[6] && !wl_wmi.svc_ext2[7],
@@ -809,7 +1093,7 @@ s_happy_direct(void)
 	reset();
 	wl15_variant = 1;
 	CHECK(run() == 0, "happy path (direct R2) failed");
-	happy_lines();
+	happy_lines(false);
 	expect("FUXI WLAN: W20 ce shadow off (fuxiwlanw15=1): pointers go to R2 through the window");
 	CHECK(shadow_writes == 0 && direct_publishes > 20 && n_ev['W'] == direct_publishes, "direct route");
 	contained_and_freed();
@@ -1120,6 +1404,395 @@ s_pure(void)
 	     "shadow writer bounds");
 }
 
+/* ---- C2 scenarios (fuxiwlanqrtr=7) ---- */
+static void c2_reset(void) { reset(); wl_w23 = true; }
+
+static unsigned
+count_text(const char *s)
+{
+	unsigned n = 0;
+	for (const char *p = strstr(logbuf, s); p; p = strstr(p + 1, s)) { n++; }
+	return n;
+}
+
+static const uint8_t B_HOME[6] = {0x3c, 0x84, 0x6a, 0x11, 0x22, 0x33}, B_CAFE[6] = {0x00, 0x1a, 0x2b, 0x44, 0x55, 0x66};
+static const uint8_t B_HID0[6] = {0xa0, 0xb1, 0xc2, 1, 2, 3}, B_HIDZ[6] = {0xa0, 0xb1, 0xc2, 4, 5, 6};
+static const uint8_t B_OFF[6] = {0x74, 0x83, 0xc2, 0xaa, 0xbb, 0xcc}, B_LAB[6] = {0x74, 0x83, 0xc2, 0xdd, 0xee, 0xff};
+static const uint8_t B_X1[6] = {2, 0, 0, 0, 0, 1}, B_X2[6] = {2, 0, 0, 0, 0, 2}, B_X3[6] = {2, 0, 0, 0, 0, 3};
+static const uint8_t B_X4[6] = {2, 0, 0, 0, 0, 4}, B_X5[6] = {2, 0, 0, 0, 0, 5}, B_BC[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+
+/* What the happy scan hears, by channel index (0 = 2412, 4 = 2432, 5 = 2437, 10 = 2462, 13 = 5180, 21 = 5500). */
+static void
+happy_frames(void)
+{
+	struct mbeacon *b;
+	char a33[34];
+	memset(a33, 'A', 33); a33[33] = 0;
+	add_frame(0, 30, 8, B_CAFE, 0x0401, "Caf\xc3\xa9 \"Free\"", 12, 1, 0, false);
+	b = add_frame(0, 22, 8, B_X2, 0x0411, "Trunc", 5, 1, 0, true); b->len = 59;     /* RSN element cut after 5 of 20 bytes */
+	b = add_frame(0, 18, 8, B_X3, 0x0401, "LongName12", 10, 1, 0, false); b->len = 41;  /* the SSID element itself cut */
+	b = add_frame(0, 40, 8, B_X4, 0x0401, "Short", 5, 1, 0, false); b->len = 30;     /* shorter than the fixed fields */
+	b = add_frame(0, 40, 8, B_X4, 0x0401, "CrcBad", 6, 1, 0, false); b->status = 0x01;
+	b = add_frame(0, 40, 8, B_X4, 0x0401, "Chan0", 5, 1, 0, false); b->rx_channel = 0; b->chan_freq = 0;
+	add_frame(0, 40, 4, B_BC, 0, "ProbeReq", 8, 0, 0, false);                       /* a probe request: not a BSS */
+	add_frame(4, 20, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);                   /* adjacent-channel copy, weaker */
+	add_frame(5, 47, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	add_frame(5, 40, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	add_frame(5, 45, 5, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);                   /* probe response, same BSSID */
+	b = add_frame(5, 40, 8, B_X5, 0x0401, "NoFrame", 7, 6, 0, false); b->mode = 1;
+	b = add_frame(5, 40, 8, B_X5, 0x0401, "BufLen", 6, 6, 0, false); b->mode = 2;
+	b = add_frame(5, 40, 8, B_X5, 0x0401, "ShortHdr", 8, 6, 0, false); b->mode = 3;
+	b = add_frame(5, 40, 8, B_X5, 0x0401, "SixGHz", 6, 6, 0, false); b->chan_freq = 5955;
+	add_frame(10, 25, 8, B_HID0, 0x0411, NULL, 0, 11, 0, true);                       /* hidden: zero-length SSID */
+	add_frame(10, 10, 8, B_X1, 0x0401, a33, 33, 11, 0, false);                         /* SSID element of 33 bytes */
+	add_frame(13, 50, 8, B_OFF, 0x0011, "Office-5G", 9, 0, 36, true);                  /* channel from HT operation */
+	add_frame(13, 35, 8, B_HIDZ, 0x0011, NULL, 8, 0, 36, true);                        /* hidden: 8 zero bytes */
+	add_frame(21, 33, 8, B_LAB, 0x0011, "Lab DFS", 7, 0, 100, true);
+}
+
+static const char *const happy_w24[] = {
+	"FUXI WLAN: W24 bss 00:1a:2b:xx:xx:xx ch 1 freq 2412 dBm -65 privacy 0 rsn 0 beacon frames 1 ssid \"Caf\\xc3\\xa9 \\x22Free\\x22\"\n",
+	"FUXI WLAN: W24 bss 02:00:00:xx:xx:xx ch 1 freq 2412 dBm -73 privacy 1 rsn 0 beacon frames 1 ssid \"Trunc\"\n",
+	"FUXI WLAN: W24 bss 02:00:00:xx:xx:xx ch 1 freq 2412 dBm -77 privacy 0 rsn 0 beacon frames 1 ssid <none>\n",
+	"FUXI WLAN: W24 bss 3c:84:6a:xx:xx:xx ch 6 freq 2437 dBm -48 privacy 1 rsn 1 beacon+probe-resp frames 4 ssid \"HomeNet\"\n",
+	"FUXI WLAN: W24 bss a0:b1:c2:xx:xx:xx ch 11 freq 2462 dBm -70 privacy 1 rsn 1 beacon frames 1 ssid <hidden>\n",
+	"FUXI WLAN: W24 bss 02:00:00:xx:xx:xx ch 11 freq 2462 dBm -85 privacy 0 rsn 0 beacon frames 1 ssid <invalid length 33>\n",
+	"FUXI WLAN: W24 bss 74:83:c2:xx:xx:xx ch 36 freq 5180 dBm -45 privacy 1 rsn 1 beacon frames 1 ssid \"Office-5G\"\n",
+	"FUXI WLAN: W24 bss a0:b1:c2:xx:xx:xx ch 36 freq 5180 dBm -60 privacy 1 rsn 1 beacon frames 1 ssid <hidden>\n",
+	"FUXI WLAN: W24 bss 74:83:c2:xx:xx:xx ch 100 freq 5500 dBm -62 privacy 1 rsn 1 beacon frames 1 ssid \"Lab DFS\"\n",
+	"FUXI WLAN: W24 scan summary frames 12 bss 9 ssids 5\n",
+	("FUXI WLAN: W24 scan detail mgmt-rx 20 hidden 3 table-full frames 0 dropped status 1 channel 2 malformed 4 other-mgmt 1 "
+	 "ie-truncated 2 noise-floor -95 dBm (L19 default; rssi-conv events 1, not applied)\n"),
+	"FUXI WLAN: W23 complete; stop/contain\n",
+};
+
+static void
+s_scan_happy(void)
+{
+	c2_reset();
+	C.wrong_vdev = true;
+	happy_frames();
+	CHECK(run() == 0, "C2 happy path failed");
+	happy_lines(true);
+	static const char *const lines[] = {
+		"FUXI WLAN: W22 complete; W23 scan next\n",
+		"FUXI WLAN: W23 chan list 38 passive (2.4 GHz 13, 5 GHz 25, dfs 16) pdev 0 commands 1 bytes 1088\n",
+		"FUXI WLAN: W23 vdev 0 sta created mac 02:46:55:58:49:01 pdev 0 bands 0x3 streams tx 2 rx 2\n",
+		"FUXI WLAN: W23 vdev 0 nss 2, sta ps rx-wake 0 tx-wake 1 pspoll 0, ps mode off\n",
+		"FUXI WLAN: W23 scan start id 0xa000 vdev 0 channels 38 passive dwell 150 ms max 8550 ms events 0x5f flags 0x11\n",
+		"FUXI WLAN: W23 scan started after ",
+		"FUXI WLAN: W23 scan foreign freq 2412\n",
+		"FUXI WLAN: W23 scan foreign freq 2422\n",
+		"FUXI WLAN: W23 wmi event 0x402b bytes 16 (logged only)\n",
+		"FUXI WLAN: W23 scan foreign freq 5500\n",
+		"FUXI WLAN: W23 scan foreign freq 5825\n",
+		"FUXI WLAN: W23 scan completed reason 0 after ",
+		" ms (foreign 38 chan-info 38)\n",
+	};
+	expect_order(lines, sizeof(lines) / sizeof(lines[0]));
+	expect_order(happy_w24, sizeof(happy_w24) / sizeof(happy_w24[0]));
+	CHECK(count_text("W23 scan foreign freq") == 38 && count_text("FUXI WLAN: W24 bss ") == 9, "foreign/bss line counts");
+	CHECK(fw_chan_cmds == 1 && fw_scan_cmds == 1 && fw_c2_step == 8 && wl_scan.wrong_vdev == 1 && wl_scan.ci_end == 38,
+	    "C2 firmware view");
+	CHECK(wl_ce.pipe[2].reaped > 2 * 64, "CE2 did not wrap twice during the scan");
+	CHECK(n_ev['L'] == n_ev['R'] && n_ev['W'] == shadow_publishes, "barriers");
+	expect_not("W23 failure");
+	contained_and_freed();
+	expect("FUXI WLAN: W23 contain: scan over, no STOP_SCAN\n");
+	CHECK(fw_stop_cmds == 0, "STOP_SCAN after a completed scan");
+	puts("W23 happy path: 38 passive channels in one command, STA vdev (K-W2 MAC) + NSS + 3 STA PS params + PS off, "
+	     "passive START_SCAN word by word, 38 foreign channels, CHAN_INFO, 20 MGMT_RX into 9 BSS (dedup, probe response, "
+	     "hidden, all-zero, 33-byte SSID, cut IEs, HT channel, escaped SSID), drops counted, contained without STOP_SCAN");
+}
+
+static void
+s_scan_bits(void)
+{
+	c2_reset();
+	wl20_bits = WL20_HTTVER | WL20_BAND24 | WL20_PDEVCAP;
+	C.exp_n = 13; C.exp_pdev = 1;
+	add_frame(5, 47, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	CHECK(run() == 0, "C2 w20 0x92 failed");
+	static const char *const lines[] = {
+		"FUXI WLAN: W23 htt version 3.4 (w20 0x02)\n",
+		"FUXI WLAN: W23 chan list 13 passive (2.4 GHz 13, 5 GHz 0, dfs 0) pdev 1 commands 1 bytes 388\n",
+		"FUXI WLAN: W23 vdev 0 sta created mac 02:46:55:58:49:01 pdev 1 bands 0x3 streams tx 2 rx 2\n",
+		"FUXI WLAN: W23 scan start id 0xa000 vdev 0 channels 13 passive dwell 150 ms max 2925 ms events 0x5f flags 0x11\n",
+		"FUXI WLAN: W24 bss 3c:84:6a:xx:xx:xx ch 6 freq 2437 dBm -48 privacy 1 rsn 1 beacon frames 1 ssid \"HomeNet\"\n",
+		"FUXI WLAN: W24 scan summary frames 1 bss 1 ssids 1\n",
+	};
+	expect_order(lines, sizeof(lines) / sizeof(lines[0]));
+	CHECK(fw_htt_req == 1 && wl_ce.pipe[4].posted == 1 && wl_ce.pipe[4].reaped == 1 && count_text("scan foreign freq") == 13,
+	    "HTT version on CE4, 13 channels");
+	expect_not("11:22:33");  /* owner decision 6: no whole BSSID in any line */
+	contained_and_freed();
+	expect("FUXI WLAN: W20 ce contain posted 186 reaped 62 tx 14\n");  /* CE0 + CE3 + the one CE4 send */
+	/* HTT major 2: L19 refuses it (dp_tx.c:1319-1323); a silent target: 3 s */
+	c2_reset(); wl20_bits = WL20_HTTVER; C.htt_major = 2;
+	CHECK(run() == 1, "HTT major 2 accepted");
+	expect("FUXI WLAN: W23 htt version 2.4 (w20 0x02)\n");
+	expect("FUXI WLAN: W23 failure: W23 HTT major version is not 3 (L19 refuses it too, dp_tx.c:1319-1323); contain, no retry\n");
+	contained_and_freed();
+	expect_not("W23 contain");
+	c2_reset(); wl20_bits = WL20_HTTVER; C.htt_silent = true;
+	CHECK(run() == 1, "no HTT version reply accepted");
+	expect("FUXI WLAN: W23 timeout HTT VERSION_CONF (3000 ms); contain, no retry\n");
+	expect(" CE4 1/1 rx CE1 ");  /* the snapshot shows the one CE4 send and its completion */
+	CHECK(fw_c2_step == 0 && fw_chan_cmds == 0, "commands after a failed HTT exchange");
+	contained_and_freed();
+	puts("W23 w20 0x92: HTT version 3.4 over CE4/CE1 first, 13 channels (2.4 GHz), pdev from EXT caps, BSSIDs masked, "
+	     "CE4 in the contain/snapshot lines; HTT major 2 refused, no HTT reply times out at 3000 ms");
+}
+
+static void
+s_scan_split_and_caps(void)
+{
+	c2_reset(); C.max_msg = 300;  /* (300 - 20) / 28 = 10 channels per command, as L19 splits (wmi.c:2895-2915) */
+	CHECK(run() == 0, "split channel list");
+	expect("FUXI WLAN: W23 chan list 38 passive (2.4 GHz 13, 5 GHz 25, dfs 16) pdev 0 commands 4 bytes 1160\n");
+	CHECK(fw_chan_cmds == 4 && fw_chan_seen == 38, "channel list split");
+	contained_and_freed();
+	c2_reset(); C.phy_bands = 0;
+	CHECK(run() == 0, "no MAC/PHY bands");
+	expect("FUXI WLAN: W23 vdev 0 sta created mac 02:46:55:58:49:01 pdev 0 bands 0x3 streams tx 2 rx 2 (rf-chains: no MAC/PHY caps)\n");
+	contained_and_freed();
+	c2_reset(); C.phy_bands = 1; C.phy_mask = 1;  /* a 2.4 GHz-only 1x1 PHY: no 5 GHz streams, NSS 1 */
+	CHECK(run() == 0, "2.4 GHz-only caps");
+	expect("FUXI WLAN: W23 vdev 0 sta created mac 02:46:55:58:49:01 pdev 0 bands 0x1 streams tx 1 rx 1\n");
+	expect("FUXI WLAN: W23 vdev 0 nss 1, sta ps");
+	contained_and_freed();
+	/* L19's preferred hw mode (DBS over SINGLE, wmi.c:4538-4551) whatever the listing order: with DBS first and a
+	 * 1x1 SINGLE last, the streams and NSS still come from the DBS PHYs (indices 0 and 1, the last one wins) */
+	c2_reset(); C.ext_single_last = true;
+	CHECK(run() == 0, "SINGLE listed after DBS");
+	expect("FUXI WLAN: W23 vdev 0 sta created mac 02:46:55:58:49:01 pdev 0 bands 0x3 streams tx 2 rx 2\n");
+	expect("FUXI WLAN: W23 vdev 0 nss 2, sta ps");
+	CHECK(wl_wmi.phy_bands == 3 && wl_wmi.phy_tx_mask == 3 && wl_wmi.phy_rx_mask == 3, "chain masks not from the DBS PHYs");
+	contained_and_freed();
+	puts("W23 channel list split by a 300-byte WMI max message (4 commands, APPEND after the first), streams from the "
+	     "preferred hw mode's MAC/PHY caps or rf-chains, 2.4 GHz-only caps, SINGLE listed after DBS");
+}
+
+static void
+s_scan_full(void)
+{
+	c2_reset();
+	for (unsigned i = 0; i < 70; i++) {
+		uint8_t bssid[6] = {0x10, 0x20, 0x30, 0, 0, (uint8_t)i};
+		char ssid[16];
+		snprintf(ssid, sizeof(ssid), "Net-%02u", i);
+		add_frame(i % 38, 30, 8, bssid, 0x0401, ssid, 6, 0, 0, false);
+		if (i == 37) {  /* channel 37 comes after the table filled up: heard twice more, counted per frame */
+			add_frame(i % 38, 31, 8, bssid, 0x0401, ssid, 6, 0, 0, false);
+			add_frame(i % 38, 32, 5, bssid, 0x0401, ssid, 6, 0, 0, false);
+		}
+	}
+	CHECK(run() == 0, "70 BSSIDs");
+	expect("FUXI WLAN: W24 scan summary frames 72 bss 64 ssids 64\n");
+	expect("FUXI WLAN: W24 scan detail mgmt-rx 72 hidden 0 table-full frames 8 ");
+	CHECK(count_text("FUXI WLAN: W24 bss ") == 64 && wl_scan.nbss == 64, "64 BSS lines");
+	expect("FUXI WLAN: W24 bss 10:20:30:xx:xx:xx ch 1 freq 2412 dBm -65 privacy 0 rsn 0 beacon frames 1 ssid \"Net-00\"\n");
+	contained_and_freed();
+	puts("W23 BSS table: 70 BSSIDs heard, 64 kept and printed; 6 BSSIDs past the table in 8 frames, counted as "
+	     "table-full frames");
+}
+
+static void
+s_scan_failures(void)
+{
+	c2_reset(); C.scan_mode = 1;
+	CHECK(run() == 1, "START_FAILED accepted");
+	expect("FUXI WLAN: W23 scan START_FAILED reason 4 (ladder: w20 0x80, then 0x10, then 0x40)\n");
+	expect("FUXI WLAN: W23 failure: W23 scan START_FAILED; contain, no retry\n");
+	contained_and_freed();
+	expect("FUXI WLAN: W23 contain: scan start failed, no STOP_SCAN\n");
+	CHECK(fw_stop_cmds == 0, "STOP_SCAN after START_FAILED");
+	/* no STARTED in 1 s (L19 mac.c:5046-5053): STOP_SCAN before the latch, values of mac.c:4883-4896 */
+	c2_reset(); C.scan_mode = 2; wl20_bits = WL20_PDEVCAP; C.exp_pdev = 1;
+	CHECK(run() == 1, "no STARTED accepted");
+	expect("FUXI WLAN: W23 timeout scan STARTED (1000 ms); contain, no retry\n");
+	expect("FUXI WLAN: W20 snapshot scan started 0 done 0 start-failed 0 events 0 ");
+	contained_and_freed();
+	expect("FUXI WLAN: W23 contain: STOP_SCAN sent (best effort), tx drained 1 after 1 ms\n");
+	CHECK(fw_stop_cmds == 1 && fw_stop_pdev == 1, "STOP_SCAN fields");
+	/* the same, but CE3 never reports the STOP_SCAN descriptor done: the drain gives up at exactly 100 ms */
+	c2_reset(); C.scan_mode = 2; C.stop_tx_stuck = true;
+	CHECK(run() == 1, "no STARTED (stuck STOP_SCAN) accepted");
+	contained_and_freed();
+	expect("FUXI WLAN: W23 contain: STOP_SCAN sent (best effort), tx drained 0 after 100 ms\n");
+	CHECK(fw_stop_cmds == 1 && !wlce_tx_idle(&wl_ce.pipe[3]), "stuck STOP_SCAN drain");
+	/* the W11 guard fails once the firmware took START_SCAN (AMSS left EE 2, SMMU fault, ...): no STOP_SCAN, no
+	 * doorbell, no descriptor (scan_plan.md 4: a healthy transport only) */
+	c2_reset(); C.guard_after_start = true;
+	CHECK(run() == 1, "guard failure after START_SCAN accepted");
+	expect("FUXI WLAN: W23 failure: AMSS/M0, ownership, discovery or access/SMMU fault; contain, no retry\n");
+	CHECK(fw_scan_cmds == 1 && !wl_scan.done && !wl_scan.start_failed && wl_ce.errors == 0, "guard case set-up");
+	{
+		unsigned tx = wl_ce.pipe[3].posted, sw = shadow_writes, cw = ce_writes;
+		contained_and_freed();
+		expect("FUXI WLAN: W23 contain: STOP_SCAN not sent (transport not healthy)\n");
+		CHECK(fw_stop_cmds == 0 && wl_ce.pipe[3].posted == tx && shadow_writes == sw && ce_writes == cw,
+		    "STOP_SCAN or a doorbell after a guard failure");
+	}
+	/* COMPLETED before STARTED is ignored as L19 does (wmi.c:6363-6381): still waiting, then STOP_SCAN */
+	c2_reset(); C.scan_mode = 4;
+	CHECK(run() == 1, "COMPLETED before STARTED accepted");
+	CHECK(wl_scan.ignored == 1 && !wl_scan.done, "early COMPLETED not ignored");
+	contained_and_freed();
+	CHECK(fw_stop_cmds == 1 && fw_stop_pdev == 0, "STOP_SCAN after an ignored COMPLETED");
+	/* STARTED, then no COMPLETED: the table is still printed, then STOP_SCAN */
+	c2_reset(); C.scan_mode = 3;
+	add_frame(5, 47, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	CHECK(run() == 1, "no COMPLETED accepted");
+	static const char *const lines[] = {
+		"FUXI WLAN: W23 timeout scan COMPLETED (8750 ms); report, contain, no retry\n",
+		"FUXI WLAN: W24 bss 3c:84:6a:xx:xx:xx ch 6 freq 2437 dBm -48 privacy 1 rsn 1 beacon frames 1 ssid \"HomeNet\"\n",
+		"FUXI WLAN: W24 scan summary frames 1 bss 1 ssids 1\n",
+		"FUXI WLAN: W20 snapshot scan COMPLETED: ",
+		"FUXI WLAN: W20 snapshot scan started 1 done 0 start-failed 0 events 39 foreign 38 chan-info 38 mgmt-rx 1 frames 1 bss 1 why -\n",
+		"FUXI WLAN: W23 failure: scan COMPLETED; contain, no retry\n",
+	};
+	expect_order(lines, sizeof(lines) / sizeof(lines[0]));
+	contained_and_freed();
+	expect("FUXI WLAN: W23 contain: STOP_SCAN sent (best effort)");
+	CHECK(fw_stop_cmds == 1, "STOP_SCAN after a scan timeout");
+	/* no credits left for STOP_SCAN: skipped, never waited for */
+	c2_reset(); C.credits = 1; C.refund_later = true; C.no_start_refund = true; C.scan_mode = 2;
+	CHECK(run() == 1, "no STARTED with no credits accepted");
+	contained_and_freed();
+	expect("FUXI WLAN: W23 contain: STOP_SCAN not sent (no HTC credits)\n");
+	CHECK(fw_stop_cmds == 0, "STOP_SCAN without credits");
+	/* a SCAN_EVENT TLV past its event: stops the run (as C1 does for TLVs); no STOP_SCAN on a refused transport */
+	c2_reset(); C.bad_scan_tlv = true;
+	CHECK(run() == 1, "SCAN_EVENT past the buffer accepted");
+	expect("FUXI WLAN: W23 failure: WMI SCAN_EVENT TLV past the buffer; contain, no retry\n");
+	contained_and_freed();
+	expect("FUXI WLAN: W23 contain: STOP_SCAN not sent (transport not healthy)\n");
+	CHECK(fw_stop_cmds == 0, "STOP_SCAN over a refused transport");
+	puts("W23 failures: START_FAILED (no STOP_SCAN), no STARTED in 1 s and COMPLETED before STARTED (STOP_SCAN with "
+	     "L19's fields before the latch; a stuck drain ends at 100 ms), a guard failure after START_SCAN (no STOP_SCAN, "
+	     "no doorbell), no COMPLETED (table printed, then STOP_SCAN), no credits (STOP_SCAN skipped), SCAN_EVENT TLV "
+	     "past the event (stop, no STOP_SCAN); every run contained and freed");
+}
+
+static void
+s_scan_quiet(void)
+{
+	c2_reset(); wl15_variant = 1;
+	CHECK(run() == 0, "silent scan");
+	static const char *const lines[] = {
+		"FUXI WLAN: W24 scan summary frames 0 bss 0 ssids 0\n",
+		"FUXI WLAN: W24 no beacon or probe response heard (chan-info 38); next rung W24b = w20 0x02\n",
+		"FUXI WLAN: W23 complete; stop/contain\n",
+	};
+	expect_order(lines, sizeof(lines) / sizeof(lines[0]));
+	CHECK(shadow_writes == 0 && direct_publishes > 100, "direct route during the scan");
+	contained_and_freed();
+	/* 20 unknown events after READY use up the 16-line budget in W22; the RSSI dBm conversion event (0x402b),
+	 * whose noise floor L19 would apply to MGMT_RX, is still logged once and counted in the W24 detail line */
+	c2_reset(); C.extra_unknown = 20;
+	CHECK(run() == 0, "silent scan after 20 unknown events");
+	CHECK(count_text("(logged only)") == 17 && count_text("W22 wmi event 0x7ff3") == 15 && wl23_rssi_conv == 1, "16-line budget");
+	expect("FUXI WLAN: W23 wmi event 0x402b bytes 16 (logged only)\n");
+	expect("noise-floor -95 dBm (L19 default; rssi-conv events 1, not applied)\n");
+	contained_and_freed();
+	puts("W23 nothing heard (and fuxiwlanw15=1, every pointer to R2): COMPLETED with CHAN_INFO, summary 0, W24b hint; "
+	     "0x402b logged past the 16-line budget and counted");
+}
+
+static void
+s_scan_pure(void)
+{
+	struct wlscan_bss b;
+	char t[WLSCAN_SSID_TEXT];
+	uint8_t f[400];
+	uint32_t tr = 0, len;
+	memset(&b, 0, sizeof(b));
+	b.ssid_state = WLSCAN_SSID_OK; b.ssid_len = 5; memcpy(b.ssid, "a\"\\\x7f\x01", 5);
+	wlscan_ssid_text(&b, t); CHECK(!strcmp(t, "ssid \"a\\x22\\x5c\\x7f\\x01\""), "SSID escaping");
+	b.ssid_len = 32; memset(b.ssid, 0xff, 32);
+	wlscan_ssid_text(&b, t); CHECK(strlen(t) == 6 + 32 * 4 + 1 && strlen(t) < WLSCAN_SSID_TEXT, "32-byte SSID text size");
+	b.ssid_state = WLSCAN_SSID_BAD; b.ssid_len = 255;
+	wlscan_ssid_text(&b, t); CHECK(!strcmp(t, "ssid <invalid length 255>"), "invalid length text");
+	b.ssid_state = WLSCAN_SSID_HIDDEN; wlscan_ssid_text(&b, t); CHECK(!strcmp(t, "ssid <hidden>"), "hidden text");
+	b.ssid_state = WLSCAN_SSID_NONE; wlscan_ssid_text(&b, t); CHECK(!strcmp(t, "ssid <none>"), "none text");
+	/* parser */
+	len = mk_frame(f, 8, B_HOME, 0x0411, "X", 1, 6, 0, true);
+	memset(&b, 0, sizeof(b));
+	CHECK(wl80211_parse_bss(f, len, &b, &tr) == 0 && b.chan == 6 && b.rsn && b.privacy && b.beacon && !tr, "beacon parse");
+	CHECK(wl80211_parse_bss(f, 1, &b, &tr) == 2 && wl80211_parse_bss(f, 35, &b, &tr) == 2, "too short");
+	f[0] = 0x08; CHECK(wl80211_parse_bss(f, len, &b, &tr) == 1, "data frame taken as a BSS");
+	f[0] = 0x40; CHECK(wl80211_parse_bss(f, len, &b, &tr) == 1, "probe request taken as a BSS");
+	len = mk_frame(f, 5, B_HOME, 0x0001, "Y", 1, 0, 0, false);
+	f[len] = 61; f[len + 1] = 1; f[len + 2] = 44; f[len + 3] = 3; f[len + 4] = 1; f[len + 5] = 40;  /* HT op 44, then DS 40 */
+	memset(&b, 0, sizeof(b));
+	CHECK(wl80211_parse_bss(f, len + 6, &b, &tr) == 0 && b.chan == 40 && b.probe_resp && !b.privacy, "DS wins over HT operation");
+	CHECK(wl80211_parse_bss(f, len + 7, &b, &tr) == 0 && tr == 1, "one stray byte after the last element");
+	/* the exact element bound: the DS body sits one byte past the frame (still inside f[], so only the bound
+	 * stops the read): truncated, the channel from HT operation */
+	memset(&b, 0, sizeof(b)); tr = 0;
+	CHECK(wl80211_parse_bss(f, len + 5, &b, &tr) == 0 && b.chan == 44 && tr == 1, "DS body one byte past the frame");
+	/* table: dedup keeps the strongest frequency, 64 entries */
+	struct wlscan *s = calloc(1, sizeof(*s));
+	CHECK(s != NULL, "alloc");
+	wlscan_init(s, 38);
+	memset(&b, 0, sizeof(b)); b.ssid_state = WLSCAN_SSID_HIDDEN; b.dbm = -80; b.freq = 2432; b.frames = 1;
+	wlscan_bss_add(s, &b);
+	b.ssid_state = WLSCAN_SSID_OK; b.ssid_len = 1; b.ssid[0] = 'Z'; b.dbm = -40; b.freq = 2437;
+	wlscan_bss_add(s, &b);
+	CHECK(s->nbss == 1 && s->bss[0].frames == 2 && s->bss[0].dbm == -40 && s->bss[0].freq == 2437 &&
+	    s->bss[0].ssid_state == WLSCAN_SSID_OK, "dedup update");
+	for (unsigned i = 1; i < 70; i++) { b.bssid[5] = (uint8_t)i; wlscan_bss_add(s, &b); }
+	CHECK(s->nbss == 64 && s->table_full == 6 && wlscan_ssids(s) == 1, "64 entries, one distinct SSID");
+	free(s);
+	/* encoders: bounds and the channel-per-command limit */
+	uint8_t out[2048];
+	CHECK(wlwmi_chan_list_max(2048) == 72 && wlwmi_chan_list_max(300) == 10 && wlwmi_chan_list_max(47) == 0 &&
+	    wlwmi_chan_list_max(0) == 0, "channels per command");
+	CHECK(wlwmi_encode_chan_list(0, 38, false, 0, out, 1087, &len) == 1 && wlwmi_encode_chan_list(30, 9, false, 0, out, 2048, &len) == 1 &&
+	    wlwmi_encode_chan_list(0, 0, false, 0, out, 2048, &len) == 1, "channel list bounds");
+	CHECK(wlwmi_encode_start_scan(39, 1, out, 2048, &len) == 1 && wlwmi_encode_start_scan(38, 1, out, 339, &len) == 1 &&
+	    wlwmi_encode_start_scan(38, 1, out, 340, &len) == 0 && len == 340, "start scan bounds");
+	CHECK(wlwmi_encode_vdev_create(B_HOME, 0, 3, 2, 2, out, 87, &len) == 1, "vdev create bounds");
+	CHECK(wlscan_max_time(38) == 8550 && wlscan_max_time(13) == 2925, "max scan time n x 150 x 3/2");
+	/* CE4: 16 TX slots on 2048 SRC entries; with 16 sends in flight the 17th is refused before it reuses slot 0 */
+	static const struct wlce_io sink_io = { io_never_wr, io_never_rd, io_sink_bar, io_model_w, io_model_r, NULL };
+	uint8_t *mem = aligned_alloc(4096, ARENA), msg[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+	struct wlce l;
+	CHECK(mem != NULL, "alloc");
+	memset(mem, 0, ARENA);
+	CHECK(wlce_layout(&l, mem, 0xa0000000ull, ARENA, wl15_shadow_v3, 36, true) == 0, "C2 local layout");
+	for (unsigned i = 0; i < 16; i++) { CHECK(wlce_send(&l, &sink_io, &l.pipe[4], 1, msg, sizeof(msg)) == 0, "CE4 send"); }
+	CHECK(wlce_send(&l, &sink_io, &l.pipe[4], 1, msg, sizeof(msg)) == 1 && l.why && !strcmp(l.why, "CE TX slots all in flight") &&
+	    l.pipe[4].posted == 16, "a 17th CE4 send with 16 in flight accepted");
+	free(mem);
+	puts("W23 pure: SSID escaping/hidden/none/invalid text, 802.11 parse (types, short, DS over HT, stray byte, element "
+	     "body one byte past the frame), table dedup/64, encoder bounds, channels per command, max scan time, CE4 slots "
+	     "in flight bound");
+}
+
+static void
+dump_c2(void)
+{
+	uint8_t out[2048];
+	uint32_t len = 0;
+	const uint32_t vp[3] = {0, WLWMI_VDEV_PARAM_NSS, 2};
+	const uint32_t stop[5] = {0, WLWMI_SCAN_ID, WLWMI_SCAN_STOP_ONE, WLWMI_VDEV_ID, 0};
+	CHECK(wlwmi_encode_chan_list(0, 38, false, 0, out, sizeof(out), &len) == 0, "dump chan list");
+	for (uint32_t i = 0; i < len / 4; i++) { fprintf(stdout, "chanlist %u %u\n", i, g32(out + 4 * i)); }
+	CHECK(wlwmi_encode_vdev_create((const uint8_t *)"\x02\x46\x55\x58\x49\x01", 0, 3, 2, 2, out, sizeof(out), &len) == 0, "dump vdev");
+	for (uint32_t i = 0; i < len / 4; i++) { fprintf(stdout, "vdev %u %u\n", i, g32(out + 4 * i)); }
+	CHECK(wlwmi_encode_start_scan(38, wlscan_max_time(38), out, sizeof(out), &len) == 0, "dump scan");
+	for (uint32_t i = 0; i < len / 4; i++) { fprintf(stdout, "scan %u %u\n", i, g32(out + 4 * i)); }
+	CHECK(wlwmi_encode_words(WLWMI_CMD_STOP_SCAN, WLWMI_TAG_STOP_SCAN_CMD, stop, 5, out, sizeof(out), &len) == 0, "dump stop");
+	for (uint32_t i = 0; i < len / 4; i++) { fprintf(stdout, "stop %u %u\n", i, g32(out + 4 * i)); }
+	CHECK(wlwmi_encode_words(WLWMI_CMD_VDEV_SET_PARAM, WLWMI_TAG_VDEV_SET_PARAM_CMD, vp, 3, out, sizeof(out), &len) == 0, "dump nss");
+	for (uint32_t i = 0; i < len / 4; i++) { fprintf(stdout, "nss %u %u\n", i, g32(out + 4 * i)); }
+	wlhtt_version_req(out);
+	fprintf(stdout, "htt 0 %u\nhtt 1 %u\n", g32(out), g32(out + 4));
+	fflush(stdout);
+}
+
 static void
 dump_init(void)
 {
@@ -1148,6 +1821,7 @@ int
 main(int argc, char **argv)
 {
 	if (argc == 2 && !strcmp(argv[1], "dump-init")) { dump_init(); return 0; }
+	if (argc == 2 && !strcmp(argv[1], "dump-c2")) { dump_c2(); return 0; }
 	s_pure();
 	s_no_w20();
 	s_happy_shadow();
@@ -1161,6 +1835,13 @@ main(int argc, char **argv)
 	s_window_and_fault();
 	s_latch();
 	s_wrap();
+	s_scan_pure();
+	s_scan_happy();
+	s_scan_bits();
+	s_scan_split_and_caps();
+	s_scan_full();
+	s_scan_failures();
+	s_scan_quiet();
 	reset();
 	puts("W20 model: all scenarios passed");
 	return 0;

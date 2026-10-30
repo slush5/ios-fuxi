@@ -27,9 +27,11 @@ Host-only, synthetic cmd-db and RSC registers, fake boot-args and a fake ADT
     the exact bytes each property adds;
   - the Fuxi build (no FUXI_SALAMI) keeps its defaults, ignores /defaults and
     starts as before;
-  - W20 (fuxiwlanqrtr=6) starts only with all 28 steps; qrtr outside 0..6,
-    keep/stop22 with qrtr 6, fuxiwlanw20 without qrtr 6 and unimplemented w20
-    bits are refused before any access; the init lines print qrtr 6.
+  - W20 (fuxiwlanqrtr=6) and W23 (fuxiwlanqrtr=7, C2) start only with all 28
+    steps; qrtr outside 0..7, keep/stop22 with qrtr 6/7, fuxiwlanw20 without
+    qrtr 6/7, w20 bits outside the set of the selected stage (0x08 ACTIVE in
+    none) and 0x01 with 0x02 are refused before any access; the init lines
+    print the real qrtr.
 """
 from pathlib import Path
 import importlib.util
@@ -495,8 +497,8 @@ def gate_suite(tmp, mk):
         ('fuxiwlan=11 fuxiwlansalami=1 fuxiwlanprobe=civac fuxiwlanseq=cycle', 1, 11, None),
         (f'fuxiwlan=1 fuxiwlansalami=1 {SET} {W14}', 1, 28, 'salami K-W1 gate open'),
         ('fuxiwlan=1 fuxiwlansalami=1 fuxiwlanw16=9 fuxiwlanqrtr=5', 0, 0, 'invalid selector 1'),
-        # W20 (C1): qrtr 6 needs all 28 steps; 7/8 (C2/C3) and anything outside 0..6 are refused, as are
-        # keep/stop22 with qrtr 6, w20 without qrtr 6 and every w20 bit but 0x01/0x04/0x40.
+        # W20 (C1): qrtr 6 needs all 28 steps; keep/stop22 with qrtr 6, w20 without qrtr 6/7 and, with
+        # qrtr 6, every w20 bit but 0x01/0x04/0x40 are refused (the C2 bits too).
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6', 1, 28, 'W20 selected qrtr=6 (CE/HTC/WMI init to READY) w20 0 valid 1'),
         ('fuxiwlan=1 fuxiwlansalami=1 fuxiwlanqrtr=6', 1, 28, 'W12 selected qrtr=6 target memory cap'),
         ('fuxiwlan=99 fuxiwlansalami=1 fuxiwlanqrtr=6', 1, 28, 'W15 variant 0'),
@@ -505,10 +507,33 @@ def gate_suite(tmp, mk):
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw15=1 fuxiwlanw16=3', 1, 28, 'W16 variant 3'),
         ('fuxiwlan=27 fuxiwlansalami=1 fuxiwlanqrtr=6', 0, 0, 'needs all 28 steps (fuxiwlan=1 or 28), limit 27; refused'),
         ('fuxiwlan=11 fuxiwlansalami=1 fuxiwlanqrtr=6', 0, 0, 'invalid selector 1'),
-        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7', 0, 0, 'W20 fuxiwlanqrtr=7 is not 0..6 in this build; refused'),
-        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=8', 0, 0, 'W20 fuxiwlanqrtr=8 is not 0..6'),
-        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=9', 0, 0, 'W20 fuxiwlanqrtr=9 is not 0..6'),
-        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=-1', 0, 0, 'W20 fuxiwlanqrtr=-1 is not 0..6'),
+        # W23 (C2): qrtr 7 = W20..W22 + the passive scan, the same 28-step gate; 8 (C3) and beyond refused.
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7', 1, 28,
+         'W20 selected qrtr=7 (CE/HTC/WMI init, then W23 passive scan) w20 0 valid 1'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7', 1, 28, 'W23 selected passive scan of 38 channels, dwell 150 ms, '
+         'nothing transmitted; BSSIDs OUI only, pdev 0, htt version not asked'),
+        ('fuxiwlan=1 fuxiwlansalami=1 fuxiwlanqrtr=7', 1, 28, 'W12 selected qrtr=7 target memory cap'),
+        ('fuxiwlan=27 fuxiwlansalami=1 fuxiwlanqrtr=7', 0, 0, 'W20 fuxiwlanqrtr=7 needs all 28 steps (fuxiwlan=1 or 28), limit 27; refused'),
+        ('fuxiwlan=11 fuxiwlansalami=1 fuxiwlanqrtr=7', 0, 0, 'invalid selector 1'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0x92', 1, 28,
+         'W23 selected passive scan of 13 channels (2.4 GHz only), dwell 150 ms, nothing transmitted; BSSIDs OUI only, '
+         'pdev from EXT caps, htt version asked'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0xd6', 1, 28, 'w20 0xd6 valid 1'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0xd5', 1, 28, 'w20 0xd5 valid 1'),
+        # 0x20 FULLBSSID (whole BSSIDs in the log) is refused at every qrtr: the owner masks every BSSID.
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0x20', 0, 0, 'w20 0x20 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0xb2', 0, 0, 'w20 0xb2 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0xf6', 0, 0, 'w20 0xf6 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=8', 0, 0, 'w20 0x8 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0xfe', 0, 0, 'w20 0xfe valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=3', 0, 0, 'w20 0x3 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0x100', 0, 0, 'w20 0x100 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=-1', 0, 0, 'w20 0xffffffff valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlankeep=1', 0, 0, 'w20 0 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanstop22=1', 0, 0, 'w20 0 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=8', 0, 0, 'W20 fuxiwlanqrtr=8 is not 0..7 in this build; refused'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=9', 0, 0, 'W20 fuxiwlanqrtr=9 is not 0..7'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=-1', 0, 0, 'W20 fuxiwlanqrtr=-1 is not 0..7'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlankeep=1', 0, 0, 'w20 0 valid 0'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanstop22=1', 0, 0, 'w20 0 valid 0'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw20=8', 0, 0, 'w20 0x8 valid 0'),
@@ -582,6 +607,8 @@ def gate_suite(tmp, mk):
         'fuxiwlan=1 fuxiwlansalami=1 fuxiwlanw16=9 fuxiwlanqrtr=5',
         'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw20=0x45 fuxiwlanmlo=0x17d',
         'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7',
+        'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0x92',
+        'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=8',
         'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=5 fuxiwlanw20=4',
     ]
     for args in equal:
@@ -639,8 +666,10 @@ def gate_suite(tmp, mk):
     # W20 on the Fuxi build: same parsing; an invalid selector stops there at step 17 (wl5_step 0x6c).
     s, lim, _, out, _ = run(fuxi, 'fuxiwlan=28 fuxiwlanqrtr=6 fuxiwlanw20=0x40')
     assert (s, lim) == (1, 28) and 'W20 selected qrtr=6 (CE/HTC/WMI init to READY) w20 0x40 valid 1' in out, out
-    s, _, _, out, _ = run(fuxi, 'fuxiwlan=28 fuxiwlanqrtr=7')
-    assert s == 1 and 'W20 fuxiwlanqrtr=7 is not 0..6 in this build; refused' in out, out
+    s, lim, _, out, _ = run(fuxi, 'fuxiwlan=28 fuxiwlanqrtr=7 fuxiwlanw20=0x10')
+    assert (s, lim) == (1, 28) and 'W20 selected qrtr=7 (CE/HTC/WMI init, then W23 passive scan) w20 0x10 valid 1' in out, out
+    s, _, _, out, _ = run(fuxi, 'fuxiwlan=28 fuxiwlanqrtr=8')
+    assert s == 1 and 'W20 fuxiwlanqrtr=8 is not 0..7 in this build; refused' in out, out
     print(f'K-W1 gate: {len(cases)} salami boot-arg cases, firmware names/overrides/refusals, Fuxi control passed')
     print(f'K-W1b /defaults: {len(equal)} knob sets equal from ADT alone and split cmdline/ADT; boot-arg wins; '
           'absent from both is off; oversize/unterminated properties; Fuxi ignores /defaults')

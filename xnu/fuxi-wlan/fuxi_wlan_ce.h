@@ -1,8 +1,11 @@
 /*
  * FUXI WLAN W20/W21/W22 (fuxiwlanqrtr=6, C1): WCN7850 copy engines on SRNG
- * rings, HTC and WMI init to WMI READY, polled. Pure C: no XNU or Linux
- * includes. The includer provides uint8_t..uint64_t, size_t, bool and memcpy
- * (bsd/dev/fuxi_wlan.c in the kernel, tools/fuxi-wlan-ce-model.c on the host).
+ * rings, HTC and WMI init to WMI READY, polled. W23/W24 (fuxiwlanqrtr=7, C2):
+ * on top of that the passive channel list, a station vdev, one passive scan,
+ * MGMT_RX parsing and a BSS table; nothing is transmitted on the air.
+ * Pure C: no XNU or Linux includes. The includer provides uint8_t..uint64_t,
+ * size_t, bool and memcpy (bsd/dev/fuxi_wlan.c in the kernel,
+ * tools/fuxi-wlan-ce-model.c on the host).
  * Hardware is reached only through struct wlce_io; every length that comes
  * from the device is bounded by the buffer it arrived in; nothing allocates.
  * Per-field provenance and the log lines: docs-lanes/wlan-w20.md.
@@ -12,7 +15,7 @@
  *   ce.c, ce.h, hal_desc.h:
  *     Copyright (c) 2018-2021 The Linux Foundation. All rights reserved.
  *     Copyright (c) 2021-2022, 2024-2025 Qualcomm Innovation Center, Inc. All rights reserved.
- *   hal.c, hal.h, hw.c, hw.h:
+ *   hal.c, hal.h, hw.c, hw.h, dp.h, dp_tx.c, reg.c:
  *     Copyright (c) 2018-2021 The Linux Foundation. All rights reserved.
  *     Copyright (c) 2021-2025 Qualcomm Innovation Center, Inc. All rights reserved.
  *   htc.c:
@@ -21,7 +24,7 @@
  *   htc.h:
  *     Copyright (c) 2018-2021 The Linux Foundation. All rights reserved.
  *     Copyright (c) 2021-2022 Qualcomm Innovation Center, Inc. All rights reserved.
- *   wmi.c, wmi.h, core.c:
+ *   wmi.c, wmi.h, core.c, core.h, mac.c, dp_rx.c:
  *     Copyright (c) 2018-2021 The Linux Foundation. All rights reserved.
  *     Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  *   pci.c:
@@ -115,8 +118,13 @@
 #define WLCE_SHADOW_REGS 40u
 
 /* Arena, one IOVA range of 512 KiB, Normal-NC: rdp, the seven rings, the TX
- * slots of CE0/CE3 (slot i = SRC entry i) and the RX buffers of CE1/CE2.
- * Ring bases are 4 KiB aligned (L19 needs 8, CE_DESC_RING_ALIGN ce.h:108). */
+ * slots of CE0/CE3/CE4 (slot i = SRC entry i mod slots) and the RX buffers of
+ * CE1/CE2. Ring bases are 4 KiB aligned (L19 needs 8, CE_DESC_RING_ALIGN
+ * ce.h:108). CE4 (HTT, src_sz_max 256, ce.c:145-220) gets 16 slots for the
+ * one HTT message C2 may send (w20 0x02); C1 never sends on it. wlce_send
+ * refuses a send while all slots of its pipe are in flight. */
+#define WLCE_CE4_BUF 256u
+#define WLCE_CE4_SLOTS 16u
 #define WLCE_ARENA_BYTES 0x80000u
 #define WLCE_OFF_RDP 0x00000u
 #define WLCE_OFF_CE0_SRC 0x01000u   /*   16 x 16 B */
@@ -130,14 +138,16 @@
 #define WLCE_OFF_CE3_TX 0x18000u    /* 32 x 2 KiB */
 #define WLCE_OFF_CE1_RX 0x28000u    /* 62 x 2 KiB */
 #define WLCE_OFF_CE2_RX 0x47000u    /* 62 x 2 KiB */
-#define WLCE_OFF_END 0x66000u
+#define WLCE_OFF_CE4_TX 0x66000u    /* 16 x 256 B */
+#define WLCE_OFF_END 0x67000u
 _Static_assert(WLCE_RDP_IDS * 4u <= WLCE_OFF_CE0_SRC && WLCE_OFF_CE0_SRC + 16u * 16u <= WLCE_OFF_CE1_DST &&
     WLCE_OFF_CE1_DST + 512u * 8u <= WLCE_OFF_CE1_STS && WLCE_OFF_CE1_STS + 512u * 16u <= WLCE_OFF_CE2_DST &&
     WLCE_OFF_CE2_DST + 64u * 8u <= WLCE_OFF_CE2_STS && WLCE_OFF_CE2_STS + 64u * 16u <= WLCE_OFF_CE3_SRC &&
     WLCE_OFF_CE3_SRC + 32u * 16u <= WLCE_OFF_CE4_SRC && WLCE_OFF_CE4_SRC + 2048u * 16u <= WLCE_OFF_CE0_TX &&
     WLCE_OFF_CE0_TX + 16u * WLCE_BUF <= WLCE_OFF_CE3_TX && WLCE_OFF_CE3_TX + 32u * WLCE_BUF <= WLCE_OFF_CE1_RX &&
     WLCE_OFF_CE1_RX + WLCE_RX_POST * WLCE_BUF <= WLCE_OFF_CE2_RX &&
-    WLCE_OFF_CE2_RX + WLCE_RX_POST * WLCE_BUF == WLCE_OFF_END && WLCE_OFF_END <= WLCE_ARENA_BYTES,
+    WLCE_OFF_CE2_RX + WLCE_RX_POST * WLCE_BUF == WLCE_OFF_CE4_TX &&
+    WLCE_OFF_CE4_TX + WLCE_CE4_SLOTS * WLCE_CE4_BUF == WLCE_OFF_END && WLCE_OFF_END <= WLCE_ARENA_BYTES,
     "W20 arena layout");
 
 /* A device-written rdp word is one 32-bit load; the host model wraps it. */
@@ -245,14 +255,14 @@ static inline int
 wlce_layout(struct wlce *ce, uint8_t *base, uint64_t iova, uint32_t bytes,
     const uint32_t *shadow_tbl, unsigned shadow_n, bool shadow)
 {
-	static const struct { uint8_t ce, kind; uint32_t entries, ring, buf, nbuf; } plan[WLCE_NRING] = {
-		{0, WLCE_SRC, 16, WLCE_OFF_CE0_SRC, WLCE_OFF_CE0_TX, 16},
-		{1, WLCE_DST, 512, WLCE_OFF_CE1_DST, WLCE_OFF_CE1_RX, WLCE_RX_POST},
-		{1, WLCE_STS, 512, WLCE_OFF_CE1_STS, 0, 0},
-		{2, WLCE_DST, 64, WLCE_OFF_CE2_DST, WLCE_OFF_CE2_RX, WLCE_RX_POST},
-		{2, WLCE_STS, 64, WLCE_OFF_CE2_STS, 0, 0},
-		{3, WLCE_SRC, 32, WLCE_OFF_CE3_SRC, WLCE_OFF_CE3_TX, 32},
-		{4, WLCE_SRC, 2048, WLCE_OFF_CE4_SRC, 0, 0},
+	static const struct { uint8_t ce, kind; uint32_t entries, ring, buf, nbuf, bsz; } plan[WLCE_NRING] = {
+		{0, WLCE_SRC, 16, WLCE_OFF_CE0_SRC, WLCE_OFF_CE0_TX, 16, WLCE_BUF},
+		{1, WLCE_DST, 512, WLCE_OFF_CE1_DST, WLCE_OFF_CE1_RX, WLCE_RX_POST, WLCE_BUF},
+		{1, WLCE_STS, 512, WLCE_OFF_CE1_STS, 0, 0, 0},
+		{2, WLCE_DST, 64, WLCE_OFF_CE2_DST, WLCE_OFF_CE2_RX, WLCE_RX_POST, WLCE_BUF},
+		{2, WLCE_STS, 64, WLCE_OFF_CE2_STS, 0, 0, 0},
+		{3, WLCE_SRC, 32, WLCE_OFF_CE3_SRC, WLCE_OFF_CE3_TX, 32, WLCE_BUF},
+		{4, WLCE_SRC, 2048, WLCE_OFF_CE4_SRC, WLCE_OFF_CE4_TX, WLCE_CE4_SLOTS, WLCE_CE4_BUF},
 	};
 	for (size_t i = 0; i < sizeof(*ce); i++) { ((uint8_t *)ce)[i] = 0; }
 	if (!base || (iova & 0xfffu) || bytes < WLCE_ARENA_BYTES || iova + WLCE_ARENA_BYTES > (1ull << 32)) {
@@ -275,7 +285,7 @@ wlce_layout(struct wlce *ce, uint8_t *base, uint64_t iova, uint32_t bytes,
 		r->r2 = block + (kind == WLCE_STS ? WLCE_STS_R2_HP : WLCE_R2_HP);
 		r->va = base + plan[i].ring;
 		r->iova = iova + plan[i].ring;
-		if (plan[i].nbuf) { p->slot0 = plan[i].buf; p->nslots = plan[i].nbuf; p->buf_bytes = WLCE_BUF; }
+		if (plan[i].nbuf) { p->slot0 = plan[i].buf; p->nslots = plan[i].nbuf; p->buf_bytes = plan[i].bsz; }
 		if (kind == WLCE_SRC) { p->has_src = true; }
 		if (kind == WLCE_DST) { p->has_dst = true; }
 		ce->ring[i] = r;
@@ -490,7 +500,9 @@ static inline bool wlce_tx_idle(const struct wlce_pipe *p) { return p->src.tp ==
 /* TX (ce.c:725-804, hal.c:1927-1939): copy into the slot of the SRC entry at
  * HP, descriptor = address, hi 8 bits, byte swap 0 (bit 9), gather 0
  * (bit 11), length 31:16, meta 15:0 = HTC endpoint id; w3 belongs to the
- * hardware. A free entry needs next HP != device TP (hal.c:2077-2080). */
+ * hardware. A free entry needs next HP != device TP (hal.c:2077-2080) and a
+ * free slot: CE4 has 16 slots on 2048 entries (CE0/CE3 have a slot per
+ * entry, so the ring bound comes first there). */
 static inline int
 wlce_send(struct wlce *ce, const struct wlce_io *io, struct wlce_pipe *p, uint32_t eid, const uint8_t *msg, uint32_t len)
 {
@@ -501,6 +513,7 @@ wlce_send(struct wlce *ce, const struct wlce_io *io, struct wlce_pipe *p, uint32
 	if (wlce_reap_tx(ce, io, p)) { return 1; }
 	uint32_t next = (r->hp + r->entry_dw) % size, slot = (r->hp / r->entry_dw) % p->nslots;
 	if (next == r->tp) { return wlce_fail(ce, "CE SRC ring full"); }
+	if (p->posted - p->reaped >= p->nslots) { return wlce_fail(ce, "CE TX slots all in flight"); }
 	uint64_t a = ce->base_iova + p->slot0 + (uint64_t)slot * p->buf_bytes;
 	memcpy(ce->base + p->slot0 + slot * p->buf_bytes, msg, len);
 	wlce_set_word(r, r->hp, (uint32_t)a);
@@ -548,6 +561,8 @@ struct wlhtc_ep {
 	int credits;
 };
 
+typedef int (*wlhtc_msg_fn)(void *ctx, const uint8_t *msg, uint32_t len);
+
 struct wlhtc {
 	uint16_t credit_size, credit_count;
 	uint8_t max_ep;
@@ -560,9 +575,9 @@ struct wlhtc {
 	const uint32_t (*map)[3];       /* the WLAN_CFG service map: service, direction, pipe */
 	unsigned map_n;
 	const char *why;
+	wlhtc_msg_fn htt_fn;            /* C2 w20 0x02 only: HTT messages; NULL = counted only */
+	void *htt_ctx;
 };
-
-typedef int (*wlhtc_msg_fn)(void *ctx, const uint8_t *msg, uint32_t len);
 
 static inline int
 wlhtc_fail(struct wlhtc *htc, const char *why)
@@ -640,7 +655,8 @@ wlhtc_trailer(struct wlhtc *htc, const uint8_t *p, uint32_t len)
  * payload left (trailer only, or empty) is dropped on every endpoint as in
  * L19 (htc.c:321-323). EP0 READY/CONNECT_RESP are copied (256 bytes at
  * most) for the waiting step; another unread control message is an error.
- * WMI messages go to FN; HTT messages are counted (no HTT parsing in C1). */
+ * WMI messages go to FN; HTT messages are counted and, with a handler set
+ * (C2 w20 0x02, the version reply), handed to it. */
 static inline int
 wlhtc_rx(struct wlhtc *htc, const uint8_t *msg, uint32_t len, wlhtc_msg_fn fn, void *ctx)
 {
@@ -671,7 +687,7 @@ wlhtc_rx(struct wlhtc *htc, const uint8_t *msg, uint32_t len, wlhtc_msg_fn fn, v
 	}
 	if (eid == htc->wmi_eid) { return fn(ctx, pl, plen); }
 	htc->htt_rx++;
-	return 0;
+	return htc->htt_fn ? htc->htt_fn(htc->htt_ctx, pl, plen) : 0;
 }
 
 /* READY on EP0: message id 15:0, credit count 31:16; credit size 15:0, max
@@ -850,6 +866,8 @@ _Static_assert(WLWMI_RC_WORDS * 4 == WLWMI_RSRC_BYTES && WLWMI_RC_FLAG1 == 44 &&
     WLWMI_RC_PEER_MAP_UNMAP_VERSION == 57 && WLWMI_RC_FLAGS2 == 68 && WLWMI_RC_HOST_SERVICE_FLAGS == 69,
     "WMI resource config word order (wmi.h:2534-2605)");
 
+struct wlscan;                      /* C2 scan state, below */
+
 struct wlwmi {
 	uint32_t svc_base[WLWMI_SVC_BM_WORDS], svc_seg[4], svc_ext2[WLWMI_EXT2_WORDS];
 	bool got_svc, got_avail, got_ext, got_ext2, got_ready, got_hw_resp;
@@ -860,6 +878,12 @@ struct wlwmi {
 	uint8_t mac[6];
 	uint32_t ext2_bytes, events, unknown_events, last_event, last_len;
 	const char *why;
+	/* C2: bands of the preferred hw mode's PHYs, chain masks of the last of
+	 * them (wmi.c:525-553, 4663-4686), and the scan the SCAN/CHAN_INFO/MGMT_RX
+	 * events feed (NULL before the scan stage and in C1: those ids stay
+	 * unknown events). */
+	uint32_t phy_bands, phy_tx_mask, phy_rx_mask;
+	struct wlscan *scan;
 };
 
 static inline int
@@ -962,16 +986,38 @@ wlwmi_fls(uint32_t v)
 	return n;
 }
 
+/* L19's hw mode priority, indexed by WMI_HOST_HW_MODE_* (wmi.c:306-318,
+ * wmi.h:185-217): DBS_SBS 0, DBS 1, DBS_OR_SBS 2, SBS 3, SBS_PASSIVE 4,
+ * SINGLE 5; ids from 6 up are skipped (wmi.c:4542-4543). */
+#define WLWMI_HW_MODE_PRI_SINGLE 5u
+#define WLWMI_HW_MODE_PRI_NONE 6u
+static inline uint32_t
+wlwmi_hw_mode_pri(uint32_t mode)
+{
+	static const uint8_t pri[] = { 5, 1, 4, 3, 0, 2 };
+	return mode < sizeof(pri) ? pri[mode] : WLWMI_HW_MODE_PRI_NONE;
+}
+
 /* SERVICE_READY_EXT (wmi.c:4847-4949): fixed TLV 0x1ac; 0x212 num_hw_modes
  * (8 bytes min, wmi.c:136-137); the first ARRAY_STRUCT holds only 0x211
  * entries, at most num_hw_modes (wmi.c:4494-4516), each adding fls(phy map)
  * PHYs; the second holds only 0x210 MAC/PHY caps, at most that many PHYs;
  * pdev id = 15:0 of word 1 of the first (wmi.h:2681-2691). Later arrays are
- * not needed in C1. Nested TLVs are bounded by their array. */
+ * not needed in C1. Nested TLVs are bounded by their array.
+ * C2 also keeps the bands and chain masks of L19's single pdev: the
+ * preferred hw mode starts as SINGLE with no PHY for a single-pdev chip
+ * (wmi.c:10207-10211) and a listed mode of strictly better priority takes
+ * its place (wmi.c:4538-4551); its PHYs are the MAC/PHY caps from index
+ * fls(phy map of the 0x211 entry listed just before it), 0 when it is
+ * first (L19 assigns that index, it does not sum: wmi.c:505-517), one per
+ * bit up to fls(its own map) (wmi.c:4663-4686). Of those, with at least 22
+ * words: supported_bands (word 4) ORed, and the 2 GHz (12/13) or else
+ * 5 GHz (20/21) tx/rx chain masks of the last one (wmi.c:525-553). */
 static inline int
 wlwmi_parse_ext(struct wlwmi *wmi, const uint8_t *p, uint32_t len)
 {
 	struct wlwmi_it it, in; int r, q; bool fixed = false, caps = false; unsigned arrays = 0;
+	uint32_t pri = WLWMI_HW_MODE_PRI_SINGLE, first = 0, nphy = 0, prev_map = 0, nmode = 0, kphy = 0;
 	wlwmi_it_init(&it, p, len);
 	while ((r = wlwmi_next(&it)) > 0) {
 		if (it.tag == WLWMI_TAG_SERVICE_READY_EXT_EVENT) { fixed = true; continue; }
@@ -988,13 +1034,22 @@ wlwmi_parse_ext(struct wlwmi *wmi, const uint8_t *p, uint32_t len)
 				if (!caps || in.tag != WLWMI_TAG_HW_MODE_CAPABILITIES || wmi->hw_mode_caps >= wmi->num_hw_modes || in.tlen < 12) {
 					return wlwmi_fail(wmi, "WMI EXT hw mode caps: tag, count or length");
 				}
+				uint32_t mode = wlce_get32(in.v), map = wlce_get32(in.v + 4);
+				if (wlwmi_hw_mode_pri(mode) < pri) { pri = wlwmi_hw_mode_pri(mode); first = nmode ? wlwmi_fls(prev_map) : 0u; nphy = wlwmi_fls(map); }
+				prev_map = map; nmode++;
 				wmi->hw_mode_caps++;
-				wmi->tot_phy += wlwmi_fls(wlce_get32(in.v + 4));
+				wmi->tot_phy += wlwmi_fls(map);
 			} else {
 				if (in.tag != WLWMI_TAG_MAC_PHY_CAPABILITIES || wmi->mac_phy_caps >= wmi->tot_phy || in.tlen < 8) {
 					return wlwmi_fail(wmi, "WMI EXT mac/phy caps: tag, count or length");
 				}
+				uint32_t k = kphy++;
 				if (!wmi->mac_phy_caps++) { wmi->pdev_id = wlce_get32(in.v + 4) & 0xffffu; wmi->pdev_valid = true; }
+				if (in.tlen >= 22u * 4u && k >= first && k - first < nphy) {  /* 1/2 = WMI_HOST_WLAN_2GHZ_CAP/5GHZ_CAP (wmi.h:220-221) */
+					uint32_t bands = wlce_get32(in.v + 4 * 4), m = bands & 1u ? 12u : bands & 2u ? 20u : 0u;
+					wmi->phy_bands |= bands;
+					if (m) { wmi->phy_tx_mask = wlce_get32(in.v + 4 * m); wmi->phy_rx_mask = wlce_get32(in.v + 4 * (m + 1)); }
+				}
 			}
 		}
 		if (q < 0) { return wlwmi_fail(wmi, "WMI EXT nested TLV past its array"); }
@@ -1055,7 +1110,11 @@ wlwmi_known(uint32_t id)
 	    id == WLWMI_EV_SERVICE_READY_EXT2 || id == WLWMI_EV_READY;
 }
 
-/* One WMI event (wmi.c:9798-9960). */
+static inline bool wlscan_known(uint32_t id);
+static inline int wlscan_rx(struct wlwmi *wmi, uint32_t id, const uint8_t *p, uint32_t len);
+
+/* One WMI event (wmi.c:9798-9960). In the C2 scan stage SCAN, CHAN_INFO and
+ * MGMT_RX go to the scan parser (wmi.c:9838-9856). */
 static inline int
 wlwmi_rx(struct wlwmi *wmi, const uint8_t *msg, uint32_t len, uint32_t *id)
 {
@@ -1064,6 +1123,7 @@ wlwmi_rx(struct wlwmi *wmi, const uint8_t *msg, uint32_t len, uint32_t *id)
 	*id = wlce_get32(msg) & 0xffffffu;
 	wmi->events++; wmi->last_event = *id; wmi->last_len = len - 4;
 	const uint8_t *p = msg + 4;
+	if (wmi->scan && wlscan_known(*id)) { return wlscan_rx(wmi, *id, p, len - 4); }
 	switch (*id) {
 	case WLWMI_EV_SERVICE_READY: return wlwmi_parse_service_ready(wmi, p, len - 4);
 	case WLWMI_EV_SERVICE_AVAILABLE: return wlwmi_parse_available(wmi, p, len - 4);
@@ -1142,6 +1202,685 @@ wlwmi_encode_hw_mode(uint8_t *out, uint32_t room, uint32_t mode, uint32_t *len)
 	wlce_put32(out + 16, 0);
 	*len = WLWMI_HW_MODE_TOTAL;
 	return 0;
+}
+
+/* ---- HTT version request (C2, w20 0x02 only) ----
+ * Adapted from Linux ath12k dp_tx.c, dp_rx.c and dp.h (BSD-3-Clause-Clear),
+ * v6.19. H2T VERSION_REQ: message 0 in 7:0 of word 0, then the TCL metadata
+ * version option {tag 5 in 7:0, length 4 in 15:8, value 2 in 31:16}
+ * (dp_tx.c:1277-1305, dp.h:433, 471, 481-491; version 2 outside FTM mode).
+ * T2H VERSION_CONF: message 0 in 7:0, minor 15:8, major 23:16; L19 waits 3 s
+ * and accepts major 3 only (dp_tx.c:1275, 1312-1323; dp_rx.c:1931-1942;
+ * dp.h:1338-1359). It travels on the HTT endpoint (CE4 up, CE1 down). */
+#define WLHTT_H2T_VERSION_REQ 0u
+#define WLHTT_T2H_VERSION_CONF 0u
+#define WLHTT_TAG_TCL_METADATA_VERSION 5u
+#define WLHTT_TCL_METADATA_VER_SZ 4u
+#define WLHTT_TCL_METADATA_VER_V2 2u
+#define WLHTT_VERSION_MAJOR 3u
+#define WLHTT_VER_REQ_BYTES 8u          /* struct htt_ver_req_cmd (dp.h:488-491) */
+
+static inline void
+wlhtt_version_req(uint8_t *p)
+{
+	wlce_put32(p, WLHTT_H2T_VERSION_REQ);
+	wlce_put32(p + 4, WLHTT_TAG_TCL_METADATA_VERSION | (WLHTT_TCL_METADATA_VER_SZ << 8) | (WLHTT_TCL_METADATA_VER_V2 << 16));
+}
+
+/* 1 = a VERSION_CONF (MAJOR/MINOR filled), 0 = any other HTT message. */
+static inline int
+wlhtt_version_conf(const uint8_t *msg, uint32_t len, uint32_t *major, uint32_t *minor)
+{
+	if (len < 4) { return 0; }
+	uint32_t w = wlce_get32(msg);
+	if ((w & 0xffu) != WLHTT_T2H_VERSION_CONF) { return 0; }
+	*minor = (w >> 8) & 0xffu;
+	*major = (w >> 16) & 0xffu;
+	return 1;
+}
+
+/* ---- W23/W24 (fuxiwlanqrtr=7, C2): channel list, station vdev, passive scan ----
+ * Adapted from Linux ath12k wmi.c, wmi.h, mac.c, reg.c and core.h
+ * (BSD-3-Clause-Clear), v6.19. Ids, tags, sizes and flags come from the
+ * wmi.h enums and structs (the host test re-derives them). Nothing here asks
+ * the radio to transmit: every channel carries PASSIVE, the scan is PASSIVE
+ * with no SSID, no extra IE and no probe count, and the one BSSID is the
+ * broadcast placeholder L19 always sends (wmi.c:2565-2570). */
+#define WLWMI_CMD_START_SCAN 0x3001u
+#define WLWMI_CMD_STOP_SCAN 0x3002u
+#define WLWMI_CMD_SCAN_CHAN_LIST 0x3003u
+#define WLWMI_CMD_VDEV_CREATE 0x5001u
+#define WLWMI_CMD_VDEV_SET_PARAM 0x5008u
+#define WLWMI_CMD_STA_POWERSAVE_MODE 0x9001u
+#define WLWMI_CMD_STA_POWERSAVE_PARAM 0x9002u
+#define WLWMI_EV_SCAN 0x3001u
+#define WLWMI_EV_CHAN_INFO 0x4002u
+#define WLWMI_EV_MGMT_RX 0x7001u
+#define WLWMI_EV_PDEV_RSSI_DBM_CONVERSION 0x402bu  /* L19 moves its noise floor with it (wmi.c:9740-9796); C2 counts it, not applied */
+#define WLWMI_TAG_ARRAY_BYTE 0x11u
+#define WLWMI_TAG_ARRAY_FIXED_STRUCT 0x13u
+#define WLWMI_TAG_SCAN_EVENT 0x24u
+#define WLWMI_TAG_CHAN_INFO_EVENT 0x26u
+#define WLWMI_TAG_MGMT_RX_HDR 0x2cu
+#define WLWMI_TAG_START_SCAN_CMD 0x4du
+#define WLWMI_TAG_STOP_SCAN_CMD 0x4eu
+#define WLWMI_TAG_SCAN_CHAN_LIST_CMD 0x4fu
+#define WLWMI_TAG_CHANNEL 0x50u
+#define WLWMI_TAG_VDEV_CREATE_CMD 0x56u
+#define WLWMI_TAG_VDEV_SET_PARAM_CMD 0x5fu
+#define WLWMI_TAG_STA_POWERSAVE_MODE_CMD 0x6cu
+#define WLWMI_TAG_STA_POWERSAVE_PARAM_CMD 0x6du
+#define WLWMI_TAG_VDEV_TXRX_STREAMS 0x19bu
+/* Command structs with their TLV header; event structs are the TLV value. */
+#define WLWMI_CHAN_LIST_BYTES 16u       /* struct wmi_scan_chan_list_cmd (wmi.h:4001-4006) */
+#define WLWMI_CHANNEL_BYTES 28u         /* struct ath12k_wmi_channel_params (wmi.h:3636-3644) */
+#define WLWMI_VDEV_CREATE_BYTES 48u     /* struct wmi_vdev_create_cmd (wmi.h:2878-2890) */
+#define WLWMI_TXRX_STREAMS_BYTES 16u    /* struct ath12k_wmi_vdev_txrx_streams_params (wmi.h:2892-2897) */
+#define WLWMI_VDEV_SET_PARAM_BYTES 16u  /* struct wmi_vdev_set_param_cmd (wmi.h:3677-3682) */
+#define WLWMI_STA_PS_PARAM_BYTES 16u    /* struct wmi_sta_powersave_param_cmd (wmi.h:3318-3323) */
+#define WLWMI_STA_PS_MODE_BYTES 12u     /* struct wmi_pdev_set_ps_mode_cmd (wmi.h:3286-3290) */
+#define WLWMI_START_SCAN_BYTES 160u     /* struct wmi_start_scan_cmd (wmi.h:3432-3464) */
+#define WLWMI_STOP_SCAN_BYTES 24u       /* struct wmi_stop_scan_cmd (wmi.h:3985-3992) */
+#define WLWMI_MAC_ADDR_BYTES 8u         /* struct ath12k_wmi_mac_addr_params, 6 + 2 pad (wmi.h:2825-2828) */
+#define WLWMI_SCAN_EVENT_BYTES 28u      /* struct wmi_scan_event (wmi.h:4525-4538) */
+#define WLWMI_CHAN_INFO_BYTES 56u       /* struct wmi_chan_info_event (wmi.h:4586-4601) */
+#define WLWMI_MGMT_RX_HDR_BYTES 68u     /* struct ath12k_wmi_mgmt_rx_params (wmi.h:4498-4513) */
+#define WLWMI_CHAN_INFO_PASSIVE (1u << 7)        /* wmi.h:3613-3626 */
+#define WLWMI_CHAN_INFO_DFS (1u << 10)
+#define WLWMI_CHAN_INFO_ALLOW_HE (1u << 17)
+#define WLWMI_MODE_11A 0u                        /* enum wmi_phy_mode (wmi.h:3031-3034) */
+#define WLWMI_MODE_11G 1u
+#define WLWMI_APPEND_CHAN_LIST 1u                /* WMI_APPEND_TO_EXISTING_CHAN_LIST_FLAG (wmi.h:170) */
+/* reg_info power in half dB: the 20 dBm cfg80211's world domain allows on
+ * every listed channel (mac.c:31 max_power 30 capped by the rule), antenna
+ * gain 0; L19 doubles the channel values (reg.c:212-215) [I]. Nothing is
+ * transmitted, so they bound nothing in C2. */
+#define WLWMI_CHAN_POWER_HALF_DB 40u
+#define WLWMI_VDEV_ID 0u                         /* the first free vdev (mac.c:10051) */
+#define WLWMI_VDEV_TYPE_STA 2u                   /* wmi.h:4626 */
+#define WLWMI_VDEV_SUBTYPE_NONE 0u               /* wmi.h:4631-4632 */
+#define WLWMI_MBSSID_NON_MBSSID_AP 1u            /* wmi.h:2974; mac.c:9742 */
+#define WLWMI_BAND_2G 0u                         /* WMI_TPC_CHAINMASK_CONFIG_BAND_2G/5G (wmi.h:2272-2274) */
+#define WLWMI_BAND_5G 1u
+#define WLWMI_NUM_BANDS 2u                       /* WMI_NUM_SUPPORTED_BAND_MAX */
+#define WLWMI_HOST_2GHZ_CAP 1u                   /* wmi.h:220-221 */
+#define WLWMI_HOST_5GHZ_CAP 2u
+#define WLWMI_VDEV_PARAM_NSS 0x22u               /* enum wmi_tlv_vdev_param (wmi.h:1114) */
+#define WLWMI_STA_PS_PARAM_RX_WAKE_POLICY 0u     /* wmi.h:4642-4644 */
+#define WLWMI_STA_PS_PARAM_TX_WAKE_THRESHOLD 1u
+#define WLWMI_STA_PS_PARAM_PSPOLL_COUNT 2u
+#define WLWMI_STA_PS_RX_WAKE_POLICY_WAKE 0u      /* wmi.h:4828 */
+#define WLWMI_STA_PS_TX_WAKE_THRESHOLD_ALWAYS 1u /* wmi.h:4662 */
+#define WLWMI_STA_PS_PSPOLL_COUNT_NO_MAX 0u      /* wmi.h:4678 */
+#define WLWMI_STA_PS_MODE_DISABLED 0u            /* wmi.h:3647 */
+#define WLWMI_SCAN_ID 0xa000u                    /* ATH12K_SCAN_ID (wmi.h:3597) */
+#define WLWMI_SCAN_REQ_ID 1u                     /* wmi.c:2545 */
+#define WLWMI_SCAN_EV_STARTED (1u << 0)          /* enum wmi_scan_event_type (wmi.h:3407-3421) */
+#define WLWMI_SCAN_EV_COMPLETED (1u << 1)
+#define WLWMI_SCAN_EV_BSS_CHANNEL (1u << 2)
+#define WLWMI_SCAN_EV_FOREIGN_CHAN (1u << 3)
+#define WLWMI_SCAN_EV_DEQUEUED (1u << 4)
+#define WLWMI_SCAN_EV_START_FAILED (1u << 6)
+#define WLWMI_SCAN_REASON_CANCELLED 1u           /* enum wmi_scan_completion_reason (wmi.h:3423-3430) */
+#define WLWMI_SCAN_FLAG_PASSIVE 0x1u             /* wmi.h:3466 */
+#define WLWMI_SCAN_CHAN_STAT_EVENT 0x10u         /* wmi.h:3470 */
+#define WLWMI_SCAN_STOP_ONE 0u                   /* wmi.h:3590 */
+#define WLWMI_CHAN_INFO_START_RESP 0u            /* wmi.h:4583-4584 */
+#define WLWMI_CHAN_INFO_END_RESP 1u
+#define WLWMI_RX_ERR_CRC 0x01u                   /* wmi.h:4473-4477 */
+#define WLWMI_RX_ERR_DECRYPT 0x08u
+#define WLWMI_RX_ERR_KEY_CACHE_MISS 0x20u
+#define WLWMI_NOISE_FLOOR (-95)                  /* ATH12K_DEFAULT_NOISE_FLOOR (core.h:634; mac.c:14226-14228) */
+#define WLWMI_MAX_5GHZ_CHAN 173u                 /* ATH12K_MAX_5GHZ_CHAN (core.h:615) */
+#define WLWMI_MIN_6GHZ_FREQ 5925u                /* ATH12K_MIN/MAX_6GHZ_FREQ (core.h:601-613) */
+#define WLWMI_MAX_6GHZ_FREQ 7125u
+/* ath12k_wmi_start_scan_init (wmi.c:2541-2571) and the passive request of
+ * ath12k_mac_initiate_hw_scan (mac.c:5335-5366): no SSID = scan_f_passive. C2
+ * adds START_FAILED to the subscribed events (L19 handles it unsubscribed,
+ * wmi.c:7351-7354) and sets max_scan_time to n x dwell x 3/2 instead of
+ * 20000 (overnight_plan.md 3.2). */
+#define WLSCAN_DWELL_ACTIVE 50u
+#define WLSCAN_DWELL_ACTIVE_2G 0u
+#define WLSCAN_DWELL_PASSIVE 150u
+#define WLSCAN_DWELL_ACTIVE_6G 70u
+#define WLSCAN_DWELL_PASSIVE_6G 70u
+#define WLSCAN_MIN_REST 50u
+#define WLSCAN_MAX_REST 500u
+#define WLSCAN_PROBE_DELAY 5u
+#define WLSCAN_EVENTS (WLWMI_SCAN_EV_STARTED | WLWMI_SCAN_EV_COMPLETED | WLWMI_SCAN_EV_BSS_CHANNEL | \
+	WLWMI_SCAN_EV_FOREIGN_CHAN | WLWMI_SCAN_EV_DEQUEUED | WLWMI_SCAN_EV_START_FAILED)
+#define WLSCAN_FLAGS (WLWMI_SCAN_FLAG_PASSIVE | WLWMI_SCAN_CHAN_STAT_EVENT)
+#define WLSCAN_NCHAN 38u
+#define WLSCAN_NCHAN_24 13u
+#define WLSCAN_BSS_MAX 64u
+_Static_assert(WLWMI_CHANNEL_BYTES == 28 && WLWMI_VDEV_CREATE_BYTES == 48 && WLWMI_START_SCAN_BYTES == 160 &&
+    WLWMI_STOP_SCAN_BYTES == 24 && WLWMI_SCAN_EVENT_BYTES == 28 && WLWMI_CHAN_INFO_BYTES == 56 &&
+    WLWMI_MGMT_RX_HDR_BYTES == 68 && WLHTT_VER_REQ_BYTES == 8, "C2 WMI/HTT wire sizes");
+_Static_assert(WLSCAN_FLAGS == 0x11u && !(WLSCAN_FLAGS & 0x2u), "C2 scans are passive: no broadcast probe request");
+
+/* struct wmi_start_scan_cmd word index (0 = TLV header). */
+enum {
+	WLWMI_SS_SCAN_ID = 1, WLWMI_SS_SCAN_REQ_ID, WLWMI_SS_VDEV_ID, WLWMI_SS_PRIORITY, WLWMI_SS_NOTIFY,
+	WLWMI_SS_DWELL_ACTIVE, WLWMI_SS_DWELL_PASSIVE, WLWMI_SS_MIN_REST, WLWMI_SS_MAX_REST, WLWMI_SS_REPEAT_PROBE,
+	WLWMI_SS_PROBE_SPACING, WLWMI_SS_IDLE, WLWMI_SS_MAX_SCAN_TIME, WLWMI_SS_PROBE_DELAY, WLWMI_SS_CTRL_FLAGS,
+	WLWMI_SS_BURST, WLWMI_SS_NUM_CHAN, WLWMI_SS_NUM_BSSID, WLWMI_SS_NUM_SSIDS, WLWMI_SS_IE_LEN, WLWMI_SS_N_PROBES,
+	WLWMI_SS_MAC_ADDR, WLWMI_SS_MAC_MASK = WLWMI_SS_MAC_ADDR + 2, WLWMI_SS_IE_BITMAP = WLWMI_SS_MAC_MASK + 2,
+	WLWMI_SS_NUM_VENDOR_OUI = WLWMI_SS_IE_BITMAP + 8, WLWMI_SS_CTRL_FLAGS_EXT, WLWMI_SS_DWELL_ACTIVE_2G,
+	WLWMI_SS_DWELL_ACTIVE_6G, WLWMI_SS_DWELL_PASSIVE_6G, WLWMI_SS_START_OFFSET, WLWMI_SS_WORDS
+};
+_Static_assert(WLWMI_SS_WORDS * 4 == WLWMI_START_SCAN_BYTES && WLWMI_SS_MAX_SCAN_TIME == 13 &&
+    WLWMI_SS_CTRL_FLAGS == 15 && WLWMI_SS_N_PROBES == 21, "WMI START_SCAN word order (wmi.h:3432-3464)");
+
+/* The C2 channel list, one for the radio and the iOS side (overnight_plan.md
+ * 3.2): 2.4 GHz 1-13, 5 GHz 36-48, 52-64 (DFS), 100-144 (DFS), 149-165; no
+ * 6 GHz. The 13 2.4 GHz channels come first: w20 0x10 scans those only. */
+static inline uint32_t
+wlscan_chan(uint32_t i)
+{
+	static const uint16_t mhz[WLSCAN_NCHAN] = {
+		2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
+		5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320,
+		5500, 5520, 5540, 5560, 5580, 5600, 5620, 5640, 5660, 5680, 5700, 5720,
+		5745, 5765, 5785, 5805, 5825,
+	};
+	return i < WLSCAN_NCHAN ? mhz[i] : 0u;
+}
+
+static inline bool wlscan_is_dfs(uint32_t mhz) { return (mhz >= 5260u && mhz <= 5320u) || (mhz >= 5500u && mhz <= 5720u); }
+static inline uint32_t wlscan_max_time(uint32_t n) { return n * WLSCAN_DWELL_PASSIVE * 3u / 2u; }
+
+static inline uint32_t
+wlwmi_popcount(uint32_t v)
+{
+	uint32_t n = 0;
+	for (; v; v &= v - 1u) { n++; }
+	return n;
+}
+
+/* Channel info as ath12k_reg_update_chan_list and the encoder set it
+ * (reg.c:200-221, wmi.c:2942-2963): allow_ht/vht/he all true, of which the
+ * else-if chain sends ALLOW_HE only; PASSIVE (C2: every channel; L19 for
+ * NO_IR or radar); DFS on radar channels; MODE_11G on 2.4 GHz, else 11A. */
+static inline uint32_t
+wlwmi_chan_info(uint32_t mhz)
+{
+	return (mhz < 3000u ? WLWMI_MODE_11G : WLWMI_MODE_11A) | WLWMI_CHAN_INFO_PASSIVE | WLWMI_CHAN_INFO_ALLOW_HE |
+	    (wlscan_is_dfs(mhz) ? WLWMI_CHAN_INFO_DFS : 0u);
+}
+
+/* Channels per SCAN_CHAN_LIST: L19 bounds the TLV payload (fixed TLV, array
+ * header, entries) by the WMI endpoint's max message (wmi.c:2895-2903);
+ * here also by one TX slot with the HTC and WMI headers. */
+static inline uint32_t
+wlwmi_chan_list_max(uint32_t max_msg)
+{
+	uint32_t room = WLCE_BUF - WLHTC_HDR - 4u;
+	if (max_msg < room) { room = max_msg; }
+	return room > WLWMI_CHAN_LIST_BYTES + 4u ? (room - WLWMI_CHAN_LIST_BYTES - 4u) / WLWMI_CHANNEL_BYTES : 0u;
+}
+
+/* SCAN_CHAN_LIST (wmi.c:2880-2997) for list entries FIRST .. FIRST + N - 1:
+ * TLV 0x4f {num_scan_chans, flags (APPEND after the first command), pdev},
+ * then ARRAY_STRUCT of TLV 0x50 {mhz, cfreq1 = mhz, cfreq2 0, info,
+ * reg_info_1 = min 0 | max power 15:8 | max reg power 23:16 | class 0,
+ * reg_info_2 = antenna 0 | max tx power 15:8 = max reg power}. L19 writes the
+ * array header with ath12k_wmi_tlv_cmd_hdr, which takes the 4-byte header off
+ * the length: it says 28 x N - 4 (wmi.c:204-207, 2923-2926); sent as L19 does. */
+static inline int
+wlwmi_encode_chan_list(uint32_t first, uint32_t n, bool append, uint32_t pdev, uint8_t *out, uint32_t room, uint32_t *len)
+{
+	uint32_t total = 4u + WLWMI_CHAN_LIST_BYTES + 4u + n * WLWMI_CHANNEL_BYTES;
+	if (!n || n > WLSCAN_NCHAN || first > WLSCAN_NCHAN - n || total > room) { return 1; }
+	for (uint32_t i = 0; i < total; i++) { out[i] = 0; }
+	wlce_put32(out, WLWMI_CMD_SCAN_CHAN_LIST);
+	wlwmi_put_tlv(out + 4, WLWMI_TAG_SCAN_CHAN_LIST_CMD, WLWMI_CHAN_LIST_BYTES - 4u);
+	wlce_put32(out + 8, n);
+	wlce_put32(out + 12, append ? WLWMI_APPEND_CHAN_LIST : 0u);
+	wlce_put32(out + 16, pdev);
+	wlwmi_put_tlv(out + 20, WLWMI_TAG_ARRAY_STRUCT, n * WLWMI_CHANNEL_BYTES - 4u);
+	for (uint32_t i = 0; i < n; i++) {
+		uint8_t *c = out + 24 + i * WLWMI_CHANNEL_BYTES;
+		uint32_t mhz = wlscan_chan(first + i);
+		wlwmi_put_tlv(c, WLWMI_TAG_CHANNEL, WLWMI_CHANNEL_BYTES - 4u);
+		wlce_put32(c + 4, mhz);
+		wlce_put32(c + 8, mhz);
+		wlce_put32(c + 16, wlwmi_chan_info(mhz));
+		wlce_put32(c + 20, (WLWMI_CHAN_POWER_HALF_DB << 8) | (WLWMI_CHAN_POWER_HALF_DB << 16));
+		wlce_put32(c + 24, WLWMI_CHAN_POWER_HALF_DB << 8);
+	}
+	*len = total;
+	return 0;
+}
+
+/* VDEV_CREATE (wmi.c:923-1010, mac.c:9727-9780, 10004-10087): TLV 0x56
+ * {vdev 0, type STA, subtype NONE, MAC + 2 pad, num_cfg_txrx_streams 2, pdev,
+ * mbssid flags NON_MBSSID_AP, tx vdev 0, stats id valid BIT(0), stats id 0
+ * (the first free one, mac.c:9667-9687)}, then ARRAY_STRUCT (exact length,
+ * ath12k_wmi_tlv_hdr) of two TLV 0x19b {band 2G / 5G, tx and rx streams =
+ * the pdev's chains where the pdev has the band, else 0}. No MLO TLV: not an
+ * MLD. The firmware sends no reply (L19 waits for none). */
+#define WLWMI_VDEV_CREATE_TOTAL (4u + WLWMI_VDEV_CREATE_BYTES + 4u + WLWMI_NUM_BANDS * WLWMI_TXRX_STREAMS_BYTES)
+static inline int
+wlwmi_encode_vdev_create(const uint8_t *mac, uint32_t pdev, uint32_t bands, uint32_t tx, uint32_t rx,
+    uint8_t *out, uint32_t room, uint32_t *len)
+{
+	if (room < WLWMI_VDEV_CREATE_TOTAL) { return 1; }
+	for (uint32_t i = 0; i < WLWMI_VDEV_CREATE_TOTAL; i++) { out[i] = 0; }
+	wlce_put32(out, WLWMI_CMD_VDEV_CREATE);
+	wlwmi_put_tlv(out + 4, WLWMI_TAG_VDEV_CREATE_CMD, WLWMI_VDEV_CREATE_BYTES - 4u);
+	wlce_put32(out + 8, WLWMI_VDEV_ID);
+	wlce_put32(out + 12, WLWMI_VDEV_TYPE_STA);
+	wlce_put32(out + 16, WLWMI_VDEV_SUBTYPE_NONE);
+	memcpy(out + 20, mac, 6);
+	wlce_put32(out + 28, WLWMI_NUM_BANDS);
+	wlce_put32(out + 32, pdev);
+	wlce_put32(out + 36, WLWMI_MBSSID_NON_MBSSID_AP);
+	wlce_put32(out + 44, 1u);
+	wlwmi_put_tlv(out + 52, WLWMI_TAG_ARRAY_STRUCT, WLWMI_NUM_BANDS * WLWMI_TXRX_STREAMS_BYTES);
+	for (uint32_t b = 0; b < WLWMI_NUM_BANDS; b++) {
+		uint8_t *s = out + 56 + b * WLWMI_TXRX_STREAMS_BYTES;
+		bool has = bands & (b == WLWMI_BAND_2G ? WLWMI_HOST_2GHZ_CAP : WLWMI_HOST_5GHZ_CAP);
+		wlwmi_put_tlv(s, WLWMI_TAG_VDEV_TXRX_STREAMS, WLWMI_TXRX_STREAMS_BYTES - 4u);
+		wlce_put32(s + 4, b == 0 ? WLWMI_BAND_2G : WLWMI_BAND_5G);
+		wlce_put32(s + 8, has ? tx : 0u);
+		wlce_put32(s + 12, has ? rx : 0u);
+	}
+	*len = WLWMI_VDEV_CREATE_TOTAL;
+	return 0;
+}
+
+/* A command that is one fixed TLV of NW words: VDEV_SET_PARAM {vdev, param,
+ * value} (wmi.c:1877-1909), STA_POWERSAVE_PARAM {vdev, param, value}
+ * (wmi.c:1815-1846), STA_POWERSAVE_MODE {vdev, mode} (wmi.c:1652-1680),
+ * STOP_SCAN {requestor, scan id, req type, vdev, pdev} (wmi.c:2832-2878). */
+static inline int
+wlwmi_encode_words(uint32_t cmd, uint32_t tag, const uint32_t *w, uint32_t nw, uint8_t *out, uint32_t room, uint32_t *len)
+{
+	uint32_t total = 8u + 4u * nw;
+	if (total > room) { return 1; }
+	wlce_put32(out, cmd);
+	wlwmi_put_tlv(out + 4, tag, 4u * nw);
+	for (uint32_t i = 0; i < nw; i++) { wlce_put32(out + 8 + 4 * i, w[i]); }
+	*len = total;
+	return 0;
+}
+
+/* START_SCAN (wmi.c:2646-2830): the fixed TLV 0x4d with the
+ * ath12k_wmi_start_scan_init values; scan_priority stays 0 on the wire (L19
+ * fills arg->scan_priority, never cmd->scan_priority, wmi.c:2708-2712);
+ * notify events and max_scan_time as above; flags PASSIVE | CHAN_STAT_EVENT,
+ * adaptive dwell mode 0 (wmi.c:2600-2643). Then ARRAY_UINT32 of the N MHz
+ * values, ARRAY_FIXED_STRUCT of 0 SSIDs, ARRAY_FIXED_STRUCT with the
+ * broadcast BSSID + 2 pad, ARRAY_BYTE of 0 extra IE bytes; no hint arrays. */
+static inline uint32_t
+wlwmi_start_scan_total(uint32_t n)
+{
+	return 4u + WLWMI_START_SCAN_BYTES + 4u + 4u * n + 4u + 4u + WLWMI_MAC_ADDR_BYTES + 4u;
+}
+
+static inline int
+wlwmi_encode_start_scan(uint32_t n, uint32_t max_time, uint8_t *out, uint32_t room, uint32_t *len)
+{
+	uint32_t total = wlwmi_start_scan_total(n);
+	if (!n || n > WLSCAN_NCHAN || total > room) { return 1; }
+	for (uint32_t i = 0; i < total; i++) { out[i] = 0; }
+	uint8_t *f = out + 4, *p = f + WLWMI_START_SCAN_BYTES;
+	wlce_put32(out, WLWMI_CMD_START_SCAN);
+	wlwmi_put_tlv(f, WLWMI_TAG_START_SCAN_CMD, WLWMI_START_SCAN_BYTES - 4u);
+	wlce_put32(f + 4 * WLWMI_SS_SCAN_ID, WLWMI_SCAN_ID);
+	wlce_put32(f + 4 * WLWMI_SS_SCAN_REQ_ID, WLWMI_SCAN_REQ_ID);
+	wlce_put32(f + 4 * WLWMI_SS_VDEV_ID, WLWMI_VDEV_ID);
+	wlce_put32(f + 4 * WLWMI_SS_NOTIFY, WLSCAN_EVENTS);
+	wlce_put32(f + 4 * WLWMI_SS_DWELL_ACTIVE, WLSCAN_DWELL_ACTIVE);
+	wlce_put32(f + 4 * WLWMI_SS_DWELL_PASSIVE, WLSCAN_DWELL_PASSIVE);
+	wlce_put32(f + 4 * WLWMI_SS_MIN_REST, WLSCAN_MIN_REST);
+	wlce_put32(f + 4 * WLWMI_SS_MAX_REST, WLSCAN_MAX_REST);
+	wlce_put32(f + 4 * WLWMI_SS_MAX_SCAN_TIME, max_time);
+	wlce_put32(f + 4 * WLWMI_SS_PROBE_DELAY, WLSCAN_PROBE_DELAY);
+	wlce_put32(f + 4 * WLWMI_SS_CTRL_FLAGS, WLSCAN_FLAGS);
+	wlce_put32(f + 4 * WLWMI_SS_NUM_CHAN, n);
+	wlce_put32(f + 4 * WLWMI_SS_NUM_BSSID, 1u);
+	wlce_put32(f + 4 * WLWMI_SS_DWELL_ACTIVE_2G, WLSCAN_DWELL_ACTIVE_2G);
+	wlce_put32(f + 4 * WLWMI_SS_DWELL_ACTIVE_6G, WLSCAN_DWELL_ACTIVE_6G);
+	wlce_put32(f + 4 * WLWMI_SS_DWELL_PASSIVE_6G, WLSCAN_DWELL_PASSIVE_6G);
+	wlwmi_put_tlv(p, WLWMI_TAG_ARRAY_UINT32, 4u * n);
+	for (uint32_t i = 0; i < n; i++) { wlce_put32(p + 4 + 4 * i, wlscan_chan(i)); }
+	p += 4u + 4u * n;
+	wlwmi_put_tlv(p, WLWMI_TAG_ARRAY_FIXED_STRUCT, 0);
+	p += 4;
+	wlwmi_put_tlv(p, WLWMI_TAG_ARRAY_FIXED_STRUCT, WLWMI_MAC_ADDR_BYTES);
+	for (uint32_t i = 0; i < 6; i++) { p[4 + i] = 0xff; }
+	p += 4u + WLWMI_MAC_ADDR_BYTES;
+	wlwmi_put_tlv(p, WLWMI_TAG_ARRAY_BYTE, 0);
+	*len = total;
+	return 0;
+}
+
+/* What the scan heard. One entry per BSSID: the strongest reception's
+ * frequency and dBm, every flag seen, the first usable SSID. */
+enum { WLSCAN_SSID_NONE, WLSCAN_SSID_OK, WLSCAN_SSID_HIDDEN, WLSCAN_SSID_BAD };
+struct wlscan_bss {
+	uint8_t bssid[6], ssid[32];
+	uint8_t ssid_len, ssid_state, chan;
+	bool beacon, probe_resp, privacy, rsn;
+	uint16_t cap;
+	uint32_t freq, frames;
+	int32_t dbm;
+};
+
+struct wlscan {
+	uint32_t nchan;
+	int32_t noise_floor;            /* dBm = SNR + this (wmi.c:7184-7187) */
+	bool started, done, start_failed, dequeued;
+	uint32_t reason;                /* of COMPLETED, DEQUEUED or START_FAILED */
+	uint32_t ev_type, ev_reason, ev_freq, ev_scan_id, ev_vdev;   /* the last SCAN_EVENT */
+	uint32_t events, foreign, bss_channel, other_types, ignored, wrong_vdev, bad_events;
+	uint32_t ci_start, ci_end, ci_ignored;
+	int32_t nf_min, nf_max;
+	bool nf_seen;
+	uint32_t mgmt, frames, drop_status, drop_channel, drop_bad, other_mgmt, ie_truncated, table_full;
+	uint32_t nbss;
+	struct wlscan_bss bss[WLSCAN_BSS_MAX];
+	const char *why;
+};
+
+static inline void
+wlscan_init(struct wlscan *s, uint32_t nchan)
+{
+	for (size_t i = 0; i < sizeof(*s); i++) { ((uint8_t *)s)[i] = 0; }
+	s->nchan = nchan;
+	s->noise_floor = WLWMI_NOISE_FLOOR;
+}
+
+static inline int
+wlscan_fail(struct wlscan *s, const char *why)
+{
+	if (!s->why) { s->why = why; }
+	return 1;
+}
+
+static inline bool
+wlscan_known(uint32_t id)
+{
+	return id == WLWMI_EV_SCAN || id == WLWMI_EV_CHAN_INFO || id == WLWMI_EV_MGMT_RX;
+}
+
+/* The last TLV of TAG (L19's tlv_parse keeps the last, wmi.c:370-379) and
+ * whether any TLV of TAG was below MIN (L19's policy then drops the event,
+ * wmi.c:345-357). -1 = a TLV past the buffer (stops the run, as in C1). */
+static inline int
+wlscan_tlv(const uint8_t *p, uint32_t len, uint32_t tag, uint32_t min, const uint8_t **v, bool *short_seen)
+{
+	struct wlwmi_it it;
+	int r;
+	*v = 0; *short_seen = false;
+	wlwmi_it_init(&it, p, len);
+	while ((r = wlwmi_next(&it)) > 0) {
+		if (it.tag != tag) { continue; }
+		if (it.tlen < min) { *short_seen = true; } else { *v = it.v; }
+	}
+	return r;
+}
+
+/* SCAN_EVENT (wmi.c:6473-6504, 7289-7368), TLV 0x24, vdev 0 only: STARTED and
+ * START_FAILED count while starting, FOREIGN_CHAN and COMPLETED while running
+ * (L19 ignores COMPLETED before STARTED, wmi.c:6363-6387); DEQUEUED ends the
+ * scan as L19's __ath12k_mac_scan_finish does (wmi.c:7355-7357). */
+static inline int
+wlscan_parse_event(struct wlscan *s, const uint8_t *p, uint32_t len)
+{
+	const uint8_t *v;
+	bool bad;
+	if (wlscan_tlv(p, len, WLWMI_TAG_SCAN_EVENT, WLWMI_SCAN_EVENT_BYTES, &v, &bad) < 0) {
+		return wlscan_fail(s, "WMI SCAN_EVENT TLV past the buffer");
+	}
+	if (bad || !v) { s->bad_events++; return 0; }
+	s->events++;
+	s->ev_type = wlce_get32(v); s->ev_reason = wlce_get32(v + 4); s->ev_freq = wlce_get32(v + 8);
+	s->ev_scan_id = wlce_get32(v + 16); s->ev_vdev = wlce_get32(v + 20);
+	if (s->ev_vdev != WLWMI_VDEV_ID) { s->wrong_vdev++; return 0; }
+	bool starting = !s->started && !s->start_failed && !s->done, running = s->started && !s->done;
+	switch (s->ev_type) {
+	case WLWMI_SCAN_EV_STARTED:
+		if (starting) { s->started = true; } else { s->ignored++; }
+		break;
+	case WLWMI_SCAN_EV_START_FAILED:
+		if (starting) { s->start_failed = true; s->reason = s->ev_reason; } else { s->ignored++; }
+		break;
+	case WLWMI_SCAN_EV_COMPLETED:
+		if (running) { s->done = true; s->reason = s->ev_reason; } else { s->ignored++; }
+		break;
+	case WLWMI_SCAN_EV_DEQUEUED:
+		if (!s->done && !s->start_failed) { s->done = s->dequeued = true; s->reason = s->ev_reason; } else { s->ignored++; }
+		break;
+	case WLWMI_SCAN_EV_FOREIGN_CHAN:
+		if (running) { s->foreign++; } else { s->ignored++; }
+		break;
+	case WLWMI_SCAN_EV_BSS_CHANNEL:
+		s->bss_channel++;
+		break;
+	default:
+		s->other_types++;
+		break;
+	}
+	return 0;
+}
+
+/* CHAN_INFO (wmi.c:6587-6623, 7493-7560), TLV 0x26: END_RESP ends the report;
+ * START_RESP of vdev 0 while the scan runs carries the noise floor. */
+static inline int
+wlscan_parse_chan_info(struct wlscan *s, const uint8_t *p, uint32_t len)
+{
+	const uint8_t *v;
+	bool bad;
+	if (wlscan_tlv(p, len, WLWMI_TAG_CHAN_INFO_EVENT, WLWMI_CHAN_INFO_BYTES, &v, &bad) < 0) {
+		return wlscan_fail(s, "WMI CHAN_INFO TLV past the buffer");
+	}
+	if (bad || !v) { s->bad_events++; return 0; }
+	uint32_t flags = wlce_get32(v + 8), vdev = wlce_get32(v + 52);
+	int32_t nf = (int32_t)wlce_get32(v + 12);
+	if (flags == WLWMI_CHAN_INFO_END_RESP) { s->ci_end++; return 0; }
+	if (vdev != WLWMI_VDEV_ID || !s->started || s->done || flags != WLWMI_CHAN_INFO_START_RESP) { s->ci_ignored++; return 0; }
+	s->ci_start++;
+	if (!s->nf_seen || nf < s->nf_min) { s->nf_min = nf; }
+	if (!s->nf_seen || nf > s->nf_max) { s->nf_max = nf; }
+	s->nf_seen = true;
+	return 0;
+}
+
+/* An 802.11 beacon (subtype 8) or probe response (subtype 5), management
+ * type 0: 24-byte header with the BSSID as address 3 (bytes 16..21), then
+ * timestamp 8, interval 2, capability 2 (Privacy = bit 4), then elements
+ * {id, length, body} (IEEE 802.11; layout facts, not code). The walk stops
+ * at the first element that does not fit, as cfg80211's element iterator
+ * does; elements before it still count. SSID (0): length 0 or all zero bytes
+ * = hidden, 1..32 = the name, above 32 = invalid; DS parameter set (3), else
+ * HT operation (61), gives the channel; RSN (48) is noted.
+ * 0 = a BSS, 1 = another frame type, 2 = too short for the fixed fields. */
+static inline int
+wl80211_parse_bss(const uint8_t *f, uint32_t len, struct wlscan_bss *b, uint32_t *truncated)
+{
+	if (len < 2) { return 2; }
+	uint32_t fc = wlce_get16(f), sub = (fc >> 4) & 0xfu, off = 36, ht = 0;
+	bool ssid_seen = false;
+	if ((fc & 0x0cu) || (sub != 8u && sub != 5u)) { return 1; }
+	if (len < 36u) { return 2; }
+	memcpy(b->bssid, f + 16, 6);
+	b->cap = (uint16_t)wlce_get16(f + 34);
+	b->privacy = (b->cap >> 4) & 1u;
+	b->beacon = sub == 8u;
+	b->probe_resp = sub == 5u;
+	while (off < len) {
+		if (len - off < 2u || (uint32_t)f[off + 1] > len - off - 2u) { (*truncated)++; break; }
+		uint32_t id = f[off], l = f[off + 1];
+		const uint8_t *v = f + off + 2;
+		if (id == 0 && !ssid_seen) {
+			bool zero = true;
+			ssid_seen = true;
+			b->ssid_len = (uint8_t)l;
+			if (l > 32u) { b->ssid_state = WLSCAN_SSID_BAD; }
+			else {
+				for (uint32_t i = 0; i < l; i++) { b->ssid[i] = v[i]; if (v[i]) { zero = false; } }
+				b->ssid_state = zero ? WLSCAN_SSID_HIDDEN : WLSCAN_SSID_OK;
+			}
+		} else if (id == 3 && l >= 1 && !b->chan) {
+			b->chan = v[0];
+		} else if (id == 61 && l >= 1 && !ht) {
+			ht = v[0];
+		} else if (id == 48) {
+			b->rsn = true;
+		}
+		off += 2u + l;
+	}
+	if (!b->chan) { b->chan = (uint8_t)ht; }
+	return 0;
+}
+
+static inline bool
+wlscan_same(const uint8_t *a, const uint8_t *b, uint32_t n)
+{
+	for (uint32_t i = 0; i < n; i++) { if (a[i] != b[i]) { return false; } }
+	return true;
+}
+
+/* Deduplicated by BSSID, 64 entries; a frame of a BSSID past them is not
+ * kept and counts once in table_full (frames, not BSSIDs). */
+static inline void
+wlscan_bss_add(struct wlscan *s, const struct wlscan_bss *n)
+{
+	for (uint32_t i = 0; i < s->nbss; i++) {
+		struct wlscan_bss *e = &s->bss[i];
+		if (!wlscan_same(e->bssid, n->bssid, 6)) { continue; }
+		e->frames++;
+		if (n->dbm > e->dbm) { e->dbm = n->dbm; e->freq = n->freq; }
+		e->beacon = e->beacon || n->beacon;
+		e->probe_resp = e->probe_resp || n->probe_resp;
+		e->privacy = e->privacy || n->privacy;
+		e->rsn = e->rsn || n->rsn;
+		if (!e->chan) { e->chan = n->chan; }
+		if ((e->ssid_state != WLSCAN_SSID_OK && n->ssid_state == WLSCAN_SSID_OK) ||
+		    (e->ssid_state == WLSCAN_SSID_NONE && n->ssid_state != WLSCAN_SSID_NONE)) {
+			e->ssid_state = n->ssid_state; e->ssid_len = n->ssid_len;
+			memcpy(e->ssid, n->ssid, sizeof(e->ssid));
+		}
+		return;
+	}
+	if (s->nbss >= WLSCAN_BSS_MAX) { s->table_full++; return; }
+	s->bss[s->nbss++] = *n;
+}
+
+/* MGMT_RX (wmi.c:6162-6234, 7113-7230): the last TLV 0x2c header of at least
+ * 68 bytes and the first ARRAY_BYTE (the frame, buf_len bytes of it: L19
+ * bounds buf_len by the event, here by the byte array itself). Dropped as
+ * L19 drops them: no header or frame, status CRC/DECRYPT/KEY_CACHE_MISS, a
+ * channel neither 1..14 nor 36..173; also 6 GHz (not on the C2 list). The
+ * frequency follows from the channel and band (ieee80211_channel_to_frequency);
+ * dBm = SNR + noise floor in u32 as L19 (wmi.c:7187). */
+static inline int
+wlscan_parse_mgmt_rx(struct wlscan *s, const uint8_t *p, uint32_t len)
+{
+	struct wlwmi_it it;
+	const uint8_t *hdr = 0, *frame = 0;
+	uint32_t flen = 0, freq;
+	bool short_hdr = false;
+	int r;
+	wlwmi_it_init(&it, p, len);
+	while ((r = wlwmi_next(&it)) > 0) {
+		if (it.tag == WLWMI_TAG_MGMT_RX_HDR) {
+			if (it.tlen < WLWMI_MGMT_RX_HDR_BYTES) { short_hdr = true; } else { hdr = it.v; }
+		} else if (it.tag == WLWMI_TAG_ARRAY_BYTE && !frame) {
+			frame = it.v; flen = it.tlen;
+		}
+	}
+	if (r < 0) { return wlscan_fail(s, "WMI MGMT_RX TLV past the buffer"); }
+	s->mgmt++;
+	if (short_hdr || !hdr || !frame) { s->drop_bad++; return 0; }
+	uint32_t channel = wlce_get32(hdr), snr = wlce_get32(hdr + 4), buf_len = wlce_get32(hdr + 16);
+	uint32_t status = wlce_get32(hdr + 20), chan_freq = wlce_get32(hdr + 64);
+	if (buf_len > flen) { s->drop_bad++; return 0; }
+	if (status & (WLWMI_RX_ERR_CRC | WLWMI_RX_ERR_DECRYPT | WLWMI_RX_ERR_KEY_CACHE_MISS)) { s->drop_status++; return 0; }
+	if (chan_freq >= WLWMI_MIN_6GHZ_FREQ && chan_freq <= WLWMI_MAX_6GHZ_FREQ) { s->drop_channel++; return 0; }
+	if (channel >= 1u && channel <= 14u) { freq = channel == 14u ? 2484u : 2407u + 5u * channel; }
+	else if (channel >= 36u && channel <= WLWMI_MAX_5GHZ_CHAN) { freq = 5000u + 5u * channel; }
+	else { s->drop_channel++; return 0; }
+	struct wlscan_bss b;
+	for (size_t i = 0; i < sizeof(b); i++) { ((uint8_t *)&b)[i] = 0; }
+	int k = wl80211_parse_bss(frame, buf_len, &b, &s->ie_truncated);
+	if (k == 1) { s->other_mgmt++; return 0; }
+	if (k) { s->drop_bad++; return 0; }
+	b.freq = freq;
+	b.dbm = (int32_t)(snr + (uint32_t)s->noise_floor);
+	b.frames = 1;
+	if (!b.chan) { b.chan = (uint8_t)channel; }
+	s->frames++;
+	wlscan_bss_add(s, &b);
+	return 0;
+}
+
+static inline int
+wlscan_rx(struct wlwmi *wmi, uint32_t id, const uint8_t *p, uint32_t len)
+{
+	struct wlscan *s = wmi->scan;
+	int r = id == WLWMI_EV_SCAN ? wlscan_parse_event(s, p, len) :
+	    id == WLWMI_EV_CHAN_INFO ? wlscan_parse_chan_info(s, p, len) : wlscan_parse_mgmt_rx(s, p, len);
+	return r ? wlwmi_fail(wmi, s->why) : 0;
+}
+
+/* Distinct visible SSIDs, and entries without one (hidden or absent). */
+static inline uint32_t
+wlscan_ssids(const struct wlscan *s)
+{
+	uint32_t k = 0;
+	for (uint32_t i = 0; i < s->nbss; i++) {
+		const struct wlscan_bss *a = &s->bss[i];
+		bool dup = false;
+		if (a->ssid_state != WLSCAN_SSID_OK) { continue; }
+		for (uint32_t j = 0; j < i && !dup; j++) {
+			const struct wlscan_bss *c = &s->bss[j];
+			dup = c->ssid_state == WLSCAN_SSID_OK && c->ssid_len == a->ssid_len && wlscan_same(c->ssid, a->ssid, a->ssid_len);
+		}
+		if (!dup) { k++; }
+	}
+	return k;
+}
+
+static inline uint32_t
+wlscan_hidden(const struct wlscan *s)
+{
+	uint32_t k = 0;
+	for (uint32_t i = 0; i < s->nbss; i++) {
+		if (s->bss[i].ssid_state == WLSCAN_SSID_HIDDEN || s->bss[i].ssid_state == WLSCAN_SSID_NONE) { k++; }
+	}
+	return k;
+}
+
+/* The SSID for the C2 proof log (owner decision: in clear): printable ASCII
+ * as is, anything else and the quote and backslash as \xNN; or <hidden>,
+ * <none>, <invalid length N>. OUT holds WLSCAN_SSID_TEXT bytes. */
+#define WLSCAN_SSID_TEXT 140u
+static inline void
+wlscan_ssid_text(const struct wlscan_bss *b, char *out)
+{
+	static const char hex[] = "0123456789abcdef";
+	const char *lit = b->ssid_state == WLSCAN_SSID_HIDDEN ? "ssid <hidden>" : b->ssid_state == WLSCAN_SSID_NONE ?
+	    "ssid <none>" : b->ssid_state == WLSCAN_SSID_BAD ? "ssid <invalid length " : "ssid \"";
+	uint32_t o = 0;
+	while (*lit) { out[o++] = *lit++; }
+	if (b->ssid_state == WLSCAN_SSID_BAD) {
+		uint32_t l = b->ssid_len;
+		if (l >= 100u) { out[o++] = (char)('0' + l / 100u); }
+		if (l >= 10u) { out[o++] = (char)('0' + l / 10u % 10u); }
+		out[o++] = (char)('0' + l % 10u);
+		out[o++] = '>';
+	} else if (b->ssid_state == WLSCAN_SSID_OK) {
+		for (uint32_t i = 0; i < b->ssid_len && i < 32u; i++) {
+			uint8_t c = b->ssid[i];
+			if (c >= 0x20u && c < 0x7fu && c != '"' && c != '\\') { out[o++] = (char)c; continue; }
+			out[o++] = '\\'; out[o++] = 'x'; out[o++] = hex[c >> 4]; out[o++] = hex[c & 15u];
+		}
+		out[o++] = '"';
+	}
+	out[o] = 0;
 }
 
 #endif /* FUXI_WLAN_CE_H */
