@@ -5,12 +5,15 @@ tuned, CHAN_INFO on all of them, no MGMT_RX at all); C2b (7caf3ed: CHAN_INFO det
 request per PHY pdev on top of C2) is committed, its readout boot is next; C2c (W26: host RX rings, the
 WBM idle link-descriptor list and the pdev chain masks, w20 0x100/0x200/0x400, all default off) ran on the
 phone (r1c2c-all: the RX engine woke, nothing landed, the scan wedged); C2d (W27: RX ring selection and the
-REO/WBM buffer return path, w20 0x800/0x1000, default off) is host-tested only (tools/test-fuxi-wlan-ce.py). Every line below that says what the target does is what
+REO/WBM buffer return path, w20 0x800/0x1000, default off) ran on the phone (r1c2d-l: everything programmed, nothing
+written, the scan wedged after 3 channels); C2e (W28: the RXDMA monitor status rings and a read-only crash line, w20
+0x2000, default off) is host-tested only (tools/test-fuxi-wlan-ce.py). Every line below that says what the target does is what
 the model does, built from Linux ath12k v6.19. C2, C2b and C2c are described in their own sections below
 ([C2: W23/W24](#c2-w23w24-one-passive-scan-fuxiwlanqrtr7),
 [C2b](#c2b-chan_info-detail-and-the-pdev-stats-requests-fuxiwlanqrtr7-diagnostic),
 [C2c: W26](#c2c-w26-host-rx-rings-the-wbm-idle-list-and-the-chain-masks-fuxiwlanqrtr7-w20-0x100-0x200-0x400),
-[C2d: W27](#c2d-w27-rx-ring-selection-and-the-reowbm-buffer-return-path-fuxiwlanqrtr7-w20-0x800-0x1000)).
+[C2d: W27](#c2d-w27-rx-ring-selection-and-the-reowbm-buffer-return-path-fuxiwlanqrtr7-w20-0x800-0x1000),
+[C2e: W28](#c2e-w28-the-rxdma-monitor-status-rings-and-the-crash-line-fuxiwlanqrtr7-w20-0x2000)).
 
 After this boot's W15 WLAN_MODE reply, the radio lane programs the host side of copy engines CE0..CE4 on
 SRNG rings, posts RX buffers, completes HTC (READY, HTT and WMI connect, SETUP_COMPLETE_EX) and WMI init
@@ -33,7 +36,7 @@ file:line below is into that tree. UniXNU-sheng was not used for any line of cod
 | `fuxiwlanqrtr=6` | | W11..W15 as `=5`, then W20..W22. Needs all 28 steps (`fuxiwlan=1` or `28`); refused with `fuxiwlankeep=1` or `fuxiwlanstop22=1`. The W15 knobs (`fuxiwlanw15`, `fuxiwlanw16`) apply. |
 | `fuxiwlanqrtr=7` | | C2: all of `=6`, then W23/W24 (one passive scan). Same gate and refusals as `=6`; on salami also `fuxiwlansalami=1`. |
 | `fuxiwlanqrtr` outside 0..7 | 8 (C3), negative, 9+ | refused (`W20 fuxiwlanqrtr=N is not 0..7 in this build; refused`). Before C1 these ran silently with no QRTR. |
-| `fuxiwlanw20=N` | 0 default | With qrtr 6 or 7: 0x01 NOHTT (no HTT connect; WMI then gets the next endpoint), 0x04 MRRS128 (endpoint PCIe Device Control max read request 128 bytes before CE init, low half only), 0x40 NOHWMODE (no PDEV_SET_HW_MODE). With qrtr 7 only: 0x02 HTTVER (HTT version request after HW mode), 0x10 BAND24 (the 13 2.4 GHz channels only), 0x80 PDEVCAP (the EXT MAC/PHY pdev id instead of 0), and C2c's 0x100 RXRING (host RX rings with 4095 buffers and their 4 HTT SRING_SETUP; only with 0x02), 0x200 IDLELINK (the WBM idle link-descriptor list), 0x400 CHAINMASK (PDEV_SET_PARAM TX/RX chain mask), and C2d's 0x800 RXSEL (RX_RING_SELECTION_CFG per MAC ring) and 0x1000 REORX (REO/release rings, buffers back to ring 160), each only with 0x100. Refused: 0x08 ACTIVE (would transmit probe requests) and 0x20 FULLBSSID (would log whole BSSIDs; the owner masks every BSSID) at every qrtr, the qrtr-7 bits with qrtr 6, 0x01 together with 0x02, 0x100 without 0x02, 0x800 or 0x1000 without 0x100, any other bit. |
+| `fuxiwlanw20=N` | 0 default | With qrtr 6 or 7: 0x01 NOHTT (no HTT connect; WMI then gets the next endpoint), 0x04 MRRS128 (endpoint PCIe Device Control max read request 128 bytes before CE init, low half only), 0x40 NOHWMODE (no PDEV_SET_HW_MODE). With qrtr 7 only: 0x02 HTTVER (HTT version request after HW mode), 0x10 BAND24 (the 13 2.4 GHz channels only), 0x80 PDEVCAP (the EXT MAC/PHY pdev id instead of 0), and C2c's 0x100 RXRING (host RX rings with 4095 buffers and their 4 HTT SRING_SETUP; only with 0x02), 0x200 IDLELINK (the WBM idle link-descriptor list), 0x400 CHAINMASK (PDEV_SET_PARAM TX/RX chain mask), and C2d's 0x800 RXSEL (RX_RING_SELECTION_CFG per MAC ring) and 0x1000 REORX (REO/release rings, buffers back to ring 160), each only with 0x100, and C2e's 0x2000 MONSTAT (the monitor status rings 185/193 and the crash line), only with 0x100. Refused: 0x08 ACTIVE (would transmit probe requests) and 0x20 FULLBSSID (would log whole BSSIDs; the owner masks every BSSID) at every qrtr, the qrtr-7 bits with qrtr 6, 0x01 together with 0x02, 0x100 without 0x02, 0x800, 0x1000 or 0x2000 without 0x100, any other bit. |
 
 Refusals set `wl_variant_invalid`; salami refuses at init before any access, the Fuxi build at step 17.
 Every boot without `fuxiwlanqrtr=6` or `7` logs and behaves as before C1, and every boot with qrtr absent
@@ -1100,6 +1103,262 @@ plus the 207 gate runs both trees' salami tests share; and c18f99d's model with 
 (17611 lines) equal byte for byte to the first part of the C2d model's log, the C2d scenarios only adding lines after
 them.
 
+## C2e: W28, the RXDMA monitor status rings and the crash line (`fuxiwlanqrtr=7`, w20 0x2000)
+
+Why: on the phone C2c (r1c2c-all, 0x702; rings 160/161/169/186 with 4095 buffers) woke the RX engine, the firmware moved
+every refill buffer into the MAC rings within 100 ms, RXDMA wrote nothing, and the scan wedged after about 15 channels
+(no more events, WMI quiet, BHI ERRDBG2 0x152ee53 / ERRDBG3 0x492, the MHI reset unconfirmed afterwards): a firmware
+crash. C2d (r1c2d-l, 0x1b02: C2c + the idle list + RX_RING_SELECTION_CFG with L19's STA words + the REO/WBM return path)
+programmed and read back everything and still wrote and reaped nothing; the wedge came earlier (3 channels) with the
+same ERRDBG words. Reading: once host RX is live the firmware crashes on the first PPDUs, and sooner with L19's ring
+selection (info0 0x1400010c sets EN_RXMON). The one ring set L19 always gives WCN7850 before any scan that C2d still
+lacks is the two RXDMA monitor status rings with host status buffers (dp_rx.c:4733-4748 allocate, 450-517 fill,
+4657-4670 announce, right before the ring selection at 4672). C2e gives them behind one w20 bit, in L19's geometry and
+order, watches them without reaping (as L19 in STA mode), and adds a read-only crash line.
+
+Code: the C2e section of `fuxi_wlan_ce.h` (`WLMS_*`, `struct wlms`, `wlms_layout`, `wlms_expect`, `wlms_fill`,
+`wlms_publish`, `wlms_sring_words` over C2c's `wlrx_sring_ring`, `wlms_written`, `wlms_watch`, `wlms_guard_count`,
+`wlms_content`, `wlms_next`, `wlms_diag_addr/ok`; pure, bounded, no allocation) and the W28 part of the W20 block of
+`fuxi_wlan.c` (`wl28_rd`, `wl28_crash`, `wl28_sring`, `wl28_watch`, `wl28_report`; the arena `wl_mon_arena` is in
+`wl_owned_alias` and is allocated, counted, zeroed and freed with the W26 arenas). C2c's `wlrx_guard_count` names
+rdp[185]/[193] and wrp[25]/[33] (not gaps) once the monitor status arena is laid out; without 0x2000 it counts exactly
+as before.
+
+### Gate and kits
+
+`WL23_BITS` gains 0x2000 MONSTAT; `WL20_BITS` (qrtr 6) does not, so qrtr 6 refuses it. It needs 0x100 (refused without
+it, which with C2c's rule also means 0x02); every other C2c/C2d bit stays optional; keep/stop22, 0x08, 0x20 and unknown
+bits stay refused. qrtr 8 (C3) is still refused in this build ("applies to qrtr 7 and 8 the way W26/W27 do": W26 and
+W27 are qrtr 7 only, and qrtr 8 refuses every w20 value until C3 exists). A valid boot with 0x2000 prints, after the
+W27 selected line (or the W26 one): `W28 selected: monitor status rings 185/193, 1023 buffers each (w20 0x2000),
+watched, not reaped; crash line at the COMPLETED timeout and before MHI reset; nothing transmitted`.
+
+| Kit | w20 | Decimal | What it is |
+|---|---|---|---|
+| r1c2e | 0x3b02 | 15106 | C2d's r1c2d-l (0x1b02) + the monitor status rings: L19's whole RX setup but REO cmd/status and cookie conversion |
+| r1c2e-r | 0x2302 | 8962 | HTT version, RX rings, the idle list and the monitor status rings only: no ring selection, no REO path |
+
+Route as C2c/C2d: r1c2's cmdline byte for byte (`fuxiwlan=28 fuxiwlanclk=1 fuxiwlanqrtr=7`, no w20) and
+`fuxiwlanw20=<decimal>` in ADT /defaults (`--wlan-defaults`); `wl_arg` logs `salami fuxiwlanw20 from ADT /defaults`.
+r1c2e first; r1c2e-r tells whether the monitor status rings alone keep RX alive without the selection (the C2c wedge
+had no selection).
+
+### Sequence (L19 order)
+
+1. W20, inside `wl26_setup`: the monitor status arena (0x820000 bytes, 2 MiB aligned, Normal-NC, live SMMU readback)
+   after the RX, link and REO arenas, so an allocation failure leaves every WBM and REO register untouched
+   (`W20 failure: W28 mon arena allocation/NC/map`). After the refill fill and its wrp[0] publish
+   (`ath12k_dp_rxdma_buf_setup`: the refill ring, then each status ring): for ring 185, then ring 193, the 0xa5
+   sentinel over bytes 0..63 of slots 0..1022, the 1023 entries (slot start, RBM 6, cookie = the slot index from 0),
+   the write barrier, HP 2046 into wrp[25] (wrp[33]). The device learns nothing of this until SRING_SETUP.
+2. W23, right after the four C2c SRING_SETUP and before the two RX_RING_SELECTION_CFG (0x800) and the 100 ms look: two
+   SRING_SETUP (mon0 185, mon1 193) through `wl_ce_send` on the HTT endpoint, no reply asked.
+3. Every W26 watch (setup+100ms, started, mid, completed): after the W26 and W27 lines one `W28 mon watch` line (both
+   TPs from rdp[185]/[193] after the read barrier, the HP we published, taken, left, buffers written, exhaustion).
+4. After the W27 report: `W28 mon sring sent`, the content per ring and the guard line; then the D5 hint.
+5. Crash line, read-only: right after `W23 timeout scan COMPLETED`, and in `wl5_abort` after the CE containment and
+   the W11 stop, right before the MHI reset write.
+6. Containment: `wl26_contain` latches `wl_ms.stopping` (no fill or publish from then on; nothing else ever writes the
+   arena); only in `wl5_abort`'s proven branch is the arena recounted, zeroed and freed, else quarantined.
+
+Register accesses, nothing else: the six reads of the crash line through `wl28_rd` (`wlms_diag_ok`: MHISTATUS 0x48,
+BHI EXECENV, ERRCODE, ERRDBG1..3 at BHIOFF + 0x28, 0x30, 0x34..0x3c, the same six the W11/W15 diagnostic reads; BHIOFF
+inside the mapped 16 KiB and word aligned). No register write at all (SRING_SETUP is an HTT message), no reap, no TP
+or HP write after W20, no interrupt, MSI, GIC, power or PMIC access, no WMI command; nothing transmitted (PASSIVE
+forced, 0x08/0x20 refused, the D4 owner-review line unchanged).
+
+### Wire, register and memory facts (all re-derived from L19 by the host test)
+
+| Ring | HAL id | HTT ring, type, pdev | Entries x bytes | HP / TP words | Buffers |
+|---|---|---|---|---|---|
+| mon0 | 185 (HAL_SRNG_RING_ID_WMAC1_SW2RXDMA1_STATBUF, mac 0) | RXDMA_MONITOR_STATUS 1, SW_TO_HW 1, pdev 1 | 1024 x 8 | wrp[25] / rdp[185] | 1023 |
+| mon1 | 193 (+ 8, PMAC stride) | RXDMA_MONITOR_STATUS 1, SW_TO_HW 1, pdev 2 | 1024 x 8 | wrp[33] / rdp[193] | 1023 |
+
+SRING_SETUP with the RX arena at A and the monitor status arena at M: mon0 info0 0x0101010b, base M, info1 0x02020800
+(2048 words, entry 2 words, LOOP_CNT_DIS), hp A + 0x464, tp A + 0x2e4, MSI 0/0/0, intr 0x003e0002 (batch 1 x 2 words,
+500 us >> 3), low 256 (1024 >> 3 entries in words); mon1 0x0101020b, M + 0x4000, 0x02020800, A + 0x484, A + 0x304,
+0x003e0002, 256. L19's thresholds are dp.c:284-289 (low threshold with LOW_THRESH_INTR_EN, batch 1, timer RX); L19
+fills the three MSI words from its WCN7850 rx_mon_status ring mask (hw.c:898-903); here they are 0, as for every ring.
+
+Entries (`ath12k_hal_rx_buf_addr_info_set`): address 31:0; address 39:32 in 7:0, RBM rx_buf_rbm SW1 6 in 11:8, cookie
+in 31:12 = the buffer's idr id from 0 (DP_RXDMA_BUF_COOKIE_BUF_ID 17:0, pdev bits 19:18 left 0). Count: L19 asks size
+/ entry size = 1024 (dp.c pads the ring by 7 bytes, the division drops them) and takes min(asked, bufs_max, num_free) =
+1023, a fresh source ring's num_free.
+
+Buffer size: L19 allocates `dev_alloc_skb(RX_MON_STATUS_BUF_SIZE)` = RX_MON_STATUS_BASE_BUF_SIZE 2048 less the 128-byte
+reservation, the 128-byte alignment and the skb tail, 128-aligned, and maps the skb's whole data area: never more than
+the 2048-byte base budget. No ring selection tells the firmware a status buffer length in STA mode (only the monitor
+mode config does, dp_tx.c:1655-1665). We post the whole 2048-byte budget at a 4096-byte stride (the upper 2048 bytes a
+guard), so any write past it lands in the slot's own guard and is counted.
+
+Monitor status arena (0x820000): ring 185 at 0, a gap to 0x4000, ring 193 at 0x4000, a gap to 0x10000, 2 x 1024 slots
+of 4 KiB from 0x10000 (ring 185's slots 0..1023, then ring 193's; slot 1023 of each never posted), a 64 KiB tail from
+0x810000. Size: the two rings need 16 KiB and the 2046 status buffers 2046 x 2 KiB = 4 MiB device-writable; at C2c's
+4 KiB stride with guards that is 8 MiB of slots plus the 64 KiB head and tail; the RX arena's 128 KiB tail could not
+hold it. The lane now holds up to 0x80000 + 0x1040000 + 0x440000 + 0x100000 + 0x820000 = 0x1e20000 bytes (30.1 MiB) of
+IOVA-mapped DMA, inside the 256 MiB W12 pool.
+
+### Lines
+
+```
+FUXI WLAN: W28 mon arena IOVA I bytes 0x820000 Normal-NC mapped; rings I I slots I
+FUXI WLAN: W28 mon status ring 185|193 filled 1023 buffers (rbm 6, cookie 0-1022, 2048 B at a 4096 B stride, sentinel 0xa5 x64, slots S-E) hp 2046 in wrp[25|33]
+FUXI WLAN: W28 htt sring setup mon0|mon1 ID info0 X info1 X intr X low N                         (x2)
+FUXI WLAN: W28 htt sring setup monM not sent: REASON                                               (then the W23 failure line)
+FUXI WLAN: W28 mon watch POINT mon0 hp H tp T taken N left L written W mon1 ...; exhausted none|mon0|mon1|mon0 mon1
+FUXI WLAN: W28 mon sring sent N of 2
+FUXI WLAN: W28 mon content mon0|mon1 written W of 1023; ring entries changed C (foreign F)
+FUXI WLAN: W28 mon guard [SPILL ]nonzero dwords: slot-upper N (slots S), unposted slots N, tail N, gaps N[; stop; owner review before any further kit]
+FUXI WLAN: W28 crash scan COMPLETED timeout|contain before MHI reset: mhistatus X (state X syserr N) ee X bhi errcode X errdbg X/X/X; access-faults N; read-only
+FUXI WLAN: W28 crash POINT: not read (MHI/BHI offsets not established)
+FUXI WLAN: W28 mon guard after containment nonzero dwords: slot-upper N (slots S), unposted slots N, tail N, gaps N[; SPILL: owner review before any further kit]
+```
+
+POINT is the W26 watch point. A TP word that is ~0u prints `tp 4294967295 unreadable`, one that is odd or not below
+2048 the raw word and `bad`; neither is acted on. taken = tp / 2, left = ((2046 - tp) mod 2048) / 2, exhausted at left 0
+(all 1023 buffers with the device: nothing gives one back). written = posted slots whose bytes 0..63 are no longer all
+0xa5. changed = ring entries that differ from what the host wrote (the device only reads a source ring), foreign = of
+those, the ones whose address is not a posted slot start of that ring. Nothing read from a status buffer is printed.
+Every W28 line is at most 218 bytes with every field at its widest (the host test's count).
+
+### Expected log, r1c2e (w20 0x3b02; the model's happy path, values from the model)
+
+```
+FUXI WLAN: salami fuxiwlanw20 from ADT /defaults
+FUXI WLAN: W20 selected qrtr=7 (CE/HTC/WMI init, then W23 passive scan) w20 0x3b02 valid 1
+FUXI WLAN: W23 selected passive scan of 38 channels, dwell 150 ms, nothing transmitted; BSSIDs OUI only, pdev 0, htt version asked
+FUXI WLAN: W26 selected: rx rings 4095 buffers, rings 160/161/169/186 (w20 0x100); wbm idle list 32767 link descriptors (w20 0x200); chain mask no; nothing selected to host rings
+FUXI WLAN: W27 selected: ring selection mac0/mac1 2048 B, mpdu-start/packet/msdu-end tlvs, data filters (w20 0x800); reo rx path rings 131/0/1-8, buffers back to ring 160 (w20 0x1000); nothing transmitted
+FUXI WLAN: W28 selected: monitor status rings 185/193, 1023 buffers each (w20 0x2000), watched, not reaped; crash line at the COMPLETED timeout and before MHI reset; nothing transmitted
+  ... W15 and W20 lines through `W20 ce init ok rings 7 writes 70 window restore checked` ...
+FUXI WLAN: W26 link arena IOVA 0xa1400000 bytes 0x440000 Normal-NC mapped
+FUXI WLAN: W26 rx arena IOVA 0xa1a00000 bytes 0x1040000 Normal-NC mapped; rdp 0xa1a00000 wrp 0xa1a00400
+FUXI WLAN: W27 reo arena IOVA 0xa2c00000 bytes 0x100000 Normal-NC mapped; rdp 0xa2c00000
+FUXI WLAN: W28 mon arena IOVA 0xa2e00000 bytes 0x820000 Normal-NC mapped; rings 0xa2e00000 0xa2e04000 slots 0xa2e10000
+  ... the W26 idle list lines and the W27 pre-read, ring 131/0 and setup lines, as r1c2d-l ...
+FUXI WLAN: W26 refill ring 160 filled 4095 buffers (rbm 6, 2048 B at a 4096 B stride, sentinel 0xa5 x64, slots 0xa1a20000-0xa2a1e000) hp 8190 in wrp[0]
+FUXI WLAN: W28 mon status ring 185 filled 1023 buffers (rbm 6, cookie 0-1022, 2048 B at a 4096 B stride, sentinel 0xa5 x64, slots 0xa2e10000-0xa320e000) hp 2046 in wrp[25]
+FUXI WLAN: W28 mon status ring 193 filled 1023 buffers (rbm 6, cookie 0-1022, 2048 B at a 4096 B stride, sentinel 0xa5 x64, slots 0xa3210000-0xa360e000) hp 2046 in wrp[33]
+FUXI WLAN: W20 ce rx posted CE1 62 CE2 62
+  ... W20 htc ready, W21 lines and the eight W27 destination rings, W22 lines as r1c2d-l ...
+FUXI WLAN: W23 htt version 3.M (w20 0x02)
+  ... the four `W26 htt sring setup` lines as C2c ...
+FUXI WLAN: W28 htt sring setup mon0 185 info0 0x0101010b info1 0x02020800 intr 0x003e0002 low 256
+FUXI WLAN: W28 htt sring setup mon1 193 info0 0x0101020b info1 0x02020800 intr 0x003e0002 low 256
+  ... the two `W27 htt rx ring selection` lines as C2d ...
+  ... `W26 rx watch setup+100ms`, `W26 idle watch setup+100ms`, `W27 reo watch setup+100ms` ...
+FUXI WLAN: W28 mon watch setup+100ms mon0 hp 2046 tp 0 taken 0 left 1023 written 0 mon1 hp 2046 tp 0 taken 0 left 1023 written 0; exhausted none
+  ... C2 lines: chan list, vdev, nss/ps, scan start, `W23 scan started after T ms`, the started watches ...
+FUXI WLAN: W28 mon watch started mon0 hp 2046 tp 0 taken 0 left 1023 written 0 mon1 hp 2046 tp 0 taken 0 left 1023 written 0; exhausted none
+  ... foreign-channel and chan-info lines, all 38 channels ...
+FUXI WLAN: W28 mon watch mid (foreign 19) mon0 hp 2046 tp 260 taken 130 left 893 written 130 mon1 hp 2046 tp 100 taken 50 left 973 written 50; exhausted none
+FUXI WLAN: W23 scan completed reason 0 after T ms (foreign 38 chan-info 38)
+FUXI WLAN: W28 mon watch completed mon0 hp 2046 tp 260 taken 130 left 893 written 130 mon1 hp 2046 tp 500 taken 250 left 773 written 250; exhausted none
+  ... W24 bss / summary lines, the C2b stats lines, the W26 content, guard, err, link and counter lines, the W27 report ...
+FUXI WLAN: W28 mon sring sent 2 of 2
+FUXI WLAN: W28 mon content mon0 written 130 of 1023; ring entries changed 0 (foreign 0)
+FUXI WLAN: W28 mon content mon1 written 250 of 1023; ring entries changed 0 (foreign 0)
+FUXI WLAN: W28 mon guard nonzero dwords: slot-upper 0 (slots 0), unposted slots 0, tail 0, gaps 0
+FUXI WLAN: W23 complete; stop/contain
+FUXI WLAN: W26 rx contain: host writes off; arenas held until bus master off, PERST and SMMU undo
+FUXI WLAN: W23 contain: scan over, no STOP_SCAN
+FUXI WLAN: W20 ce contain posted P reaped R tx T
+FUXI WLAN: W11 QRTR BYE sent before containment
+FUXI WLAN: W28 crash contain before MHI reset: mhistatus 0x201 (state 0x2 syserr 0) ee 0x2 bhi errcode 0 errdbg 0/0/0; access-faults 0; read-only
+FUXI WLAN: abort step 28 MHI reset done, bus master off yes, PERST asserted yes
+FUXI WLAN: W26 rx guard after containment nonzero dwords: slot-upper 0 (slots 0), slot 4095 0, tail 0, gaps 0
+FUXI WLAN: W27 reo guard after containment nonzero dwords: gaps 0, tail 0
+FUXI WLAN: W28 mon guard after containment nonzero dwords: slot-upper 0 (slots 0), unposted slots 0, tail 0, gaps 0
+FUXI WLAN: W26 arenas zeroed 0x1da0000 bytes before free
+FUXI WLAN: abort buffers freed
+```
+
+The model writes ten status PPDUs per channel (mac0 on the 13 2.4 GHz channels, mac1 on the 25 5 GHz ones): 380 status
+buffers, none given back. On the phone the PPDU count is RXDMA's: if it writes a status TLV for every PPDU it hears,
+expect both rings `exhausted` within the first channels (L19 STA mode reaps none either; read `left` and `written`).
+MHISTATUS 0x201 / EE 0x2 is a healthy M0/AMSS; the ERRDBG words are whatever the firmware left there.
+
+### Expected log, r1c2e-r (w20 0x2302; values from the model)
+
+The same as r1c2e without any W27 line and without the REO arena: `W28 mon arena IOVA 0xa2c00000`, the two `W28 mon
+status ring` lines (slots 0xa2c10000-0xa300e000 and 0xa3010000-0xa340e000), the two `W28 htt sring setup` lines right
+after the four C2c ones, the four `W28 mon watch` lines as above, all 38 channels, then
+
+```
+FUXI WLAN: W24 scan summary frames 0 bss 0 ssids 0
+FUXI WLAN: W26 rx content refill taken 2048 kept 0; buffers written 0 of 4095
+FUXI WLAN: W28 mon sring sent 2 of 2
+FUXI WLAN: W28 mon content mon0 written 130 of 1023; ring entries changed 0 (foreign 0)
+FUXI WLAN: W28 mon content mon1 written 250 of 1023; ring entries changed 0 (foreign 0)
+FUXI WLAN: W28 mon guard nonzero dwords: slot-upper 0 (slots 0), unposted slots 0, tail 0, gaps 0
+FUXI WLAN: W24 no beacon or probe response heard (chan-info 38); next rung 0x3b02 (15106): the scan ran with the monitor status rings; add ring selection, the REO path and the idle list
+FUXI WLAN: W23 complete; stop/contain
+  ... containment as r1c2e, `W26 arenas zeroed 0x1ca0000 bytes before free` ...
+```
+
+(The model's firmware takes 2048 refill buffers here and RXDMA writes no data buffer without ring selection; on the
+phone those counts are the firmware's.)
+
+### The crash, as the model plays it (`C.mon_crash`, the C2e scenarios only)
+
+With RX live and the monitor status rings missing (C2c's 0x302, C2d's 0x1b02, or 0x3b02 with a firmware that drops the
+two SRING_SETUP) the model's firmware stops the scan after 15 channels (3 with ring selection), sends nothing more,
+sets MHISTATUS 0xff04 (state SYS_ERR 0xff, SYSERR 1) and ERRDBG2/3 to the phone's 0x152ee53 / 0x492, and never
+confirms the MHI reset. 0x3b02 then prints:
+
+```
+FUXI WLAN: W23 timeout scan COMPLETED (8750 ms); report, contain, no retry
+FUXI WLAN: W28 crash scan COMPLETED timeout: mhistatus 0xff04 (state 0xff syserr 1) ee 0x2 bhi errcode 0 errdbg 0/0x152ee53/0x492; access-faults 0; read-only
+  ... the completed watches (W28: tp 0 written 0 on both rings), W24, the W26/W27/W28 report lines, the W20 snapshot ...
+FUXI WLAN: W28 crash contain before MHI reset: mhistatus 0xff04 (state 0xff syserr 1) ee 0x2 bhi errcode 0 errdbg 0/0x152ee53/0x492; access-faults 0; read-only
+FUXI WLAN: abort step 28 MHI reset unconfirmed, bus master off yes, PERST asserted yes
+  ... the recounts, `W26 arenas zeroed`, `abort buffers freed` ...
+```
+
+The EE and ERRCODE values in that block are the model's guesses; only the ERRDBG2/3 words are the phone's.
+
+### Reading the next boot
+
+| Pattern | Conclusion | Next |
+|---|---|---|
+| W24 frames > 0, all 38 channels | C2 PASS: with the monitor status rings the firmware survives and forwards beacons | C3 |
+| all 38 channels, `written` > 0 on either ring, frames 0 | the crash is gone; status lands; nothing forwarded | r1c2e-r showed it alone: r1c2e; r1c2e: C3 management forwarding |
+| all 38 channels, `written` 0 on both rings | the firmware survives but never used the status rings | owner review (RXDMA status needs the monitor mode ring config?) |
+| `exhausted mon0` / `mon1` at a watch | RXDMA filled all 1023 status buffers (no reap, as L19 STA) | if the scan still ran on: fine; if it wedged right after: owner review (reaping the status rings is the next rung) |
+| the scan stops early again, `W28 crash ... syserr 1` | the firmware still crashes with the status rings in place | owner review: compare `taken`/`written` at the last watch, the REO cmd/status rings and cookie conversion are left |
+| `W28 crash ... syserr 0`, state 0x2 at the timeout | the scan stalled without an MHI SYS_ERR | owner review |
+| `changed` > 0 or `foreign` > 0 | the device wrote a source ring entry | stop, owner review before any further kit |
+| `SPILL` on any guard line | a device write where no address was given | stop, owner review |
+| `W28 htt sring setup ... not sent` | the HTT endpoint or CE4 was not ready | owner review |
+| any D4 line | the passive rule is broken | stop the radio lane |
+
+### Deviations from L19, all deliberate
+
+- No MSI on the two rings (L19 has them in its rx_mon_status ext group); the thresholds are L19's and shape nothing.
+- The status buffers are the 2048-byte RX_MON_STATUS_BASE_BUF_SIZE budget at a 4 KiB stride with a guard, not an skb;
+  L19 maps at most the same 2048 bytes.
+- Cookies are the slot index per ring (L19's idr hands out 0, 1, 2, ... on a fresh ring: the same numbers).
+- No reap and no replenish (as L19 in STA mode), so a ring is exhausted after 1023 PPDUs; L19 behaves the same.
+- The crash line is new (read-only, six reads of the existing diagnostic).
+
+### What the host tests cover, and what only the device can answer
+
+Host-tested: every word, ring id, size, count, order, the allowlist, the latch, the free, the line widths, the
+phone's crash pattern without the rings and survival with them, exhaustion, spills, changed and foreign entries, bad
+and unreadable TPs, containment mid-scan with status still written during the MHI reset, unproven containment, an
+allocation failure, a guard failure between the two SRING_SETUP, and a mutant per rule. Only the phone can say: whether
+the missing monitor status rings are what crashes the firmware, whether RXDMA writes status into them in STA mode
+without a status-ring selection, how fast it fills them, whether exhaustion matters to the firmware, and what the BHI
+words mean (ERRDBG2 0x152ee53 looks like a firmware PC; nothing here decodes it).
+
+### Proof that boots without 0x2000 are unchanged
+
+Differentials against a5a04bf, each tree built from its own sources (scripts in this session's scratchpad, recorded in
+the commit body): the W15, W11 and W16 harness logs byte for byte; the init/configure gate over boot-arg sets without
+0x2000 (salami and Fuxi builds, cmdline and ADT /defaults) byte for byte; a5a04bf's model with all its C1, C2, C2b, C2c
+and C2d scenarios equal byte for byte to the first part of the C2e model's log (every printed line, same
+instrumentation in both), the C2e scenarios only adding lines after them.
+
 ## Host tests
 
 `CC=cc python3 tools/test-fuxi-wlan-ce.py` (also in tools/ci/build.sh): the model in
@@ -1282,6 +1541,33 @@ code: selection words, write order, thresholds, the REO setup values, the refusa
 zeroing, barriers, bounds, RBM checks, link returns, the shadow index, the W21 re-read, the latch, the gate, the
 zeroing before free, the TP publish) are all caught. test-fuxi-wlan-salami.py covers the gate for the W27 bits
 (salami and Fuxi builds, cmdline and ADT /defaults, the kit route with r1c2's cmdline and 6402 / 6914 in /defaults).
+
+C2e in the same model: the monitor status arena with the device's permission per region (ring entries read, the
+posted half of a posted slot written, the TP words rdp[185]/[193] written and the HP words wrp[25]/[33] read only with
+0x2000; anything else fails the test except the injected spills), both HP publishes checked when they happen (write
+barrier right before, ring 185 then 193, after the refill publish and before any SRING_SETUP, every entry, sentinel
+and zero word of the arena in place), the 5th and 6th SRING_SETUP word by word against the model's own table (and the
+selection, chain masks and channel list only after all six), a fake RXDMA that per PPDU takes the status buffer at its
+TP (a posted slot of that ring, RBM 6, its cookie) and writes one status TLV (frame data the log must never show),
+nothing given back, and the six MHI/BHI registers (any other BAR0 read, or one without 0x2000, fails the test). In the
+C2e scenarios only (`C.mon_crash`) the firmware plays the phone: RX live without the monitor status rings stops the
+scan after 15 channels (3 with ring selection), SYS_ERR with the phone's ERRDBG words, the MHI reset never confirmed.
+Scenarios (`c2e`): pure checks (the allowlist exactly six reads and none at a bad BHIOFF, the layout and both
+SRING_SETUP, entries 0/1022/1023, the TP watch, written/guard/changed counts, no write after the latch); 0x3b02 (380
+status TLVs, frames landed and returned as C2d, recounted, zeroed, freed); 0x2302 (all 38 channels, the hint names
+0x3b02); the phone's crash for 0x302 (15 channels) and 0x1b02 (3), with no W28 line and no MHI/BHI read without 0x2000,
+and 0x3b02 with the SRING_SETUP dropped (crash lines at the timeout and before the MHI reset, still freed); full rings
+(mon1, then both: exhausted, 227 PPDUs without a buffer, the hint); spills in a slot's upper half, an unposted slot,
+the tail and a head gap; a foreign entry and one with another cookie; bad and unreadable TPs; containment mid-scan
+with a status written during the MHI reset; unproven containment; the arena allocation failure; a guard failure
+after the 5th SRING_SETUP. Static (`static_c2e`): the gate, W28's place in L19's order, the one read path through the
+allowlist (the W11/W15 diagnostic's six offsets) and no register write, the crash line in exactly its two places,
+SRING_SETUP the only message, arena writes only at W20 and refused after the latch, never reaped, the free, no arena
+word in any W28 print, every W28 line within 254 bytes. L19 (`l19_c2e`): ring ids, the hal.c config, sizes, the
+entry struct, the alloc, fill and announcement order, the fill count, RBM and cookie, the buffer budget and alignment,
+the HTT ring id and type, thresholds, and the MSI, reap and status-selection facts the deviations rest on; the model's
+dump word by word. Mutants (`C2E_MUTANTS`, 31 rules broken once each) are all caught. test-fuxi-wlan-salami.py covers
+the gate for 0x2000 (salami and Fuxi builds, cmdline and ADT /defaults, the kit route with 15106 / 8962 in /defaults).
 
 What only the device can answer: whether the firmware fetches from the rings at all with zero interrupt
 thresholds, which pipe carries HTC READY (both are polled), the credit numbers, the real pdev id, whether

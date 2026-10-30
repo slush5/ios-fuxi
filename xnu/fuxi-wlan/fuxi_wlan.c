@@ -869,7 +869,13 @@ static bool wl16_large, wl16_redrive;
  * RX_RING_SELECTION_CFG per MAC ring right after the SRING_SETUPs; 0x1000 REORX
  * the UMAC RX path (WBM2SW3 release and REO2SW0 exception rings and the REO
  * setup at W20, REO2SW1..8 after service ready) with every returned buffer
- * given back to the refill ring. */
+ * given back to the refill ring.
+ * C2e (W28, qrtr 7 only, default off, needs 0x100): 0x2000 MONSTAT the two
+ * RXDMA monitor status rings 185/193 with 1023 host status buffers each, filled
+ * at W20 after the refill ring and announced by HTT SRING_SETUP after the four
+ * C2c ones and before the ring selection; watched, never reaped (L19 STA mode
+ * reaps none); a read-only MHI/BHI crash line at the COMPLETED timeout and in
+ * containment before the MHI reset. */
 #define WL20_NOHTT 0x01u
 #define WL20_HTTVER 0x02u
 #define WL20_MRRS128 0x04u
@@ -883,10 +889,11 @@ static bool wl16_large, wl16_redrive;
 #define WL20_CHAINMASK 0x400u
 #define WL20_RXSEL 0x800u
 #define WL20_REORX 0x1000u
+#define WL20_MONSTAT 0x2000u
 #define WL26_BITS (WL20_RXRING | WL20_IDLELINK | WL20_CHAINMASK)
 #define WL27_BITS (WL20_RXSEL | WL20_REORX)
 #define WL20_BITS (WL20_NOHTT | WL20_MRRS128 | WL20_NOHWMODE)
-#define WL23_BITS (WL20_BITS | WL20_HTTVER | WL20_BAND24 | WL20_PDEVCAP | WL26_BITS | WL27_BITS)
+#define WL23_BITS (WL20_BITS | WL20_HTTVER | WL20_BAND24 | WL20_PDEVCAP | WL26_BITS | WL27_BITS | WL20_MONSTAT)
 #define WL20_QRTR_MAX 7
 static bool wl_w20, wl_w23;
 static unsigned wl20_bits;
@@ -1028,7 +1035,7 @@ static uint64_t wl_target_total;
 static struct wl_dma wl_ipcr;
 static struct wl_dma wl_ce_arena; /* W20: rdp, CE rings, TX slots, RX buffers (fuxi_wlan_ce.h layout) */
 /* C2c W26: the RX arena (w20 0x100) and the link arena (w20 0x200), fuxi_wlan_ce.h layouts. */
-static struct wl_dma wl_rx_arena, wl_link_arena, wl_reo_arena;
+static struct wl_dma wl_rx_arena, wl_link_arena, wl_reo_arena, wl_mon_arena;
 /* W14 inputs are retained through keep/containment, including partial reads. */
 static struct wl_dma wl14_regdb, wl14_bdf, wl14_m3;
 static char wl14_bdf_name[65]; /* one extra byte detects XNU string truncation */
@@ -1243,7 +1250,8 @@ wl_probe_configure(void)
 	 * 0x01 with 0x02, and keep or stop22 with qrtr 6/7 (no keep path exists
 	 * for live copy engines). C2c: 0x100 without 0x02 is refused (with 0x01
 	 * too, through the 0x01 + 0x02 rule); qrtr 6 refuses every W26 bit. C2d:
-	 * 0x800 or 0x1000 without 0x100 is refused; qrtr 6 refuses both. */
+	 * 0x800 or 0x1000 without 0x100 is refused; qrtr 6 refuses both. C2e:
+	 * 0x2000 without 0x100 is refused; qrtr 6 refuses it. */
 	wl20_bits = 0;
 	bool w20_given = PE_parse_boot_argn("fuxiwlanw20", &w20, sizeof(w20));
 	if (qrtr < 0 || qrtr > WL20_QRTR_MAX) {
@@ -1254,7 +1262,8 @@ wl_probe_configure(void)
 		unsigned allowed = wl_w23 ? WL23_BITS : WL20_BITS;
 		if (w20 < 0 || ((unsigned)w20 & ~allowed) || ((unsigned)w20 & (WL20_NOHTT | WL20_HTTVER)) == (WL20_NOHTT | WL20_HTTVER) ||
 		    ((unsigned)w20 & (WL20_RXRING | WL20_HTTVER)) == WL20_RXRING || stop22 == 1 || keep == 1 ||
-		    (((unsigned)w20 & WL27_BITS) && !((unsigned)w20 & WL20_RXRING))) { wl_variant_invalid = true; }
+		    (((unsigned)w20 & WL27_BITS) && !((unsigned)w20 & WL20_RXRING)) ||
+		    (((unsigned)w20 & WL20_MONSTAT) && !((unsigned)w20 & WL20_RXRING))) { wl_variant_invalid = true; }
 		else { wl20_bits = (unsigned)w20; }
 		printf("FUXI WLAN: W20 selected qrtr=%d (%s) w20 %#x valid %u\n", qrtr,
 		    wl_w23 ? "CE/HTC/WMI init, then W23 passive scan" : "CE/HTC/WMI init to READY", (unsigned)w20, !wl_variant_invalid);
@@ -1273,6 +1282,10 @@ wl_probe_configure(void)
 			printf("FUXI WLAN: W27 selected: ring selection %s; reo rx path %s; nothing transmitted\n",
 			    (wl20_bits & WL20_RXSEL) ? "mac0/mac1 2048 B, mpdu-start/packet/msdu-end tlvs, data filters (w20 0x800)" : "no",
 			    (wl20_bits & WL20_REORX) ? "rings 131/0/1-8, buffers back to ring 160 (w20 0x1000)" : "no");
+		}
+		if (wl20_bits & WL20_MONSTAT) {
+			printf("FUXI WLAN: W28 selected: monitor status rings 185/193, 1023 buffers each (w20 0x2000), watched, not reaped; "
+			    "crash line at the COMPLETED timeout and before MHI reset; nothing transmitted\n");
 		}
 	} else if (w20_given && w20) {
 		wl_variant_invalid = true;
@@ -2374,7 +2387,7 @@ wl_pt_pa(unsigned table)
 static vm_offset_t
 wl_owned_alias(uint64_t pa, unsigned bytes, bool tables_only)
 {
-	struct wl_dma *bufs[] = { &wl_tables, &wl_image, &wl_vectors, &wl_contexts, &wl_rddm, &wl_rxvectors, &wl_msi_sink, &wl_amss, &wl_ipcr, &wl14_regdb, &wl14_bdf, &wl14_m3, &wl_ce_arena, &wl_rx_arena, &wl_link_arena, &wl_reo_arena };
+	struct wl_dma *bufs[] = { &wl_tables, &wl_image, &wl_vectors, &wl_contexts, &wl_rddm, &wl_rxvectors, &wl_msi_sink, &wl_amss, &wl_ipcr, &wl14_regdb, &wl14_bdf, &wl14_m3, &wl_ce_arena, &wl_rx_arena, &wl_link_arena, &wl_reo_arena, &wl_mon_arena };
 	unsigned fixed = sizeof(bufs)/sizeof(bufs[0]);
 	for (unsigned i = 0; i < (tables_only ? 1u : fixed + WL_TARGET_MAX); i++) {
 		struct wl_dma *d = i < fixed ? bufs[i] : &wl_target[i-fixed];
@@ -4820,6 +4833,12 @@ static void wl27_watch(const char *point);
 static int wl27_setup(void);
 static int wl27_dest(void);
 static int wl27_sel(unsigned mac);
+/* C2e W28: the monitor status arena state (fuxi_wlan_ce.h) and the crash line. */
+static struct wlms wl_ms;
+static int wl28_sring(unsigned m);
+static void wl28_watch(unsigned p, const char *point);
+static void wl28_report(void);
+static void wl28_crash(const char *where);
 static void wl27_report(void);
 
 /* One register access through the dynamic window: the wl_soc_write
@@ -5503,6 +5522,7 @@ wl26_setup(void)
 {
 	bzero(&wl_rx, sizeof(wl_rx));
 	bzero(&wl_rd, sizeof(wl_rd));  /* C2d */
+	bzero(&wl_ms, sizeof(wl_ms));  /* C2e */
 	wl26_wbm_writes = wl27_reo_writes = 0;
 	wl26_heard_none = false;
 	if (!(wl20_bits & (WL20_RXRING | WL20_IDLELINK))) { return 0; }
@@ -5529,6 +5549,14 @@ wl26_setup(void)
 		printf("FUXI WLAN: W27 reo arena IOVA %#llx bytes %#x Normal-NC mapped; rdp %#llx\n", wl_reo_arena.iova,
 		    (unsigned)wl_reo_arena.size, wl_rd.rdp_iova);
 	}
+	if (wl20_bits & WL20_MONSTAT) {  /* C2e: the fourth arena, still before any WBM or REO write */
+		if (wl26_alloc(&wl_mon_arena, WLMS_ARENA_BYTES, "W28 mon arena allocation/NC/map")) { return 1; }
+		if (wlms_layout(&wl_ms, &wl_rx, (uint8_t *)wl_mon_arena.va, wl_mon_arena.iova, (uint32_t)wl_mon_arena.size)) {
+			return wl_w11_fail("W28 mon arena layout");
+		}
+		printf("FUXI WLAN: W28 mon arena IOVA %#llx bytes %#x Normal-NC mapped; rings %#llx %#llx slots %#llx\n", wl_mon_arena.iova,
+		    (unsigned)wl_mon_arena.size, wl_ms.ring[0].iova, wl_ms.ring[1].iova, wl_ms.bufs_iova);
+	}
 	if ((wl20_bits & WL20_IDLELINK) && wl26_idle()) { return 1; }
 	if (wl27_setup()) { return 1; }  /* C2d: release and exception rings, REO setup (dp_alloc's common setup, before its RX alloc) */
 	if (wl20_bits & WL20_RXRING) {
@@ -5538,6 +5566,12 @@ wl26_setup(void)
 		printf("FUXI WLAN: W26 refill ring 160 filled %u buffers (rbm 6, 2048 B at a 4096 B stride, sentinel 0xa5 x64, "
 		    "slots %#llx-%#llx) hp %u in wrp[0]\n", WLRX_NBUF, wl_rx.bufs_iova,
 		    wl_rx.bufs_iova + (uint64_t)(WLRX_NBUF - 1u) * WLRX_SLOT_BYTES, WLRX_NBUF * WLRX_BUF_DW);
+	}
+	for (unsigned m = 0; (wl20_bits & WL20_MONSTAT) && m < 2u; m++) {  /* C2e: after the refill (ath12k_dp_rxdma_buf_setup) */
+		if (wlms_fill(&wl_ms, &wl_rx, m) || wlms_publish(&wl_ms, &wl_rx, &wl_ce_io, m)) { return wl_w11_fail("W28 mon status fill"); }
+		printf("FUXI WLAN: W28 mon status ring %u filled %u buffers (rbm 6, cookie 0-%u, 2048 B at a 4096 B stride, sentinel 0xa5 "
+		    "x64, slots %#llx-%#llx) hp %u in wrp[%u]\n", wl_ms.ring[m].id, WLMS_NBUF, WLMS_NBUF - 1u, wlms_slot_iova(&wl_ms, m, 0),
+		    wlms_slot_iova(&wl_ms, m, WLMS_NBUF - 1u), wl_ms.hp[m], wl_ms.ring[m].id - WLRX_DMAC_START);
 	}
 	return wl_w11_guard();
 }
@@ -5597,6 +5631,7 @@ wl26_rings(void)
 	unsigned took = 0;
 	if (wl_rx.rx_on) {
 		for (unsigned i = 0; i < WLRX_NRING; i++) { if (wl26_sring(i)) { return 1; } }
+		if ((wl20_bits & WL20_MONSTAT) && (wl28_sring(0) || wl28_sring(1))) { return 1; }  /* C2e: dp_rx.c:4657-4670 */
 		if ((wl20_bits & WL20_RXSEL) && (wl27_sel(0) || wl27_sel(1))) { return 1; }  /* C2d: dp_rx.c:4672 */
 		if (wl23_poll_for(WL20_W_NONE, 100, &took) == 1) { return 1; }
 	}
@@ -5646,6 +5681,7 @@ wl26_watch(unsigned p)
 		printf("FUXI WLAN: W26 idle watch %s %s; exhausted %s\n", lb, mc[2], (w->exhausted & WLRX_F_IDLE) ? "idle" : "none");
 	}
 	wl27_watch(lb);  /* C2d; silent without the REO path */
+	wl28_watch(p, lb);  /* C2e; silent without the monitor status rings */
 }
 
 /* Non-zero counts as " NAME N" (or " 0xT:N" with no names, then " other N"), as
@@ -5726,8 +5762,11 @@ wl26_report(void)
 		    wl_rx.tx_stats[0], wl_rx.tx_stats[1], wl_rx.tx_stats[2], wl_rx.tx_stats[3], wl_rx.tx_stats[4]);
 	}
 	wl27_report();  /* C2d; silent without a W27 bit */
+	wl28_report();  /* C2e; silent without 0x2000 */
 	if (wl26_heard_none) {
 		printf("FUXI WLAN: W24 no beacon or probe response heard (chan-info %u); next rung %s\n", wl_scan.ci_start,
+		    (wl20_bits & WL20_MONSTAT) ? wlms_next(&wl_ms, wl20_bits, (wl20_bits & WL27_BITS) ? wlrd_next(&wl_rd, wl20_bits,
+		    wl_rx.c.bufs_written) : wlrx_next(&wl_rx, wl20_bits)) :
 		    (wl20_bits & WL27_BITS) ? wlrd_next(&wl_rd, wl20_bits, wl_rx.c.bufs_written) : wlrx_next(&wl_rx, wl20_bits));
 	}
 }
@@ -5739,6 +5778,7 @@ static void
 wl26_contain(void)
 {
 	wl_rd.stopping = true;  /* C2d: no reap, return, replenish or REO access from here on */
+	wl_ms.stopping = true;  /* C2e: no host write to the monitor status arena from here on */
 	if (!wl_rx_arena.va && !wl_link_arena.va) { return; }
 	wl_rx.stopping = true;
 	printf("FUXI WLAN: W26 rx contain: host writes off; arenas held until bus master off, PERST and SMMU undo\n");
@@ -5764,16 +5804,24 @@ wl26_free(void)
 		printf("FUXI WLAN: W27 reo guard after containment nonzero dwords: gaps %u, tail %u%s\n", gap, tail,
 		    gap || tail ? "; SPILL: owner review before any further kit" : "");
 	}
+	if (wl_mon_arena.va && wl_ms.base) {  /* C2e */
+		wlms_guard_count(&wl_ms, &up, &slots, &last, &tail, &gap);
+		printf("FUXI WLAN: W28 mon guard after containment nonzero dwords: slot-upper %u (slots %u), unposted slots %u, tail %u, "
+		    "gaps %u%s\n", up, slots, last, tail, gap, up || last || tail || gap ? "; SPILL: owner review before any further kit" : "");
+	}
 	if (wl_rx_arena.va) { bzero((void *)wl_rx_arena.va, wl_rx_arena.size); bytes += (uint32_t)wl_rx_arena.size; }
 	if (wl_link_arena.va) { bzero((void *)wl_link_arena.va, wl_link_arena.size); bytes += (uint32_t)wl_link_arena.size; }
 	if (wl_reo_arena.va) { bzero((void *)wl_reo_arena.va, wl_reo_arena.size); bytes += (uint32_t)wl_reo_arena.size; }
+	if (wl_mon_arena.va) { bzero((void *)wl_mon_arena.va, wl_mon_arena.size); bytes += (uint32_t)wl_mon_arena.size; }
 	wl_ce_wbarrier(NULL);
 	printf("FUXI WLAN: W26 arenas zeroed %#x bytes before free\n", bytes);
 	wl_dma_free(&wl_rx_arena);
 	wl_dma_free(&wl_link_arena);
 	wl_dma_free(&wl_reo_arena);
+	wl_dma_free(&wl_mon_arena);
 	bzero(&wl_rx, sizeof(wl_rx));
 	bzero(&wl_rd, sizeof(wl_rd));
+	bzero(&wl_ms, sizeof(wl_ms));
 }
 
 /* ---- C2d (fuxiwlanqrtr=7): W27, RX ring selection and the REO/WBM buffer return path ----
@@ -6022,6 +6070,116 @@ wl27_report(void)
 	}
 }
 
+/* ---- C2e (fuxiwlanqrtr=7): W28, the RXDMA monitor status rings and the crash line ----
+ * w20 0x2000 MONSTAT, default off, needing 0x100 (docs-lanes/wlan-w20.md, C2e;
+ * the layout, the fill, the encoder, the watch and the counts are in
+ * fuxi_wlan_ce.h). In L19's order: at W20, inside wl26_setup, the fourth arena
+ * with the other three (before any WBM or REO write), then after the refill
+ * ring the two rings' 1023 entries each and their HP publishes (wrp[25],
+ * wrp[33]; ath12k_dp_rxdma_buf_setup, dp_rx.c:483-517); at W23 their two
+ * SRING_SETUP after the four C2c ones and before the ring selection
+ * (dp_rx.c:4657-4672). Never reaped (L19 STA mode reaps none): at every W26
+ * watch the device TPs, buffers written, fill and exhaustion; after the scan
+ * the content and guard counts. The crash line: the six MHI/BHI reads of the
+ * W11/W15 diagnostic through wlms_diag_ok's allowlist, at the COMPLETED timeout
+ * and in containment before the MHI reset. No register write, no MSI,
+ * interrupt, GIC, power or PMIC access, nothing transmitted. The arena is held,
+ * counted, zeroed and freed with the W26 arenas (wl26_free), else quarantined.
+ * Adapted from Linux ath12k dp.c, dp_mon.c, dp_rx.c, dp_tx.c and hal.c
+ * (BSD-3-Clause-Clear), v6.19; notice in bsd/dev/fuxi_wlan_ce.h. */
+
+/* One crash-line read: wlms_diag_ok's six addresses only, ~0u otherwise. */
+static uint32_t
+wl28_rd(uint32_t off)
+{
+	if (!wlms_diag_ok(off, wl_bhi)) { return ~0u; }
+	return wl_mrd(off);
+}
+
+/* The read-only crash line (no write, no retry; silent without 0x2000). */
+static void
+wl28_crash(const char *where)
+{
+	uint32_t v[WLMS_DIAG_N];
+	const unsigned before = fw_faults;
+	if (!(wl20_bits & WL20_MONSTAT)) { return; }
+	if (!wl_mhi_valid || !wlms_diag_ok(WLMS_MHISTATUS, wl_bhi)) {
+		printf("FUXI WLAN: W28 crash %s: not read (MHI/BHI offsets not established)\n", where);
+		return;
+	}
+	for (unsigned i = 0; i < WLMS_DIAG_N; i++) { v[i] = wl28_rd(wlms_diag_addr(i, wl_bhi)); }
+	printf("FUXI WLAN: W28 crash %s: mhistatus %#x (state %#x syserr %u) ee %#x bhi errcode %#x errdbg %#x/%#x/%#x; "
+	    "access-faults %u; read-only\n", where, v[0], (v[0] >> 8) & 0xffu, (v[0] >> 2) & 1u, v[1], v[2], v[3], v[4], v[5],
+	    fw_faults - before);
+}
+
+/* One monitor status SRING_SETUP through wl_ce_send on the HTT endpoint (CE4,
+ * one in flight, TX drained), no reply asked, as wl26_sring. */
+static int
+wl28_sring(unsigned m)
+{
+	uint32_t w[WLRX_SRING_WORDS];
+	uint8_t msg[4u * WLRX_SRING_WORDS];
+	const uint32_t eid = wl_htc.htt_eid;
+	const struct wlce_pipe *p = &wl_ce.pipe[wl_htc.ep[eid].ul_pipe];
+	const char *why = !eid || !wl_htc.ep[eid].used ? "no HTT endpoint" : wl_ms.stopping ? "stopping" :
+	    !wl_ms.hp[m & 1u] ? "ring not filled" : p->posted - p->reaped >= p->nslots ? "CE4 slots all in flight" : NULL;
+	if (why) {
+		printf("FUXI WLAN: W28 htt sring setup mon%u not sent: %s\n", m, why);
+		return wl_w11_fail("W28 htt sring setup not sent");
+	}
+	wlms_sring_words(&wl_ms, m, w);
+	for (unsigned k = 0; k < WLRX_SRING_WORDS; k++) { wlce_put32(msg + 4u * k, w[k]); }
+	if (wl_ce_send(eid, msg, sizeof(msg), "HTT SRING_SETUP")) { return 1; }
+	wl_ms.sring_sent++;
+	wl_ms.on = wl_ms.sring_sent == 2u;
+	printf("FUXI WLAN: W28 htt sring setup mon%u %u info0 %#010x info1 %#010x intr %#010x low %u\n", m, wl_ms.ring[m & 1u].id,
+	    w[0], w[3], w[11], w[12] & 0xffffu);
+	return 0;
+}
+
+/* At each W26 watch, after its lines (host reads only). */
+static void
+wl28_watch(unsigned p, const char *point)
+{
+	const struct wlms_watch *w = &wl_ms.w[p < WLRX_NPOINT ? p : 0];
+	char mc[2][64];
+	if (!wl_ms.on || wl_ms.stopping || p >= WLRX_NPOINT) { return; }
+	wlms_watch(&wl_ms, &wl_rx, &wl_ce_io, p);
+	for (unsigned m = 0; m < 2; m++) {
+		const uint8_t f = m ? WLMS_F_MON1 : WLMS_F_MON0;
+		if ((w->bad | w->unreadable) & f) {
+			snprintf(mc[m], sizeof(mc[m]), "hp %u tp %u %s written %u", wl_ms.hp[m], w->tp[m], (w->unreadable & f) ? "unreadable" : "bad",
+			    w->written[m]);
+		} else {
+			snprintf(mc[m], sizeof(mc[m]), "hp %u tp %u taken %u left %u written %u", wl_ms.hp[m], w->tp[m], w->taken[m], w->left[m],
+			    w->written[m]);
+		}
+	}
+	printf("FUXI WLAN: W28 mon watch %s mon0 %s mon1 %s; exhausted %s\n", point, mc[0], mc[1],
+	    w->exhausted == (WLMS_F_MON0 | WLMS_F_MON1) ? "mon0 mon1" : w->exhausted & WLMS_F_MON0 ? "mon0" :
+	    w->exhausted & WLMS_F_MON1 ? "mon1" : "none");
+}
+
+/* In wl26_report, before the D5 hint: the content and guard counts (host
+ * reads; nothing from a buffer). Silent without 0x2000. */
+static void
+wl28_report(void)
+{
+	if (!(wl20_bits & WL20_MONSTAT)) { return; }
+	printf("FUXI WLAN: W28 mon sring sent %u of 2\n", wl_ms.sring_sent);
+	if (!wl_ms.on || wl_ms.stopping) { return; }
+	wlms_content(&wl_ms, &wl_ce_io);
+	for (unsigned m = 0; m < 2; m++) {
+		printf("FUXI WLAN: W28 mon content mon%u written %u of %u; ring entries changed %u (foreign %u)\n", m, wl_ms.written[m],
+		    WLMS_NBUF, wl_ms.changed[m], wl_ms.foreign[m]);
+	}
+	printf("FUXI WLAN: W28 mon guard %snonzero dwords: slot-upper %u (slots %u), unposted slots %u, tail %u, gaps %u%s\n",
+	    wl_ms.guard_upper || wl_ms.guard_last || wl_ms.guard_tail || wl_ms.guard_gap ? "SPILL " : "", wl_ms.guard_upper,
+	    wl_ms.guard_upper_slots, wl_ms.guard_last, wl_ms.guard_tail, wl_ms.guard_gap,
+	    wl_ms.guard_upper || wl_ms.guard_last || wl_ms.guard_tail || wl_ms.guard_gap ? "; stop; owner review before any further kit" : "");
+}
+
 static int
 wl_w23_run(void)
 {
@@ -6107,6 +6265,7 @@ wl_w23_run(void)
 		    wl_scan.foreign, wl_scan.ci_start, wl_scan.dequeued ? ", dequeued" : "");
 	} else {
 		printf("FUXI WLAN: W23 timeout scan COMPLETED (%u ms); report, contain, no retry\n", took);
+		wl28_crash("scan COMPLETED timeout");  /* C2e: read-only, before anything else touches the device */
 	}
 	wl26_watch(WLRX_P_COMPLETED);  /* C2c: as soon as the wait returned, before the W24 lines */
 	wl24_report();
@@ -6809,6 +6968,7 @@ wl5_abort(unsigned step)
 	if (wl_w11_attempted) { wl_w11_stop(); }
 	wl5_status(step);
 	(void)wl_smmu_fault(step);
+	wl28_crash("contain before MHI reset");  /* C2e: read-only; silent without w20 0x2000 */
 	int reset_bad = 0;
 	if (wl_mhi_valid) {
 		reset_bad = wl_contain_wr((uint64_t)WL_BAR0 + 0x38, 2);

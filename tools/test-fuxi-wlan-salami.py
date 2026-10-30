@@ -39,6 +39,9 @@ Host-only, synthetic cmd-db and RSC registers, fake boot-args and a fake ADT
   - C2d (W27): qrtr 7 takes w20 0x800 and 0x1000, each only with 0x100, from the
     cmdline and from ADT /defaults (6402, 6914); qrtr 6 refuses both; a boot
     without them prints no W27 line.
+  - C2e (W28): qrtr 7 takes w20 0x2000 only with 0x100, from the cmdline and
+    from ADT /defaults (15106 = 0x3b02, 8962 = 0x2302); qrtr 6 refuses it; a
+    boot without it prints no W28 line.
 """
 from pathlib import Path
 import importlib.util
@@ -587,7 +590,7 @@ def gate_suite(tmp, mk):
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0x500', 0, 0, 'w20 0x500 valid 0'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0x208', 0, 0, 'w20 0x208 valid 0'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0x420', 0, 0, 'w20 0x420 valid 0'),
-        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0x2f02', 0, 0, 'w20 0x2f02 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0x4f02', 0, 0, 'w20 0x4f02 valid 0'),
         # C2d (W27): 0x800 RXSEL and 0x1000 REORX with qrtr 7, each needing 0x100; the kit values 6402 (0x1902) and 6914
         # (0x1b02) in decimal; refused without 0x100, with qrtr 6, with 0x08 or 0x20 next to them
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=6402', 1, 28,
@@ -613,6 +616,27 @@ def gate_suite(tmp, mk):
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw20=0x702', 0, 0, 'w20 0x702 valid 0'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=5 fuxiwlanw20=512', 0, 0, 'W20 fuxiwlanw20 0x200 needs fuxiwlanqrtr=6; refused'),
         ('fuxiwlan=27 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=512', 0, 0, 'needs all 28 steps'),
+        # C2e (W28): 0x2000 MONSTAT with qrtr 7, needing 0x100; the kit values 15106 (0x3b02) and 8962 (0x2302) in decimal;
+        # refused without 0x100, with qrtr 6, with keep, with 0x08 or 0x20 next to it, and 0x2f02 is now a valid C2e value
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=15106', 1, 28,
+         'W28 selected: monitor status rings 185/193, 1023 buffers each (w20 0x2000), watched, not reaped; crash line at the '
+         'COMPLETED timeout and before MHI reset; nothing transmitted'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=15106', 1, 28, 'w20 0x3b02 valid 1'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=8962', 1, 28, 'w20 0x2302 valid 1'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0x2102', 1, 28, 'w20 0x2102 valid 1'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0x2f02', 1, 28, 'w20 0x2f02 valid 1'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0x3f92', 1, 28, 'w20 0x3f92 valid 1'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0x2002', 0, 0, 'w20 0x2002 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0x2000', 0, 0, 'w20 0x2000 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0x2a02', 0, 0, 'w20 0x2a02 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0x2100', 0, 0, 'w20 0x2100 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0x210a', 0, 0, 'w20 0x210a valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0x2122', 0, 0, 'w20 0x2122 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=15106 fuxiwlankeep=1', 0, 0, 'w20 0x3b02 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=15106 fuxiwlanstop22=1', 0, 0, 'w20 0x3b02 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw20=0x2000', 0, 0, 'w20 0x2000 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw20=15106', 0, 0, 'w20 0x3b02 valid 0'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=8 fuxiwlanw20=15106', 0, 0, 'W20 fuxiwlanqrtr=8 is not 0..7 in this build; refused'),
     ]
     for args, starts, limit, text in cases:
         s, lim, names, out, reads = run(salami, args)
@@ -633,6 +657,8 @@ def gate_suite(tmp, mk):
         assert ('W26' in out) == w26, (args, out)
         w27 = bool(w26 and int(m20[1], 0) & 0x1800)  # C2d: a W27 line only for a valid qrtr 7 boot with a W27 bit
         assert ('W27' in out) == w27, (args, out)
+        w28 = bool(w26 and int(m20[1], 0) & 0x2000)  # C2e: a W28 line only for a valid qrtr 7 boot with 0x2000
+        assert ('W28' in out) == w28, (args, out)
     # Firmware names: salami Android defaults, boot-arg overrides, bad names refused.
     s, _, names, out, _ = run(salami, f'fuxiwlan=1 fuxiwlansalami=1 {W14}')
     assert s == 1 and names == {'bdf': 'bdwlan.b0e', 'regdb': 'regdb.bin', 'm3': 'phy_ucode20.elf', 'amss': ''}, names
@@ -697,6 +723,10 @@ def gate_suite(tmp, mk):
         'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=6402',
         'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=6914',
         'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=2050',
+        # C2e: the two kit values and a refusal
+        'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=15106',
+        'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=8962',
+        'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=8194',
     ]
     for args in equal:
         want = run(salami, args)
@@ -727,6 +757,10 @@ def gate_suite(tmp, mk):
             1810: (0x712, 'chain mask pdev tx/rx (w20 0x400)'),
             6402: (0x1902, 'rx rings 4095 buffers, rings 160/161/169/186 (w20 0x100); wbm idle list no; chain mask no'),
             6914: (0x1b02, 'rx rings 4095 buffers, rings 160/161/169/186 (w20 0x100); wbm idle list 32767 link descriptors (w20 '
+                   '0x200); chain mask no'),
+            15106: (0x3b02, 'rx rings 4095 buffers, rings 160/161/169/186 (w20 0x100); wbm idle list 32767 link descriptors (w20 '
+                    '0x200); chain mask no'),
+            8962: (0x2302, 'rx rings 4095 buffers, rings 160/161/169/186 (w20 0x100); wbm idle list 32767 link descriptors (w20 '
                    '0x200); chain mask no')}
     for dec, (hexv, sel) in kits.items():
         s, lim, _, out, reads = run(salami, 'fuxiwlan=28 fuxiwlanclk=1 fuxiwlanqrtr=7', enc(f'{s4} fuxiwlanw20={dec}'))
@@ -736,6 +770,8 @@ def gate_suite(tmp, mk):
         assert 'salami fuxiwlanqrtr from ADT' not in out and reads >= 4, (dec, reads, out)
         assert ('FUXI WLAN: W27 selected: ring selection mac0/mac1' in out and 'reo rx path rings 131/0/1-8' in out) == \
             bool(hexv & 0x1800), (dec, out)
+        assert ('FUXI WLAN: W28 selected: monitor status rings 185/193, 1023 buffers each (w20 0x2000)' in out) == \
+            bool(hexv & 0x2000), (dec, out)
     # (c) A boot-arg wins over /defaults, number or string, also when the boot-arg says less.
     s, lim, names, out, _ = run(salami, 'fuxiwlan=12 fuxiwlansalami=1 fuxiwlanrails=2 fuxiwlanqrtr=4 fuxiwlanbdf=a.bin',
                                 enc('fuxiwlan=11 fuxiwlansalami=0 fuxiwlanrails=1 fuxiwlanbdf=b.bin fuxiwlanm3=c.elf'))
