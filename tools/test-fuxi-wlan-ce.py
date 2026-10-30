@@ -79,6 +79,10 @@ counts REO CFG1 alone as an owner (the phone's values program cc), the
 fuxiwlanw29 default 0x9f (no LRO, no IDLE_PS); L19 (l19_c2g): LMAC rings have no
 register or shadow, their HP/TP only in wrp/rdp, and L19 never touches the
 pointers of rings 161/169 after SRING_SETUP; mutants.
+C2h: with w20 0x4000, PPT pre-reads holding another session's entries print one
+read-only summary line (count, all-ones, first/last index, +1 page steps, up to 4
+samples) before the refusal, from the 280 values already read (model s_c2h_ppt;
+mutants).
 No device, no network.
 """
 from pathlib import Path
@@ -1816,6 +1820,13 @@ C2F_MUTANTS = [
     ('h', 'p->n = mon ? WLRX_NPTR : 4u;', 'p->n = 4u;', 'pointer words: 185/193 left out with 0x2000'),
     ('h', 'if (!p->valid[m]) { p->first[m] = i; }', 'p->first[m] = i;', 'valid span: first index not the first'),
     ('h', '\t\t\tp->last[m] = i;\n', '', 'valid span: last index not kept'),
+    # C2h: the read-only PPT summary.
+    ('d', '\t\tif (own == WLCM_CMEM_OWNED) { wl29_ppt_before(); }   /* C2h, read-only */\n', '', 'PPT summary not printed'),
+    ('h', 's->steps += i && cm->ppt_pre[i - 1u] && v == cm->ppt_pre[i - 1u] + 1u;', 's->steps += i && v == cm->ppt_pre[i - 1u] + 1u;',
+     'PPT steps count a step from a zero entry'),
+    ('h', 's->ones += v == ~0u;', '', 'PPT all-ones entries not counted'),
+    ('h', 'if (!s->nz) { s->first = i; }', 's->first = i;', 'PPT first index not the first'),
+    ('h', 'want[3] = s->nz - 1u;', 'want[3] = s->nz - 2u;', 'PPT samples miss the last entry'),
 ]
 
 

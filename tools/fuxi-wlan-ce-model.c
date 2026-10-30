@@ -2046,6 +2046,7 @@ static struct {
 	uint32_t cmem_lo, cmem_hi, cc_pre[6];
 	uint32_t cmem_rd, cmem_wr, cc_rd, cc_wr, ring_rd, ring_wr, ring_wr_before_cmem, cmem_wr_after_ring;
 	uint32_t n, addr[256], val[256];
+	uint32_t cmem_val[1024];  /* C2h: what each CMEM word reads as from cmem_lo (0 unless a scenario seeds it) */
 } cmd;
 
 static void
@@ -2067,7 +2068,10 @@ cm_access(uint32_t off, bool wr, uint32_t *v)
 		if (wr) {
 			if (!cmd.cmem_wr) { cmd.ring_wr_before_cmem = cmd.ring_wr; }
 			cmd.cmem_wr++; cmd.cmem_wr_after_ring += cmd.ring_wr != 0;
-		} else { cmd.cmem_rd++; *v = 0; }
+		} else {
+			const uint32_t w = (off - cmd.cmem_lo) / 4u;
+			cmd.cmem_rd++; *v = w < 1024u ? cmd.cmem_val[w] : 0;
+		}
 		return true;
 	}
 	for (unsigned k = 0; k < 6; k++) {
@@ -5602,6 +5606,54 @@ s_c2f_bisect(void)
 	     "word, in L19's order and place (the default: no LRO, no idle-PS); the scan completes");
 }
 
+/* C2h, read-only: the PPT pre-reads hold entries another driver session left (the phone at every boot): one line with
+ * the count of non-zero entries of the 280 read, the all-ones ones, the first and last index, the +1 page steps and up to
+ * 4 samples (non-zero ordinals 0, nz/3, 2nz/3, nz-1, no repeat), then the existing refusal; exactly the 280 pre-reads,
+ * no CMEM, cc_config or extra access, cc dropped. All-zero PPT: no such line, cc programmed as before. */
+static void
+s_c2h_ppt(void)
+{
+	static const char why[] = "FUXI WLAN: W29 cookie conversion not programmed: a CMEM PPT entry is already non-zero "
+	    "(cookie converter owned); w20 0x4000 cc dropped for this boot\n";
+	static const struct { const char *line; } want[] = {
+		{ "FUXI WLAN: W29 ppt before: base 0x113000 non-zero 280 of 280 (all-ones 0) first 0 last 279 steps 279; samples "
+		  "[0]=0xa1000 [93]=0xa105d [186]=0xa10ba [279]=0xa1117; nothing written\n" },
+		{ "FUXI WLAN: W29 ppt before: base 0x113000 non-zero 2 of 280 (all-ones 1) first 5 last 200 steps 0; samples "
+		  "[5]=0x1234 [200]=0xffffffff; nothing written\n" },
+		{ "FUXI WLAN: W29 ppt before: base 0x113000 non-zero 1 of 280 (all-ones 0) first 279 last 279 steps 0; samples "
+		  "[279]=0x1; nothing written\n" },
+		{ "FUXI WLAN: W29 ppt before: base 0x113000 non-zero 3 of 280 (all-ones 0) first 10 last 13 steps 1; samples "
+		  "[10]=0x100 [11]=0x101 [13]=0x102; nothing written\n" },
+		{ "FUXI WLAN: W29 ppt before: base 0x113000 non-zero 280 of 280 (all-ones 280) first 0 last 279 steps 0; samples "
+		  "[0]=0xffffffff [93]=0xffffffff [186]=0xffffffff [279]=0xffffffff; nothing written\n" },
+	};
+	for (unsigned c = 0; c < sizeof(want) / sizeof(want[0]); c++) {
+		c2f_gate_reset();
+		switch (c) {
+		case 0: for (unsigned i = 0; i < 280u; i++) { cmd.cmem_val[i] = 0xa1000u + i; } break;
+		case 1: cmd.cmem_val[5] = 0x1234u; cmd.cmem_val[200] = ~0u; break;
+		case 2: cmd.cmem_val[279] = 1u; break;
+		case 3: cmd.cmem_val[10] = 0x100u; cmd.cmem_val[11] = 0x101u; cmd.cmem_val[13] = 0x102u; break;
+		default: for (unsigned i = 0; i < 280u; i++) { cmd.cmem_val[i] = ~0u; } break;
+		}
+		cmd.cmem_val[280] = 0xdeadu;  /* past the 280 PPT entries: never read, never counted */
+		CHECK(wl27_setup() == 0 && wl_rd.reo_on && wl_cm.rings_on && !wl_cm.cc_on && !wl_rx.cc_on && !wl_rd.cc_on, "c2h ppt run");
+		CHECK(cmd.cmem_rd == 280u && !cmd.cmem_wr && !wl29_cmem_writes && cmd.cc_rd == 8u && !cmd.cc_wr, "c2h ppt: an access beyond the pre-reads");
+		CHECK(wl29_cc_config() == 0 && !cmd.cc_wr && !cmd.cmem_wr, "c2h ppt cc_config");
+		{
+			const char *const order[] = { "FUXI WLAN: W29 cc before:", want[c].line, why };
+			expect_order(order, 3);
+		}
+		show(c ? "c2h ppt case" : "c2h ppt contiguous");
+	}
+	c2f_gate_reset();
+	CHECK(wl27_setup() == 0 && wl_cm.cc_on && cmd.cmem_rd == 280u && cmd.cmem_wr == 280u, "c2h ppt all zero");
+	expect_not("W29 ppt before");
+	c2f_gate_done();
+	puts("C2h: PPT pre-reads with entries left by another session (contiguous, sparse with ~0, one, a gap, all ~0): one "
+	     "read-only summary line within 254 bytes before the refusal, only the 280 pre-reads, nothing written; all zero: no line");
+}
+
 /* C2g, read-only: at every W26 watch the raw remote pointer words of each LMAC ring set up, named by where L19 puts
  * them (an SRC ring's HP in wrp[id - 160] and TP in rdp[id], a DST ring the reverse), then the valid entries of the
  * MAC rings 161/169 with the first and last index. The model's firmware mirrors its MAC ring HP into wrp[1]/[9]; the
@@ -5820,6 +5872,7 @@ main(int argc, char **argv)
 		s_c2f_mask_gate();
 		s_c2f_bisect();
 		s_c2g_ptrs();
+		s_c2h_ppt();
 		reset();
 		puts("C2f model: all scenarios passed");
 		return 0;
@@ -5881,6 +5934,7 @@ main(int argc, char **argv)
 	s_c2f_mask_gate();
 	s_c2f_bisect();
 	s_c2g_ptrs();
+	s_c2h_ppt();
 	reset();
 	puts("W20 model: all scenarios passed");
 	return 0;

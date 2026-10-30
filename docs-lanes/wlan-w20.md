@@ -1733,6 +1733,15 @@ commit body):
 
 So boots without 0x100 print nothing new, and boots without 0x4000 are unchanged apart from the read-only lines.
 
+## C2h: the read-only PPT summary (w20 0x4000)
+
+With w20 0x4000, when the 280 PPT pre-reads of `wl29_cc_init` find any non-zero entry, one line before the existing
+`W29 cookie conversion not programmed: a CMEM PPT entry is already non-zero` refusal:
+`W29 ppt before: base B non-zero N of 280 (all-ones U) first I last L steps S; samples [i]=V ...; nothing written`
+(at most 191 bytes), built from the values already read; no new access, nothing written, no new w20 bit. The line, the
+model scenario `s_c2h_ppt` and the vendor driver study behind it (who owns the PPT, why it is stale, the ranked
+differences and the next rungs) are in `docs-lanes/wlan-kiwi-rx-study.md`.
+
 ## Host tests
 
 `CC=cc python3 tools/test-fuxi-wlan-ce.py` (also in tools/ci/build.sh): the model in

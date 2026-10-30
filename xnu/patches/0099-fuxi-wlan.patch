@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,7822 @@
+@@ -0,0 +1,7841 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -6457,6 +6457,24 @@
 +	}
 +}
 +
++/* C2h, read-only: the PPT pre-reads found non-zero (another driver session's
++ * table, docs-lanes/wlan-kiwi-rx-study.md): one line from the values already
++ * read through the CMEM allowlist, no further access. */
++static void
++wl29_ppt_before(void)
++{
++	struct wlcm_ppt_sum s;
++	char smp[96];
++	int len = 0;
++	wlcm_ppt_summary(&wl_cm, &s);
++	smp[0] = '\0';
++	for (unsigned k = 0; k < s.ns && len >= 0 && (size_t)len < sizeof(smp); k++) {
++		len += snprintf(smp + len, sizeof(smp) - (size_t)len, " [%u]=%#x", s.idx[k], s.val[k]);
++	}
++	printf("FUXI WLAN: W29 ppt before: base %#x non-zero %u of %u (all-ones %u) first %u last %u steps %u; samples%s; nothing written\n",
++	    wl_cm.cmem_base, s.nz, WLCM_NSPT, s.ones, s.first, s.last, s.steps, smp);
++}
++
 +/* dp_alloc's cookie-converter init (ath12k_dp_cc_init, dp.c:1583-1667): the PPT
 + * table in CMEM and the SPT pages. Called from wl27_setup once C2d's REO
 + * pre-reads and W29's common-ring pre-reads are read, before any common-ring
@@ -6486,6 +6504,7 @@
 +	if (own == WLCM_FREE) {
 +		for (unsigned i = 0; i < WLCM_NSPT; i++) { wl_cm.ppt_pre[i] = wl29_cmem_rd(wlcm_ppt_addr(&wl_cm, i)); }
 +		own = wlcm_cmem_owned(&wl_cm);
++		if (own == WLCM_CMEM_OWNED) { wl29_ppt_before(); }   /* C2h, read-only */
 +	}
 +	if (own != WLCM_FREE) {
 +		printf("FUXI WLAN: W29 cookie conversion not programmed: %s; w20 0x4000 cc dropped for this boot\n", wlcm_why(own));
@@ -7854,7 +7873,7 @@
 +#endif /* FUXI */
 --- a/bsd/dev/fuxi_wlan_ce.h
 +++ b/bsd/dev/fuxi_wlan_ce.h
-@@ -0,0 +1,4211 @@
+@@ -0,0 +1,4251 @@
 +/*
 + * FUXI WLAN W20/W21/W22 (fuxiwlanqrtr=6, C1): WCN7850 copy engines on SRNG
 + * rings, HTC and WMI init to WMI READY, polled. W23/W24 (fuxiwlanqrtr=7, C2):
@@ -12017,6 +12036,46 @@
 +{
 +	for (unsigned i = 0; i < WLCM_NSPT; i++) { if (cm->ppt_pre[i]) { return WLCM_CMEM_OWNED; } }
 +	return WLCM_FREE;
++}
++
++/* C2h, read-only: the PPT pre-reads summarised when they hold entries another
++ * driver session left (docs-lanes/wlan-kiwi-rx-study.md): nz non-zero of the
++ * WLCM_NSPT read, ones of them ~0 (unreadable), the first and last non-zero
++ * index, steps = non-zero entries equal to their non-zero predecessor + 1 (4 KiB
++ * pages laid out one after another), and up to 4 samples: the non-zero entries
++ * of ordinal 0, nz/3, 2nz/3 and nz-1, without repeats. Nothing is written. */
++#define WLCM_PPT_SAMPLES 4u
++struct wlcm_ppt_sum {
++	unsigned nz, ones, steps, first, last, ns;
++	unsigned idx[WLCM_PPT_SAMPLES];
++	uint32_t val[WLCM_PPT_SAMPLES];
++};
++
++static inline void
++wlcm_ppt_summary(const struct wlcm *cm, struct wlcm_ppt_sum *s)
++{
++	unsigned want[WLCM_PPT_SAMPLES], ord = 0;
++	*s = (struct wlcm_ppt_sum){ 0 };
++	for (unsigned i = 0; i < WLCM_NSPT; i++) {
++		const uint32_t v = cm->ppt_pre[i];
++		if (!v) { continue; }
++		if (!s->nz) { s->first = i; }
++		s->last = i;
++		s->nz++;
++		s->ones += v == ~0u;
++		s->steps += i && cm->ppt_pre[i - 1u] && v == cm->ppt_pre[i - 1u] + 1u;
++	}
++	if (!s->nz) { return; }
++	want[0] = 0; want[1] = s->nz / 3u; want[2] = 2u * s->nz / 3u; want[3] = s->nz - 1u;
++	for (unsigned i = 0; i < WLCM_NSPT && s->ns < WLCM_PPT_SAMPLES; i++) {
++		if (!cm->ppt_pre[i]) { continue; }
++		for (unsigned k = 0; k < WLCM_PPT_SAMPLES; k++) {
++			if (want[k] != ord) { continue; }
++			s->idx[s->ns] = i; s->val[s->ns++] = cm->ppt_pre[i];
++			break;
++		}
++		ord++;
++	}
 +}
 +
 +/* Non-zero dwords where the device was given no address (counts only). The

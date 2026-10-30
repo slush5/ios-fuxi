@@ -6425,6 +6425,24 @@ wl29_cc_before(const uint32_t regs[WLCM_CC_REGS][2])
 	}
 }
 
+/* C2h, read-only: the PPT pre-reads found non-zero (another driver session's
+ * table, docs-lanes/wlan-kiwi-rx-study.md): one line from the values already
+ * read through the CMEM allowlist, no further access. */
+static void
+wl29_ppt_before(void)
+{
+	struct wlcm_ppt_sum s;
+	char smp[96];
+	int len = 0;
+	wlcm_ppt_summary(&wl_cm, &s);
+	smp[0] = '\0';
+	for (unsigned k = 0; k < s.ns && len >= 0 && (size_t)len < sizeof(smp); k++) {
+		len += snprintf(smp + len, sizeof(smp) - (size_t)len, " [%u]=%#x", s.idx[k], s.val[k]);
+	}
+	printf("FUXI WLAN: W29 ppt before: base %#x non-zero %u of %u (all-ones %u) first %u last %u steps %u; samples%s; nothing written\n",
+	    wl_cm.cmem_base, s.nz, WLCM_NSPT, s.ones, s.first, s.last, s.steps, smp);
+}
+
 /* dp_alloc's cookie-converter init (ath12k_dp_cc_init, dp.c:1583-1667): the PPT
  * table in CMEM and the SPT pages. Called from wl27_setup once C2d's REO
  * pre-reads and W29's common-ring pre-reads are read, before any common-ring
@@ -6454,6 +6472,7 @@ wl29_cc_init(void)
 	if (own == WLCM_FREE) {
 		for (unsigned i = 0; i < WLCM_NSPT; i++) { wl_cm.ppt_pre[i] = wl29_cmem_rd(wlcm_ppt_addr(&wl_cm, i)); }
 		own = wlcm_cmem_owned(&wl_cm);
+		if (own == WLCM_CMEM_OWNED) { wl29_ppt_before(); }   /* C2h, read-only */
 	}
 	if (own != WLCM_FREE) {
 		printf("FUXI WLAN: W29 cookie conversion not programmed: %s; w20 0x4000 cc dropped for this boot\n", wlcm_why(own));

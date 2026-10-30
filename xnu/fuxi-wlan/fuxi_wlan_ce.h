@@ -4162,6 +4162,46 @@ wlcm_cmem_owned(const struct wlcm *cm)
 	return WLCM_FREE;
 }
 
+/* C2h, read-only: the PPT pre-reads summarised when they hold entries another
+ * driver session left (docs-lanes/wlan-kiwi-rx-study.md): nz non-zero of the
+ * WLCM_NSPT read, ones of them ~0 (unreadable), the first and last non-zero
+ * index, steps = non-zero entries equal to their non-zero predecessor + 1 (4 KiB
+ * pages laid out one after another), and up to 4 samples: the non-zero entries
+ * of ordinal 0, nz/3, 2nz/3 and nz-1, without repeats. Nothing is written. */
+#define WLCM_PPT_SAMPLES 4u
+struct wlcm_ppt_sum {
+	unsigned nz, ones, steps, first, last, ns;
+	unsigned idx[WLCM_PPT_SAMPLES];
+	uint32_t val[WLCM_PPT_SAMPLES];
+};
+
+static inline void
+wlcm_ppt_summary(const struct wlcm *cm, struct wlcm_ppt_sum *s)
+{
+	unsigned want[WLCM_PPT_SAMPLES], ord = 0;
+	*s = (struct wlcm_ppt_sum){ 0 };
+	for (unsigned i = 0; i < WLCM_NSPT; i++) {
+		const uint32_t v = cm->ppt_pre[i];
+		if (!v) { continue; }
+		if (!s->nz) { s->first = i; }
+		s->last = i;
+		s->nz++;
+		s->ones += v == ~0u;
+		s->steps += i && cm->ppt_pre[i - 1u] && v == cm->ppt_pre[i - 1u] + 1u;
+	}
+	if (!s->nz) { return; }
+	want[0] = 0; want[1] = s->nz / 3u; want[2] = 2u * s->nz / 3u; want[3] = s->nz - 1u;
+	for (unsigned i = 0; i < WLCM_NSPT && s->ns < WLCM_PPT_SAMPLES; i++) {
+		if (!cm->ppt_pre[i]) { continue; }
+		for (unsigned k = 0; k < WLCM_PPT_SAMPLES; k++) {
+			if (want[k] != ord) { continue; }
+			s->idx[s->ns] = i; s->val[s->ns++] = cm->ppt_pre[i];
+			break;
+		}
+		ord++;
+	}
+}
+
 /* Non-zero dwords where the device was given no address (counts only). The
  * device never writes this arena in a passive scan (no TX, no REO command), so
  * every region here should stay as the host left it:
