@@ -8,7 +8,9 @@ phone (r1c2c-all: the RX engine woke, nothing landed, the scan wedged); C2d (W27
 REO/WBM buffer return path, w20 0x800/0x1000, default off) ran on the phone (r1c2d-l: everything programmed, nothing
 written, the scan wedged after 3 channels); C2e (W28: the RXDMA monitor status rings and a read-only crash line, w20
 0x2000, default off) is host-tested only (tools/test-fuxi-wlan-ce.py); C2f (W29: L19's dp_alloc order, cookie conversion
-and the common SRNGs L19 programs before any scan, w20 0x4000, default off) is host-tested only too. Every line below that
+and the common SRNGs L19 programs before any scan, w20 0x4000, default off) is host-tested only too; C2g (where the per-MAC
+RXDMA ring pointers live, read-only pointer-word lines, the relaxed cookie-conversion gate and the `fuxiwlanw29` default
+0x9f) is host-tested only. Every line below that
 says what the target does is what
 the model does, built from Linux ath12k v6.19. C2, C2b and C2c are described in their own sections below
 ([C2: W23/W24](#c2-w23w24-one-passive-scan-fuxiwlanqrtr7),
@@ -16,7 +18,8 @@ the model does, built from Linux ath12k v6.19. C2, C2b and C2c are described in 
 [C2c: W26](#c2c-w26-host-rx-rings-the-wbm-idle-list-and-the-chain-masks-fuxiwlanqrtr7-w20-0x100-0x200-0x400),
 [C2d: W27](#c2d-w27-rx-ring-selection-and-the-reowbm-buffer-return-path-fuxiwlanqrtr7-w20-0x800-0x1000),
 [C2e: W28](#c2e-w28-the-rxdma-monitor-status-rings-and-the-crash-line-fuxiwlanqrtr7-w20-0x2000),
-[C2f: W29](#c2f-w29-l19s-dp_alloc-order-cookie-conversion-and-the-common-srngs-fuxiwlanqrtr7-w20-0x4000)).
+[C2f: W29](#c2f-w29-l19s-dp_alloc-order-cookie-conversion-and-the-common-srngs-fuxiwlanqrtr7-w20-0x4000),
+[C2g](#c2g-the-per-mac-ring-pointers-the-cc-gate-and-the-w29-default)).
 
 After this boot's W15 WLAN_MODE reply, the radio lane programs the host side of copy engines CE0..CE4 on
 SRNG rings, posts RX buffers, completes HTC (READY, HTT and WMI connect, SETUP_COMPLETE_EX) and WMI init
@@ -1389,7 +1392,8 @@ the W20 block of `fuxi_wlan.c` (`wl29_reg`, `wl29_cmem`, `wl29_ring`, `wl29_cc_i
 0x02), because it layers on C2d's REO path and extends `wl27_setup`'s common setup. keep/stop22, 0x08, 0x20 and unknown bits
 stay refused. A valid boot with 0x4000 prints, after the W28 selected line: `W29 selected: L19 dp_alloc order, cookie
 conversion (CMEM from QMI), common rings sw2wbm/tcl+comp x3/reinject/reo-cmd/reo-status programmed never posted, mac-start
-pdev params and vdev encap/decap (w20 0x4000); nothing transmitted`.
+pdev params and vdev encap/decap (w20 0x4000); nothing transmitted` (until C2g; since C2g a boot without `fuxiwlanw29`
+prints the mask form with `fuxiwlanw29 0x9f default`, see [C2g](#c2g-the-per-mac-ring-pointers-the-cc-gate-and-the-w29-default)).
 
 | Kit | w20 | Decimal | What it is |
 |---|---|---|---|
@@ -1485,7 +1489,7 @@ pages), `spt-nonzero` counts every non-zero dword of the 280 SPT pages, which mu
 ### Lines
 
 ```
-FUXI WLAN: W29 selected: L19 dp_alloc order, cookie conversion (CMEM from QMI), common rings ... (w20 0x4000); nothing transmitted   (at init)
+FUXI WLAN: W29 selected: L19 dp_alloc order, fuxiwlanw29 0xN[ default]: common rings yes|no, ... (w20 0x4000); nothing transmitted   (at init, C2g form)
 FUXI WLAN: W29 arena IOVA I bytes 0x474000 Normal-NC mapped; rdp I spt I
 FUXI WLAN: W29 cookie conversion cmem base X pages 280 (rx 24 tx 256) spt I ppt writes 280; cc on
 FUXI WLAN: W29 cookie conversion not programmed: REASON; w20 0x4000 cc dropped for this boot                 (no CMEM / owned)
@@ -1555,7 +1559,7 @@ containment ... spt-lost 4095`: `wlcm_guard_count` counted every zero RX SPT ent
   positions are re-derived from L19's hal.h by `l19_c2f` (dump `ccfield`). Nothing is written by these lines.
 - `fuxiwlanw29` (an int, boot-arg or ADT /defaults like `fuxiwlanw20`, `--wlan-defaults fuxiwlanw29=N`): a bitmask of the
   W29 pieces when w20 0x4000 is valid. Absent = all pieces, exactly the C2f boot (the C2f `W29 selected` line byte for
-  byte). Given, the selected line lists the set (`W29 selected: L19 dp_alloc order, fuxiwlanw29 0xN: common rings yes|no,
+  byte); C2g changed this: absent is now 0x9f, without LRO and IDLE_PS (see C2g). Given, the selected line lists the set (`W29 selected: L19 dp_alloc order, fuxiwlanw29 0xN: common rings yes|no,
   cookie conversion ..., pdev params ..., dfs-offload ..., ppdu-stats ..., lro ..., idle-ps ..., encap/decap ... (w20
   0x4000); nothing transmitted`). Refused before any access (one `W20 fuxiwlanw29 ... refused` line, the run invalid): 0,
   negative, a bit outside 0xff, 0x02 without 0x01, without a valid w20 0x4000, without qrtr 7.
@@ -1607,6 +1611,127 @@ fuxiwlanw29-free parts (a full 0x4002 scan with every mac-start piece, the gate'
 reports) against both: equal except the cc value lines and the cc-dropped guard line (`SPILL ... spt-lost 4095` becomes
 `spt-nonzero 0`); the salami and Fuxi init/configure gate over boot-arg sets without `fuxiwlanw29`, with and without
 0x4000, cmdline and ADT /defaults: byte for byte.
+
+## C2g: the per-MAC ring pointers, the cc gate and the W29 default
+
+Code and host tests only; nothing ran on the phone. No new w20 bit: L19 performs no host write for the per-MAC rings
+that we do not (below), so there is nothing to put behind one.
+
+### The phone's reading
+
+With w20 0x100 the firmware moves all 4095 refill buffers out of ring 160 within 100 ms; the content check finds 2047
+VALID entries in ring 161 and 2016 in ring 169. Every W26 watch still reads `mac0 hp 0 tp 0 avail 0, mac1 hp 0 tp 0`;
+RXDMA then writes nothing anywhere and the scan wedges after a few channels with the firmware alive (M0, no SYSERR).
+
+### Where those pointers live (L19 v6.19, file:line)
+
+- Rings 161/169 on WCN7850 are `rx_mac_buf_ring[i]`: `ath12k_dp_srng_setup(..., HAL_RXDMA_BUF, 1, i, 2048)`
+  (dp_rx.c:4699-4711), `hw_params.rx_mac_buf_ring = true` (hw.c:1436); the WCN7850 config makes RXDMA_BUF a PMAC ring
+  with two ring numbers (hal.c:1421-1423), so ring_id = 160 + 1 + 8 x mac = 161, 169 (hal.c:1818-1838).
+- SRING_SETUP for them: ring type HTT_SW_TO_HW_RING, ring id HTT_RXDMA_HOST_BUF_RING; ring 160 itself is
+  HTT_HOST1_TO_FW_RXBUF_RING / HTT_SW_TO_SW_RING, under L19's comment "host fills rx buffer to fw and fw fills to rxbuf
+  ring for each rxdma" (dp_tx.c:1111-1127). PDEV_ID = DP_SW2HW_MACID(mac), LOOP_CNT_DIS set (dp_tx.c:1193-1196,
+  1228-1229). The head and tail "remote" addresses are `ath12k_hal_srng_get_hp_addr/get_tp_addr` (dp_tx.c:1180-1181,
+  1231-1235).
+- Those return 0 for a UMAC ring and, for an LMAC ring, an address in host memory: an SRC ring's HP in `wrp` and TP in
+  `rdp`, a DST ring the reverse (hal.c:1881-1911). `ath12k_hal_srng_setup` sets them as `wrp.vaddr + (ring_id - 160)` and
+  `rdp.vaddr + ring_id` and flags the ring HAL_SRNG_FLAGS_LMAC_RING (hal.c:2374-2431). So ring 161's HP is wrp[1], its TP
+  rdp[161]; ring 169's are wrp[9] and rdp[169]: exactly the words we name and read (`wlrx_layout`).
+- There is no register and no shadow for these rings: `ath12k_hal_srng_setup` returns before `ath12k_hal_srng_hw_init`
+  for any non-UMAC ring (hal.c:2434-2437), and `ath12k_hal_srng_shadow_config` skips DMAC and PMAC rings (hal.c:2523-2525).
+  For LMAC rings "ring pointer updates are done through FW and hence written to a shared memory location that is read by
+  FW" (hal.c:2173-2190, the LMAC branch of `access_end`: a plain memory store, never `ath12k_hif_write32`). The rdp/wrp
+  blocks are `dma_alloc_coherent`, zeroed (hal.c:1564-1604).
+- L19 never reads or writes the pointers of rings 161/169 after SRING_SETUP: its five uses of `rx_mac_buf_ring[` are
+  setup, cleanup, the two SRING_SETUP / RX_RING_SELECTION_CFG loops (dp_rx.c:4503-4504, 4597-4605, 4624-4633,
+  4699-4711; dp_tx.c:1636-1638). No `access_begin`/`access_end`, no `get_next_entry`, no doorbell. The host's only
+  producer pointer on this path is ring 160's HP in wrp[0] (we publish it as L19 does).
+
+### Conclusion
+
+The HP of an HTT_RXDMA_HOST_BUF_RING set up by SRING_SETUP is the wrp word we give (wrp[1], wrp[9]) and its TP is the rdp
+word (rdp[161], rdp[169]); L19 puts them nowhere else and has no hardware or shadow register for them. The producer of
+these two rings is the firmware, not the host (it fills them from ring 160); the host never writes those words, so they
+are 0 in L19 too unless the firmware mirrors its pointer there, which L19 neither expects nor checks. Our zeros are
+therefore neither a blind read of the wrong place nor, on L19's evidence, proof that RXDMA sees an empty ring: the
+firmware's own pointer for a ring it produces into is not published to the host in any way L19 relies on. There is no
+host update, initialisation, doorbell or shadow write that L19 performs for these rings and we skip, so nothing new is
+implemented and no w20 bit is added. The wedge has to be looked for elsewhere; the new lines below make the next boot show
+the raw words and where the firmware's entries actually are (a fill from index 0 to 2046 with wrp[1] still 0 says the
+firmware keeps its HP private).
+
+### New read-only lines (every W26 watch with 0x100)
+
+After each `W26 rx watch` line, host reads of our own arena only (each pointer word followed by the read barrier; no
+register access, nothing written):
+
+```
+FUXI WLAN: W26 rx ptr words <point>: 160 hp wrp[0] X tp rdp[160] X; 161 hp wrp[1] X tp rdp[161] X; 169 hp wrp[9] X tp rdp[169] X
+FUXI WLAN: W26 rx ptr words <point>: 186 hp rdp[186] X tp wrp[26] X; 185 hp wrp[25] X tp rdp[185] X; 193 hp wrp[33] X tp rdp[193] X
+FUXI WLAN: W26 rx ptr words <point>: 186 hp rdp[186] X tp wrp[26] X; 185/193 not set up        (without 0x2000)
+FUXI WLAN: W26 rx valid span <point>: mac0 valid N first I last I; mac1 valid N first I last I   (first none last none at 0)
+```
+
+X is the raw 32-bit word in hex (`%#x`, so 0 prints `0`); valid uses the content check's rule (the address alone is the
+start of a posted slot). Ring 186 is a DST ring, so its HP is the device's rdp[186] and its TP the host's wrp[26]. The
+widest line is about 205 bytes. Model: `s_c2g_ptrs` (the C2c happy path, the phone with `C.mac_hp_silent`, which prints
+the phone's `mac0 hp 0 tp 0 avail 0` with `valid 2047 first 0 last 2046` / `valid 2016 first 0 last 2015`, 0x3b02 with
+185/193, a full RXDMA error ring, no entry at all); `l19_c2g` re-derives every fact of the list above from the tree.
+
+### The cookie-conversion gate, relaxed
+
+The phone reads at every boot: reo-cfg0 0, reo-cfg1 0x111700, wbm-cfg0 0, wbm-cfg1 0, wbm-cfg2 0x40, convert 0. reo-cfg1
+decodes as COOKIE_PPT_MSB 0x17, COOKIE_SPT_MSB 0x8, GLOBAL_ENABLE (L19 itself writes PPT_MSB 0x13, so this is not L19's
+value, just a reset or leftover one); there is no base anywhere and WBM is off. The old gate refused on REO CFG1
+ENABLE/GLOBAL_ENABLE and so dropped cookie conversion on every phone boot. Now `wlcm_cc_owned` refuses only on:
+
+- REO CFG0 or WBM CFG0 non-zero (a base);
+- the WBM CFG1 enable: L19 names no enable field in WBM CFG1 (hal.h:270-273 end at ALIGN, bit 18), so bits 19 and 20,
+  the REO twin's ENABLE and GLOBAL_ENABLE (hal.h:333-334), are taken as it (conservative: either refuses);
+- the convert-config GLOBAL_EN (hal.h:284);
+- any ~0 (unreadable), as before.
+
+REO CFG1 with both bases 0 is not an owner: L19 writes it whole, unconditionally, with no read before it
+(dp.c:1340-1352). The six `W29 cc before` values and their decode are printed as before. The refusal line now reads
+`(cfg0 base, wbm cfg1 enable or convert global)`. Model: `s_c2f_ccvals` with the phone's exact values (not owned, 280 PPT
+writes, `W29 cc_config reo-cfg1 0x1d1310 wbm-cfg1 0x51310 cfg2 0x40->0x4b convert 0->0x13a; writes 6`), and `s_c2f_gate`
+with REO CFG1 alone (bit 19, bit 20, 0x111700, L19's 0x1d1310, 0xfffffffe) programming cc and the WBM CFG1 bits dropping
+it.
+
+### The W29 default: 0x9f
+
+`fuxiwlanw29` absent now means 0x9f (0x01 common rings, 0x02 cookie conversion, 0x04 PPDU stats, 0x08 pdev params, 0x10
+DFS offload, 0x80 encap/decap), not 0xff. LRO config (0x20) and IDLE_PS (0x40) are sent only when selected: the
+`fuxiwlanw29` bisect on the phone showed each of the two stalls WMI processing on our polled host, which has no
+interrupt or MSI yet (a separate later step); the other pieces were clean. Scan
+start itself stays intermittent in clean configs, so a single boot without SCAN_STARTED proves nothing. The selected line
+names the default: `W29 selected: L19 dp_alloc order, fuxiwlanw29 0x9f default: common rings yes, cookie conversion yes,
+pdev params yes, dfs-offload yes, ppdu-stats yes, lro no, idle-ps no, encap/decap yes (w20 0x4000); nothing transmitted`.
+`fuxiwlanw29=0xff` still sends all eight, exactly the C2f boot; the refusals are unchanged. Without LRO and IDLE_PS
+`wl29_macstart_post` prints nothing (as for any given mask without them). Model: `s_c2f_bisect` runs the default in a
+full scan (no LRO, no IDLE_PS command reaches the firmware).
+
+### Safety
+
+Unchanged: allowlists, pre-reads and refusals; device-writable memory only in the arenas; frees only after bus master off
+and PERST; no IRQ or MSI; no PMIC or voltage write; nothing transmits; every console line within 254 bytes (the static
+bound and the model's line check). The new lines read only the RX arena.
+
+### Proof that boots are otherwise unchanged
+
+Differentials against ded1b1e, each tree built from its own sources (script in this session's scratchpad, recorded in the
+commit body):
+
+- D1: ded1b1e's model with all its scenarios (238 logs), instrumented to dump every log and to record a failed check
+  instead of stopping, linked against ded1b1e's and this change's production code: 714 added `W26 rx ptr words` /
+  `W26 rx valid span` lines; with those removed, every other difference is in the cc gate runs: the refusal text (`wbm
+  cfg1 enable`), and the runs whose only "configured" register was REO CFG1 (s_c2f_gate's bit 19 and bit 20 cases,
+  s_c2f_guard's cc-dropped setup) now programming cc, as intended.
+- D2: the salami and Fuxi init/configure gate over 3528 boot-arg sets (qrtr, w20, fuxiwlanw29, keep and mlo
+  combinations), cmdline and ADT /defaults: 14112 runs, 14058 byte for byte, 54 differing only in the `W29 selected` line,
+  all of them valid 0x4000 boots without `fuxiwlanw29` (the C2f line becomes `fuxiwlanw29 0x9f default`).
+
+So boots without 0x100 print nothing new, and boots without 0x4000 are unchanged apart from the read-only lines.
 
 ## Host tests
 

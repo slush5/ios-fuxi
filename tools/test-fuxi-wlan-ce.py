@@ -73,6 +73,12 @@ non-zero SPT dwords otherwise (the phone's r1c2g false SPILL), the cc_config
 pre-reads printed read-only with their hal.h names, and each W29 piece gated on
 its bit in L19 order (model s_c2f_guard, s_c2f_ccvals, s_c2f_mask_gate,
 s_c2f_bisect; mutants; the decode names re-derived from hal.h).
+C2g: the read-only pointer-word and valid-span lines at every W26 watch (model
+s_c2g_ptrs, with the phone's silent MAC ring HP), the cc gate that no longer
+counts REO CFG1 alone as an owner (the phone's values program cc), the
+fuxiwlanw29 default 0x9f (no LRO, no IDLE_PS); L19 (l19_c2g): LMAC rings have no
+register or shadow, their HP/TP only in wrp/rdp, and L19 never touches the
+pointers of rings 161/169 after SRING_SETUP; mutants.
 No device, no network.
 """
 from pathlib import Path
@@ -502,7 +508,9 @@ def static_c2c():
     assert header_define('WLRX_ERR_W5_FRAME') == 0x003fff00 and header_define('WLRX_ERR_W6_FRAME') == 0x7ff80780
     own = between(HEADER, 'static inline unsigned\nwlrx_idle_owned(', '\n}\n')
     assert own.index('WLRX_IDLE_UNREADABLE') < own.index('WLRX_IDLE_SRNG') < own.index('WLRX_IDLE_BASE') < own.index('WLRX_IDLE_AMBIGUOUS')
-    longest = c2c_line_bounds(fns, cfg, extra={'dec': 199})
+    # C2g: wl26_ptr_lines prints the watch label it is given, wl26_watch's char lb[28] (s_c2c_widest drives its widest)
+    assert 'char lb[28], ' in fns['wl26_watch'] and 'wl26_ptr_lines(lb);' in fns['wl26_watch']
+    longest = c2c_line_bounds(fns, cfg, extra={'dec': 199, 'lb': 27})
     print('C2c static: gate (0x100 needs 0x02, qrtr 6 refuses W26), W26 in L19\'s order (W20 between the CE rings and the RX '
           'post, W23 between VERSION_CONF and the channel list, watches at STARTED/mid/COMPLETED), one window path for the CE '
           'and WBM allowlists, one shadow-19 HP publish, no WBM write before the pre-reads or after a refusal, arena fills only '
@@ -559,7 +567,7 @@ def c2c_line_bounds(fns, cfg, tag='W26', min_lines=28, extra=None):
         local, assigned, sizes = {}, dict(extra or {}), {}
         for decl in re.findall(r'\bchar ([^;=]*);', body):  # char a[N], b[M][N], ...: the last dimension
             for d in decl.split(','):
-                m = re.match(r'\s*(\w+)((?:\[\d+\])+)\s*$', d)
+                m = re.match(r'\s*(\w+)((?:\[\w+\])*\[\d+\])\s*$', d)  # C2g: an outer dimension may be a macro
                 if m:
                     sizes[m[1]] = int(re.findall(r'\[(\d+)\]', m[2])[-1])
         for m in re.finditer(r'const char \*(\w+) = (.*?);', body, re.S):
@@ -967,6 +975,63 @@ def l19_c2e(dump):
           'error ring and before the ring selection, batch 1, 500 us, low 128 entries in words, L19\'s MSI for them (ours 0), '
           'no reap and no status-ring selection in STA mode; the model\'s dump word by word (2 x 13 SRING_SETUP words: '
           '0x0101010b / 0x0101020b, 0x02020800, 0x003e0002, low 256; entries 0 and 1022)')
+
+
+def l19_c2g():
+    """C2g: where the LMAC rings' pointers live and what L19 does with those of the per-MAC rings 161/169 (the r1c2c
+    "hp 0 tp 0" question), re-derived from L19: no register and no shadow for DMAC/PMAC rings, HP/TP only in the
+    host's wrp/rdp words named by SRING_SETUP, and no read or write of rx_mac_buf_ring's pointers anywhere; the cc
+    gate's premise (cc_config writes REO CFG1 whole, never read-modify-write)."""
+    if not (L19 / 'wmi.h').exists():
+        print(f'L19 re-derivation (C2g) SKIPPED: no Linux ath12k v6.19 tree at {L19} (set ATH12K_SRC)')
+        return
+    flat = lambda t: ' '.join(t.replace('\\\n', ' ').split())  # noqa: E731
+    hal_c, dp_tx_c, dp_c = (flat(l19_text(n)) for n in ('hal.c', 'dp_tx.c', 'dp.c'))
+    setup = between(hal_c, 'int ath12k_hal_srng_setup(', 'static void ath12k_hal_srng_update_hp_tp_addr(')
+    # SRC: TP in rdp[ring_id]; HP in R2 (UMAC) or wrp[ring_id - DMAC_CMN_ID_START] with the LMAC flag; DST the reverse
+    assert 'srng->u.src_ring.tp_addr = (void *)(hal->rdp.vaddr + ring_id);' in setup
+    assert 'srng->u.dst_ring.hp_addr = (void *)(hal->rdp.vaddr + ring_id);' in setup
+    assert setup.count('idx = ring_id - HAL_SRNG_RING_ID_DMAC_CMN_ID_START;') == 2
+    assert 'srng->u.src_ring.hp_addr = (void *)(hal->wrp.vaddr + idx);' in setup
+    assert 'srng->u.dst_ring.tp_addr = (void *)(hal->wrp.vaddr + idx);' in setup
+    assert setup.count('srng->flags |= HAL_SRNG_FLAGS_LMAC_RING;') == 2
+    # no hw_init (no register write) for a non-UMAC ring
+    assert setup.index('if (srng_config->mac_type != ATH12K_HAL_SRNG_UMAC) return ring_id;') < \
+        setup.index('ath12k_hal_srng_hw_init(ab, srng);')
+    # the shadow config skips DMAC and PMAC rings
+    shadow = between(hal_c, 'void ath12k_hal_srng_shadow_config(', 'void ath12k_hal_srng_get_shadow_config(')
+    assert 'if (srng_config->mac_type == ATH12K_HAL_SRNG_DMAC || srng_config->mac_type == ATH12K_HAL_SRNG_PMAC) continue;' in shadow
+    # the remote addresses SRING_SETUP carries are those words (0 for a UMAC ring)
+    hp = between(hal_c, 'dma_addr_t ath12k_hal_srng_get_hp_addr(', 'dma_addr_t ath12k_hal_srng_get_tp_addr(')
+    assert 'if (!(srng->flags & HAL_SRNG_FLAGS_LMAC_RING)) return 0;' in hp and 'ab->hal.wrp.paddr' in hp and 'ab->hal.rdp.paddr' in hp
+    sr = between(dp_tx_c, 'int ath12k_dp_tx_htt_srng_setup(', '#define HTT_TARGET_VERSION_TIMEOUT_HZ')
+    assert 'hp_addr = ath12k_hal_srng_get_hp_addr(ab, srng);' in sr and \
+        'cmd->ring_head_off32_remote_addr_lo = cpu_to_le32(lower_32_bits(hp_addr));' in sr
+    # LMAC pointer updates go to that shared memory, never a register (access_end)
+    end = between(hal_c, 'void ath12k_hal_srng_access_end(', 'void ath12k_hal_setup_link_idle_list(')
+    lmac = end.split('if (srng->flags & HAL_SRNG_FLAGS_LMAC_RING) {', 1)[1].split('} else {', 1)[0]
+    assert 'WRITE_ONCE(*srng->u.src_ring.hp_addr, srng->u.src_ring.hp);' in lmac and 'ath12k_hif_write32' not in lmac
+    # 161/169 on WCN7850: RXDMA_BUF ring_num 1, HTT_RXDMA_HOST_BUF_RING / SW_TO_HW; firmware fills them from ring 160
+    assert 'if (ring_id == HAL_SRNG_SW2RXDMA_BUF0) { *htt_ring_id = HTT_HOST1_TO_FW_RXBUF_RING; *htt_ring_type = HTT_SW_TO_SW_RING; ' \
+        '} else { *htt_ring_id = HTT_RXDMA_HOST_BUF_RING; *htt_ring_type = HTT_SW_TO_HW_RING; }' in dp_tx_c
+    # no access of rx_mac_buf_ring's pointers anywhere in L19: every use is setup, cleanup, SRING_SETUP or the filter
+    uses = []
+    for name in sorted(p.name for p in L19.glob('*.c')):
+        for line in l19_text(name).splitlines():
+            if 'rx_mac_buf_ring[' in line:
+                uses.append(line.strip())
+    allowed = ('ath12k_dp_srng_cleanup(ab, &dp->rx_mac_buf_ring[i]);', 'ring_id = dp->rx_mac_buf_ring[i].ring_id;',
+               'ring_id = ab->dp.rx_mac_buf_ring[i].ring_id;', '&dp->rx_mac_buf_ring[i],')
+    assert uses and all(u in allowed for u in uses), uses
+    # the cc gate's premise: REO CFG1 written whole, no read before it
+    cc = between(dp_c, 'void ath12k_dp_cc_config(', 'static u32 ath12k_dp_cc_cookie_gen(')
+    assert 'ath12k_hif_write32(ab, reo_base + HAL_REO1_SW_COOKIE_CFG1(ab), val);' in cc and \
+        cc.index('ath12k_hif_read32') > cc.index('HAL_REO1_SW_COOKIE_CFG1(ab), val);')
+    print('L19 re-derivation (C2g): LMAC (DMAC/PMAC) rings have no register and no shadow (setup returns before hw_init, '
+          'shadow config skips them), their HP/TP only in wrp[id - 160] / rdp[id] (SRC; DST the reverse), the words '
+          'SRING_SETUP names; rings 161/169 are HTT_RXDMA_HOST_BUF_RING SW_TO_HW, filled by the firmware from ring 160, and '
+          f'L19 never reads or writes their pointers ({len(uses)} uses: setup, cleanup, SRING_SETUP, filter); cc_config '
+          'writes REO CFG1 whole')
 
 
 def l19_c2f(dump):
@@ -1709,9 +1774,9 @@ C2F_MUTANTS = [
     ('h', '\t\tif (off == WLCM_REO_CC_CFG0 || off == WLCM_REO_CC_CFG1 || off == WLCM_WBM_CC_CFG0 || off == WLCM_WBM_CC_CFG1) '
      '{ return true; }\n', '', 'cc registers not in the read allowlist'),
     ('h', 'if (pre[0] || pre[2] || ', 'if (', 'a configured cc CFG0 base not refused'),
-    ('h', '(pre[1] & WLCM_REO_CC_CFG1_EN) || ', '', 'REO cc CFG1 enable not refused'),
-    ('h', '#define WLCM_REO_CC_CFG1_EN ((1u << 19) | (1u << 20))', '#define WLCM_REO_CC_CFG1_EN (1u << 19)',
-     'REO cc CFG1 GLOBAL_ENABLE not refused'),
+    ('h', '(pre[3] & WLCM_WBM_CC_CFG1_EN) || ', '', 'WBM cc CFG1 enable not refused'),
+    ('h', '#define WLCM_WBM_CC_CFG1_EN ((1u << 19) | (1u << 20))', '#define WLCM_WBM_CC_CFG1_EN (1u << 19)',
+     'WBM cc CFG1 bit 20 not refused'),
     ('h', ' || (pre[5] & WLCM_WBM_CC_CONVERT_GLOBAL)', '', 'convert GLOBAL_EN not refused'),
     ('h', '!(start & 3u) && ', '', 'CMEM alignment not checked'),
     ('h', 'start >= WLCM_CMEM_LO && ', '', 'CMEM lower bound not checked'),
@@ -1739,6 +1804,18 @@ C2F_MUTANTS = [
     ('d', 'if ((m & WL29_PDEV) &&\n\t    wl23_words(WLWMI_CMD_PDEV_SET_PARAM, WLWMI_TAG_PDEV_SET_PARAM_CMD, a, 3, "WMI PDEV_SET_PARAM MESH_MCAST"))',
      'if (\n\t    wl23_words(WLWMI_CMD_PDEV_SET_PARAM, WLWMI_TAG_PDEV_SET_PARAM_CMD, a, 3, "WMI PDEV_SET_PARAM MESH_MCAST"))',
      'MESH_MCAST not gated'),
+    # C2g: the cc gate (REO CFG1 alone is no owner), the default mask, the read-only pointer words and valid span.
+    ('h', 'if (pre[0] || pre[2] || ', 'if (pre[0] || pre[2] || (pre[1] & ((1u << 19) | (1u << 20))) || ',
+     'REO CFG1 alone refuses cc again (the phone values)'),
+    ('d', '#define WL29_DEFAULT (WL29_ALL & ~(WL29_LRO | WL29_IDLEPS))', '#define WL29_DEFAULT WL29_ALL',
+     'the default mask sends LRO and IDLE_PS'),
+    ('d', '\t\twl26_ptr_lines(lb);  /* C2g, read-only */\n', '', 'pointer word lines not printed'),
+    ('h', 'volatile uint32_t *w = &rx->wrp[ring[i].id - WLRX_DMAC_START]', 'volatile uint32_t *w = &rx->wrp[ring[i].id - WLRX_DMAC_START + 1u]',
+     'pointer words: a wrp index off by one'),
+    ('h', '{ WLRX_RING_ERR, 0 },\n', '{ WLRX_RING_ERR, 1 },\n', 'pointer words: ring 186 read as a source ring'),
+    ('h', 'p->n = mon ? WLRX_NPTR : 4u;', 'p->n = 4u;', 'pointer words: 185/193 left out with 0x2000'),
+    ('h', 'if (!p->valid[m]) { p->first[m] = i; }', 'p->first[m] = i;', 'valid span: first index not the first'),
+    ('h', '\t\t\tp->last[m] = i;\n', '', 'valid span: last index not kept'),
 ]
 
 
@@ -2741,6 +2818,7 @@ def main():
     l19_checks(dump, c2dump, c2cdump, c2ddump)
     l19_c2e(c2edump)
     l19_c2f(c2fdump)
+    l19_c2g()
     mutants()
     mutants(C2E_MUTANTS, 'c2e')
     mutants(C2F_MUTANTS, 'c2f')

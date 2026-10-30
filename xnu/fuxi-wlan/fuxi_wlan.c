@@ -46,7 +46,9 @@
  *   fuxiwlanw29=N  C2f bisect, only with qrtr=7 and a valid w20 0x4000: the W29 pieces
  *                 (0x01 common rings, 0x02 cookie conversion (needs 0x01), 0x04 PPDU stats,
  *                 0x08 pdev params, 0x10 DFS offload, 0x20 LRO, 0x40 IDLE_PS, 0x80 encap/decap);
- *                 absent = all; 0, unknown bits or any other use refused
+ *                 absent = 0x9f (all but LRO and IDLE_PS, which stall WMI on this polled,
+ *                 interrupt-less host; sent only when selected); 0, unknown bits or any
+ *                 other use refused
  * Salami (FUXI_SALAMI, OnePlus 11, K-W1): the driver runs only when
  * fuxiwlansalami=1 is present as well; its absence or any other value refuses
  * before the thread starts, as do fuxiwlanseq with cyclerails and any invalid
@@ -901,7 +903,10 @@ static bool wl16_large, wl16_redrive;
 #define WL23_BITS (WL20_BITS | WL20_HTTVER | WL20_BAND24 | WL20_PDEVCAP | WL26_BITS | WL27_BITS | WL20_MONSTAT | WL20_L19ORDER)
 #define WL20_QRTR_MAX 7
 /* C2f bisect (fuxiwlanw29, only with a valid qrtr 7 w20 0x4000): which W29
- * pieces run, each in its L19 place. Absent = all (the C2f boot); given, it
+ * pieces run, each in its L19 place. Absent = WL29_DEFAULT (C2g: 0x9f, every
+ * piece but LRO 0x20 and IDLE_PS 0x40; the fuxiwlanw29 bisect showed each of
+ * those two stalls WMI processing on this polled host, so they are sent only
+ * when selected; 0xff is the C2f boot); given, it
  * must be non-zero, inside WL29_ALL, and 0x02 needs 0x01 (cookie conversion
  * takes ownership from the common-ring pre-reads); anything else refuses the
  * run before any access. The arena and its guards stay with 0x4000. */
@@ -914,7 +919,8 @@ static bool wl16_large, wl16_redrive;
 #define WL29_IDLEPS 0x40u     /* IDLE_PS */
 #define WL29_ENCAP 0x80u      /* vdev encap/decap */
 #define WL29_ALL 0xffu
-static unsigned wl29_mask = WL29_ALL;
+#define WL29_DEFAULT (WL29_ALL & ~(WL29_LRO | WL29_IDLEPS))   /* 0x9f */
+static unsigned wl29_mask = WL29_DEFAULT;
 static bool wl_w20, wl_w23;
 static unsigned wl20_bits;
 static unsigned wl20_qrtr; /* 6 or 7 when wl_w20, for the init lines */
@@ -1274,7 +1280,7 @@ wl_probe_configure(void)
 	 * 0x2000 without 0x100 is refused; qrtr 6 refuses it. */
 	wl20_bits = 0;
 	bool w20_given = PE_parse_boot_argn("fuxiwlanw20", &w20, sizeof(w20));
-	wl29_mask = WL29_ALL;
+	wl29_mask = WL29_DEFAULT;
 	bool w29_given = PE_parse_boot_argn("fuxiwlanw29", &w29, sizeof(w29));
 	if (qrtr < 0 || qrtr > WL20_QRTR_MAX) {
 		wl_variant_invalid = true;
@@ -1318,13 +1324,11 @@ wl_probe_configure(void)
 			printf("FUXI WLAN: W28 selected: monitor status rings 185/193, 1023 buffers each (w20 0x2000), watched, not reaped; "
 			    "crash line at the COMPLETED timeout and before MHI reset; nothing transmitted\n");
 		}
-		if ((wl20_bits & WL20_L19ORDER) && !w29_given) {
-			printf("FUXI WLAN: W29 selected: L19 dp_alloc order, cookie conversion (CMEM from QMI), common rings sw2wbm/tcl+comp x3/"
-			    "reinject/reo-cmd/reo-status programmed never posted, mac-start pdev params and vdev encap/decap (w20 0x4000); nothing transmitted\n");
-		} else if (wl20_bits & WL20_L19ORDER) {   /* C2f bisect: the pieces fuxiwlanw29 selects, in L19 order */
+		if (wl20_bits & WL20_L19ORDER) {   /* C2f bisect: the pieces fuxiwlanw29 selects (C2g: absent = the default), in L19 order */
 			const unsigned m = wl29_mask;
-			printf("FUXI WLAN: W29 selected: L19 dp_alloc order, fuxiwlanw29 %#x: common rings %s, cookie conversion %s, pdev params %s, "
+			printf("FUXI WLAN: W29 selected: L19 dp_alloc order, fuxiwlanw29 %#x%s: common rings %s, cookie conversion %s, pdev params %s, "
 			    "dfs-offload %s, ppdu-stats %s, lro %s, idle-ps %s, encap/decap %s (w20 0x4000); nothing transmitted\n", m,
+			    w29_given ? "" : " default",
 			    m & WL29_RINGS ? "yes" : "no", m & WL29_CC ? "yes" : "no", m & WL29_PDEV ? "yes" : "no", m & WL29_DFS ? "yes" : "no",
 			    m & WL29_PPDU ? "yes" : "no", m & WL29_LRO ? "yes" : "no", m & WL29_IDLEPS ? "yes" : "no", m & WL29_ENCAP ? "yes" : "no");
 		}
@@ -5713,6 +5717,36 @@ wl26_rings(void)
 	return (wl20_bits & WL20_CHAINMASK) ? wl26_chainmask() : 0;
 }
 
+/* C2g, at each W26 watch with the RX rings, host reads only: the raw remote
+ * pointer words of every LMAC ring set up (160, 161, 169, 186, and 185/193 with
+ * C2e), each named by where L19 puts it, then the valid entries of 161/169 with
+ * the first and last index. LMAC ring pointers have no register or shadow in
+ * L19 (wlrx_ptrs_read), so these memory words are the whole truth the host can
+ * see; nothing is written. */
+static void
+wl26_ptr_lines(const char *lb)
+{
+	/* the words, in wlrx_ptrs_read's order: an SRC ring's HP in wrp[id - 160] and TP in rdp[id], ring 186 (DST) the reverse */
+	static const char *const wl26_ptr_hp[WLRX_NPTR] = { "160 hp wrp[0]", "161 hp wrp[1]", "169 hp wrp[9]", "186 hp rdp[186]",
+		"185 hp wrp[25]", "193 hp wrp[33]" };
+	static const char *const wl26_ptr_tp[WLRX_NPTR] = { "rdp[160]", "rdp[161]", "rdp[169]", "wrp[26]", "rdp[185]", "rdp[193]" };
+	struct wlrx_ptrs p;
+	char it[WLRX_NPTR][56], sp[2][56];
+	wlrx_ptrs_read(&wl_rx, &wl_ce_io, wl_rx.mon_named, &p);
+	wlrx_ptrs_span(&wl_rx, &wl_ce_io, &p);
+	for (unsigned i = 0; i < p.n; i++) {
+		snprintf(it[i], sizeof(it[i]), "%s %#x tp %s %#x", wl26_ptr_hp[i], p.hp[i], wl26_ptr_tp[i], p.tp[i]);
+	}
+	printf("FUXI WLAN: W26 rx ptr words %s: %s; %s; %s\n", lb, it[0], it[1], it[2]);
+	if (p.n == WLRX_NPTR) { printf("FUXI WLAN: W26 rx ptr words %s: %s; %s; %s\n", lb, it[3], it[4], it[5]); }
+	else { printf("FUXI WLAN: W26 rx ptr words %s: %s; 185/193 not set up\n", lb, it[3]); }
+	for (unsigned m = 0; m < 2; m++) {
+		if (p.valid[m]) { snprintf(sp[m], sizeof(sp[m]), "valid %u first %u last %u", p.valid[m], p.first[m], p.last[m]); }
+		else { snprintf(sp[m], sizeof(sp[m]), "valid 0 first none last none"); }
+	}
+	printf("FUXI WLAN: W26 rx valid span %s: mac0 %s; mac1 %s\n", lb, sp[0], sp[1]);
+}
+
 /* A watch (B4, D2): the four rings' device-side words and ring 120's R2 HP and
  * TP, raw and derived, two lines; host reads only. */
 static void
@@ -5750,6 +5784,7 @@ wl26_watch(unsigned p)
 		    " mac0" : "", (w->exhausted & WLRX_F_MAC1) ? " mac1" : "", (w->exhausted & WLRX_F_ERR) ? " err" : "");
 		printf("FUXI WLAN: W26 rx watch %s refill %s mac0 %s mac1 %s err %s; exhausted%s%s\n", lb, rf, mc[0], mc[1], er,
 		    fl[0] ? fl : " none", w->refill_empty ? "; refill-empty" : "");
+		wl26_ptr_lines(lb);  /* C2g, read-only */
 	}
 	if (wl_rx.idle_on) {
 		printf("FUXI WLAN: W26 idle watch %s %s; exhausted %s\n", lb, mc[2], (w->exhausted & WLRX_F_IDLE) ? "idle" : "none");

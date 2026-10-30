@@ -43,8 +43,10 @@ Host-only, synthetic cmd-db and RSC registers, fake boot-args and a fake ADT
     from ADT /defaults (15106 = 0x3b02, 8962 = 0x2302); qrtr 6 refuses it; a
     boot without it prints no W28 line.
   - C2f bisect: fuxiwlanw29 (cmdline and ADT /defaults) selects the W29 pieces of a valid
-    qrtr 7 w20 0x4000 boot and is listed in the W29 selected line; absent = the C2f line;
-    0, negative, unknown bits, 0x02 without 0x01, without 0x4000 or qrtr 7 refused.
+    qrtr 7 w20 0x4000 boot and is listed in the W29 selected line; absent = the C2g
+    default 0x9f (no LRO, no IDLE_PS: they stall a polled host), listed as
+    "fuxiwlanw29 0x9f default"; 0xff still sends every piece; 0, negative, unknown
+    bits, 0x02 without 0x01, without 0x4000 or qrtr 7 refused.
 """
 from pathlib import Path
 import importlib.util
@@ -643,7 +645,8 @@ def gate_suite(tmp, mk):
         # C2f (W29): 0x4000 L19ORDER with qrtr 7, needing 0x1000 (so 0x100 and 0x02); the kit value 32514 (0x7f02) = everything;
         # refused without 0x1000, with qrtr 6, with keep, alone.
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32514', 1, 28,
-         'W29 selected: L19 dp_alloc order, cookie conversion (CMEM from QMI), common rings'),
+         'W29 selected: L19 dp_alloc order, fuxiwlanw29 0x9f default: common rings yes, cookie conversion yes, pdev params yes, '
+         'dfs-offload yes, ppdu-stats yes, lro no, idle-ps no, encap/decap yes (w20 0x4000); nothing transmitted'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32514', 1, 28, 'w20 0x7f02 valid 1'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0x7f02', 1, 28, 'w20 0x7f02 valid 1'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0x4902', 0, 0, 'w20 0x4902 valid 0'),
@@ -651,7 +654,7 @@ def gate_suite(tmp, mk):
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0x4000', 0, 0, 'w20 0x4000 valid 0'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32514 fuxiwlankeep=1', 0, 0, 'w20 0x7f02 valid 0'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw20=32514', 0, 0, 'w20 0x7f02 valid 0'),
-        # C2f bisect: fuxiwlanw29 selects the W29 pieces of a valid qrtr 7 w20 0x4000 boot (absent = all, the C2f line);
+        # C2f bisect: fuxiwlanw29 selects the W29 pieces of a valid qrtr 7 w20 0x4000 boot (C2g: absent = the default 0x9f);
         # refused when 0, negative, with a bit outside 0xff, 0x02 without 0x01, without 0x4000, or without qrtr 7
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32514 fuxiwlanw29=1', 1, 28,
          'W29 selected: L19 dp_alloc order, fuxiwlanw29 0x1: common rings yes, cookie conversion no, pdev params no, '
@@ -704,10 +707,10 @@ def gate_suite(tmp, mk):
         assert ('W28' in out) == w28, (args, out)
         w29 = bool(w26 and int(m20[1], 0) & 0x4000)  # C2f: a W29 line only for a valid qrtr 7 boot with 0x4000
         assert ('W29' in out) == w29, (args, out)
-        m29 = re.search(r'fuxiwlanw29=(\S+)', args)  # C2f bisect: absent = the C2f line byte for byte; given = its set
-        assert ('W29 selected: L19 dp_alloc order, cookie conversion (CMEM from QMI), common rings sw2wbm/' in out) == \
-            bool(w29 and not m29), (args, out)
-        assert ('W29 selected: L19 dp_alloc order, fuxiwlanw29 ' in out) == bool(w29 and m29), (args, out)
+        m29 = re.search(r'fuxiwlanw29=(\S+)', args)  # C2g: absent = the default 0x9f, named so; given = its set
+        assert ('W29 selected: L19 dp_alloc order, fuxiwlanw29 0x9f default: ' in out) == bool(w29 and not m29), (args, out)
+        assert ('W29 selected: L19 dp_alloc order, fuxiwlanw29 ' in out) == w29, (args, out)
+        assert 'cookie conversion (CMEM from QMI)' not in out, (args, out)
         if m29 and not w29:
             assert 'fuxiwlanw29' in out and 'refused' in out, (args, out)
     # Firmware names: salami Android defaults, boot-arg overrides, bad names refused.
@@ -904,8 +907,8 @@ def gate_suite(tmp, mk):
     print(f'K-W1 gate: {len(cases)} salami boot-arg cases, firmware names/overrides/refusals, Fuxi control passed')
     print(f'K-W1b /defaults: {len(equal)} knob sets equal from ADT alone and split cmdline/ADT; boot-arg wins; '
           'absent from both is off; oversize/unterminated properties; Fuxi ignores /defaults')
-    print(f'C2f bisect: fuxiwlanw29 parsed (cmdline and ADT /defaults), the selected set in the W29 line, absent = the C2f '
-          f'line; 0, negative, unknown bits, 0x02 without 0x01, without 0x4000 or without qrtr 7 refused; {len(bisect)} '
+    print(f'C2f bisect: fuxiwlanw29 parsed (cmdline and ADT /defaults), the selected set in the W29 line, absent = the C2g '
+          f'default 0x9f (no LRO, no IDLE_PS); 0, negative, unknown bits, 0x02 without 0x01, without 0x4000 or without qrtr 7 refused; {len(bisect)} '
           'bisect kit values from /defaults')
     print(f'C2c..C2f kit route: r1c2 cmdline with fuxiwlanw20 from ADT /defaults for {len(kits)} kit values (512 .. 32514, '
           'including C2d/C2e/C2f 6402/15106/32514), each read from /defaults and giving its W26..W29 selection; the bits '
