@@ -3,6 +3,9 @@
  * Fuxi adaptations, 2026-10-23: opt-in iOS shim; see docs-lanes/wifi-ios.md.
  * Fuxi, 2026-10-29: the requests wifid of 20H392 was seen to make and the shim refused are answered
  * or refused on purpose (each says which below); a summary of the run is said now and then.
+ * Fuxi, 2026-10-30 (K2): a scan's result carries the noise figure when there is one and its channel's
+ * own flags (passive, radar); with the radio backends (fuxiwifiios=3/4) the elements are kept whole
+ * within the room wifid gives, and GET 43/44 say which backend answers.
  * Original file commentary is retained below. See LICENSE.HackiOS.
  */
 /*
@@ -57,6 +60,7 @@
 #include <sys/kernel.h>
 #include <sys/proc.h>
 #include <sys/fuxi_wifi_net.h>
+#include <sys/fuxi_wifi_radio.h>
 #include <sys/fuxi_wifi_sta.h>
 #include <sys/sockio.h>
 #include <sys/systm.h>
@@ -111,6 +115,23 @@ static uint32_t join_result;                    /* of the last join asked for: 0
  */
 static char country[3] = "US";
 
+/*
+ * (Fuxi, K2) Who answers, for GET 43/44, and whether a scan's records carry real elements: the radio
+ * backends (fuxiwifiios=3/4) say so once at init (fuxi_wifi_apple80211_backend); the synthetic and route U
+ * backends never call it, and what they are answered stays as it was.
+ */
+static char driver_name[256] = "Fuxi Wi-Fi iOS shim (synthetic backend)";
+static bool whole_elements;
+static bool room_said;
+
+void
+fuxi_wifi_apple80211_backend(const char *name, bool whole)
+{
+	bzero(driver_name, sizeof(driver_name));
+	snprintf(driver_name, sizeof(driver_name), "%s", name);
+	whole_elements = whole;
+}
+
 /* ---- channels ---------------------------------------------------------------------------------------- */
 
 static unsigned
@@ -137,6 +158,21 @@ channel_fill(struct apple80211_channel *channel, unsigned frequency, unsigned fl
 	channel->channel = channel_number(frequency);
 	channel->flags = CHANNEL_20MHZ | (frequency < 4000 ? CHANNEL_2GHZ : CHANNEL_5GHZ) | (flags & FUXI_WIFI_STA_CHANNEL_PASSIVE ?
 	    0 : CHANNEL_ACTIVE) | (flags & FUXI_WIFI_STA_CHANNEL_RADAR ? CHANNEL_DFS : 0);
+}
+
+/* (Fuxi, K2) What the station's list says of a channel (passive, radar); 0 when it is not on the list. */
+static unsigned
+channel_flags(unsigned frequency)
+{
+	struct fuxi_wifi_sta_channel channels[96];
+	unsigned count = fuxi_wifi_sta_channels(channels, 96);
+
+	for (unsigned i = 0; i < count; i++) {
+		if (channels[i].frequency == frequency) {
+			return channels[i].flags;
+		}
+	}
+	return 0;
 }
 
 /* ---- an access point's rates --------------------------------------------------------------------------- */
@@ -186,12 +222,17 @@ give(const struct apple80211req *request, const void *data, size_t length)
 	       request->req_len);
 }
 
-/* An access point in the form a scan's result has; the caller has said how much room for elements there is. */
+/*
+ * An access point in the form a scan's result has; the caller has said how much room for elements there is.
+ * (Fuxi, K2) With whole elements (the radio backends) a room of 0 or over 1024 counts as 1024, a short
+ * buffer's room is what follows the fixed fields, and the elements that fit are kept whole, those that show a
+ * network and its protection first (fuxi_wifi_elements_fit). Otherwise all of them or none, as before.
+ */
 static int
 give_network(const struct apple80211req *request, const struct fuxi_wifi_sta_bss *bss)
 {
 	struct apple80211_scan_result *result = kalloc_data(sizeof(*result), Z_WAITOK | Z_ZERO);
-	unsigned room = sizeof(result->elements);
+	unsigned room = sizeof(result->elements), asked = 0, head = (unsigned)offsetof(struct apple80211_scan_result, elements);
 	int error;
 
 	if (bss->ssid_length > sizeof(bss->ssid) || bss->elements_length > sizeof(bss->elements)) {
@@ -203,13 +244,24 @@ give_network(const struct apple80211req *request, const struct fuxi_wifi_sta_bss
 	if (result == NULL) {
 		return ENOMEM;
 	}
-	if (request->req_len >= sizeof(*result) && copyin(request->req_data, result, offsetof(struct apple80211_scan_result,
-	    elements)) == 0 && result->elements_length < room) {
-		room = result->elements_length;
+	if (request->req_len >= sizeof(*result)) {
+		if (copyin(request->req_data, result, head) == 0) {
+			asked = result->elements_length;
+			room = asked < room && (asked != 0 || !whole_elements) ? asked : room;
+		}
+	} else if (whole_elements) {
+		room = request->req_len > head ? request->req_len - head : 0;
 	}
 	bzero(result, sizeof(*result));
 	result->version = 1;
-	channel_fill(&result->channel, bss->frequency, 0);
+	channel_fill(&result->channel, bss->frequency, channel_flags(bss->frequency));
+	if (bss->noise != 0) {                  /* (the synthetic BSS has none: its result is as before) */
+		int snr = bss->rssi - bss->noise;
+
+		result->noise_known = 1;
+		result->noise = bss->noise;
+		result->snr = (int16_t)(snr < 0 ? 0 : snr > 100 ? 100 : snr);
+	}
 	result->rssi = bss->rssi;
 	result->beacon_interval = bss->beacon_interval;
 	result->capability = bss->capability;
@@ -217,8 +269,17 @@ give_network(const struct apple80211req *request, const struct fuxi_wifi_sta_bss
 	result->ssid_length = bss->ssid_length;
 	memcpy(result->ssid, bss->ssid, bss->ssid_length);
 	result->age_ms = bss->age_ms;
-	result->elements_length = (uint16_t)(bss->elements_length <= room ? bss->elements_length : 0);
-	memcpy(result->elements, bss->elements, result->elements_length);
+	if (whole_elements) {
+		result->elements_length = (uint16_t)fuxi_wifi_elements_fit(bss->elements, bss->elements_length, result->elements,
+		    room);
+		if (!__atomic_exchange_n(&room_said, true, __ATOMIC_RELAXED)) {
+			printf("FUXI WIFI IOS: apple80211: first SCAN_RESULT room %u bytes (wifid's %u in %u bytes)\n", room, asked,
+			    request->req_len);
+		}
+	} else {
+		result->elements_length = (uint16_t)(bss->elements_length <= room ? bss->elements_length : 0);
+		memcpy(result->elements, bss->elements, result->elements_length);
+	}
 	result->rate_count = (uint8_t)bss_rates(bss, result->rates, (unsigned)(sizeof(result->rates) / sizeof(result->rates[0])));
 	error = give(request, result, sizeof(*result));
 	kfree_data(result, sizeof(*result));
@@ -235,11 +296,8 @@ get(struct apple80211req *request, char *said, size_t said_size)
 
 	switch (request->req_type) {
 	case 43:
-	case 44: {                              /* the driver's and the hardware's name: the text alone, in 256 bytes */
-		static const char name[256] = "Fuxi Wi-Fi iOS shim (synthetic backend)";
-
-		return give(request, name, sizeof(name));
-	}
+	case 44:                                /* the driver's and the hardware's name: the text alone, in 256 bytes */
+		return give(request, driver_name, sizeof(driver_name));
 	case 12: {
 		/*
 		 * What the card can do, a bit each (apple80211_var.h: APPLE80211_CAP_*): the 13 bytes are the

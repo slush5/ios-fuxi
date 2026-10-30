@@ -2,6 +2,9 @@
  * Build on macOS: xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.7
  *   -O2 tools/fuxi-wifi-ios-test.c -o fuxi-wifi-ios-test
  * Sign/stage with the project's existing local userland tooling.
+ * --scan-only (K2, also the only mode on fuxiwifiios=3/4): one scan, then one line per network heard
+ * (band, channel, RSSI, privacy bit, RSN element, the name's length; never the name). Nothing is joined.
+ * "scan PASS" (exit 0) only when a network was heard; none heard is "scan EMPTY" (exit 1).
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -99,11 +102,96 @@ out:
 }
 #endif
 
+/* GET 19: 1 when the radio is on as iOS sees it, 0 when it is off, -1 when it cannot be read. */
+static int
+powered(int socket)
+{
+	struct { uint32_t version, radios, state[4]; } power = { 0 };
+
+	if (request(socket, false, 19, &power, sizeof(power), NULL) < 0) {
+		return -1;
+	}
+	return power.state[0] != 0;
+}
+
+/* K2: every channel once (IO80211's own fallback form, type 3 with channel 0), then what was heard.
+ * 0: at least one network heard; 1: none (not a PASS); -1 (errno): the scan never began, never ended or failed. */
+static int
+scan_only(int socket)
+{
+	struct apple80211_scan_request scan = { .version = 1, .scan_type = 3, .channel_count = 1 };
+	struct apple80211_scan_result result;
+	unsigned heard = 0, i;
+	int state = 0;
+
+	scan.channels[0] = (struct apple80211_channel){ 1, 0, 0 };
+	if (request(socket, true, 10, &scan, sizeof(scan), NULL) < 0) {
+		return -1;
+	}
+	/*
+	 * STATE is 1 while the radio has the scan: about 6 s with a radio, 1.5 s canned. Until it was 1 once, GET 11
+	 * gives the last scan's networks; a radio that is not ready (or stopped) ends the scan at once without it.
+	 */
+	for (i = 0; i < 40 && state != 1; i++) {
+		usleep(50000);
+		if (request(socket, false, 13, NULL, 0, &state) < 0) {
+			return -1;
+		}
+	}
+	if (state != 1) {
+		fprintf(stderr, "P-WIFI TEST: the scan never began: %s\n", powered(socket) == 0 ?
+		    "Wi-Fi is reported off (the kernel's \"radio:\" line says why)" : "the radio is not ready");
+		errno = ENETDOWN;
+		return -1;
+	}
+	for (i = 0; i < 80 && state == 1; i++) {
+		usleep(200000);
+		if (request(socket, false, 13, NULL, 0, &state) < 0) {
+			return -1;
+		}
+	}
+	if (state == 1) {
+		errno = ETIMEDOUT;                      /* (the iOS side gives a scan 15 s at most) */
+		return -1;
+	}
+	usleep(500000);                                 /* the station copies the records after the radio's part */
+	for (;;) {
+		bool rsn = false;
+
+		memset(&result, 0, sizeof(result));
+		result.elements_length = sizeof(result.elements);
+		if (request(socket, false, 11, &result, sizeof(result), NULL) < 0) {
+			break;
+		}
+		for (unsigned at = 0; at + 2 <= result.elements_length && at + 2u + result.elements[at + 1] <= result.elements_length;
+		    at += 2u + result.elements[at + 1]) {
+			rsn |= result.elements[at] == 48;
+		}
+		printf("P-WIFI TEST: heard %u: %s GHz, channel %u, flags %#x, %d dBm, privacy %u, RSN %s, a name of %u bytes\n",
+		    ++heard, result.channel.flags & CHANNEL_2GHZ ? "2.4" : "5", (unsigned)result.channel.channel,
+		    (unsigned)result.channel.flags, (int)result.rssi, (unsigned)((result.capability >> 4) & 1), rsn ? "yes" : "no",
+		    (unsigned)result.ssid_length);
+	}
+	if (errno != EIO) {
+		return -1;
+	}
+	if (heard == 0) {
+		printf("P-WIFI TEST: scan EMPTY (0 networks heard%s; not a PASS)\n", powered(socket) == 0 ? ", Wi-Fi reported off" : "");
+		return 1;
+	}
+	printf("P-WIFI TEST: scan PASS (%u networks; nothing joined)\n", heard);
+	return 0;
+}
+
 int
 main(int argc, char **argv)
 {
-	if (geteuid() != 0 || argc > 2 || (argc == 2 && strcmp(argv[1], "--loopback") != 0)) {
-		fprintf(stderr, "usage (root, synthetic boot only): fuxi-wifi-ios-test [--loopback]\n");
+	static const char *const scan_only_names[] = { "Fuxi Wi-Fi iOS shim (radio backend, scan only)",
+		                                       "Fuxi Wi-Fi iOS shim (canned scan backend)" };
+	bool only_scan = argc == 2 && strcmp(argv[1], "--scan-only") == 0;
+
+	if (geteuid() != 0 || argc > 2 || (argc == 2 && strcmp(argv[1], "--loopback") != 0 && !only_scan)) {
+		fprintf(stderr, "usage (root, an opted-in boot only): fuxi-wifi-ios-test [--loopback | --scan-only]\n");
 		return 2;
 	}
 	int socket_fd = socket(AF_INET, SOCK_DGRAM, 0), rc = 1, value = 0;
@@ -112,8 +200,27 @@ main(int argc, char **argv)
 		return 1;
 	}
 	char driver[256] = { 0 };
-	if (request(socket_fd, false, 43, driver, sizeof(driver), NULL) < 0 ||
-	    strcmp(driver, "Fuxi Wi-Fi iOS shim (synthetic backend)") != 0) {
+	if (request(socket_fd, false, 43, driver, sizeof(driver), NULL) < 0) {
+		fprintf(stderr, "P-WIFI TEST: no Fuxi shim\n");
+		close(socket_fd);
+		return 2;
+	}
+	if (strcmp(driver, scan_only_names[0]) == 0 || strcmp(driver, scan_only_names[1]) == 0 || only_scan) {
+		/* the radio backends (fuxiwifiios=3/4) are scan only: no join, no loopback */
+		if (!only_scan) {
+			fprintf(stderr, "P-WIFI TEST: %s: only --scan-only (no join on this backend)\n", driver);
+			close(socket_fd);
+			return 2;
+		}
+		int scanned = scan_only(socket_fd);
+
+		if (scanned < 0) {
+			perror("P-WIFI TEST: FAIL");
+		}
+		close(socket_fd);
+		return scanned != 0;
+	}
+	if (strcmp(driver, "Fuxi Wi-Fi iOS shim (synthetic backend)") != 0) {
 		fprintf(stderr, "P-WIFI TEST: requires the synthetic Fuxi shim\n");
 		close(socket_fd);
 		return 2;

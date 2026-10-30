@@ -1,6 +1,8 @@
 /*
  * Ported from HackiOS xnu/files/bsd/dev/redwood_sta.c (APSL-2.0)
  * Fuxi adaptations, 2026-10-23: opt-in iOS shim; see docs-lanes/wifi-ios.md.
+ * Fuxi, 2026-10-30 (K2): a radio that stops by itself turns the station off for the boot
+ * (fuxi_wifi_sta_radio_off), and a scan can ask whether "off" waits (fuxi_wifi_sta_power_pending).
  * Original file commentary is retained below. See LICENSE.HackiOS.
  */
 /*
@@ -42,6 +44,7 @@ static const struct fuxi_wifi_sta_ops *sta_ops;   /* the station side, while the
 static bool sta_thread_made;
 static bool sta_calls;                          /* the thread is in a call of the station side's */
 static bool sta_on;                             /* the radio's power, as last asked for */
+static bool sta_gone;                           /* the radio stopped by itself: it stays off until reboot */
 
 /* what has been asked for and not begun */
 static bool asked_power, asked_power_on, asked_scan, asked_join, asked_leave;
@@ -104,7 +107,7 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 
 		if (power) {
 			struct fuxi_wifi_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
-			bool was_joined = false;
+			bool was_joined = false, on;
 
 			if (state != NULL) {
 				ops->state(state);
@@ -113,14 +116,15 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 			}
 			error = ops->power(power_on);
 			lck_mtx_lock(&sta_lock);
+			on = (error == 0 ? power_on : !power_on) && !sta_gone;
 			if (!asked_power) {
-				sta_on = error == 0 ? power_on : !power_on;
+				sta_on = on;
 			}
 			lck_mtx_unlock(&sta_lock);
 			if (!power_on && was_joined) {
 				fuxi_wifi_apple80211_event(FUXI_WIFI_STA_LINK, 0);
 			}
-			fuxi_wifi_apple80211_event(FUXI_WIFI_STA_POWER, error == 0 ? power_on : !power_on);
+			fuxi_wifi_apple80211_event(FUXI_WIFI_STA_POWER, on);
 		} else if (leave) {
 			ops->leave();
 			fuxi_wifi_apple80211_event(FUXI_WIFI_STA_LINK, 0);
@@ -191,6 +195,38 @@ fuxi_wifi_sta_lost(int error)
 	fuxi_wifi_apple80211_event(FUXI_WIFI_STA_LINK, error != 0 ? error : ECONNRESET);
 }
 
+/*
+ * (Fuxi, K2) The radio behind the station stopped by itself (sys/fuxi_wifi_radio.h): the station is off,
+ * what waited is dropped, iOS hears "power off", and asking for "on" again leaves it off until reboot.
+ */
+void
+fuxi_wifi_sta_radio_off(void)
+{
+	lck_mtx_lock(&sta_lock);
+	if (sta_ops == NULL) {
+		lck_mtx_unlock(&sta_lock);
+		return;
+	}
+	sta_gone = true;
+	sta_on = false;
+	asked_scan = asked_join = false;
+	bzero(&asked_join_what, sizeof(asked_join_what));
+	lck_mtx_unlock(&sta_lock);
+	fuxi_wifi_apple80211_event(FUXI_WIFI_STA_POWER, 0);
+}
+
+/* (Fuxi, K2) "Off" is asked for and the thread has not begun it: a scan that waits gives up. */
+bool
+fuxi_wifi_sta_power_pending(void)
+{
+	bool off;
+
+	lck_mtx_lock(&sta_lock);
+	off = asked_power && !asked_power_on;
+	lck_mtx_unlock(&sta_lock);
+	return off;
+}
+
 /* ---- who wants a network ------------------------------------------------------------------------------- */
 
 bool
@@ -232,7 +268,7 @@ fuxi_wifi_sta_ask_power(bool on)
 		lck_mtx_unlock(&sta_lock);
 		return ENXIO;
 	}
-	sta_on = on;
+	sta_on = on && !sta_gone;
 	asked_power = true;
 	asked_power_on = on;
 	if (!on) {

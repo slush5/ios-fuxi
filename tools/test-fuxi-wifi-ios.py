@@ -46,6 +46,7 @@ static int log_printf(const char *format, ...) {
 #define printf log_printf
 /* The clock and one thread call: time stands still until the test moves it; the call runs when the test says. */
 #define NSEC_PER_SEC 1000000000ull
+#define THREAD_CALL_PRIORITY_KERNEL 1
 #define THREAD_CALL_PRIORITY_LOW 3
 #define THREAD_CALL_OPTIONS_ONCE 1u
 #define THREAD_CALL_DELAY_LEEWAY 0x20u
@@ -59,7 +60,53 @@ static void clock_get_uptime(uint64_t *t) { *t = now_abs; }
 static void absolutetime_to_nanoseconds(uint64_t a, uint64_t *ns) { *ns = a; }
 static void clock_interval_to_deadline(uint32_t interval, uint32_t scale, uint64_t *d) { *d = now_abs + (uint64_t)interval * scale; }
 static void clock_interval_to_absolutetime_interval(uint32_t interval, uint32_t scale, uint64_t *r) { *r = (uint64_t)interval * scale; }
+/* K2: the radio handoff's call (THREAD_CALL_PRIORITY_KERNEL) is another one. Entered, it runs on a pthread of
+   its own, never twice at once (THREAD_CALL_OPTIONS_ONCE); entered with a deadline, it waits for other_fire().
+   Entered while it runs, it runs once more after it returns, when the last entry says (XNU 8796 thread_call.c:
+   _pending_call_enqueue and _delayed_call_enqueue on a RUNNING ONCE call, then thread_call_finish). */
+static struct fake_call other_call;
+static pthread_mutex_t other_lock = PTHREAD_MUTEX_INITIALIZER, other_run_lock = PTHREAD_MUTEX_INITIALIZER;
+static atomic_uint other_entered, other_ran;
+static uint64_t other_deadline;     /* 0: not armed */
+static bool other_running, other_again;
+static void (*other_hook)(void);    /* a test's, run once inside the call's next thread_call_enter_delayed */
+static void other_start(void);
+static void *other_run(void *a) {
+ bool again;
+ (void)a; pthread_mutex_lock(&other_run_lock);
+ pthread_mutex_lock(&other_lock); other_running = true; pthread_mutex_unlock(&other_lock);
+ other_call.func(NULL, NULL);
+ pthread_mutex_lock(&other_lock); other_running = false; again = other_again && !other_deadline; other_again = false;
+ pthread_mutex_unlock(&other_lock);
+ pthread_mutex_unlock(&other_run_lock);
+ if (again) other_start();
+ atomic_fetch_add(&other_ran, 1); return NULL;
+}
+static void other_start(void) {
+ pthread_t t; atomic_fetch_add(&other_entered, 1); assert(!pthread_create(&t, NULL, other_run, NULL)); pthread_detach(t);
+}
+static int thread_call_enter(thread_call_t c) {
+ bool running; assert(c == &other_call && other_call.func);
+ pthread_mutex_lock(&other_lock); other_deadline = 0; running = other_running; other_again |= running; pthread_mutex_unlock(&other_lock);
+ if (!running) other_start();
+ return 0;
+}
+static bool other_fire(void) {
+ bool due; pthread_mutex_lock(&other_lock); due = other_deadline && now_abs >= other_deadline; pthread_mutex_unlock(&other_lock);
+ if (due) thread_call_enter(&other_call);
+ return due;
+}
+static uint64_t other_armed(void) { pthread_mutex_lock(&other_lock); uint64_t d = other_deadline; pthread_mutex_unlock(&other_lock); return d; }
+static void other_settle(void) {
+ struct timespec pause = { .tv_nsec = 1000000 };
+ for (unsigned i = 0; i < 5000 && atomic_load(&other_ran) != atomic_load(&other_entered); i++) nanosleep(&pause, NULL);
+ assert(atomic_load(&other_ran) == atomic_load(&other_entered));
+}
 static thread_call_t thread_call_allocate_with_options(thread_call_func_t f, thread_call_param_t p, int priority, unsigned options) {
+ if (priority != THREAD_CALL_PRIORITY_LOW) {
+  assert(f && !p && priority == THREAD_CALL_PRIORITY_KERNEL && options == THREAD_CALL_OPTIONS_ONCE && !other_call.func);
+  other_call.func = f; return &other_call;
+ }
  assert(f && !p && priority == THREAD_CALL_PRIORITY_LOW && options == THREAD_CALL_OPTIONS_ONCE);
  calls_made++; the_call.func = f; return &the_call;
 }
@@ -73,6 +120,14 @@ static thread_call_t thread_call_allocate_with_options(thread_call_func_t f, thr
 #define LEEWAY(s) ((uint64_t)(s) * 0)
 #endif
 static int thread_call_enter_delayed(thread_call_t c, uint64_t deadline) {
+ if (c == &other_call) {
+  void (*hook)(void);
+  assert(other_call.func && deadline > now_abs);
+  pthread_mutex_lock(&other_lock); hook = other_hook; other_hook = NULL; pthread_mutex_unlock(&other_lock);
+  if (hook) hook();
+  pthread_mutex_lock(&other_lock); other_deadline = deadline; other_again |= other_running; pthread_mutex_unlock(&other_lock);
+  return 0;
+ }
 #if defined(FUXI_SALAMI)
  (void)c; (void)deadline; assert(!"salami: thread_call_enter_delayed without leeway"); return 0;
 #else
@@ -103,7 +158,9 @@ static int thread_call_enter_delayed_with_leeway(thread_call_t c, thread_call_pa
 #define LCK_MTX_DECLARE(n,g) pthread_mutex_t n = PTHREAD_MUTEX_INITIALIZER
 #define lck_mtx_lock pthread_mutex_lock
 #define lck_mtx_unlock pthread_mutex_unlock
-#define kalloc_data(n,f) calloc(1,n)
+static atomic_uint kallocs;   /* (K2: a default boot allocates nothing) */
+static void *model_kalloc(size_t n) { atomic_fetch_add(&kallocs, 1); return calloc(1, n); }
+#define kalloc_data(n,f) model_kalloc(n)
 #define kfree_data(p,n) free(p)
 typedef uintptr_t user_addr_t;
 typedef unsigned long u_long;
@@ -121,7 +178,20 @@ static pthread_cond_t wake_cond = PTHREAD_COND_INITIALIZER;
 static void lck_mtx_sleep(pthread_mutex_t *m, int flags, event_t e, int t) {
  (void)flags; (void)e; (void)t; pthread_cond_wait(&wake_cond,m);
 }
-static void thread_wakeup(event_t e) { (void)e; pthread_cond_broadcast(&wake_cond); }
+/* every wakeup is noted (K2: a stop must wake the scan that waits) */
+static pthread_mutex_t woken_lock = PTHREAD_MUTEX_INITIALIZER;
+static const void *woken[4096];
+static unsigned woken_count;
+static void thread_wakeup(event_t e) {
+ pthread_mutex_lock(&woken_lock); woken[woken_count++ % 4096] = e; pthread_mutex_unlock(&woken_lock);
+ pthread_cond_broadcast(&wake_cond);
+}
+static unsigned woken_mark(void) { pthread_mutex_lock(&woken_lock); unsigned n = woken_count; pthread_mutex_unlock(&woken_lock); return n; }
+static bool woken_since(unsigned mark, const void *e) {
+ bool seen = false; pthread_mutex_lock(&woken_lock); assert(woken_count - mark <= 4096);
+ for (unsigned i = mark; i < woken_count; i++) seen |= woken[i % 4096] == e;
+ pthread_mutex_unlock(&woken_lock); return seen;
+}
 static void thread_set_thread_name(thread_t t, const char *n) { (void)t; (void)n; }
 static void thread_deallocate(thread_t t) { pthread_detach(t); }
 /* Each thread runs its own function: the station's and route U's RX thread may start together. */
@@ -170,6 +240,7 @@ static unsigned model_usbnet_size, model_usbnet_maps, model_usbnet_lookups;
 static uintptr_t model_usbnet_region;
 static uint64_t model_usbnet_pa;
 static atomic_uint model_usbnet_waits[2];  /* 1 ms, 20 ms */
+static atomic_uint model_radio_waits[2];   /* K2: 10 ms (a scan waits), 40 ms (a canned dwell) */
 static int SecureDTLookupEntry(DTEntry from,const char *path,DTEntry *out) {
  assert(!from && !strcmp(path,"/chosen")); model_usbnet_lookups++; *out=&model_usbnet_prop; return kSuccess;
 }
@@ -182,8 +253,10 @@ static vm_offset_t ml_io_map_wcomb(vm_offset_t pa,vm_size_t size) {
  assert(pa==model_usbnet_pa && size==0x24000); model_usbnet_maps++; return model_usbnet_region;
 }
 static int assert_wait_timeout(event_t e,int how,uint32_t interval,uint64_t scale) {
- assert(e && how==THREAD_UNINT && scale==NSEC_PER_MSEC && (interval==1 || interval==20));
- atomic_fetch_add(&model_usbnet_waits[interval==20],1); return 0;
+ assert(e && how==THREAD_UNINT && scale==NSEC_PER_MSEC && (interval==1 || interval==20 || interval==10 || interval==40));
+ if (interval==1 || interval==20) atomic_fetch_add(&model_usbnet_waits[interval==20],1);
+ else atomic_fetch_add(&model_radio_waits[interval==40],1);
+ return 0;
 }
 static int thread_block(void *c) { assert(!c); struct timespec pause={.tv_nsec=200000}; nanosleep(&pause,NULL); return 0; }
 '''
@@ -227,9 +300,11 @@ static bool said_since(size_t from,const char *what) { return strstr(logbuf+from
 int main(void) {
  assert(sizeof(struct apple80211req)==40 && offsetof(struct apple80211req,req_data)==32);
  fuxi_wifi_ios_init(); assert(!attached && !registry && !fuxi_wifi_sta_present());
- opt=3; fuxi_wifi_ios_init(); assert(!attached);
- /* without fuxiwifiios=1 (or 2, route U: tools/test-fuxi-usbnet.py): nothing is made, nothing said, no timer */
- assert(loglen==0 && !calls_made && !calls_armed);
+ opt=5; fuxi_wifi_ios_init(); assert(!attached);
+ opt=-1; fuxi_wifi_ios_init(); assert(!attached);
+ /* without fuxiwifiios=1 (or 2, route U: tools/test-fuxi-usbnet.py; 3 and 4, the radio backends:
+    tools/test-fuxi-wifi-radio.py): nothing is made, nothing said, no timer, nothing allocated */
+ assert(loglen==0 && !calls_made && !calls_armed && !atomic_load(&kallocs) && !other_call.func);
  opt=1; fuxi_wifi_ios_init(); assert(attached==1 && registry==1);
  fuxi_wifi_ios_init(); assert(attached==1);
  assert(!fuxi_wifi_ios_attach(&fake_backend));
@@ -255,6 +330,10 @@ int main(void) {
  assert(result.ssid_length==13 && !memcmp(result.ssid,"Fuxi Loopback",13));
  assert(result.rssi==-42 && result.channel.channel==1 && result.elements_length==4);
  assert(result.rate_count==2 && result.rates[0]==1 && result.rates[1]==2);
+ /* K2 left fuxiwifiios=1 as it was: no noise figure, an active 2.4 GHz channel (0x8a), the four element bytes */
+ assert(result.version==1 && result.channel.version==1 && result.channel.flags==0x8a && !result.noise_known && !result.noise);
+ assert(!result.snr && result.beacon_interval==100 && result.capability==1 && !memcmp(result.elements,"\x01\x02\x82\x84",4));
+ assert(!memcmp(result.bssid,"\x02\x46\x55\x58\x49\x02",6) && !result.age_ms && !result.flags);
  assert(request(false,11,&result,sizeof(result),NULL)==EIO);
  /* IO80211's fallback scan (type 3, one channel {1, 0, 0}): every channel, so the BSS is heard */
  scan.scan_type=3; scan.channel_count=1; scan.channels[0]=(struct apple80211_channel){ 1, 0, 0 };
@@ -262,10 +341,12 @@ int main(void) {
  assert(atomic_load(&events[10])==2);
  result.elements_length=1024; assert(request(false,11,&result,sizeof(result),NULL)==0 && result.ssid_length==13);
  assert(request(false,11,&result,sizeof(result),NULL)==EIO);
- /* channel 0 next to a channel without the BSS: still every channel */
+ /* channel 0 next to a channel without the BSS: still every channel. A room of 0 still gets no elements
+    with fuxiwifiios=1 (only the radio backends count 0 as 1024) */
  scan.channel_count=2; scan.channels[1]=(struct apple80211_channel){ 1, 6, CHANNEL_2GHZ };
  assert(request(true,10,&scan,sizeof(scan),NULL)==0); settle();
- result.elements_length=1024; assert(request(false,11,&result,sizeof(result),NULL)==0);
+ result.elements_length=0; assert(request(false,11,&result,sizeof(result),NULL)==0);
+ assert(result.ssid_length==13 && result.elements_length==0 && result.rate_count==2);
  /* a channel without the BSS alone: a scan that hears nothing */
  scan.scan_type=1; scan.channel_count=1; scan.channels[0]=scan.channels[1];
  assert(request(true,10,&scan,sizeof(scan),NULL)==0); settle();
@@ -334,6 +415,11 @@ int main(void) {
  value=7; assert(!request_with(false,18,7,NULL,0,&value) && value==0);
  /* RATE: only while joined */
  assert(request(false,8,NULL,0,NULL)==ENXIO);
+ /* DRIVER_VERSION / HARDWARE_VERSION: the synthetic backend's name, as before K2 */
+ char driver[256]; memset(driver,1,sizeof(driver));
+ assert(!request(false,43,driver,sizeof(driver),NULL) && !strcmp(driver,"Fuxi Wi-Fi iOS shim (synthetic backend)"));
+ for (unsigned i=strlen(driver);i<sizeof(driver);i++) assert(!driver[i]);
+ assert(!request(false,44,driver,sizeof(driver),NULL) && !strcmp(driver,"Fuxi Wi-Fi iOS shim (synthetic backend)"));
  /* refused on purpose, and the log says so */
  before=loglen;
  assert(request(false,96,NULL,0,NULL)==EOPNOTSUPP && request(false,97,cc,3,NULL)==EOPNOTSUPP);
@@ -419,8 +505,9 @@ int main(void) {
  }
  assert(calls_made==1);
  fuxi_wifi_apple80211_summary(); assert(said_times("apple80211: summary 3,")==0);
- /* nothing a network carries was said: its name, its passphrase */
+ /* nothing a network carries was said: its name, its passphrase; nothing of the radio backends either */
  assert(!strstr(logbuf,"Fuxi Loopback") && !strstr(logbuf,"password"));
+ assert(!strstr(logbuf,"radio:") && !strstr(logbuf,"SCAN_RESULT room") && !other_call.func);
  puts("PASS: production station, ioctl layouts/events, fake frame callbacks and gates");
 #if defined(FUXI_SALAMI)
  puts("PASS: salami summary timer 20 s, 60 s, then every 10 min, a tenth of each wait as leeway");
@@ -432,8 +519,21 @@ int main(void) {
 '''
 
 
-def stripped(name):
-    return re.sub(r'^#include[^\n]*\n', '', (SRC / name).read_text(), flags=re.M)
+def stripped(name, src=SRC):
+    return re.sub(r'^#include[^\n]*\n', '', (Path(src) / name).read_text(), flags=re.M)
+
+
+# The kernel units in one translation unit on the model, in an order that declares before use (K2 added the
+# radio handoff, which fuxi_wifi_apple80211.c and fuxi_wifi_ios.c call). test-fuxi-usbnet.py and
+# test-fuxi-wifi-radio.py build theirs with this too.
+HEADERS = ('fuxi_wifi_sta.h', 'fuxi_wifi_net.h', 'fuxi_wifi_ios.h', 'fuxi_wifi_apple80211.h', 'fuxi_wifi_radio.h')
+UNITS = ('fuxi_wifi_sta.c', 'fuxi_wifi_apple80211.c', 'fuxi_wifi_radio.c', 'fuxi_usbnet_ring.h', 'fuxi_wifi_ios.c')
+
+
+def unit_source(model=MODEL, src=SRC):
+    source = model + ''.join(stripped(name, src) for name in HEADERS)
+    source += 'bool fuxi_wifi_net_attach(const struct fuxi_wifi_net_link *);\n'
+    return source + ''.join(stripped(name, src) for name in UNITS)
 
 
 def compile_run(source, directory, name, defs=()):
@@ -636,11 +736,7 @@ def main():
                     '-fsyntax-only', str(ROOT / 'tools/fuxi-wifi-ios-test.c')], check=True)
     with tempfile.TemporaryDirectory(prefix='fuxi-wifi-test-') as tmp:
         directory = Path(tmp)
-        source = MODEL + stripped('fuxi_wifi_sta.h') + stripped('fuxi_wifi_net.h')
-        source += stripped('fuxi_wifi_ios.h') + stripped('fuxi_wifi_apple80211.h')
-        source += 'bool fuxi_wifi_net_attach(const struct fuxi_wifi_net_link *);\n'
-        source += stripped('fuxi_wifi_sta.c') + stripped('fuxi_wifi_apple80211.c')
-        source += stripped('fuxi_usbnet_ring.h') + stripped('fuxi_wifi_ios.c') + TEST
+        source = unit_source() + TEST
         compile_run(source, directory, 'ios')
         compile_run(source, directory, 'ios-salami', ['-DFUXI_SALAMI=1'])   # K-W1b summary back-off
         wpa_test(directory)

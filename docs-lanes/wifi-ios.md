@@ -9,7 +9,8 @@ Host tests and local arm64 syntax checks pass; no device result is claimed.
 ## Enablement and backend boundary
 
 `fuxiwifiios=1` enables the shim; `fuxiwifiios=2` enables it with route U
-(below). Missing, zero or other values do nothing:
+(below); `fuxiwifiios=3` and `=4` enable the scan-only radio backends (K2,
+below). Missing, zero or other values do nothing:
 no interface, station thread or discovery services are created. Preserve all
 other caller boot arguments. No `fuxiwlan` argument is required for the fake
 backend. The existing USB Ethernet interface is `ue0`; it is not renamed.
@@ -33,8 +34,9 @@ events. The backend changes the BSD carrier with `link_state`; unrequested
 loss also calls `fuxi_wifi_sta_lost(errno)` after updating its state snapshot.
 The shim bounds cached SSIDs, information elements and channel counts.
 
-For a future `fuxi_wlan` adapter, select its backend instead of `fake_backend`
-at the init call, after firmware/data-path readiness. Supply Ethernet
+For a future `fuxi_wlan` adapter, select its backend at the init call, as K2's
+radio backend does; readiness is the backend's own state (init runs before
+launchd, long before a radio is up), not a reason to attach later. Supply Ethernet
 encapsulation/decapsulation and a bounded worker for real RX. The ported
 `fuxi_wifi_wpa.h` offers PMK derivation, four-way/group EAPOL processing and
 key outputs. The adapter must generate fresh nonces, own EAPOL routing and
@@ -83,10 +85,10 @@ no compatibility. Static assertions and tests verify our encoding, not Apple's
 | Outer request | 40; type 16, value 20, length 24, arm64 user pointer 32 | arm64 C layout/ioctl size checked; consumer unverified |
 | GET / SET ioctl | `0xc02869c9` / `0x802869c8` | use recorded in lane notes; layout unverified |
 | ASSOCIATE (20) | 592; SSID length `0x0c`, key `0x48` | unverified |
-| SCAN_REQ (10) | 5456; channels `0x48`, flags `0x1308`, names `0x1318` | unverified |
-| SCAN_RESULT (11), CURRENT_NETWORK (103) | 1164; SSID length `0x60`, age `0x84`, IEs `0x8c` | unverified |
-| SUPPORTED_CHANNELS (27/254) | 4824 | unverified |
-| CHANNELS_INFO (207) | 10016; number row `0x32e`, flags `0x12d0` | unverified |
+| SCAN_REQ (10) | 5456; channels `0x48`, flags `0x1308`, names `0x1318` | checked against 20H392 IO80211 (`__getScanData`), 2026-10-29 |
+| SCAN_RESULT (11), CURRENT_NETWORK (103) | 1164; SSID length `0x60`, age `0x84`, IEs `0x8c` | checked against 20H392 (`__addScanResultToList`); 103 unverified |
+| SUPPORTED_CHANNELS (27/254) | 4824 | 254 checked against 20H392 |
+| CHANNELS_INFO (207) | 10016; number row `0x32e`, flags `0x12d0` | checked against 20H392 |
 | Link event 4 | 32 after the 16-byte interface name; reason `0x14` | unverified |
 | POWER (19) | 24 | unverified |
 | CHANNEL (4), AUTH_TYPE (2) | 16 each | unverified |
@@ -325,6 +327,65 @@ launch and a phone reboot under a running bridge; 57 mutants of the rules and
 bounds), and
 `python3 tools/fuxi_usbnet_ring.py --selftest`.
 
+## Radio backends: real scan results, scan only (fuxiwifiios=3/4, K2)
+
+Plan: `op11-tools/salami-port/wlan/r1/overnight_plan.md` 3.2 and `ios_scan_plan.md`.
+`bsd/dev/fuxi_wifi_radio.c` (`bsd/sys/fuxi_wifi_radio.h`) is the handoff between
+a producer that scans and the iOS side. It owns every shared byte and one leaf
+lock; requests and records are copied, no pointer crosses, and the iOS side
+never sees MMIO or DMA. The tables (about 140 KB) are allocated only with
+`fuxiwifiios=3/4`.
+
+- `fuxiwifiios=3`: the producer is the radio lane (patch 0099). Its
+  STARTING/STOPPED calls are a later 0099 change, so in this build nothing
+  reports and the backend turns Wi-Fi off when iOS first asks for a scan or the
+  state, or 30 s after attach: `radio: no radio lane reported before iOS first
+  asked (code 0x50001); Wi-Fi reported off, no retry this boot` (or `within 30 s
+  of attach`, `0x50002`). With the hooks, a boot without `fuxiwlan` says
+  `radio: the radio lane stopped (code 0x10000); ...` instead.
+- `fuxiwifiios=4`: the canned producer, no radio: four networks with locally
+  administered BSSIDs `02:46:55:58:4a:01..04`, one channel every 40 ms: "Fuxi
+  Canned WPA2" (channel 6 heard on 5, the DS correction, RSN, -48 dBm), "Fuxi
+  Canned Open" (36, -61), a hidden one (11, RSN, -70) and "Fuxi Canned DFS" (52,
+  radar, RSN, -74). The radio lane's calls are ignored.
+- Channels: 38, all passive, no 6 GHz: 1-13, 36-48, 52-64 and 100-144 (radar),
+  149-165. Every scan is passive whatever wifid asks, 150 ms a channel (50-200
+  if asked); the iOS side waits 1000 + n * dwell * 3/2 ms, at most 15 s.
+- Results: SSID, BSSID, channel (the DS or HT operation channel), RSSI, noise
+  (-95 dBm when the radio has none) and SNR, beacon interval, capability, and
+  the elements kept whole within wifid's room (0 or over 1024 counts as 1024),
+  the name, RSN and WPA first, then rates, channel, country, HT/VHT/HE; at most
+  64 networks, the strongest. GET 43/44 name the backend.
+- A join is refused at once without any radio access (`EOPNOTSUPP`:
+  ASSOCIATE_RESULT 2 and event 9, never "wrong password"); the link stays down
+  and no frame passes en0.
+- Wi-Fi goes off for the boot when the producer stops, when 3 scans in a row
+  time out (`0x60003`), when there is no producer, or when `ready()` names no
+  listed channel (`0x7000n`, n channels named: MHz expected, no 6 GHz); SET 19
+  "on" is answered and Wi-Fi stays off.
+- Producer API, for the radio lane: `starting`, `ready(freqs)`, `take`,
+  `cancelled(seq)`, `frame(seq, frame, length, MHz, dBm, noise)` or
+  `bss(seq, record)`, `done(seq, status)`, `stopped(code)`. It never sleeps and
+  never calls the iOS side; before the consumer exists only the state word is
+  stored. Stop codes are class << 16 | detail: 1 not requested, 2 refused,
+  3 no thread, 4 exited (detail: fw_run's step << 8 | reason), 5 no producer,
+  6 gave up, 7 no usable channel.
+- Logs carry counts, bands, flags and errno; never an SSID, BSSID or element
+  byte. M1 (`=4`) lines: `enabled, canned scan backend (no radio)`, `radio: canned
+  producer ready, 38 channels (13 at 2.4 GHz, 25 at 5 GHz), passive only`,
+  `radio: scan 1: 38 channels passive, 4 heard (2 at 2.4 GHz, 2 at 5 GHz, 3 RSN,
+  1 hidden), <T> ms, status 0`, `apple80211: first SCAN_RESULT room <N> bytes
+  (...)`, four `gets 11 ... answered` and one `error 5`, and on a join
+  `radio: join refused (scan-only backend), no radio access`.
+- `fuxiwifiios=1` and `=2` are unchanged: the same lines and the same GET 11
+  bytes (no noise figure, an active channel `0x8a`, a room of 0 still gives no
+  elements).
+- `tools/fuxi-wifi-ios-test.c --scan-only` lists what one scan heard (band,
+  channel, RSSI, privacy, RSN, the name's length) and refuses any join on these
+  backends. `scan PASS` (exit 0) only when a network was heard; none is
+  `scan EMPTY` (exit 1); a scan that never began (radio not ready, Wi-Fi off)
+  or never ended is `FAIL`.
+
 ## Provenance and exclusions
 
 HackiOS kernel checkout `8e61187098f2c26c5daee8f9f72b6416aa64b9ab`,
@@ -365,9 +426,20 @@ does not supply retransmissions or a working radio supplicant.
 ```sh
 python3 tools/sync-fuxi-wifi-ios.py --check
 python3 tools/test-fuxi-wifi-ios.py
+CC=cc python3 -B tools/test-fuxi-wifi-radio.py
 CC=cc python3 -B tools/test-fuxi-usbnet.py
 python3 tools/check-fuxi-wifi-ios.py "$XNU_BUILDTREE"
 ```
+
+`test-fuxi-wifi-radio.py` (K2) runs the handoff and the `fuxiwifiios=3/4`
+backends on the same model: the frame parser and element fit (every drop
+reason, 20000 fuzzed frames), the table, a fake radio lane (passive forced,
+GET 11 field by field, timeouts, a stop or a power-off mid-scan, no producer,
+READY while the backstop re-arms, a `ready()` with no usable channel), the
+canned producer, a default boot that allocates nothing, static rules for the
+leaf lock and the producer, and 17 mutants. The model's radio thread call
+follows XNU's ONCE rule: entered while it runs, it runs once more, when the
+last entry says.
 
 The tests compile production C with ASan/UBSan and a pthread station adapter;
 cover missing/invalid/enabled gates, one-time attachment, malformed requests,

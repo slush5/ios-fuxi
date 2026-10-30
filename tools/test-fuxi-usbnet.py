@@ -1188,11 +1188,8 @@ def backend_suite(tmp):
     if not check('backend: the wifi-ios model has the net_input stub to record frames', W.MODEL.count(RX_STUB) == 1):
         return
     said = W.TEST[W.TEST.index('static unsigned said_times'):W.TEST.index('static bool said_since')]
-    source = W.MODEL.replace(RX_STUB, RX_RECORD) + W.stripped('fuxi_wifi_sta.h') + W.stripped('fuxi_wifi_net.h')
-    source += W.stripped('fuxi_wifi_ios.h') + W.stripped('fuxi_wifi_apple80211.h')
-    source += 'bool fuxi_wifi_net_attach(const struct fuxi_wifi_net_link *);\n'
-    source += W.stripped('fuxi_wifi_sta.c') + W.stripped('fuxi_wifi_apple80211.c')
-    source += W.stripped('fuxi_usbnet_ring.h') + W.stripped('fuxi_wifi_ios.c') + said + BACKEND_MAIN
+    # every kernel unit of the shim, the radio handoff (K2) included, as test-fuxi-wifi-ios.py builds them
+    source = W.unit_source(W.MODEL.replace(RX_STUB, RX_RECORD)) + said + BACKEND_MAIN
     exes = {}
     for defs, label in (((), 'fuxi'), (('-DFUXI_SALAMI=1',), 'salami')):
         path = tmp / f'backend-{label}.c'

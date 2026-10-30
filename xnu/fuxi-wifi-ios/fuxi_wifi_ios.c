@@ -1,11 +1,13 @@
 /* Fuxi Wi-Fi iOS shim entry and synthetic Ethernet link. No radio access.
- * fuxiwifiios=2 (route U) carries that link's frames over the loader's USB monitor. */
+ * fuxiwifiios=2 (route U) carries that link's frames over the loader's USB monitor.
+ * fuxiwifiios=3/4 (K2) list real scan results from the handoff of sys/fuxi_wifi_radio.h, scan only. */
 #if defined(FUXI)
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/errno.h>
 #include <sys/fuxi_wifi_ios.h>
 #include <sys/fuxi_wifi_net.h>
+#include <sys/fuxi_wifi_radio.h>
 #include <sys/fuxi_usbnet_ring.h>
 #include <kern/clock.h>
 #include <kern/locks.h>
@@ -324,6 +326,141 @@ usbnet_rx(__unused void *parameter, __unused wait_result_t result)
 	}
 }
 
+/* fuxiwifiios=3 (radio) and =4 (canned producer, no radio), K2: what a scan hears comes through the
+ * handoff of sys/fuxi_wifi_radio.h, which copies every request and record; this backend never sees MMIO
+ * or DMA and never calls the radio lane. Every channel is passive, a join is refused without touching
+ * anything (never EAUTH: Settings would blame the password), no frame passes en0 and its link stays
+ * down. A radio that stops, or that never reports, turns Wi-Fi off for the boot. */
+static LCK_MTX_DECLARE(rscan_backend_lock, &fake_group);
+static const struct fuxi_wifi_input *rscan_input;       /* kept, never called: nothing is received */
+static int rscan_refused;                               /* EOPNOTSUPP once a join was refused (state()) */
+static unsigned rscan_joins;
+
+static void
+rscan_start(const struct fuxi_wifi_input *in)
+{
+	rscan_input = in;
+}
+
+static int
+rscan_power(bool on)
+{
+	if (!on) {
+		fuxi_wifi_radio_cancel();
+		return 0;
+	}
+	return fuxi_wifi_radio_state(NULL) == FUXI_WIFI_RADIO_STOPPED ? EIO : 0;
+}
+
+/* The listed channels wifid asked for (all of them for "any"), passive, 150 ms each unless it asked for
+ * 50 to 200; waited for at most 1 s plus one and a half dwells a channel (15 s at most), so that the radio
+ * lane, which gives its own scan n * dwell * 3 / 2, always finishes or aborts first. */
+static int
+rscan_scan(const struct fuxi_wifi_sta_scan *what)
+{
+	struct fuxi_wifi_radio_request request = { .passive = what->passive };
+	struct fuxi_wifi_sta_channel channels[FUXI_WIFI_RADIO_CHANNELS];
+	unsigned count = fuxi_wifi_radio_channels(channels, FUXI_WIFI_RADIO_CHANNELS), dwell, timeout;
+
+	for (unsigned i = 0; i < count; i++) {
+		bool asked = what->frequency_count == 0;
+
+		for (unsigned j = 0; j < what->frequency_count && j < FUXI_WIFI_RADIO_FREQS_MOST; j++) {
+			asked |= what->frequencies[j] == channels[i].frequency;
+		}
+		if (asked) {
+			request.freqs[request.freq_count++] = channels[i].frequency;
+		}
+	}
+	request.ssid_length = what->ssid_length <= sizeof(request.ssid) ? what->ssid_length : 0;
+	memcpy(request.ssid, what->ssid, request.ssid_length);
+	dwell = what->dwell_ms >= 50 && what->dwell_ms <= 200 ? what->dwell_ms : FUXI_WIFI_RADIO_DWELL_MS;
+	request.dwell_ms = (uint16_t)dwell;
+	timeout = 1000 + request.freq_count * dwell * 3 / 2;
+	return fuxi_wifi_radio_scan(&request, timeout < FUXI_WIFI_RADIO_WAIT_MOST_MS ? timeout : FUXI_WIFI_RADIO_WAIT_MOST_MS,
+	           fuxi_wifi_sta_power_pending);
+}
+
+static void
+rscan_heard(void (*each)(const struct fuxi_wifi_sta_bss *, void *), void *context)
+{
+	(void)fuxi_wifi_radio_results(each, context);
+}
+
+static int
+rscan_join(__unused const struct fuxi_wifi_sta_join *what)
+{
+	unsigned times;
+
+	lck_mtx_lock(&rscan_backend_lock);
+	rscan_refused = EOPNOTSUPP;
+	times = ++rscan_joins;
+	lck_mtx_unlock(&rscan_backend_lock);
+	if (times <= 24 || times % 100 == 0) {
+		printf("FUXI WIFI IOS: radio: join refused (scan-only backend), no radio access\n");
+	}
+	return EOPNOTSUPP;
+}
+
+static int
+rscan_leave(void)
+{
+	return 0;
+}
+
+static void
+rscan_snapshot(struct fuxi_wifi_sta_state *state)
+{
+	bool scanning;
+	enum fuxi_wifi_radio_state radio = fuxi_wifi_radio_state(&scanning);
+
+	bzero(state, sizeof(*state));
+	state->phase = radio == FUXI_WIFI_RADIO_STOPPED ? FUXI_WIFI_STA_OFF : scanning ? FUXI_WIFI_STA_SCANNING :
+	    FUXI_WIFI_STA_IDLE;
+	lck_mtx_lock(&rscan_backend_lock);
+	state->last_error = rscan_refused;
+	lck_mtx_unlock(&rscan_backend_lock);
+}
+
+static bool
+rscan_tx(__unused const uint8_t *frame, __unused size_t length)
+{
+	return false;
+}
+
+/* thread call context (fuxi_wifi_radio.c's notify), after attach */
+static void
+rscan_changed(enum fuxi_wifi_radio_state state)
+{
+	if (state == FUXI_WIFI_RADIO_STOPPED) {
+		fuxi_wifi_sta_radio_off();
+	}
+}
+
+static const struct fuxi_wifi_backend rscan_backend = {
+	.station = { .power = rscan_power, .scan = rscan_scan, .heard = rscan_heard, .join = rscan_join,
+		.leave = rscan_leave, .state = rscan_snapshot, .channels = fuxi_wifi_radio_channels,
+		.address = { 0x02, 0x46, 0x55, 0x58, 0x49, 0x01 } },
+	.tx_frame = rscan_tx, .start = rscan_start,
+};
+
+static void
+rscan_init(bool canned)
+{
+	printf("FUXI WIFI IOS: enabled, %s; Apple80211 16.7 ABI unverified\n", canned ? "canned scan backend (no radio)" :
+	    "radio scan backend (scan only, no join)");
+	link.name = "radio-scan";
+	fuxi_wifi_apple80211_backend(canned ? "Fuxi Wi-Fi iOS shim (canned scan backend)" :
+	    "Fuxi Wi-Fi iOS shim (radio backend, scan only)", true);
+	if (!fuxi_wifi_radio_use(canned, rscan_changed)) {
+		printf("FUXI WIFI IOS: radio: no memory or thread call for the scan handoff; no retry this boot\n");
+		return;
+	}
+	if (fuxi_wifi_ios_attach(&rscan_backend)) {
+		fuxi_wifi_radio_attached();
+	}
+}
+
 void
 fuxi_wifi_ios_init(void)
 {
@@ -331,10 +468,14 @@ fuxi_wifi_ios_init(void)
 	thread_t thread;
 	int on = 0;
 	PE_parse_boot_argn("fuxiwifiios", &on, sizeof(on));
-	if ((on != 1 && on != 2) || enabled) {
+	if (on < 1 || on > 4 || enabled) {
 		return;
 	}
 	enabled = true;
+	if (on >= 3) {
+		rscan_init(on == 4);
+		return;
+	}
 	if (on == 2 && usbnet_open()) {
 		usbnet_backend = fake_backend;
 		usbnet_backend.tx_frame = usbnet_tx;

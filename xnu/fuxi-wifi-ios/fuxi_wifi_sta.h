@@ -1,6 +1,8 @@
 /*
  * Ported from HackiOS xnu/files/bsd/sys/redwood_sta.h (APSL-2.0)
  * Fuxi adaptations, 2026-10-23: opt-in iOS shim; see docs-lanes/wifi-ios.md.
+ * Fuxi, 2026-10-30 (K2): a record's noise figure; the radio backends' Wi-Fi off and power-off check,
+ * and the name they give Apple80211 (sys/fuxi_wifi_radio.h).
  * Original file commentary is retained below. See LICENSE.HackiOS.
  */
 /*
@@ -32,6 +34,7 @@ struct fuxi_wifi_sta_bss {
 	uint8_t ssid[32], ssid_length;
 	uint16_t frequency;                     /* MHz */
 	int16_t rssi;                           /* dBm */
+	int16_t noise;                          /* dBm; 0: not known */
 	uint16_t beacon_interval;               /* in units of 1024 microseconds */
 	uint16_t capability;                    /* the beacon's capability field */
 	uint32_t age_ms;                        /* how long ago it was last heard */
@@ -103,6 +106,8 @@ enum fuxi_wifi_sta_event {
 /* ---- the station side ---- */
 void     fuxi_wifi_sta_attach(const struct fuxi_wifi_sta_ops *ops);         /* init only; immutable boot-lifetime backend */
 void     fuxi_wifi_sta_lost(int error);                                   /* the network joined is gone by itself */
+void     fuxi_wifi_sta_radio_off(void);                                   /* the radio is gone by itself: off until reboot */
+bool     fuxi_wifi_sta_power_pending(void);                               /* "off" is asked for and not begun (a scan gives up) */
 
 /* ---- who wants a network: each asks and returns; the outcome is an event. 0, or an errno ---- */
 bool     fuxi_wifi_sta_present(void);
@@ -122,6 +127,8 @@ bool     fuxi_wifi_sta_address(uint8_t *address);
 void     fuxi_wifi_apple80211_event(enum fuxi_wifi_sta_event event, int status);
 void     fuxi_wifi_apple80211_summary(void);                              /* what was asked in this run so far, to the log
                                                                          * (a timer says it every minute while requests come) */
+/* init only, the radio backends: their name (GET 43/44), and a scan's records carry real elements, kept whole */
+void     fuxi_wifi_apple80211_backend(const char *name, bool whole_elements);
 #endif
 
 #endif
