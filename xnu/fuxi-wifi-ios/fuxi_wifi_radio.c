@@ -309,8 +309,9 @@ radio_open_locked(uint32_t seq, bool lane)
 
 /*
  * fuxiwifiios=3: iOS asks the station something (a scan, its state) and no producer has said anything.
- * Patch 0099 calls fuxi_wlan_init from the root device probe, before launchd starts whatever asks, so
- * the radio lane of this kernel does not report (its STARTING/STOPPED calls are a later change).
+ * Patch 0099 calls fuxi_wlan_init from the root device probe, before launchd starts whatever asks, and
+ * (C3) that reports STARTING or STOPPED on every boot, so a radio lane still silent by then is not in
+ * this kernel.
  */
 static thread_call_t
 radio_asked_locked(void)
@@ -689,6 +690,22 @@ bool
 fuxi_wifi_radio_cancelled(uint32_t seq)
 {
 	return radio_cancelled(seq, true);
+}
+
+/*
+ * Whether a radio lane that serves requests should go on: false once STOPPED, which is terminal (the iOS side
+ * gave up after 3 timeouts, ready() named no usable channel, or a stop was reported). Always true with
+ * fuxiwifiios=4, where the lane's calls are ignored anyway.
+ */
+bool
+fuxi_wifi_radio_wanted(void)
+{
+	bool wanted;
+
+	lck_mtx_lock(&radio_lock);
+	wanted = radio_canned || radio_state != FUXI_WIFI_RADIO_STOPPED;
+	lck_mtx_unlock(&radio_lock);
+	return wanted;
 }
 
 int

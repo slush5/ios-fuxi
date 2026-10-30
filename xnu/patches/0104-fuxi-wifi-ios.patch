@@ -3028,7 +3028,7 @@
 +#endif /* _SYS_FUXI_WIFI_NET_H_ */
 --- /dev/null
 +++ b/bsd/dev/fuxi_wifi_radio.c
-@@ -0,0 +1,1189 @@
+@@ -0,0 +1,1206 @@
 +/*
 + * Fuxi Wi-Fi iOS shim: the scan handoff (sys/fuxi_wifi_radio.h). Original Fuxi code, 2026-10-30 (K2).
 + *
@@ -3340,8 +3340,9 @@
 +
 +/*
 + * fuxiwifiios=3: iOS asks the station something (a scan, its state) and no producer has said anything.
-+ * Patch 0099 calls fuxi_wlan_init from the root device probe, before launchd starts whatever asks, so
-+ * the radio lane of this kernel does not report (its STARTING/STOPPED calls are a later change).
++ * Patch 0099 calls fuxi_wlan_init from the root device probe, before launchd starts whatever asks, and
++ * (C3) that reports STARTING or STOPPED on every boot, so a radio lane still silent by then is not in
++ * this kernel.
 + */
 +static thread_call_t
 +radio_asked_locked(void)
@@ -3720,6 +3721,22 @@
 +fuxi_wifi_radio_cancelled(uint32_t seq)
 +{
 +	return radio_cancelled(seq, true);
++}
++
++/*
++ * Whether a radio lane that serves requests should go on: false once STOPPED, which is terminal (the iOS side
++ * gave up after 3 timeouts, ready() named no usable channel, or a stop was reported). Always true with
++ * fuxiwifiios=4, where the lane's calls are ignored anyway.
++ */
++bool
++fuxi_wifi_radio_wanted(void)
++{
++	bool wanted;
++
++	lck_mtx_lock(&radio_lock);
++	wanted = radio_canned || radio_state != FUXI_WIFI_RADIO_STOPPED;
++	lck_mtx_unlock(&radio_lock);
++	return wanted;
 +}
 +
 +int
@@ -4220,7 +4237,7 @@
 +#endif /* FUXI */
 --- /dev/null
 +++ b/bsd/sys/fuxi_wifi_radio.h
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,119 @@
 +/*
 + * Fuxi Wi-Fi iOS shim: the scan handoff between the radio lane and the iOS side.
 + * Original Fuxi code, 2026-10-30 (K2: wlan/r1 overnight_plan 3.2, ios_scan_plan 1.2-2.5).
@@ -4323,6 +4340,7 @@
 +void     fuxi_wifi_radio_ready(const uint16_t *freqs, unsigned count);         /* the channels the firmware may use */
 +bool     fuxi_wifi_radio_take(struct fuxi_wifi_radio_request *out);            /* a new request, copied */
 +bool     fuxi_wifi_radio_cancelled(uint32_t seq);                              /* stop scanning for it */
++bool     fuxi_wifi_radio_wanted(void);          /* false once STOPPED (terminal): no request comes this boot */
 +int      fuxi_wifi_radio_frame(uint32_t seq, const uint8_t *frame, size_t length, uint16_t rx_mhz, int16_t rssi_dbm,
 +    int16_t noise_dbm);                                                        /* parsed and copied during the call */
 +int      fuxi_wifi_radio_bss(uint32_t seq, const struct fuxi_wifi_sta_bss *bss);       /* a record parsed elsewhere */
