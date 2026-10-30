@@ -22,8 +22,9 @@ salami build. Each scenario is a process of its own (the radio state is one word
      nochannel    ready() names no listed channel: Wi-Fi off with code 0x7000n, not on with an empty list
   T7 canned       fuxiwifiios=4: four canned networks (one hidden, WPA2, DFS), the radio lane ignored
   T8 default      no fuxiwifiios: producer calls only store the state word; nothing allocated or said
-  T6 static       the leaf lock rule, the producer never sleeps, no wl_ symbol on the iOS side, and any
-                  fuxi_wlan.c prototype of the producer API equals the header (none yet: 0099 hooks deferred)
+  T6 static       the leaf lock rule, the producer never sleeps, no wl_ symbol on the iOS side, and
+                  fuxi_wlan.c (C3: the STARTING/STOPPED hooks and the W25 service of patch 0099) names
+                  only the producer API, with prototypes, request struct and defines equal to the header
   T9 mutants      17 source mutations, each must fail a scenario or a static rule
 """
 import importlib.util
@@ -609,6 +610,7 @@ static void scenario_radio(void) {
  memset(name,1,sizeof(name));
  assert(!request(false,43,name,sizeof(name),NULL) && !strcmp(name,"Fuxi Wi-Fi iOS shim (radio backend, scan only)"));
  /* 3 scans in a row that the radio takes and never answers: each times out (9550 ms), then Wi-Fi is off */
+ assert(fuxi_wifi_radio_wanted());
  atomic_store(&lane_mode,LANE_SILENT);
  for (unsigned i=0;i<3;i++) {
   takes=atomic_load(&lane_takes); uint64_t start=(uint64_t)(60+20*i)*NSEC_PER_SEC; now_abs=start;
@@ -620,6 +622,8 @@ static void scenario_radio(void) {
  }
  wait_said("FUXI WIFI IOS: radio: scans timed out 3 times in a row (code 0x60003); Wi-Fi reported off, no retry this boot\n");
  other_settle();
+ /* C3: the radio lane's service sees the iOS side gone (and ends) */
+ assert(!fuxi_wifi_radio_wanted());
  assert(atomic_load(&events[1])==2 && !power_now() && !fuxi_wifi_sta_powered());
  assert(scan_ask(3,0,0)==ENETDOWN);
  assert(!power_set(true) && !power_now() && atomic_load(&events[1])==3);
@@ -647,7 +651,7 @@ static void scenario_stop(void) {
  /* terminal: later calls change nothing */
  fuxi_wifi_radio_stopped(FUXI_WIFI_RADIO_EXITED | 1); fuxi_wifi_radio_starting(); fuxi_wifi_radio_ready(all38,38); other_settle();
  assert(fuxi_wifi_radio_state(NULL)==FUXI_WIFI_RADIO_STOPPED && said_times("Wi-Fi reported off")==1 && !said("0x40001"));
- struct fuxi_wifi_radio_request r; assert(!fuxi_wifi_radio_take(&r) && fuxi_wifi_radio_cancelled(1));
+ struct fuxi_wifi_radio_request r; assert(!fuxi_wifi_radio_take(&r) && fuxi_wifi_radio_cancelled(1) && !fuxi_wifi_radio_wanted());
  assert(scan_ask(3,0,0)==ENETDOWN && !request(false,13,NULL,0,NULL));
  lane_end(); other_settle(); free(k); clean_log();
  puts("stop: PASS");
@@ -662,7 +666,7 @@ static void scenario_cancel(void) {
  wait_count(&lane_cancels,1);
  assert(said(SAY("FUXI WIFI IOS: apple80211: the station says: a scan is over, %d\n",ECANCELED)));
  assert(said(SAY("FUXI WIFI IOS: radio: scan 1: 38 channels passive, 0 heard (0 at 2.4 GHz, 0 at 5 GHz, 0 RSN, 0 hidden), 0 ms, status %d\n",ECANCELED)));
- assert(!power_now() && result_get(1024)==EIO);
+ assert(!power_now() && result_get(1024)==EIO && fuxi_wifi_radio_wanted());   /* off by the user: not the end of the radio */
  /* on again: the radio is READY, so it is on, and a scan is heard */
  assert(!power_set(true) && power_now()==1);
  atomic_store(&lane_mode,LANE_ANSWER);
@@ -772,7 +776,7 @@ static void scenario_canned(void) {
  /* the radio lane is ignored */
  fill_all(); uint16_t two[2]={2412,5180};
  fuxi_wifi_radio_stopped(FUXI_WIFI_RADIO_EXITED | 7); fuxi_wifi_radio_starting(); fuxi_wifi_radio_ready(two,2);
- struct fuxi_wifi_radio_request r; assert(!fuxi_wifi_radio_take(&r) && fuxi_wifi_radio_cancelled(1));
+ struct fuxi_wifi_radio_request r; assert(!fuxi_wifi_radio_take(&r) && fuxi_wifi_radio_cancelled(1) && fuxi_wifi_radio_wanted());
  assert(fuxi_wifi_radio_state(NULL)==FUXI_WIFI_RADIO_READY && !said("Wi-Fi reported off") && power_now()==1);
  /* M1: a type-3 scan, four networks, four answers then EIO */
  assert(!scan_ask(3,0,0)); settle();
@@ -809,8 +813,10 @@ static void scenario_default(void) {
  fill_all();
  fuxi_wifi_radio_starting(); fuxi_wifi_radio_ready(all38,38);
  assert(!fuxi_wifi_radio_take(&r) && !fuxi_wifi_radio_take(NULL) && fuxi_wifi_radio_cancelled(1) && fuxi_wifi_radio_cancelled(0));
+ assert(fuxi_wifi_radio_wanted());   /* no consumer: the radio lane idles to its lifetime, as without this call */
  assert(fuxi_wifi_radio_frame(1,f,n,2412,-40,-95)==FUXI_WIFI_RADIO_DROP_STALE && fuxi_wifi_radio_bss(1,b)==FUXI_WIFI_RADIO_DROP_STALE);
  fuxi_wifi_radio_done(1,0); fuxi_wifi_radio_stopped(FUXI_WIFI_RADIO_EXITED | 3); fuxi_wifi_radio_stopped(FUXI_WIFI_RADIO_EXITED | 4);
+ assert(!fuxi_wifi_radio_wanted());
  opt=0; fuxi_wifi_ios_init(); opt=5; fuxi_wifi_ios_init();
  assert(radio_state==FUXI_WIFI_RADIO_STOPPED && radio_code==(FUXI_WIFI_RADIO_EXITED | 3));
  assert(!atomic_load(&kallocs) && !loglen && !other_call.func && !attached && !registry);
@@ -871,7 +877,8 @@ def run(exe, scenario, timeout=60):
 LOCKED_CALLS = {'memcpy', 'bzero', 'memcmp', 'assert_wait_timeout', 'lck_mtx_sleep'}
 NOT_CALLS = {'if', 'for', 'while', 'switch', 'return', 'sizeof'}
 PRODUCER = ('fuxi_wifi_radio_starting', 'fuxi_wifi_radio_ready', 'fuxi_wifi_radio_take', 'fuxi_wifi_radio_cancelled',
-            'fuxi_wifi_radio_frame', 'fuxi_wifi_radio_bss', 'fuxi_wifi_radio_done', 'fuxi_wifi_radio_stopped')
+            'fuxi_wifi_radio_wanted', 'fuxi_wifi_radio_frame', 'fuxi_wifi_radio_bss', 'fuxi_wifi_radio_done',
+            'fuxi_wifi_radio_stopped')
 PRODUCER_INSIDE = ('radio_starting', 'radio_ready', 'radio_cancelled', 'radio_frame', 'radio_bss', 'radio_done',
                    'radio_keep', 'radio_count', 'radio_reset', 'radio_summarize', 'fuxi_wifi_radio_parse',
                    'fuxi_wifi_elements_fit', 'element_rank', 'radio_listed', 'radio_dbm')
@@ -950,17 +957,29 @@ def static_rules(src=SRC):
         bad = re.findall(r'\b(wl_\w+|wl\d+\w*|fw_\w+|ml_phys\w*|IOMemoryDescriptor|pmap_\w+)\b', text)
         if bad:
             problems.append(f'{name}: names {sorted(set(bad))}')
-    # fuxi_wlan.c (patch 0099, not touched by K2): only the producer API, prototypes as in the header
+    # fuxi_wlan.c (patch 0099): only the producer API and its request struct, each prototype, the struct and
+    # every FUXI_WIFI_RADIO_ define as in the header (C3: 0099 copies them, it does not include the 0104 header)
     header = re.sub(r'\s+', ' ', uncomment((Path(src) / 'fuxi_wifi_radio.h').read_text()))
     if WLAN.exists():
         wlan = uncomment(WLAN.read_text())
         for m in re.finditer(r'\bfuxi_wifi_\w+', wlan):
-            if m.group(0) not in PRODUCER and not m.group(0).startswith('FUXI_WIFI_RADIO_'):
+            if m.group(0) not in PRODUCER + ('fuxi_wifi_radio_request',) and not m.group(0).startswith('FUXI_WIFI_RADIO_'):
                 problems.append(f'fuxi_wlan.c names {m.group(0)}')
+        protos = 0
         for m in re.finditer(r'extern\s+([^;]*\bfuxi_wifi_radio_\w+\s*\([^;]*\));', wlan):
             proto = re.sub(r'\s+', ' ', m.group(1)).strip()
+            protos += 1
             if proto.replace(' (', '(') not in header.replace(' (', '('):
                 problems.append(f'fuxi_wlan.c prototype differs from the header: {proto}')
+        used = set(re.findall(r'\b(fuxi_wifi_radio_\w+)\s*\(', wlan)) - {'fuxi_wifi_radio_request'}
+        if protos != len(used):
+            problems.append(f'fuxi_wlan.c calls {sorted(used)} with {protos} extern prototypes')
+        for m in re.finditer(r'struct fuxi_wifi_radio_request \{[^}]*\};', wlan):
+            if re.sub(r'\s+', ' ', m.group(0)) not in header:
+                problems.append('fuxi_wlan.c struct fuxi_wifi_radio_request differs from the header')
+        for m in re.finditer(r'#define (FUXI_WIFI_RADIO_\w+)\s+([^\n]+)', wlan):
+            if f'#define {m.group(1)} {m.group(2).strip()} ' not in header + ' ':
+                problems.append(f'fuxi_wlan.c {m.group(1)} differs from the header')
     return problems
 
 
@@ -996,6 +1015,8 @@ MUTANTS = [
     ('no entry after the backstop re-arm', 'fuxi_wifi_radio.c', 'again = radio_state != FUXI_WIFI_RADIO_ABSENT;',
      'again = false;'),
     ('READY with no usable channel', 'fuxi_wifi_radio.c', 'if (n == 0) {', 'if (false) {'),
+    ('the radio lane never told the iOS side stopped (C3)', 'fuxi_wifi_radio.c',
+     'wanted = radio_canned || radio_state != FUXI_WIFI_RADIO_STOPPED;', 'wanted = true;'),
 ]
 
 

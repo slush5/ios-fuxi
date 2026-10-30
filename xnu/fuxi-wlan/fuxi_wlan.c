@@ -29,25 +29,35 @@
  *                 enable it, 0x100 decode BHI error words and scan RDDM text
  *   fuxiwlanqrtr=1  W11 capability-only diagnostic; =2 W12 setup; =3 W13 small-chunk negotiation; =4 W14 downloads; =5 W15 config/mode
  *   fuxiwlanqrtr=6  W20-W22: W15, then copy engines, HTC and WMI init to WMI READY (needs
- *                 fuxiwlan=28 or 1; not with keep/stop22); any other value outside 0..7 is refused
+ *                 fuxiwlan=28 or 1; not with keep/stop22); any other value outside 0..8 is refused
  *   fuxiwlanqrtr=7  W23/W24: all of 6, then the 38-channel passive list, a station vdev and one
  *                 passive scan; logs SSIDs and OUI-only BSSIDs; nothing is transmitted (same needs);
  *                 C2b: a line per CHAN_INFO and a pdev stats request per PHY pdev after the scan
- *   fuxiwlanw15=1  W15 only (qrtr 5..7): omit WLAN_CFG shadow-v3 TLV (default 0); W20 then
+ *   fuxiwlanqrtr=8  W25 (C3): all of 7 up to the station vdev, then a passive scan service for
+ *                 the iOS side (fuxiwifiios=3, the handoff of patch 0104) in this same thread,
+ *                 30 min (less if the iOS side stops first), then contain; Wi-Fi turns off in
+ *                 iOS when it ends (same needs)
+ *   fuxiwlanw15=1  W15 only (qrtr 5..8): omit WLAN_CFG shadow-v3 TLV (default 0); W20 then
  *                 publishes CE pointers to R2 through the window
- *   fuxiwlanw16=N  qrtr=5..7 only: 1 larger IPCR, 2 doorbell redrive, 3 both,
+ *   fuxiwlanw16=N  qrtr=5..8 only: 1 larger IPCR, 2 doorbell redrive, 3 both,
  *                 4 diagnostics only; all include MODE context diagnostics
- *   fuxiwlanw20=N  qrtr=6/7: 0x01 no HTT connect, 0x04 endpoint MRRS 128, 0x40 no
- *                 PDEV_SET_HW_MODE; qrtr=7 also 0x02 HTT version request, 0x10 2.4 GHz only,
+ *   fuxiwlanw20=N  qrtr=6/7/8: 0x01 no HTT connect, 0x04 endpoint MRRS 128, 0x40 no
+ *                 PDEV_SET_HW_MODE; qrtr=7/8 also 0x02 HTT version request, 0x10 2.4 GHz only,
  *                 0x80 EXT MAC/PHY pdev id; C2c (W26) 0x100 host RX rings (needs 0x02),
  *                 0x200 WBM idle link-descriptor list, 0x400 pdev chain masks; 0x08 (active
  *                 scan), 0x20 (whole BSSIDs; the owner masks every BSSID) and every other bit
  *                 refused, as is 0x01 with 0x02 (docs-lanes/wlan-w20.md)
+ * Every boot reports the radio lane's STARTING and STOPPED to the iOS scan
+ * handoff (fuxi_wifi_radio_starting/stopped, patch 0104); without
+ * fuxiwifiios=3 that only stores a state word there, and no line here changes.
  * Salami (FUXI_SALAMI, OnePlus 11, K-W1): the driver runs only when
- * fuxiwlansalami=1 is present as well; its absence or any other value refuses
- * before the thread starts, as do fuxiwlanseq with cyclerails and any invalid
- * selector. Step 1 expects the salami cmd-db (ldob15 0x40b00), step 2 votes
- * S4E 950 mV (salami live DT), and rh_send_request checks every RPMh command
+ * fuxiwlansalami=1 (or the C3 profile =2) is present as well; its absence or
+ * any other value refuses before the thread starts, as do fuxiwlanseq with
+ * cyclerails and any invalid selector. fuxiwlansalami=2 adds the defaults
+ * fuxiwlanclk=1, fuxiwlanprobe=civac and fuxiwlanseq=cycle,parf,dbi,eq,
+ * hostirq,msi,por,prefix; a boot-arg or ADT /defaults value of the same knob
+ * wins (wl_arg_profile). Step 1 expects the salami cmd-db (ldob15 0x40b00),
+ * step 2 votes S4E 950 mV (salami live DT), and rh_send_request checks every RPMh command
  * before the first TCS write: only a salami WLAN rail at its live-DT mV,
  * enable 1 or mode 7 (HPM), or a BCM address; never an OFF, another mode or
  * a headroom vote, never 0x40a00 (salami ldob12, panel vddio).
@@ -97,6 +107,7 @@
 #include <sys/vnode.h>
 #include <sys/uio.h>
 #include <sys/random.h>
+#include <sys/errno.h>
 #include <string.h>
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -141,17 +152,46 @@ wl_arg_adt(const char *name, void *buf, int size)
 	printf("FUXI WLAN: salami %s from ADT /defaults\n", name);
 	return true;
 }
+/* C3 profile (overnight_plan.md 3.3, the M2 ADT budget; owner decision 7,
+ * to be confirmed): fuxiwlansalami=2 is the salami gate of =1 plus these
+ * defaults, the S4 selector set and the clock votes the r1c1 kit passed
+ * with. Each is used only when its knob is in neither the boot-args nor ADT
+ * /defaults, so an explicit knob always wins; a number fills an int, a
+ * string must fit the caller's buffer with its NUL (else absent, as
+ * PE_get_default). No fuxiwlanmlo default, never CLKON, cyclerails or
+ * fuxiwlancnss=pdc: a change of the profile is a change of this table.
+ * fuxi_wlan_init sets wl_salami_profile before any other knob is read. */
+static int wl_salami_profile;
+static const struct { const char *name, *text; int number; } wl_salami_defaults[] = {
+	{ "fuxiwlanclk", NULL, 1 },
+	{ "fuxiwlanprobe", "civac", 0 },
+	{ "fuxiwlanseq", "cycle,parf,dbi,eq,hostirq,msi,por,prefix", 0 },
+};
+static bool
+wl_arg_profile(const char *name, void *buf, int size)
+{
+	for (unsigned i = 0; wl_salami_profile == 2 && i < sizeof(wl_salami_defaults) / sizeof(wl_salami_defaults[0]); i++) {
+		const char *text = wl_salami_defaults[i].text;
+		if (strcmp(name, wl_salami_defaults[i].name)) { continue; }
+		if (text ? size <= 0 || strlen(text) >= (size_t)size : size != (int)sizeof(int)) { return false; }
+		if (text) { memcpy(buf, text, strlen(text) + 1); }
+		else { memcpy(buf, &wl_salami_defaults[i].number, sizeof(int)); }
+		printf("FUXI WLAN: salami %s from the fuxiwlansalami=2 profile\n", name);
+		return true;
+	}
+	return false;
+}
 static bool
 wl_arg(const char *name, void *buf, int size)
 {
 	if ((PE_parse_boot_argn)(name, buf, size)) { return true; }
-	return wl_arg_adt(name, buf, size);
+	return wl_arg_adt(name, buf, size) || wl_arg_profile(name, buf, size);
 }
 static bool
 wl_arg_str(const char *name, char *buf, int size)
 {
 	if ((PE_parse_boot_arg_str)(name, buf, size)) { return true; }
-	return wl_arg_adt(name, buf, size);
+	return wl_arg_adt(name, buf, size) || wl_arg_profile(name, buf, size);
 }
 #define PE_parse_boot_argn(name, buf, size) wl_arg((name), (buf), (size))
 #define PE_parse_boot_arg_str(name, buf, size) wl_arg_str((name), (buf), (size))
@@ -857,25 +897,33 @@ static bool wl16_large, wl16_redrive;
  * calls this rung PDEV0). 0x08 ACTIVE would transmit probe requests and stays
  * refused; 0x20 FULLBSSID (whole BSSIDs in the log) stays refused too: the
  * owner's decision masks the last three octets of every BSSID. 0x01 with 0x02
- * is refused (no HTT endpoint to ask). qrtr 8 (C3) is refused until it exists.
- * C2c (W26, qrtr 7 only, all default off): 0x100 RXRING the RX arena, the
+ * is refused (no HTT endpoint to ask). W25 (fuxiwlanqrtr=8, C3) runs W23 up to
+ * its station vdev, then serves the iOS side's scan requests (wl_w25_run)
+ * until WL25_LIFETIME_MS (owner decision 8, to be confirmed), the iOS side's
+ * stop, WL25_FAILS_MOST failed scans in a row or a fault; it takes the qrtr 7 bits (the scan
+ * commands are its own: 0x10 then limits iOS to the 13 2.4 GHz channels).
+ * 9 and beyond are refused.
+ * C2c (W26, qrtr 7 and 8, all default off): 0x100 RXRING the RX arena, the
  * refill/per-MAC/RXDMA-error rings with 4095 host buffers and their four HTT
  * SRING_SETUP messages (refused without 0x02: L19 asks the HTT version before
  * any ring announcement, core.c:955 then 1143); 0x200 IDLELINK the WBM idle
  * link-descriptor list (ring 120, programmed only after read-only pre-reads
  * show no owner); 0x400 CHAINMASK PDEV_SET_PARAM TX then RX chain mask before
  * the channel list. 0x200 and 0x400 need no other bit.
- * C2d (W27, qrtr 7 only, default off, both need 0x100): 0x800 RXSEL one HTT
+ * C2d (W27, qrtr 7 and 8, default off, both need 0x100): 0x800 RXSEL one HTT
  * RX_RING_SELECTION_CFG per MAC ring right after the SRING_SETUPs; 0x1000 REORX
  * the UMAC RX path (WBM2SW3 release and REO2SW0 exception rings and the REO
  * setup at W20, REO2SW1..8 after service ready) with every returned buffer
  * given back to the refill ring.
- * C2e (W28, qrtr 7 only, default off, needs 0x100): 0x2000 MONSTAT the two
+ * C2e (W28, qrtr 7 and 8, default off, needs 0x100): 0x2000 MONSTAT the two
  * RXDMA monitor status rings 185/193 with 1023 host status buffers each, filled
  * at W20 after the refill ring and announced by HTT SRING_SETUP after the four
  * C2c ones and before the ring selection; watched, never reaped (L19 STA mode
  * reaps none); a read-only MHI/BHI crash line at the COMPLETED timeout and in
- * containment before the MHI reset. */
+ * containment before the MHI reset.
+ * Under qrtr 8 the W26, W27 and W28 setup runs exactly as under qrtr 7 (same
+ * place, same lines); their watches and reports follow the first W25 scan
+ * only, and the C2b post-scan stats stay qrtr 7 only. */
 #define WL20_NOHTT 0x01u
 #define WL20_HTTVER 0x02u
 #define WL20_MRRS128 0x04u
@@ -894,10 +942,44 @@ static bool wl16_large, wl16_redrive;
 #define WL27_BITS (WL20_RXSEL | WL20_REORX)
 #define WL20_BITS (WL20_NOHTT | WL20_MRRS128 | WL20_NOHWMODE)
 #define WL23_BITS (WL20_BITS | WL20_HTTVER | WL20_BAND24 | WL20_PDEVCAP | WL26_BITS | WL27_BITS | WL20_MONSTAT)
-#define WL20_QRTR_MAX 7
-static bool wl_w20, wl_w23;
+#define WL20_QRTR_MAX 8
+#define WL25_LIFETIME_MS (30u * 60u * 1000u)
+#define WL25_FAILS_MOST 3u
+static bool wl_w20, wl_w23, wl_w25;
+/* ---- the scan handoff of patch 0104 (bsd/sys/fuxi_wifi_radio.h), producer half ----
+ * C3: the W25 service hands what it hears to the iOS side through
+ * bsd/dev/fuxi_wifi_radio.c (patch 0104; both patches are always applied
+ * together, tools/ci/prepare-kernel.py), and every boot reports the radio
+ * lane's STARTING and STOPPED there (fuxi_wlan_init, fw_thread). 0099 does not
+ * include the 0104 header: what it uses is copied here, word for word, in the
+ * file's style for other units' symbols, and tools/test-fuxi-wlan-ce.py and
+ * tools/test-fuxi-wifi-radio.py (T6) check it equals the header. Without
+ * fuxiwifiios=3 every call only stores the state word there; none waits,
+ * allocates, logs or touches hardware. */
+#define FUXI_WIFI_RADIO_FREQS_MOST      64      /* = fuxi_wifi_sta_scan.frequencies */
+#define FUXI_WIFI_RADIO_NOT_REQUESTED   (1u << 16)      /* no fuxiwlan on this boot */
+#define FUXI_WIFI_RADIO_REFUSED         (2u << 16)      /* the radio lane refused its knobs at init */
+#define FUXI_WIFI_RADIO_NO_THREAD       (3u << 16)      /* no thread for the radio lane (or for the canned producer) */
+#define FUXI_WIFI_RADIO_EXITED          (4u << 16)      /* the radio lane's thread ended, the device contained */
+struct fuxi_wifi_radio_request {
+	uint32_t seq;                                                   /* never 0 */
+	uint16_t freqs[FUXI_WIFI_RADIO_FREQS_MOST], freq_count;         /* MHz, never 0 of them */
+	uint8_t ssid[32], ssid_length;                                  /* wifid's; unused while passive */
+	bool passive;                                                   /* always true until the active milestone */
+	uint16_t dwell_ms;                                              /* on each channel */
+};
+extern void fuxi_wifi_radio_starting(void);
+extern void fuxi_wifi_radio_ready(const uint16_t *freqs, unsigned count);
+extern bool fuxi_wifi_radio_take(struct fuxi_wifi_radio_request *out);
+extern bool fuxi_wifi_radio_cancelled(uint32_t seq);
+extern bool fuxi_wifi_radio_wanted(void);
+extern int fuxi_wifi_radio_frame(uint32_t seq, const uint8_t *frame, size_t length, uint16_t rx_mhz, int16_t rssi_dbm,
+    int16_t noise_dbm);
+extern void fuxi_wifi_radio_done(uint32_t seq, int status);
+extern void fuxi_wifi_radio_stopped(unsigned code);
+/* ---- end scan handoff ---- */
 static unsigned wl20_bits;
-static unsigned wl20_qrtr; /* 6 or 7 when wl_w20, for the init lines */
+static unsigned wl20_qrtr; /* 6, 7 or 8 when wl_w20, for the init lines */
 /* ---- P17: opt-in WCN7850 MODE-silence probes (fuxiwlanmlo bits >= 4) ----
  * Low two bits keep the W12 meaning (1 PHY_CAP, 2 omit MLO). Bits:
  *   0x004 HOSTMEM   HOST_CAP vendor TLV 0x33 (u8 1, "host memory on demand")
@@ -1198,7 +1280,8 @@ wl_probe_configure(void)
 	(void)PE_parse_boot_argn("fuxiwlanstop22", &stop22, sizeof(stop22));
 	(void)PE_parse_boot_argn("fuxiwlankeep", &keep, sizeof(keep));
 	(void)PE_parse_boot_argn("fuxiwlanqrtr", &qrtr, sizeof(qrtr));
-	wl_w23 = qrtr == 7; /* C2: the W23 passive scan runs on top of W20..W22 */
+	wl_w25 = qrtr == 8; /* C3: the W25 scan service replaces the one W23 scan */
+	wl_w23 = qrtr == 7 || wl_w25; /* C2: the W23 passive scan runs on top of W20..W22 */
 	wl_w20 = qrtr == 6 || wl_w23; /* W20 runs on top of the whole W11..W15 chain */
 	wl20_qrtr = wl_w20 ? (unsigned)qrtr : 0;
 	wl_w15 = qrtr == 5 || wl_w20; wl_w14 = qrtr == 4 || wl_w15; wl_w13 = qrtr == 3 || wl_w14; wl_w12 = qrtr == 2 || wl_w13; wl_qrtr = qrtr == 1 || wl_w12; wl_w11_attempted = wl_w11_ok = false;
@@ -1245,13 +1328,15 @@ wl_probe_configure(void)
 		}
 	}
 	/* W20: qrtr outside 0..WL20_QRTR_MAX used to run silently without QRTR;
-	 * it is refused now, like w20 without qrtr 6/7, bits outside the set of
-	 * the selected stage (0x08 ACTIVE and 0x20 FULLBSSID are in neither),
-	 * 0x01 with 0x02, and keep or stop22 with qrtr 6/7 (no keep path exists
-	 * for live copy engines). C2c: 0x100 without 0x02 is refused (with 0x01
-	 * too, through the 0x01 + 0x02 rule); qrtr 6 refuses every W26 bit. C2d:
+	 * it is refused now, like w20 without qrtr 6/7/8, bits outside the set of
+	 * the selected stage (0x08 ACTIVE and 0x20 FULLBSSID are in neither; qrtr
+	 * 8 takes the qrtr 7 set), 0x01 with 0x02, and keep or stop22 with qrtr
+	 * 6/7/8 (no keep path exists for live copy engines). C2c: 0x100 without
+	 * 0x02 is refused (with 0x01 too, through the 0x01 + 0x02 rule); qrtr 6
+	 * refuses every W26 bit. C2d:
 	 * 0x800 or 0x1000 without 0x100 is refused; qrtr 6 refuses both. C2e:
-	 * 0x2000 without 0x100 is refused; qrtr 6 refuses it. */
+	 * 0x2000 without 0x100 is refused; qrtr 6 refuses it. qrtr 8 takes the
+	 * W26, W27 and W28 bits as qrtr 7 does. */
 	wl20_bits = 0;
 	bool w20_given = PE_parse_boot_argn("fuxiwlanw20", &w20, sizeof(w20));
 	if (qrtr < 0 || qrtr > WL20_QRTR_MAX) {
@@ -1266,10 +1351,12 @@ wl_probe_configure(void)
 		    (((unsigned)w20 & WL20_MONSTAT) && !((unsigned)w20 & WL20_RXRING))) { wl_variant_invalid = true; }
 		else { wl20_bits = (unsigned)w20; }
 		printf("FUXI WLAN: W20 selected qrtr=%d (%s) w20 %#x valid %u\n", qrtr,
+		    wl_w25 ? "CE/HTC/WMI init, then the W25 scan service for iOS" :
 		    wl_w23 ? "CE/HTC/WMI init, then W23 passive scan" : "CE/HTC/WMI init to READY", (unsigned)w20, !wl_variant_invalid);
 		if (wl_w23) {
-			printf("FUXI WLAN: W23 selected passive scan of %s, dwell 150 ms, nothing transmitted; BSSIDs OUI only, pdev %s, htt version %s\n",
+			printf("FUXI WLAN: W23 selected passive scan of %s, %s, nothing transmitted; BSSIDs OUI only, pdev %s, htt version %s\n",
 			    (wl20_bits & WL20_BAND24) ? "13 channels (2.4 GHz only)" : "38 channels",
+			    wl_w25 ? "dwell per request (50..200 ms, else 150)" : "dwell 150 ms",
 			    (wl20_bits & WL20_PDEVCAP) ? "from EXT caps" : "0", (wl20_bits & WL20_HTTVER) ? "asked" : "not asked");
 		}
 		if (wl20_bits & WL26_BITS) {
@@ -1286,6 +1373,11 @@ wl_probe_configure(void)
 		if (wl20_bits & WL20_MONSTAT) {
 			printf("FUXI WLAN: W28 selected: monitor status rings 185/193, 1023 buffers each (w20 0x2000), watched, not reaped; "
 			    "crash line at the COMPLETED timeout and before MHI reset; nothing transmitted\n");
+		}
+		if (wl_w25) {
+			printf("FUXI WLAN: W25 selected scan service for iOS (fuxiwifiios=3): passive only, nothing transmitted; "
+			    "%u s, or %u failed scans in a row, then contain; first scan W24 lines, then one W25 line a scan\n",
+			    WL25_LIFETIME_MS / 1000u, WL25_FAILS_MOST);
 		}
 	} else if (w20_given && w20) {
 		wl_variant_invalid = true;
@@ -3458,7 +3550,7 @@ static bool wl_cmd_done, wl_hello, wl_cap_sent, wl_cap_done, wl_w11_stopping;
 static unsigned wl_w11_error;
 enum { WL12_DISCOVERY, WL12_IND, WL12_HOST, WL12_REQUEST, WL12_RESPOND,
     WL12_READY, WL12_CAP, WL12_DONE, WL14_REGDB, WL14_BDF, WL14_M3, WL14_READY,
-    WL15_INI, WL15_CFG, WL15_MODE, WL15_OBSERVE, WL20_CE, WL21_HTC, WL22_WMI, WL23_SCAN };
+    WL15_INI, WL15_CFG, WL15_MODE, WL15_OBSERVE, WL20_CE, WL21_HTC, WL22_WMI, WL23_SCAN, WL25_SERVICE };
 static unsigned wl12_stage;
 static uint16_t wl12_txn, wl12_msg;
 static bool wl12_reply, wl12_requested, wl12_ready;
@@ -3528,7 +3620,8 @@ wl16_snapshot(const char *phase)
 static int
 wl_w11_fail(const char *reason)
 {
-	if (!wl_w11_error) { printf("FUXI WLAN: %s failure: %s; contain, no retry\n", wl12_stage == WL23_SCAN ? "W23" : wl12_stage == WL22_WMI ? "W22" :
+	if (!wl_w11_error) { printf("FUXI WLAN: %s failure: %s; contain, no retry\n", wl12_stage == WL25_SERVICE ? "W25" :
+	    wl12_stage == WL23_SCAN ? "W23" : wl12_stage == WL22_WMI ? "W22" :
 	    wl12_stage == WL21_HTC ? "W21" : wl12_stage == WL20_CE ? "W20" : wl_w15 && wl12_stage >= WL15_INI ? "W15" : wl_w12 ? "W12" : "W11", reason); }
 	wl_w11_error = 1; wl_w11_ok = false;
 	return 1;
@@ -4801,6 +4894,8 @@ wl14_download(const char *name, struct wl_dma *d, unsigned stage)
  * diagnostics (CHAN_INFO lines, pdev stats requests) inside it, and with a
  * C2c bit (w20 0x100/0x200/0x400) the W26 RX resources: the only other
  * registers are ring 120's of the WBM (wlrx_wbm_ok) and its shadow register.
+ * With qrtr 8 (C3) W23 sets up the same station vdev (and the same W26
+ * resources when a C2c bit is given) and the W25 scan service follows.
  * Per-field provenance and every log line: docs-lanes/wlan-w20.md. */
 static struct wlce wl_ce;
 static struct wlhtc wl_htc;
@@ -4810,7 +4905,9 @@ static unsigned wl_ce_waited, wl_ce_need_eid, wl_ce_need_len, wl_ce_tx_pipe, wl_
 /* W23 (C2): scan state, set up by wl_w23_run, read by the poll and the contain hook.
  * wl23_guard_bad: a poll pass saw the W11 events or guard fail (AMSS/M0, SYSERR,
  * MHI reset, discovery, MEM|MASTER, SMMU CB); containment then sends nothing.
- * wl23_rssi_conv: 0x402b events seen with qrtr 7 (W24 detail line). */
+ * wl23_rssi_conv: 0x402b events seen with qrtr 7 (W24 detail line).
+ * wl23_scan_id: the id of the scan a containment STOP_SCAN names (C2 0xa000,
+ * C3 the service's scan in flight). */
 static struct wlscan wl_scan;
 static bool wl23_scan_sent, wl23_htt_seen, wl23_guard_bad;
 static unsigned wl23_lines, wl23_pdev, wl23_htt_major, wl23_htt_minor, wl23_rssi_conv;
@@ -4840,6 +4937,16 @@ static void wl28_watch(unsigned p, const char *point);
 static void wl28_report(void);
 static void wl28_crash(const char *where);
 static void wl27_report(void);
+static uint32_t wl23_scan_id;
+/* W25 (C3), kept by the helpers above the W25 part (wl_ce_wmi_rx, wl_ce_send,
+ * wl_ce_snapshot); all stay 0 with qrtr 6/7, where wl_scan.want_id is 0 and
+ * wl12_stage never reaches WL25_SERVICE. wl25_other_id: the last scan id of a
+ * SCAN_EVENT the id filter ignored in the scan in flight; wl25_other: such
+ * events in the service; wl25_id_lines: their lines (8 at most); wl25_waits:
+ * HTC credit waits in the service (their line: the first 16, every 100th). */
+static uint32_t wl25_other_id;
+static unsigned wl25_other, wl25_id_lines, wl25_waits;
+static bool wl25_ci_off; /* C2b chan-info lines end with the first W25 scan (wl25_scan) */
 
 /* One register access through the dynamic window: the wl_soc_write
  * discipline without its per-access log line (pci.c:163-182, 1201-1285;
@@ -4890,7 +4997,8 @@ static const struct wlce_io wl_ce_io = { wl_ce_io_wr, wl_ce_io_rd, wl_ce_io_bar_
 static const char *
 wl_ce_lane(void)
 {
-	return wl12_stage == WL23_SCAN ? "W23" : wl12_stage == WL22_WMI ? "W22" : wl12_stage == WL21_HTC ? "W21" : "W20";
+	return wl12_stage == WL25_SERVICE ? "W25" : wl12_stage == WL23_SCAN ? "W23" : wl12_stage == WL22_WMI ? "W22" :
+	    wl12_stage == WL21_HTC ? "W21" : "W20";
 }
 
 /* Failure evidence, RAM only: host ring pointers next to their rdp words,
@@ -4921,6 +5029,10 @@ wl_ce_snapshot(const char *stage)
 		printf("FUXI WLAN: W20 snapshot scan started %u done %u start-failed %u events %u foreign %u chan-info %u mgmt-rx %u frames %u bss %u why %s\n",
 		    wl_scan.started, wl_scan.done, wl_scan.start_failed, wl_scan.events, wl_scan.foreign, wl_scan.ci_start,
 		    wl_scan.mgmt, wl_scan.frames, wl_scan.nbss, wl_scan.why ? wl_scan.why : "-");
+		if (wl_scan.want_id) { /* C3 only: the id filter's count */
+			printf("FUXI WLAN: W20 snapshot scan id %#x: events of another id %u (last %#x), of another vdev %u\n",
+			    wl_scan.want_id, wl_scan.wrong_id, wl25_other_id, wl_scan.wrong_vdev);
+		}
 	}
 	wl_wlfw_diagnostics("W20 snapshot");
 }
@@ -5049,16 +5161,27 @@ wl23_ci_line(void)
  * and never fail the run. In the W23 scan stage
  * SCAN, CHAN_INFO and MGMT_RX feed wl_scan; each new foreign channel gets a
  * line (64 at most), each CHAN_INFO a C2b detail line. In the C2b stats wait
- * UPDATE_STATS feeds wl_stats and gets no line of its own here. */
+ * UPDATE_STATS feeds wl_stats and gets no line of its own here. C3: a
+ * SCAN_EVENT the scan id filter ignores gets a line too, 8 in the whole
+ * service (a target that answers with an id of its own then shows it,
+ * instead of looking silent). */
 static int
 wl_ce_wmi_rx(void *ctx, const uint8_t *msg, uint32_t len)
 {
-	uint32_t id = 0, foreign = wl_scan.foreign, ci = wl_scan.ci_seen;
+	uint32_t id = 0, foreign = wl_scan.foreign, ci = wl_scan.ci_seen, other = wl_scan.wrong_id;
 	(void)ctx;
 	if (wlwmi_rx(&wl_wmi, msg, len, &id)) { return 1; }
 	if (wl_wmi.scan && wlscan_known(id)) {
 		if (wl_scan.foreign != foreign && wl23_lines++ < 64) { printf("FUXI WLAN: W23 scan foreign freq %u\n", wl_scan.ev_freq); }
-		if (wl_scan.ci_seen != ci) { wlrx_note_ci(&wl_rx, wl_scan.ci); wl23_ci_line(); }  /* C2c: D4/D5 notes, no line */
+		/* C2c: D4/D5 notes, no line; C2b: a line (W25: in the first scan only) */
+		if (wl_scan.ci_seen != ci) { wlrx_note_ci(&wl_rx, wl_scan.ci); if (!wl25_ci_off) { wl23_ci_line(); } }
+		if (wl_scan.wrong_id != other) {
+			wl25_other_id = wl_scan.ev_scan_id; wl25_other++;
+			if (wl25_id_lines++ < 8u) {
+				printf("FUXI WLAN: W25 ignored scan event %#x of id %#x (in flight %#x)\n", wl_scan.ev_type,
+				    wl_scan.ev_scan_id, wl_scan.want_id);
+			}
+		}
 		return 0;
 	}
 	if (wl_wmi.stats && wlstats_known(id)) { return 0; }
@@ -5122,7 +5245,9 @@ wl_ce_observe(unsigned what, unsigned ms)
 }
 
 /* One HTC message at a time, as W11: credits first (3 s, wmi.c:435-456),
- * frame, slot copy and publish (wlce_send), then the TX drain. */
+ * frame, slot copy and publish (wlce_send), then the TX drain. In the W25
+ * service (C3, 30 minutes of scans) a wait is said only the first 16 times
+ * and every 100th; wl25_end gives the count. */
 static int
 wl_ce_send(uint32_t eid, const uint8_t *payload, uint32_t len, const char *what)
 {
@@ -5131,8 +5256,10 @@ wl_ce_send(uint32_t eid, const uint8_t *payload, uint32_t len, const char *what)
 	if (eid >= WLHTC_EPS || !wl_htc.ep[eid].used) { return wl_w11_fail("W21 send on an unconnected HTC endpoint"); }
 	if (!wlhtc_has_credits(&wl_htc, eid, total)) {
 		wl_ce_need_eid = eid; wl_ce_need_len = total;
-		printf("FUXI WLAN: %s %s waits for %u HTC credits (has %d)\n", wl_ce_lane(), what,
-		    wlhtc_credits_needed(&wl_htc, total), wl_htc.ep[eid].credits);
+		if (wl12_stage != WL25_SERVICE || ++wl25_waits <= 16u || wl25_waits % 100u == 0) {
+			printf("FUXI WLAN: %s %s waits for %u HTC credits (has %d)\n", wl_ce_lane(), what,
+			    wlhtc_credits_needed(&wl_htc, total), wl_htc.ep[eid].credits);
+		}
 		if (wl_ce_wait(WL20_W_CREDITS, 3000, "HTC credits")) { return 1; }
 	}
 	wl_ce_tx_pipe = wl_htc.ep[eid].ul_pipe;
@@ -6180,6 +6307,277 @@ wl28_report(void)
 	    wl_ms.guard_upper || wl_ms.guard_last || wl_ms.guard_tail || wl_ms.guard_gap ? "; stop; owner review before any further kit" : "");
 }
 
+/* ---- W25: the scan service for iOS (fuxiwlanqrtr=8, C3) ----
+ * W23 sets up the channel list and the station vdev exactly as for qrtr 7;
+ * then, instead of its one scan, this radio-lane thread serves the scan
+ * requests of the iOS side (fuxiwifiios=3) through the handoff of patch 0104
+ * (sys/fuxi_wifi_radio.h; ios_scan_plan.md 2.2-2.5): the channel list goes to
+ * fuxi_wifi_radio_ready, then one request at a time from fuxi_wifi_radio_take:
+ *   - not passive: done EINVAL, nothing sent (nothing is ever transmitted);
+ *     its channels are kept only where the W23 list has them, each once;
+ *     none left: done EINVAL, nothing sent;
+ *   - one START_SCAN of those channels (wlwmi_encode_start_scan_list, PASSIVE
+ *     forced) with the request's dwell when 50..200 ms (the iOS side's own
+ *     rule; 150 otherwise), max_scan_time n x dwell x 3/2 (the iOS side waits
+ *     1000 ms more, so the scan ends or is stopped before it gives up) and a
+ *     scan id of its own (SCAN_EVENTs of another id are ignored, counted and
+ *     said: wl_ce_wmi_rx);
+ *   - every beacon or probe response the MGMT_RX parser keeps goes to
+ *     fuxi_wifi_radio_frame while its RX buffer is in hand (the iOS side parses
+ *     and copies it during that call; nothing points back here);
+ *   - COMPLETED: done 0; START_FAILED or DEQUEUED: done EIO; cancelled by the
+ *     iOS side: STOP_SCAN (L19's values with this scan's id), at most 300 ms
+ *     for its COMPLETED or DEQUEUED, done ECANCELED; no STARTED in 1 s (L19
+ *     mac.c:5046-5053) or no end by max_scan_time + 200 ms (mac.c:5385-5388),
+ *     whichever comes first: the same STOP_SCAN, done ETIMEDOUT. A stop not
+ *     confirmed in those 300 ms: done all the same (the iOS side's margin),
+ *     then, before the next request, polls on for that scan's end until 3 s
+ *     after the STOP_SCAN (L19 waits 3 s, mac.c:4902).
+ * Polls: 1 ms while a scan runs or ends, 10 ms idle; every pass is wl_ce_poll
+ * (the W11 events and guard, RX with each buffer posted again as it is
+ * consumed, TX completions, HTC credit reports). The service ends after
+ * WL25_LIFETIME_MS, when the iOS side has stopped for the boot (idle and
+ * fuxi_wifi_radio_wanted false: its own 3 timeouts in a row, say), after
+ * WL25_FAILS_MOST failed scans in a row (START_FAILED, DEQUEUED, a timeout, a
+ * cancel whose STOP_SCAN is never confirmed) or at the first failure of the
+ * transport, the guard or a command, always into wl5_abort; fw_thread then
+ * reports EXITED and iOS turns Wi-Fi off. Logs: the first scan sent prints
+ * its foreign-channel lines, the first completed one the W24 proof lines
+ * (SSIDs in clear, BSSIDs OUI-only, as C2), every scan one W25 line of counts,
+ * the firmware's reason and scan ids (no SSID, no BSSID): the first 24, every
+ * hundredth and the first 24 failed ones. Elapsed time is mach_absolute_time,
+ * not counted sleeps. Adapted from Linux ath12k mac.c and wmi.c
+ * (BSD-3-Clause-Clear), v6.19, as W23. */
+#define WL25_STARTED_MS 1000u
+#define WL25_OVERRUN_MS 200u
+#define WL25_STOP_MS 300u
+#define WL25_ABORT_MS 3000u
+#define WL25_SAID_MOST 24u
+static unsigned wl25_scans, wl25_sent, wl25_ok, wl25_failed, wl25_cancelled, wl25_refused, wl25_fails, wl25_late;
+static unsigned wl25_handed, wl25_kept, wl25_scan_handed, wl25_scan_kept;
+static uint32_t wl25_seq; /* the request whose frames go to iOS, 0: none */
+static bool wl25_on, wl25_proved;
+static uint64_t wl25_t0;
+static const char *wl25_why;
+
+static uint64_t
+wl25_ms(void)
+{
+	uint64_t ns = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns / 1000000ull;
+}
+
+/* The MGMT_RX hook (wlscan.heard), inside wlce_reap_rx's call for this RX
+ * buffer, before the buffer is posted again. dBm and noise as int16 (the iOS
+ * side clamps them to -127..0); fuxi_wifi_radio_frame returns 0 when kept. */
+static void
+wl25_heard(void *ctx, const uint8_t *frame, uint32_t len, uint32_t mhz, int32_t dbm, int32_t nf)
+{
+	(void)ctx;
+	if (!wl25_seq) { return; }
+	int16_t s = (int16_t)(dbm < -128 ? -128 : dbm > 127 ? 127 : dbm), f = (int16_t)(nf < -128 ? -128 : nf > 127 ? 127 : nf);
+	wl25_scan_handed++; wl25_handed++;
+	if (fuxi_wifi_radio_frame(wl25_seq, frame, len, (uint16_t)mhz, s, f) == 0) { wl25_scan_kept++; wl25_kept++; }
+}
+
+/* A poll pass every 1 ms, at most MS ms from now, until the scan the id
+ * filter names has ended (COMPLETED or DEQUEUED). 1 ended, 0 not, -1
+ * contained. */
+static int
+wl25_wait_end(unsigned ms)
+{
+	uint64_t t0 = wl25_ms();
+	for (;;) {
+		if (wl_ce_poll()) { return -1; }
+		if (wl_scan.done) { return 1; }
+		if (wl25_ms() - t0 >= ms) { return 0; }
+		wl_sleep(1);
+	}
+}
+
+/* STOP_SCAN of the scan in flight (ath12k_scan_stop's values with its id,
+ * mac.c:4883-4896), then at most WL25_STOP_MS for its COMPLETED or DEQUEUED.
+ * 1 confirmed, 0 not (yet), -1 contained. */
+static int
+wl25_stop(void)
+{
+	const uint32_t w[5] = { 0, wl23_scan_id, WLWMI_SCAN_STOP_ONE, WLWMI_VDEV_ID, wl23_pdev };
+	if (wl23_words(WLWMI_CMD_STOP_SCAN, WLWMI_TAG_STOP_SCAN_CMD, w, 5, "WMI STOP_SCAN")) { return -1; }
+	return wl25_wait_end(WL25_STOP_MS);
+}
+
+/* One W25 line: counts, the firmware's reason and scan ids only, never an
+ * SSID or a BSSID; scans 1..24, every 100th and the first 24 failed ones.
+ * ID 0: nothing sent. */
+static void
+wl25_say(unsigned number, uint32_t seq, uint32_t id, uint32_t n, uint32_t dwell, uint64_t ms, int status, const char *how,
+    const char *stop, bool failed)
+{
+	if (number > WL25_SAID_MOST && number % 100u && !(failed && wl25_failed <= WL25_SAID_MOST)) { return; }
+	if (!id) {
+		printf("FUXI WLAN: W25 scan %u seq %u: %s, nothing sent, status %d\n", number, seq, how, status);
+		return;
+	}
+	printf("FUXI WLAN: W25 scan %u seq %u id %#x: %u channels passive dwell %u ms, %s%s after %llu ms, reason %u, status %d; "
+	    "frames %u bss %u, to iOS %u kept %u; scan events %u, of another id %u (last %#x)\n", number, seq, id, n, dwell, how,
+	    stop, (unsigned long long)ms, wl_scan.reason, status, wl_scan.frames, wl_scan.nbss, wl25_scan_handed, wl25_scan_kept,
+	    wl_scan.events, wl_scan.wrong_id, wl25_other_id);
+}
+
+/* One request (see the block comment): 0 served (whatever its status), 1
+ * contained. NLIST: the channels W23 gave the firmware (38, or 13). */
+static int
+wl25_scan(const struct fuxi_wifi_radio_request *rq, uint32_t nlist)
+{
+	static uint8_t cmd[WLCE_BUF];
+	uint16_t mhz[WLSCAN_NCHAN];
+	uint32_t n = 0, len = 0, dwell, max_ms, id;
+	unsigned number = ++wl25_scans;
+	const char *how = "-", *said = "";
+	int status = EIO;
+	bool stop = true, ended = true, failed;
+	uint64_t ms;
+	bool first;
+	for (uint32_t i = 0; i < rq->freq_count && i < FUXI_WIFI_RADIO_FREQS_MOST; i++) {
+		bool again = false;
+		for (uint32_t j = 0; j < n; j++) { again |= mhz[j] == rq->freqs[i]; }
+		if (!again && n < WLSCAN_NCHAN && wlscan_listed(rq->freqs[i], nlist)) { mhz[n++] = rq->freqs[i]; }
+	}
+	if (!rq->passive || !n) {
+		wl25_refused++;
+		fuxi_wifi_radio_done(rq->seq, EINVAL);
+		wl25_say(number, rq->seq, 0, 0, 0, 0, EINVAL, !rq->passive ? "not passive, refused" : "no listed channel, refused", "",
+		    false);
+		return 0;
+	}
+	dwell = rq->dwell_ms >= 50u && rq->dwell_ms <= 200u ? rq->dwell_ms : WLSCAN_DWELL_PASSIVE;
+	max_ms = n * dwell * 3u / 2u;
+	id = WLSCAN_ID_FIRST + wl25_sent % (WLSCAN_ID_LAST - WLSCAN_ID_FIRST + 1u);
+	if (wlwmi_encode_start_scan_list(mhz, n, id, dwell, max_ms, cmd, sizeof(cmd), &len)) {
+		return wl_w11_fail("W25 START_SCAN encode bounds");
+	}
+	first = ++wl25_sent == 1u;
+	wlscan_init(&wl_scan, n);
+	wl_scan.want_id = id;
+	wl_scan.heard = wl25_heard;
+	wl25_seq = rq->seq;
+	wl25_scan_handed = wl25_scan_kept = 0;
+	wl25_other_id = 0;
+	wl23_scan_id = id;
+	wl23_scan_sent = true; /* containment asks for STOP_SCAN unless this scan is over */
+	if (wl_ce_send(wl_htc.wmi_eid, cmd, len, "WMI START_SCAN")) { return 1; }
+	uint64_t t0 = wl25_ms(), t;
+	for (;;) {
+		if (wl_ce_poll()) { return 1; }
+		t = wl25_ms() - t0;
+		if (first && wl_scan.started) { wl26_watch(WLRX_P_STARTED); }  /* C2c: first scan only; each watch once */
+		if (first && wl_scan.started && wl_scan.foreign >= (wl_scan.nchan + 1u) / 2u) { wl26_watch(WLRX_P_MID); }
+		if (wl_scan.start_failed) { status = EIO; how = "start failed"; stop = false; break; }
+		if (wl_scan.done) { status = wl_scan.dequeued ? EIO : 0; how = wl_scan.dequeued ? "dequeued" : "completed"; stop = false; break; }
+		if (fuxi_wifi_radio_cancelled(rq->seq)) { status = ECANCELED; how = "cancelled"; break; }
+		if (t >= max_ms + WL25_OVERRUN_MS || (!wl_scan.started && t >= WL25_STARTED_MS)) {
+			status = ETIMEDOUT; how = wl_scan.started ? "no end by max + 200 ms" : "no STARTED";
+			break;
+		}
+		wl_sleep(1);
+	}
+	if (stop) {
+		int s = wl25_stop();
+		if (s < 0) { return 1; }
+		ended = s == 1;
+		said = ended ? ", stop confirmed" : ", stop not confirmed";
+	}
+	wl25_seq = 0;
+	ms = wl25_ms() - t0;
+	fuxi_wifi_radio_done(rq->seq, status);
+	if (!ended) {
+		/* iOS has its answer; the next START_SCAN waits for this scan's end, 3 s after its STOP_SCAN at most */
+		int s = wl25_wait_end(WL25_ABORT_MS - WL25_STOP_MS);
+		if (s < 0) { return 1; }
+		ended = s == 1;
+		if (ended) { wl25_late++; said = ", stop confirmed late"; }
+	}
+	failed = status != 0 && !(status == ECANCELED && ended);
+	if (status == 0) { wl25_ok++; wl25_fails = 0; }
+	else if (!failed) { wl25_cancelled++; }
+	else { wl25_failed++; wl25_fails++; }
+	if (first) {
+		wl23_lines = 64;  /* foreign-channel lines: the first scan only */
+		wl25_ci_off = true;  /* C2b chan-info lines likewise (the C2c CHAN_INFO notes go on) */
+		wl26_watch(WLRX_P_COMPLETED);  /* C2c: as soon as the first scan ended, before the W24 lines */
+	}
+	if (status == 0 && !wl25_proved) { wl25_proved = true; wl24_report(); }
+	wl25_say(number, rq->seq, id, n, dwell, ms, status, how, said, failed);
+	if (first) {
+		/* C2c, first scan only: the W26 lines as after the qrtr 7 scan, without
+		 * the C2b stats (qrtr 7 only); the D5 hint when it heard nothing */
+		wl23_ci_flush();
+		wl26_heard_none = status == 0 && !wl_scan.frames && (wl20_bits & WL26_BITS);
+		wl26_report();
+	}
+	return 0;
+}
+
+/* The service's last line, from wl_ce_contain (every end). */
+static void
+wl25_end(void)
+{
+	if (!wl25_on) { return; }
+	wl25_on = false;
+	/* two lines: the console keeps 254 bytes of a line (C2b's rule) */
+	printf("FUXI WLAN: W25 service end: %s after %llu s; scans %u (completed %u, failed %u, cancelled %u, refused %u), "
+	    "frames to iOS %u kept %u; stops confirmed late %u, scan events of another id %u, credit waits %u;\n", wl25_why,
+	    (unsigned long long)((wl25_ms() - wl25_t0) / 1000u), wl25_scans, wl25_ok, wl25_failed, wl25_cancelled, wl25_refused,
+	    wl25_handed, wl25_kept, wl25_late, wl25_other, wl25_waits);
+	printf("FUXI WLAN: W25 service end rings: rx CE1 %u/%u CE2 %u/%u tx CE3 %u/%u credits %d\n", wl_ce.pipe[1].posted,
+	    wl_ce.pipe[1].reaped, wl_ce.pipe[2].posted, wl_ce.pipe[2].reaped, wl_ce.pipe[3].posted, wl_ce.pipe[3].reaped,
+	    wl_htc.wmi_eid < WLHTC_EPS ? wl_htc.ep[wl_htc.wmi_eid].credits : -1);
+}
+
+static int
+wl_w25_run(uint32_t n)
+{
+	struct fuxi_wifi_radio_request rq;
+	uint16_t list[WLSCAN_NCHAN];
+	uint32_t low = 0;
+	wl12_stage = WL25_SERVICE;
+	wl25_scans = wl25_sent = wl25_ok = wl25_failed = wl25_cancelled = wl25_refused = wl25_fails = wl25_late = 0;
+	wl25_handed = wl25_kept = wl25_scan_handed = wl25_scan_kept = 0;
+	wl25_other = wl25_id_lines = wl25_waits = 0; wl25_other_id = 0; wl25_ci_off = false;
+	wl25_seq = 0; wl25_proved = false; wl25_why = "a failure (above)";
+	for (uint32_t i = 0; i < n && i < WLSCAN_NCHAN; i++) { list[i] = (uint16_t)wlscan_chan(i); low += list[i] < 3000u; }
+	/* The channels W23 gave the firmware: C2 records no regulatory event to intersect with (CC_EXT is logged only). */
+	fuxi_wifi_radio_ready(list, n);
+	wl25_on = true;
+	wl25_t0 = wl25_ms();
+	printf("FUXI WLAN: W25 service ready: %u channels passive to iOS (2.4 GHz %u, 5 GHz %u), lifetime %u s\n", n, low,
+	    n - low, WL25_LIFETIME_MS / 1000u);
+	for (;;) {
+		if (wl_ce_poll()) { return 1; }
+		if (wl25_ms() - wl25_t0 >= WL25_LIFETIME_MS) {
+			wl25_why = "lifetime over";
+			printf("FUXI WLAN: W25 complete: lifetime over (%u s); stop/contain\n", WL25_LIFETIME_MS / 1000u);
+			return 0;
+		}
+		if (!fuxi_wifi_radio_take(&rq)) {
+			/* STOPPED is terminal on the iOS side: no request can come this boot */
+			if (!fuxi_wifi_radio_wanted()) {
+				wl25_why = "the iOS side stopped";
+				printf("FUXI WLAN: W25 complete: the iOS side stopped; stop/contain\n");
+				return 0;
+			}
+			wl_sleep(10);
+			continue;
+		}
+		if (wl25_scan(&rq, n)) { return 1; }
+		if (wl25_fails >= WL25_FAILS_MOST) {
+			wl25_why = "3 failed scans in a row";
+			return wl_w11_fail("W25 3 failed scans in a row");
+		}
+	}
+}
+
 static int
 wl_w23_run(void)
 {
@@ -6245,6 +6643,7 @@ wl_w23_run(void)
 		if (wl23_words(WLWMI_CMD_STA_POWERSAVE_MODE, WLWMI_TAG_STA_POWERSAVE_MODE_CMD, mode, 2, "WMI STA_POWERSAVE_MODE")) { return 1; }
 		printf("FUXI WLAN: W23 vdev 0 nss %u, sta ps rx-wake 0 tx-wake 1 pspoll 0, ps mode off\n", nss);
 	}
+	if (wl_w25) { return wl_w25_run(n); } /* C3: the scan service instead of the one scan below */
 	if (wlwmi_encode_start_scan(n, max_ms, cmd, sizeof(cmd), &len)) { return wl_w11_fail("W23 START_SCAN encode bounds"); }
 	wl23_scan_sent = true; /* from here on containment asks for STOP_SCAN unless the scan is over */
 	printf("FUXI WLAN: W23 scan start id %#x vdev 0 channels %u passive dwell %u ms max %u ms events %#x flags %#x\n",
@@ -6300,7 +6699,7 @@ static void
 wl23_stop_scan(void)
 {
 	static uint8_t cmd[4 + WLWMI_STOP_SCAN_BYTES], frame[WLCE_BUF];
-	const uint32_t w[5] = { 0, WLWMI_SCAN_ID, WLWMI_SCAN_STOP_ONE, WLWMI_VDEV_ID, wl23_pdev };
+	const uint32_t w[5] = { 0, wl23_scan_id, WLWMI_SCAN_STOP_ONE, WLWMI_VDEV_ID, wl23_pdev };
 	uint32_t len = 0, total = 0;
 	unsigned t = 0;
 	if (!wl23_scan_sent) { return; }
@@ -6413,7 +6812,7 @@ wl_w20_run(void)
 	wl_ce_started = true; wl_ce_waited = wl_ce_logged = 0;
 	bzero(&wl_htc, sizeof(wl_htc)); bzero(&wl_wmi, sizeof(wl_wmi));
 	wl23_scan_sent = wl23_guard_bad = false; /* C2: no STOP_SCAN in containment unless W23 sent START_SCAN */
-	wl23_rssi_conv = 0;
+	wl23_rssi_conv = 0; wl23_scan_id = WLWMI_SCAN_ID; wl25_on = false;
 	if ((wl20_bits & WL20_MRRS128) && wl_ce_mrrs128()) { return 1; }
 	if (wl_ce_alloc() || wl_ce_init_rings()) { return 1; }
 	if (wl26_setup()) { return 1; }  /* C2c: W26 arenas, idle list, refill ring; silent without 0x100/0x200 */
@@ -6434,13 +6833,14 @@ wl_w20_run(void)
  * proven, else it stays quarantined (wl5_abort). C2's best-effort STOP_SCAN
  * goes in this function before the latch (the latch refuses every send): one
  * bounded send and a short TX drain whose failure never fails the abort
- * (wl23_stop_scan). */
+ * (wl23_stop_scan). C3 first prints the W25 service's last line. */
 static void
 wl_ce_contain(unsigned step)
 {
 	(void)step;
 	if (!wl_ce_started) { return; }
 	wl_ce_started = false;
+	if (wl_w25) { wl25_end(); }  /* C3: the service's last line, before any W26 or W23 containment line */
 	wl26_contain();  /* C2c: W26 host writes and WBM access off first; silent without a W26 arena */
 	if (wl_w23) { wl23_stop_scan(); } /* before the latch: it refuses every send */
 	wl_ce.stopping = true;
@@ -7241,7 +7641,7 @@ static void
 fw_thread(void *arg, wait_result_t result)
 {
 	unsigned limit = (unsigned)(uintptr_t)arg;
-	unsigned mapped = 0;
+	unsigned mapped = 0, detail = 0xffffu;
 	(void)result;
 	for (unsigned i = 0; i < FW_NWIN; i++) {
 		if ((!wl_cnss || wl_variant_invalid) &&
@@ -7257,8 +7657,13 @@ fw_thread(void *arg, wait_result_t result)
 	printf("FUXI WLAN: mapped %llu bytes in %u windows; running steps 1..%u\n",
 	    fw_mapped_bytes, mapped, limit);
 	fw_run(limit);
+	detail = wl4_report[3] & 0xffffu; /* fw_run's step << 8 | reason, 0 when every step passed */
 out:
 	printf("FUXI WLAN: thread exit\n");
+	/* C3: every exit, once, after fw_run's containment (wl5_abort on every
+	 * path that touched the device; 0xffff: no step ran): the iOS side's scan
+	 * handoff goes STOPPED and iOS reports Wi-Fi off. Prints nothing here. */
+	fuxi_wifi_radio_stopped(FUXI_WIFI_RADIO_EXITED | detail);
 	(void)thread_terminate(current_thread());
 	thread_block(THREAD_CONTINUE_NULL);
 }
@@ -7284,16 +7689,25 @@ fuxi_wlan_init(void)
 	 * default to the salami Android files, and rh_send_request refuses any
 	 * OFF vote, any mode but 7 or other address (wl_salami_vote_ok). Both
 	 * knobs, like every fuxiwlan* knob, may come from ADT /defaults (wl_arg).
+	 * C3: fuxiwlansalami=2 is the same gate plus the profile defaults of
+	 * wl_arg_profile, set here before any other knob is read; the refusal
+	 * line is unchanged (it names =1, the gate both values open).
 	 */
 	if (requested) {
 		int salami = 0;
-		if (!PE_parse_boot_argn("fuxiwlansalami", &salami, sizeof(salami)) || salami != 1) {
+		if (!PE_parse_boot_argn("fuxiwlansalami", &salami, sizeof(salami)) || (salami != 1 && salami != 2)) {
 			printf("FUXI WLAN: refused on salami (fuxiwlan=%d needs fuxiwlansalami=1)\n", arg);
-			requested = false;
+			fuxi_wifi_radio_stopped(FUXI_WIFI_RADIO_REFUSED | 1); /* C3: iOS reports Wi-Fi off */
+			return;
 		}
+		wl_salami_profile = salami;
 	}
 #endif
+	/* C3: these returns and the thread's exit (fw_thread) tell the iOS
+	 * side's scan handoff why there is no radio; without fuxiwifiios=3 that
+	 * stores one word there, and nothing is printed. */
 	if (!requested) {
+		fuxi_wifi_radio_stopped(FUXI_WIFI_RADIO_NOT_REQUESTED);
 		return;
 	}
 	unsigned limit = (arg == 1 || arg > (int)WL5_STEPS) ? WL5_STEPS : (unsigned)arg;
@@ -7312,17 +7726,20 @@ fuxi_wlan_init(void)
 		if (invalid || (wl_seq_flags & WL_O_CYCLERAILS)) {
 			printf("FUXI WLAN: refused on salami before any access (invalid selector %u, cyclerails %u)\n",
 			    invalid, !!(wl_seq_flags & WL_O_CYCLERAILS));
+			fuxi_wifi_radio_stopped(FUXI_WIFI_RADIO_REFUSED | 2);
 			return;
 		}
 	}
-	printf("FUXI WLAN: salami K-W1 gate open (fuxiwlansalami=1, fuxiwlanrails %u)\n", wl_rails_variant);
+	printf("FUXI WLAN: salami K-W1 gate open (fuxiwlansalami=%d, fuxiwlanrails %u)\n", wl_salami_profile, wl_rails_variant);
 #endif
 	printf("FUXI WLAN: enabled (fuxiwlan=%d), WCN7850 power-up + PCIe0 + MHI firmware, limit %u\n",
 	    arg, limit);
+	fuxi_wifi_radio_starting();
 	if (kernel_thread_start(fw_thread, (void *)(uintptr_t)limit, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	} else {
 		printf("FUXI WLAN: kernel_thread_start failed\n");
+		fuxi_wifi_radio_stopped(FUXI_WIFI_RADIO_NO_THREAD);
 	}
 }
 #endif /* FUXI */
