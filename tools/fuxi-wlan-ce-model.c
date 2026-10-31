@@ -375,7 +375,9 @@ static unsigned fw_cmd_n;
  * 0x11 an HTT PPDU_STATS_CFG, 0x1d LRO) */
 static uint32_t fw_w29_log[16];
 static unsigned fw_w29_n, fw_w29_at;
-struct mbeacon { unsigned idx; uint32_t rx_channel, snr, status, chan_freq, mode, len; uint8_t f[400]; };
+struct mbeacon { unsigned idx; uint32_t rx_channel, snr, status, chan_freq, mode, len, splits; uint8_t f[400]; };   /* W25f: splits: heard only in the full splits whose bit (1 << (n - 1)) is set, 0 = in all */
+static unsigned m_split_no;   /* W25f: the full splits started so far (each 2.4 GHz-first START_SCAN of a split counts one) */
+static bool m_bcn_in(const struct mbeacon *b) { return !b->splits || (m_split_no >= 1u && m_split_no <= 32u && ((b->splits >> (m_split_no - 1u)) & 1u)); }
 static struct mbeacon beacons[96];
 static unsigned n_beacons;
 
@@ -1873,7 +1875,7 @@ fw_c3_script(unsigned mode, uint32_t id, uint32_t n, uint32_t dwell)
 	for (uint32_t i = 0; i < n && i < stop_at; i++) {
 		uint32_t t0 = 5 + dwell * i, k = 0, heard = 0, ix = 0;
 		while (ix < 38 && m_chan(ix) != fw_c3_chan[i]) { ix++; }
-		for (unsigned j = 0; j < n_beacons; j++) { heard += beacons[j].idx == ix; }
+		for (unsigned j = 0; j < n_beacons; j++) { heard += beacons[j].idx == ix && m_bcn_in(&beacons[j]); }
 		/* C2c: C2c's RXDMA frames in the first W25 scan only (its buffers never come back); C3 on the split: the
 		 * first request, both its parts */
 		if (C.rx_frames && fw_c3_first_req()) { act(now + t0 + 3, A_FRAMES, ix < 13 ? 0u : 1u, C.rx_frames); }
@@ -1882,7 +1884,7 @@ fw_c3_script(unsigned mode, uint32_t id, uint32_t n, uint32_t dwell)
 		fw_scan_event_id(1u << 3, 0, fw_c3_chan[i], 0, id, t0);
 		fw_chan_info(0, fw_c3_chan[i], -96, ix, heard, t0 + 1);
 		for (unsigned j = 0; j < n_beacons; j++) {
-			if (beacons[j].idx == ix && deliver_mgmt) {
+			if (beacons[j].idx == ix && deliver_mgmt && m_bcn_in(&beacons[j])) {
 				fw_mgmt_rx(&beacons[j], t0 + 2 + k++);
 #if !defined(FUXI_WLAN_E2E)
 				if (beacons[j].mode == 0 && h_oracle) { h_mh_add(&beacons[j]); }
@@ -1911,7 +1913,7 @@ fw_c3_start(const uint8_t *pl, uint32_t plen, unsigned need)
 	CHECK(fw_c2_step == 7 || fw_c2_step == 8, "W25 START_SCAN before the vdev was set up");
 	CHECK(n >= 1 && n <= 38 && plen == 4 + 160 + 4 + 4 * n + 4 + 4 + 8 + 4, "W25 START_SCAN length / channel count");
 	CHECK(id >= 0xa001 && id <= 0xafff && id != fw_c3_id, "W25 scan id not fresh in 0xa001..0xafff");
-	CHECK(dwell >= 50 && dwell <= 200, "W25 passive dwell outside 50..200");
+	CHECK((dwell >= 50 && dwell <= 200) || (dwell == 300 && (wl23_chmask & WL23_CH_LONGPRE)), "W25 passive dwell outside 50..200 (300 only with fuxiwlanch bit 30: the prescan alone, checked below)");
 	want[0] = 0x4du << 16 | 156u; want[1] = id; want[2] = 1; want[5] = 0x5f; want[6] = 50; want[7] = dwell; want[8] = 50;
 	want[9] = 500; want[13] = n * dwell * 3 / 2; want[14] = 5; want[15] = 0x11; want[17] = n; want[18] = 1; want[37] = 70;
 	want[38] = 70; want[35] = m_ext;
@@ -1939,7 +1941,7 @@ fw_c3_start(const uint8_t *pl, uint32_t plen, unsigned need)
 	CHECK(h_part_off == 0 || (fw_c3_ended_at != ~0ull && now >= fw_c3_ended_at && fw_c3_stop_id != fw_c3_id),
 	    "the 5 GHz START_SCAN before the 2.4 GHz part's COMPLETED");
 	for (unsigned i = 0; i < n; i++) { CHECK(fw_c3_chan[i] == h_expect[h_part_off + i], "W25 START_SCAN is not the kept list's channels"); }
-	if (h_part_off == 0) { h_mh_n = 0; }   /* a new full split: the model's copy of the cache starts again */
+	if (h_part_off == 0) { h_mh_n = 0; m_split_no++; }   /* a new full split: the model's copy of the cache starts again */
 	h_part_off += n;
 #endif
 	fw_c3_scans++; fw_scan_cmds++; fw_c2_step = 8;
@@ -2417,7 +2419,8 @@ static bool h_req_valid, h_must_hit, h_must_scan;
 /* the model's own copy of the last full split's frames, one a BSSID (newest wins; past 64 a stronger replaces the
  * weakest), and when its last COMPLETED was sent. h_oracle off: only counts are checked (scenarios whose firmware
  * view sends frames the parser drops) */
-static struct { uint8_t bssid[6]; uint16_t mhz; int16_t rssi; } h_mh[64];
+struct h_mf { uint8_t bssid[6]; uint16_t mhz; int16_t rssi; };
+static struct h_mf h_mh[64];
 static unsigned h_mh_lost, h_hits, h_splits;
 static bool h_cache_valid, h_oracle = true;
 static uint64_t h_cache_at;
@@ -2425,7 +2428,7 @@ static uint64_t h_cache_at;
  * (m_stale_phase, set by a scenario just before it calls wl25_stale_serve) answers from the last COMPLETED full split's frames: h_sh, a
  * copy taken whenever the model's cache becomes valid. */
 static bool h_prescan, m_stale_phase;
-static struct { uint8_t bssid[6]; uint16_t mhz; int16_t rssi; } h_sh[64];
+static struct h_mf h_sh[64];
 static unsigned h_sh_n;
 
 static void
@@ -2488,7 +2491,7 @@ fuxi_wifi_radio_ready(const uint16_t *freqs, unsigned count)
 			h_exp24 += f < 3000u;
 		}
 		h_prescan = true; h_req_passive = true; h_req_valid = true; h_req_n = 0; h_must_hit = false; h_must_scan = true;
-		h_expect_dwell = 150;
+		h_expect_dwell = (wl23_chmask & WL23_CH_LONGPRE) ? 300 : 150;   /* W25f: bit 30, the prescan alone */
 	}
 }
 
@@ -2532,12 +2535,30 @@ h_in_req(unsigned mhz)
 	return false;
 }
 
-/* W25d: the model's copy of the cache just became valid (a completed full split): keep its frames as the stale cache's */
+/* W25d: the model's copy of the cache just became valid (a completed full split): its frames go to the stale cache. W25f: MERGED into it, the
+ * model's own oracle of the merged table (fuxiwlanch bit 29): one entry per BSSID, the newest split's frame winning, past 64 BSSIDs the
+ * strongest kept; h_sh_new: the BSSIDs this split added. */
+static unsigned h_sh_new;
 static void
 h_sh_copy(void)
 {
-	memcpy(h_sh, h_mh, sizeof(h_sh));
-	h_sh_n = h_mh_n;
+	h_sh_new = 0;
+	for (unsigned k = 0; k < h_mh_n; k++) {
+		unsigned i = 0;
+		while (i < h_sh_n && memcmp(h_sh[i].bssid, h_mh[k].bssid, 6)) { i++; }
+		if (i == h_sh_n) {
+			if (h_sh_n < 64) {
+				h_sh_n++;
+			} else {
+				unsigned w = 0;
+				for (unsigned j = 1; j < 64; j++) { w = h_sh[j].rssi < h_sh[w].rssi ? j : w; }
+				if (h_mh[k].rssi <= h_sh[w].rssi) { continue; }
+				i = w;
+			}
+			h_sh_new++;
+		}
+		h_sh[i] = h_mh[k];
+	}
 }
 
 bool
@@ -2601,9 +2622,9 @@ int
 fuxi_wifi_radio_frame(uint32_t seq, const uint8_t *frame, size_t length, uint16_t rx_mhz, int16_t rssi_dbm, int16_t noise_dbm)
 {
 	CHECK(seq && seq == h_live, "a frame for a request not in flight");
-	CHECK(m_stale_phase ? (frame >= (const uint8_t *)wl25_stale && frame + length <= (const uint8_t *)(wl25_stale + WL25_CACHE_BSS)) :
+	CHECK(m_stale_phase || (wl23_chmask & WL23_CH_PRESCAN) ? (frame >= (const uint8_t *)wl25_stale && frame + length <= (const uint8_t *)(wl25_stale + WL25_CACHE_BSS)) :
 	    (frame >= (const uint8_t *)wl25_cache && frame + length <= (const uint8_t *)(wl25_cache + WL25_CACHE_BSS)),
-	    m_stale_phase ? "a frame not from the stale copy" : "a frame not from the result cache");
+	    m_stale_phase || (wl23_chmask & WL23_CH_PRESCAN) ? "a frame not from the stale copy (the merged table)" : "a frame not from the result cache");
 	CHECK(length >= 36 && length <= WLCE_BUF, "frame length");
 	CHECK(h_req_valid && h_in_req(rx_mhz), "a frame heard outside the request's channels, or for a refused request");
 	h_cur_frames++;
@@ -2652,16 +2673,19 @@ fuxi_wifi_radio_done(uint32_t seq, int status)
 			CHECK(h_cache_valid, "done(0) with nothing sent and no cache");
 			h_hits++;
 		}
-		/* the frames: the cache's, of the request's channels, once each */
-		for (unsigned i = 0; i < h_mh_n; i++) { want += h_in_req(h_mh[i].mhz); }
+		/* the frames: the cache's, of the request's channels, once each (W25f, fuxiwlanch bit 29: the merged table's) */
+		const bool mg = (wl23_chmask & WL23_CH_PRESCAN) != 0;
+		const unsigned tn = mg ? h_sh_n : h_mh_n;
+		const struct h_mf *tb = mg ? h_sh : h_mh;
+		for (unsigned i = 0; i < tn; i++) { want += h_in_req(tb[i].mhz); }
 		if (h_oracle) {
 			CHECK(h_cur_frames == want, "frames handed over differ from the cache's frames of the request's channels");
 			if (h_live_idx != H_AUTO) {
-				for (unsigned i = 0; i < h_mh_n; i++) {
+				for (unsigned i = 0; i < tn; i++) {
 					unsigned found = 0;
-					if (!h_in_req(h_mh[i].mhz)) { continue; }
+					if (!h_in_req(tb[i].mhz)) { continue; }
 					for (unsigned k = h_fr_n - h_cur_frames; k < h_fr_n; k++) {
-						found += !memcmp(h_fr[k].bssid, h_mh[i].bssid, 6) && h_fr[k].mhz == h_mh[i].mhz && h_fr[k].rssi == h_mh[i].rssi;
+						found += !memcmp(h_fr[k].bssid, tb[i].bssid, 6) && h_fr[k].mhz == tb[i].mhz && h_fr[k].rssi == tb[i].rssi;
 					}
 					CHECK(found == 1, "a cached frame of the request's channels was not handed over (or twice, or changed)");
 				}
@@ -3066,6 +3090,7 @@ reset(void)
 	/* C3 */
 	wl_w25 = false; sleeps_1 = sleeps_10 = 0;
 	fw_tag = fw_dead_tag = 0; fw_dropped = 0; starved_since = 0;
+	m_split_no = 0;
 	fw_c3_scans = fw_c3_mode_now = 0; fw_c3_id = fw_c3_n = fw_c3_dwell = fw_c3_max = fw_c3_flags = fw_c3_stop_id = 0;
 	fw_c3_start_at = fw_c3_stop_at = 0; h_expect_n = 0; h_expect_dwell = 0; h_req_passive = false;
 	h_exp24 = h_part_off = 0; fw_c3_ended_at = ~0ull;   /* C3 on the split */
@@ -8200,6 +8225,489 @@ s_w25d_stale(void)
 	     "EINVAL, until the iOS side stops, nothing sent to the device and no ring touched; the request the lane died on is answered first; with no "
 	     "completed split, without the bit, or with the iOS side already stopped the service does nothing and says nothing; the lifetime end counts");
 }
+/* ---- W25f: the per-part RX ring census (always on with qrtr 8), the merged results table (fuxiwlanch bit 29) and the long prescan (bit 30) ----
+ * The census lines are compared with numbers the model works out for itself: the first request's 5 GHz part ends right before the first scan's W26/W27/W28
+ * "completed" watches (no poll, no sleep between the two), so its census must be the watches' numbers to the digit; the part that dies is compared with the
+ * model's own ring words (frozen once the firmware went silent). The merged table is compared, request by request, with the model's own union of the
+ * splits it saw complete (h_sh_copy), by done(). */
+#define F_NUM 28   /* the census numbers in line order: refill tp taken left; mac0 hp tp avail; mac1 hp tp avail; err hp fill; idle hp tp avail;
+                    * reo rel exc dst ret; mon0 hp tp taken left written; mon1 hp tp taken left written */
+
+/* the census of the NTH part (0-based, in the log's order) as numbers; EX gets the text after "exhausted" */
+static bool
+f_cen_get(unsigned nth, unsigned *v, char *ex, size_t exsz, const char **l1p)
+{
+	const char *l1 = d_line("FUXI WLAN: W25 census part ", 2 * nth), *l2 = d_line("FUXI WLAN: W25 census part ", 2 * nth + 1), *a, *b, *nl;
+	int n1 = 0, n2 = 0;
+	char fmt[1];
+	(void)fmt;
+	if (!l1 || !l2) { return false; }
+	if (l1p) { *l1p = l1; }
+	a = strstr(l1, "): refill tp "); b = strstr(l2, ": reo rel ");
+	if (!a || !b) { return false; }
+	if (sscanf(a, "): refill tp %u taken %u left %u mac0 hp %u tp %u avail %u mac1 hp %u tp %u avail %u err hp %u fill %u idle hp %u tp %u avail %u%n",
+	    &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9], &v[10], &v[11], &v[12], &v[13], &n1) != 14 || a[n1] != '\n') { return false; }
+	if (sscanf(b, ": reo rel %u exc %u dst %u ret %u; mon0 hp %u tp %u taken %u left %u written %u mon1 hp %u tp %u taken %u left %u written %u; exhausted%n",
+	    &v[14], &v[15], &v[16], &v[17], &v[18], &v[19], &v[20], &v[21], &v[22], &v[23], &v[24], &v[25], &v[26], &v[27], &n2) != 14) { return false; }
+	nl = strchr(b + n2, '\n');
+	if (!nl || (size_t)(nl - (b + n2)) >= exsz) { return false; }
+	memcpy(ex, b + n2, (size_t)(nl - (b + n2))); ex[nl - (b + n2)] = 0;
+	return true;
+}
+
+/* the first scan's "completed" watches as the same 28 numbers; WX gets the exhausted words of the four watch lines joined */
+static bool
+f_watch_get(unsigned *v, char *ex, size_t exsz)
+{
+	const char *r = d_line("FUXI WLAN: W26 rx watch completed ", 0), *i = d_line("FUXI WLAN: W26 idle watch completed ", 0),
+	    *o = d_line("FUXI WLAN: W27 reo watch completed ", 0), *m = d_line("FUXI WLAN: W28 mon watch completed ", 0);
+	char e1[48] = "", e2[16] = "", e3[16] = "";
+	unsigned rel, exc, dst, ret;
+	if (!r || !i || !o || !m) { return false; }
+	if (sscanf(r, "FUXI WLAN: W26 rx watch completed refill tp %u taken %u left %u mac0 hp %u tp %u avail %u mac1 hp %u tp %u avail %u err hp %u fill %u;",
+	    &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9], &v[10]) != 11) { return false; }
+	if (sscanf(i, "FUXI WLAN: W26 idle watch completed hp %u tp %u avail %u;", &v[11], &v[12], &v[13]) != 3) { return false; }
+	if (sscanf(o, "FUXI WLAN: W27 reo watch completed reaped rel %u exc %u dst %u; returned %u", &rel, &exc, &dst, &ret) != 4) { return false; }
+	v[14] = rel; v[15] = exc; v[16] = dst; v[17] = ret;
+	if (sscanf(m, "FUXI WLAN: W28 mon watch completed mon0 hp %u tp %u taken %u left %u written %u mon1 hp %u tp %u taken %u left %u written %u;",
+	    &v[18], &v[19], &v[20], &v[21], &v[22], &v[23], &v[24], &v[25], &v[26], &v[27]) != 10) { return false; }
+	{   /* the exhausted words: rx line "; exhausted none|refill mac0 ..." (+ "; refill-empty"), idle "exhausted idle|none", mon "exhausted mon0 mon1|mon0|mon1|none" */
+		const char *x = strstr(r, "; exhausted"), *nl = strchr(r, '\n'), *y = strstr(i, "; exhausted "), *z = strstr(m, "; exhausted ");
+		if (!x || !y || !z) { return false; }
+		snprintf(e1, sizeof(e1), "%.*s", (int)((nl ? (size_t)(nl - x) : strlen(x)) - 11), x + 11);
+		snprintf(e2, sizeof(e2), "%.*s", (int)(strcspn(y + 12, "\n")), y + 12);
+		snprintf(e3, sizeof(e3), "%.*s", (int)(strcspn(z + 12, "\n")), z + 12);
+		snprintf(ex, exsz, "%s|%s|%s", e1, e2, e3);
+	}
+	return true;
+}
+
+/* the numbers the model works out from its own ring words (the firmware's side of the SRING pointers, the WBM idle ring registers) and the host's
+ * REO / monitor counters, for the moment the firmware went silent and nothing moved any more */
+static void
+f_oracle(unsigned *v)
+{
+	const unsigned rtp = wl_rx.rdp[160], mh[2] = { wl_rx.wrp[1], wl_rx.wrp[9] }, mt[2] = { wl_rx.rdp[161], wl_rx.rdp[169] }, ehp = wl_rx.rdp[186];
+	const unsigned head = wl_rd.refill_hp, mtp[2] = { wl_rx.rdp[185], wl_rx.rdp[193] };
+	v[0] = rtp; v[1] = rtp / 2u; v[2] = ((head + 8192u - rtp) % 8192u) / 2u;
+	for (unsigned m = 0; m < 2; m++) { v[3 + 3 * m] = mh[m]; v[4 + 3 * m] = mt[m]; v[5 + 3 * m] = ((mh[m] + 4096u - mt[m]) % 4096u) / 2u; }
+	v[9] = ehp; v[10] = ehp / 8u;
+	v[11] = m_idle_hp; v[12] = m_idle_tp; v[13] = ((m_idle_hp + 65536u - m_idle_tp) % 65536u) / 2u;
+	v[14] = wl_rd.ring[0].reaped; v[15] = wl_rd.ring[1].reaped;
+	v[16] = 0; for (unsigned n = 2; n < 10; n++) { v[16] += wl_rd.ring[n].reaped; }
+	v[17] = wl_rd.returned;
+	for (unsigned m = 0; m < 2; m++) {
+		v[18 + 5 * m] = wl_ms.hp[m]; v[19 + 5 * m] = mtp[m]; v[20 + 5 * m] = mtp[m] / 2u; v[21 + 5 * m] = ((wl_ms.hp[m] + 2048u - mtp[m]) % 2048u) / 2u;
+		v[22 + 5 * m] = wlms_written(&wl_ms, m);
+	}
+}
+
+static bool
+f_has(const char *s, const char *word)
+{
+	const size_t n = strlen(word);
+	for (const char *p = s; (p = strstr(p, word)) != NULL; p++) {
+		if ((p == s || p[-1] == ' ' || p[-1] == '|' || p[-1] == ';') && (p[n] == 0 || p[n] == ' ' || p[n] == '|' || p[n] == ';')) { return true; }
+	}
+	return false;
+}
+
+/* the exhausted words the numbers imply (the model's own rules: mac ring avail 0 with its tp moved, err fill from 1023, idle avail 0, a monitor ring with
+ * nothing left); the refill word is judged separately */
+static void
+f_flags(const unsigned *v, bool *mac0, bool *mac1, bool *err, bool *idle, bool *mon0, bool *mon1)
+{
+	*mac0 = v[5] == 0 && v[4] != 0; *mac1 = v[8] == 0 && v[7] != 0; *err = v[10] >= 1023u; *idle = v[13] == 0;
+	*mon0 = v[21] == 0; *mon1 = v[26] == 0;
+}
+
+static void
+f_check_flags(const unsigned *v, const char *ex, const char *what)
+{
+	bool a, b, c, d, e, f;
+	f_flags(v, &a, &b, &c, &d, &e, &f);
+	CHECK(f_has(ex, "mac0") == a && f_has(ex, "mac1") == b && f_has(ex, "err") == c && f_has(ex, "idle") == d && f_has(ex, "mon0") == e && f_has(ex, "mon1") == f, what);
+	CHECK((f_has(ex, "refill") || f_has(ex, "refill-empty")) == (v[2] == 0), what);   /* refill left 0: exhausted, or the refill-empty note; else neither */
+}
+
+static unsigned
+f_widest(const char *prefix)
+{
+	unsigned w = 0;
+	for (const char *q = logbuf; *q;) {
+		const char *nl2 = strchr(q, '\n');
+		if (!strncmp(q, prefix, strlen(prefix)) && (unsigned)(nl2 - q) > w) { w = (unsigned)(nl2 - q); }
+		q = nl2 + 1;
+	}
+	return w;
+}
+
+static void
+s_w25f_census(void)
+{
+	uint16_t all[38];
+	unsigned p1[F_NUM], p2[F_NUM], w[F_NUM], o[F_NUM], d1[F_NUM], d2[F_NUM];
+	char e1[64], e2[64], ew[96], e3[64], e4[64];
+	const char *l1;
+	for (unsigned i = 0; i < 38; i++) { all[i] = (uint16_t)m_chan(i); }
+	/* (a) the phone's whole RX stack (w20 0x3b02, the r1c2e kit): two requests, the second one's 5 GHz part goes silent after 2 channels (the firmware thread
+	 * asserts). Four parts, four censuses, two lines each. */
+	c3_reset(); wl20_bits = 0x3b02;
+	h_oracle = false;
+	C.rx_rule = 6; C.mon_crash = true; C.mon_ppdu = 10; C.d_frames = 120;
+	C.c3_silent_scan = 4; C.c3_silent_n = 2;
+	happy_frames();
+	h_push_at(all, 38, true, 150, -1, 3000);
+	h_push_at(all, 38, true, 150, -1, 40000);
+	CHECK(run() == 0, "W25f census (a)");
+	CHECK(fw_c3_scans == 4 && fw_stop_cmds == 1 && h_status[0] == 0, "W25f: the second request's 5 GHz part was the 4th START_SCAN, and the host stopped it");
+	CHECK(count_text("FUXI WLAN: W25 census part ") == 8, "W25f: one census of two lines for each of the four parts (completed or not)");
+	CHECK(f_cen_get(0, p1, e1, sizeof(e1), &l1) && f_cen_get(1, p2, e2, sizeof(e2), NULL), "W25f: the first request's two censuses parse");
+	CHECK(strstr(l1, "census part 1 (2.4 GHz, id 0xa001, completed): refill tp ") != NULL, "W25f: the census is labelled as its part");
+	/* the first request's 5 GHz part: nothing moves between its end and the first scan's COMPLETED watches, so its census is theirs, number for number */
+	CHECK(f_watch_get(w, ew, sizeof(ew)), "W25f: the first scan's completed watches parse");
+	for (unsigned i = 0; i < F_NUM; i++) {
+		if (p2[i] != w[i]) { fprintf(stderr, "census number %u: part 2 %u, watches %u\n", i, p2[i], w[i]); }
+		CHECK(p2[i] == w[i], "W25f: the 5 GHz part's census equals the completed W26/W27/W28 watches");
+	}
+	{   /* the exhausted words: the rx watch line's, the idle one's, the monitor one's, in the census order */
+		char *s1 = strdup(ew), *s2 = strchr(s1, '|'), *s3;
+		CHECK(s2 != NULL, "W25f: watch flags");
+		*s2++ = 0; s3 = strchr(s2, '|'); *s3++ = 0;
+		CHECK(f_has(e2, "refill") == f_has(s1, "refill") && f_has(e2, "refill-empty") == (strstr(s1, "refill-empty") != NULL) &&
+		    f_has(e2, "mac0") == f_has(s1, "mac0") && f_has(e2, "mac1") == f_has(s1, "mac1") && f_has(e2, "err") == f_has(s1, "err") &&
+		    f_has(e2, "idle") == f_has(s2, "idle") && f_has(e2, "mon0") == f_has(s3, "mon0") && f_has(e2, "mon1") == f_has(s3, "mon1"),
+		    "W25f: the exhausted flags of the 5 GHz part's census are the watches' flags");
+		free(s1);
+	}
+	f_check_flags(p1, e1, "W25f: the 2.4 GHz part's exhausted flags follow its numbers");
+	f_check_flags(p2, e2, "W25f: the 5 GHz part's exhausted flags follow its numbers");
+	/* the 2.4 GHz part was earlier: every counter that only grows has grown, the rings are the same rings */
+	CHECK(p1[17] > 0 && p1[16] > 0 && p1[17] < p2[17] && p1[16] < p2[16] && p1[14] <= p2[14] && p1[15] <= p2[15], "W25f: the REO counters grew between the two parts of the first request");
+	CHECK(p1[22] <= p2[22] && p1[27] <= p2[27] && p1[19] <= p2[19] && p1[24] <= p2[24] && p1[13] >= p2[13], "W25f: monitor TP/written grew, idle avail fell");
+	/* the second request: its 2.4 GHz part completed (a later state than the first request's), its 5 GHz part died */
+	CHECK(f_cen_get(2, d1, e3, sizeof(e3), NULL) && f_cen_get(3, d2, e4, sizeof(e4), &l1), "W25f: the second request's two censuses parse");
+	CHECK(strstr(l1, "census part 2 (5 GHz, id 0xa004, no end by max + 200 ms): refill tp ") != NULL, "W25f: the dying part's census is labelled with how it ended");
+	CHECK(d1[17] >= p2[17] && d2[17] > d1[17] && d2[16] > d1[16], "W25f: later parts have later REO counters");
+	/* the dying part against the model's own ring words: nothing has moved since the firmware went silent */
+	f_oracle(o);
+	for (unsigned i = 0; i < F_NUM; i++) {
+		if (d2[i] != o[i]) { fprintf(stderr, "census number %u: dying part %u, model %u\n", i, d2[i], o[i]); }
+		CHECK(d2[i] == o[i], "W25f: the dying part's census equals the model's own ring state");
+	}
+	f_check_flags(d2, e4, "W25f: the dying part's exhausted flags follow its numbers");
+	/* the order: the census right after its part's two lines, before the request's own W25 line; none before the part ended */
+	{
+		static const char *const order[] = {
+			"FUXI WLAN: W25 scan start id 0xa004 ", "FUXI WLAN: W25 part 2 (5 GHz, id 0xa004, no end by max + 200 ms): polls ",
+			"FUXI WLAN: W25 part 2 (5 GHz, id 0xa004, no end by max + 200 ms): wmi events scan ",
+			"FUXI WLAN: W25 census part 2 (5 GHz, id 0xa004, no end by max + 200 ms): refill tp ", "FUXI WLAN: W25 census part 2: reo rel ",
+			"FUXI WLAN: W25 trace 1/",
+		};
+		expect_order(order, sizeof(order) / sizeof(order[0]));
+		CHECK(strstr(logbuf, "FUXI WLAN: W25 census part 1 (2.4 GHz, id 0xa003, completed)") > strstr(logbuf, "FUXI WLAN: W25 scan 1 seq 1: full split") &&
+		    strstr(logbuf, "FUXI WLAN: W25 census part 1 (2.4 GHz, id 0xa003, completed)") < strstr(logbuf, "FUXI WLAN: W25 scan 2 seq 2: full split"),
+		    "W25f: said with the request's part lines, not before (nothing on the console while a scan runs)");
+	}
+	{   /* the census is a snapshot taken by reads only: exactly the loads of the watches' words, read barriers after each, no publish, no shadow or
+	     * BAR0 shadow write; the two idle ring registers through the one window accessor; nothing in the watches' own slots moves */
+		const unsigned L0 = n_ev['L'], R0 = n_ev['R'], W0 = n_ev['W'], P0 = n_ev['P'], sh0 = shadow_writes, ws0 = win_selects, wb0 = wbm_writes;
+		struct wlrx_watch rxw[WLRX_NPOINT];
+		struct wlms_watch msw[WLRX_NPOINT];
+		const uint32_t head0 = wl_rx.refill_head;
+		memcpy(rxw, wl_rx.w, sizeof(rxw)); memcpy(msw, wl_ms.w, sizeof(msw));
+		wl25_cen_take(1);
+		CHECK(n_ev['L'] - L0 == 8u && n_ev['R'] - R0 == 8u && n_ev['W'] == W0 && n_ev['P'] == P0 && shadow_writes == sh0 && wbm_writes == wb0,
+		    "W25f: the census is 6 ring-word loads (refill TP, MAC rings HP and TP, error HP) and 2 monitor TP loads, each with its read barrier, no write");
+		CHECK(win_selects - ws0 == 2u, "W25f: the two WBM idle ring registers are read through the window accessor (one select each, the restore checked by the model) and nothing else");
+		CHECK(!memcmp(rxw, wl_rx.w, sizeof(rxw)) && !memcmp(msw, wl_ms.w, sizeof(msw)) && head0 == wl_rx.refill_head,
+		    "W25f: the watches' own slots (W26/W28 words, taken flags, the refill head) are not touched");
+		CHECK(wl25_cen[1].rx && wl25_cen[1].idle && wl25_cen[1].reo && wl25_cen[1].mon && wl25_cen_pend[1], "W25f: the snapshot says which pieces it read");
+		wl25_cen_pend[1] = false;
+	}
+	{
+		char msg[420];
+		snprintf(msg, sizeof(msg), "W25f census (a): 4 parts, 8 lines; 5 GHz part of request 1 equals the completed watches (refill taken %u left %u, mac0 avail %u mac1 avail %u, idle avail %u, "
+		    "reo dst %u ret %u, mon0 taken %u written %u); the dying part equals the model's ring words (refill taken %u, idle avail %u, reo ret %u); widest census line %u",
+		    p2[1], p2[2], p2[5], p2[8], p2[13], p2[16], p2[17], p2[20], p2[22], d2[1], d2[13], d2[17], f_widest("FUXI WLAN: W25 census "));
+		puts(msg);
+	}
+	CHECK(f_widest("FUXI WLAN: W25 census ") <= 254, "W25f: no census line passes 254 bytes");
+	c3_lifetime_end();
+	contained_and_freed();
+	/* (b) the lane stops in the middle of the 5 GHz part: the census of that part says every piece off (the RX path is being torn down: nothing is read) */
+	c3_reset(); wl20_bits = 0x3b02;
+	h_oracle = false;
+	C.rx_rule = 6; C.mon_crash = true; C.mon_ppdu = 10; C.d_frames = 120; C.on_line = 3;
+	happy_frames();
+	h_push_at(all, 38, true, 150, -1, 0);
+	CHECK(run() == 1, "W25f census (b)");
+	{
+		const unsigned L0 = n_ev['L'];
+		contained_and_freed();
+		CHECK(count_text("FUXI WLAN: W25 census part 2 (5 GHz, id 0xa002, contained): rx off idle off\n") == 1 &&
+		    count_text("FUXI WLAN: W25 census part 2: reo off; mon0 off mon1 off; exhausted none\n") == 1, "W25f: a part that was running when the lane stopped says every piece off");
+		CHECK(n_ev['L'] == L0, "W25f: the contained part's census reads nothing");
+	}
+	/* (c) qrtr 8 with none of the RX pieces (w20 0): every piece off, in the same two lines; with only the rings and the idle list (0x302) the rest off */
+	c3_reset();
+	add_frame(5, 47, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	{
+		static const uint16_t two[2] = {2437, 5180};
+		h_push_at(two, 2, true, 150, -1, 3000);
+	}
+	CHECK(run() == 0, "W25f census (c)");
+	CHECK(count_text("FUXI WLAN: W25 census part 1 (2.4 GHz, id 0xa001, completed): rx off idle off\n") == 1 &&
+	    count_text("FUXI WLAN: W25 census part 2 (5 GHz, id 0xa002, completed): rx off idle off\n") == 1 &&
+	    count_text("FUXI WLAN: W25 census part 1: reo off; mon0 off mon1 off; exhausted none\n") == 1 &&
+	    count_text("FUXI WLAN: W25 census part 2: reo off; mon0 off mon1 off; exhausted none\n") == 1, "W25f: without any RX piece every piece says off");
+	{
+		const unsigned L0 = n_ev['L'], ws0 = win_selects;
+		wl25_cen_take(0);
+		CHECK(n_ev['L'] == L0 && win_selects == ws0, "W25f: without any RX piece the census reads nothing at all");
+		wl25_cen_pend[0] = false;
+	}
+	c3_lifetime_end();
+	contained_and_freed();
+	c3_reset(); wl20_bits = 0x302;
+	h_oracle = false;
+	C.rx_rule = 2; C.links_used = true; C.rx_frames = 2; C.setup_delay = 50;
+	happy_frames();
+	h_push_at(all, 38, true, 150, -1, 3000);
+	CHECK(run() == 0, "W25f census (c2)");
+	CHECK(count_text(" idle hp ") >= 2 && count_text("FUXI WLAN: W25 census part 1: reo off; mon0 off mon1 off; exhausted") == 1, "W25f: rings and idle list only: the REO and monitor pieces say off");
+	CHECK(f_widest("FUXI WLAN: W25 census ") <= 254, "W25f: no census line passes 254 bytes (0x302)");
+	c3_lifetime_end();
+	contained_and_freed();
+	/* (d) the widest lines: every field at its widest value, every flag, the widest label, every piece bad, unreadable and on */
+	{
+		struct wl25_cen c;
+		char l1[256], l2[256];
+		const char *lab = "part 2 (5 GHz, id 0xafff, no end by max + 200 ms)";
+		unsigned widest1 = 0, widest2 = 0;
+		for (unsigned variant = 0; variant < 6; variant++) {
+			memset(&c, 0, sizeof(c));
+			c.rx = c.idle = c.reo = c.mon = true;
+			c.w.refill_tp = c.w.mac_hp[0] = c.w.mac_hp[1] = c.w.mac_tp[0] = c.w.mac_tp[1] = c.w.err_hp = c.w.idle_hp = c.w.idle_tp = 0xfffffffeu;
+			c.w.refill_taken = c.w.refill_left = c.w.mac_avail[0] = c.w.mac_avail[1] = c.w.err_fill = c.w.idle_avail = 0xfffffffeu;
+			c.reo_rel = c.reo_exc = c.reo_dst = c.reo_ret = 0xfffffffeu;
+			c.m.tp[0] = c.m.tp[1] = c.m.taken[0] = c.m.taken[1] = c.m.left[0] = c.m.left[1] = c.m.written[0] = c.m.written[1] = 0xfffffffeu;
+			c.mon_hp[0] = c.mon_hp[1] = 0xfffffffeu;
+			if (variant == 1) { c.w.bad = c.m.bad = 0xff; }
+			if (variant == 2) { c.w.unreadable = c.m.unreadable = 0xff; }
+			if (variant == 3) { c.w.exhausted = 0xff; c.m.exhausted = 0xff; c.w.refill_empty = true; }
+			if (variant == 4) { c.w.exhausted = 0xff; c.m.exhausted = 0xff; }
+			wl25_cen_fmt(l1, sizeof(l1), l2, sizeof(l2), &c, lab, 1);
+			if (strlen(l1) > widest1) { widest1 = (unsigned)strlen(l1); }
+			if (strlen(l2) > widest2) { widest2 = (unsigned)strlen(l2); }
+			CHECK(strlen(l1) <= 254 && strlen(l2) <= 254, "W25f: a census line passes 254 bytes");
+			if (variant == 5) { CHECK(strstr(l1, "refill tp 99999 taken 99999 left 99999 mac0 hp 99999 tp 99999 avail 99999") && strstr(l2, "reo rel 9999999 exc 9999999 dst 9999999 ret 9999999"), "W25f: the numbers are capped"); }
+		}
+		memset(&c, 0, sizeof(c));
+		wl25_cen_fmt(l1, sizeof(l1), l2, sizeof(l2), &c, "part 1 (2.4 GHz, id 0xa001, completed)", 0);
+		CHECK(!strcmp(l1, "FUXI WLAN: W25 census part 1 (2.4 GHz, id 0xa001, completed): rx off idle off") &&
+		    !strcmp(l2, "FUXI WLAN: W25 census part 1: reo off; mon0 off mon1 off; exhausted none"), "W25f: every piece off");
+		{
+			char msg[200];
+			snprintf(msg, sizeof(msg), "W25f census widest lines: line 1 %u bytes, line 2 %u bytes (every number at its cap, every flag, bad and unreadable words, the widest label)", widest1, widest2);
+			puts(msg);
+		}
+	}
+	reset();
+}
+
+/* the merged table: d_find returns the index of the BSSID in the table, or -1 */
+static int
+f_find(const uint8_t *bssid)
+{
+	for (unsigned i = 0; i < wl25_stale_n; i++) { if (!memcmp(wl25_stale[i].frame + 16, bssid, 6)) { return (int)i; } }
+	return -1;
+}
+
+static void
+s_w25f_merge(void)
+{
+	uint16_t all[38];
+	struct mbeacon *b;
+	unsigned dv_sel0;
+	for (unsigned i = 0; i < 38; i++) { all[i] = (uint16_t)m_chan(i); }
+	/* (a) bit 29: the prescan is split 1, the requests are splits 2 (seq 1), 3 (seq 2, its 5 GHz part goes silent: it does not complete) and 4 (seq 3), a cache hit (seq 4)
+	 * and a request the lane stops in the middle of (seq 5), then the stale service answers it and the next. Beacons are heard only in the splits their mask names. */
+	c3_reset();
+	wl23_chmask = WL23_CH_PRESCAN;
+	C.c3_silent_scan = 6; C.c3_silent_n = 2;
+	C.c3_guard_after = 9;
+	b = add_frame(5, 47, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true); b->splits = 1;          /* split 1: 2437 MHz, -48 dBm */
+	b = add_frame(3, 35, 8, B_CAFE, 0x0401, "Cafe", 4, 1, 0, false); b->splits = 1;            /* split 1 only: disjoint from split 2 */
+	b = add_frame(5, 30, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true); b->splits = 2;          /* split 2: the same BSSID, a weaker frame: it wins (newest) */
+	b = add_frame(13, 50, 8, B_OFF, 0x0011, "Office-5G", 9, 0, 36, true); b->splits = 2;       /* split 2 only: new */
+	b = add_frame(6, 44, 8, B_LAB, 0x0011, "Lab", 3, 1, 0, true); b->splits = 4;               /* split 3 only: heard in its 2.4 GHz part, the split fails: never merged */
+	b = add_frame(21, 41, 8, B_X1, 0x0011, "Late5G", 6, 0, 100, true); b->splits = 8;          /* split 4 only: new */
+	h_push_at(all, 38, true, 150, -1, 40000);
+	h_push_at(all, 38, true, 150, -1, 80000);
+	h_push_at(all, 38, true, 150, -1, 120000);
+	h_push_at(all, 38, true, 150, -1, 125000);
+	h_push_at(all, 38, true, 150, -1, 170000);
+	h_push_at(all, 38, true, 150, -1, 180000);
+	h_gone_after = 6;
+	CHECK(run() == 1, "W25f merge (a)");
+	CHECK(h_takes == 5 && h_dones == 4 && wl25_live_on && h_status[0] == 0 && h_status[1] == ETIMEDOUT && h_status[2] == 0 && h_status[3] == 0,
+	    "W25f merge: split 3 timed out, request 5 was in flight when the lane stopped");
+	CHECK(h_splits == 3 && h_hits == 1, "W25f merge: three splits completed (prescan, requests 1 and 3), one cache hit");
+	expect("FUXI WLAN: W25 scan 1 seq 0: merged 2 BSS (+2 new)\n");
+	expect("FUXI WLAN: W25 scan 2 seq 1: merged 3 BSS (+1 new)\n");
+	CHECK(!d_line("FUXI WLAN: W25 scan 3 seq 2: merged ", 0) && count_text("FUXI WLAN: W25 scan 3 seq 2: full split") == 1 && count_text("ETIMEDOUT") + count_text("no end by max + 200 ms") >= 1,
+	    "W25f merge: the split that did not complete says no merge");
+	expect("FUXI WLAN: W25 scan 4 seq 3: merged 4 BSS (+1 new)\n");
+	expect("FUXI WLAN: W25 scan 5 seq 4: cache hit (age ");
+	expect(" ms, 4 of 4 frames match), nothing sent, status 0; to iOS 4 kept 4\n");
+	CHECK(count_text(": merged ") == 3, "W25f merge: one merged line for each completed split");
+	CHECK(wl25_stale_n == 4 && wl25_stale_ok && f_find(B_HOME) >= 0 && f_find(B_CAFE) >= 0 && f_find(B_OFF) >= 0 && f_find(B_X1) >= 0 && f_find(B_LAB) < 0,
+	    "W25f merge: the union of the three completed splits, the failed split's BSSID in it never");
+	{
+		const struct wl25_cached *h = &wl25_stale[f_find(B_HOME)];
+		CHECK(h->mhz == 2437 && h->dbm == 30 - 95, "W25f merge: one frame a BSSID, the newest split's (-65 dBm, not the first split's -48)");
+		CHECK(wl25_stale[f_find(B_CAFE)].dbm == 35 - 95, "W25f merge: a BSSID only an earlier split heard is kept");
+	}
+	contained_and_freed();
+	dv_sel0 = win_selects;
+	m_stale_phase = true;
+	wl25_stale_serve();
+	m_stale_phase = false;
+	CHECK(win_selects == dv_sel0 && h_dones == 6 && h_status[4] == 0 && h_status[5] == 0, "W25f merge: the stale service answered the request the lane died on and the next, from the merged table");
+	expect("FUXI WLAN: W25 lane stopped, serving stale cache of 4 BSS (completed ");
+	expect("FUXI WLAN: W25 stale answer 1 seq 5: 4 of 4 frames match (cache ");
+	expect("FUXI WLAN: W25 stale answer 2 seq 6: 4 of 4 frames match (cache ");
+	{
+		char msg[300];
+		snprintf(msg, sizeof(msg), "W25f merge (a): prescan + 3 requests: merged 2 (+2), 3 (+1), failed split nothing, 4 (+1); one frame a BSSID with the newest winning (HomeNet -65 dBm), the failed split's BSSID never in; "
+		    "the cache hit and the stale answers (requests 5 and 6) from the 4-BSS table");
+		puts(msg);
+	}
+	reset();
+	/* (b) without bit 29 none of it: no merged line, no table, each request answered from its own split's cache as before */
+	c3_reset();
+	b = add_frame(5, 47, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true); b->splits = 1;
+	b = add_frame(13, 50, 8, B_OFF, 0x0011, "Office-5G", 9, 0, 36, true); b->splits = 2;
+	h_push_at(all, 38, true, 150, -1, 3000);
+	h_push_at(all, 38, true, 150, -1, 40000);
+	CHECK(run() == 0, "W25f merge (b)");
+	CHECK(h_splits == 2 && !d_line(": merged ", 0) && wl25_stale_n == 0 && !wl25_stale_ok, "W25f merge: without bit 29 nothing is merged or said");
+	expect("FUXI WLAN: W25 scan 2 seq 2: full split scan id 0xa003+0xa004:");
+	CHECK(wl25_cache_n == 1 && !memcmp(wl25_cache[0].frame + 16, B_OFF, 6), "W25f merge: the cache is the last split's frames alone, as before");
+	c3_lifetime_end();
+	contained_and_freed();
+	/* (c) the 64-BSSID rule, on the production function: a full table, a stronger new BSSID replaces the weakest, a weaker one is dropped, a known BSSID is replaced
+	 * by its newer frame even when weaker */
+	reset();
+	wl23_chmask = WL23_CH_PRESCAN;
+	{
+		unsigned fresh;
+		memset(wl25_stale, 0, sizeof(wl25_stale)); memset(wl25_cache, 0, sizeof(wl25_cache));
+		for (unsigned i = 0; i < WL25_CACHE_BSS; i++) {
+			wl25_stale[i].len = 36; wl25_stale[i].mhz = 2437; wl25_stale[i].dbm = (int16_t)(-90 + (int)i); wl25_stale[i].frame[16] = 2; wl25_stale[i].frame[21] = (uint8_t)(i + 1u);
+		}
+		wl25_stale_n = WL25_CACHE_BSS;                                     /* BSSID 02:00:00:00:00:(i+1), dBm -90 + i: the weakest is #0 (-90) */
+		wl25_cache_n = 3; wl25_cache_at = 1234;
+		for (unsigned k = 0; k < 3; k++) { wl25_cache[k].len = 36; wl25_cache[k].mhz = 5180; wl25_cache[k].frame[16] = 2; }
+		wl25_cache[0].frame[21] = 10; wl25_cache[0].dbm = -85;             /* known BSSID #9 (-81), a weaker frame: replaces it */
+		wl25_cache[1].frame[21] = 200; wl25_cache[1].dbm = -80;            /* new, stronger than the weakest (-90): replaces #0 */
+		wl25_cache[2].frame[21] = 201; wl25_cache[2].dbm = -91;            /* new, weaker than the weakest now (#1, -89): dropped */
+		wl25_stale_take();
+		fresh = wl25_merge_new;
+		CHECK(wl25_stale_n == WL25_CACHE_BSS && fresh == 1 && wl25_stale[9].dbm == -85 && wl25_stale[9].mhz == 5180 && wl25_stale[0].frame[21] == 200 && wl25_stale[0].dbm == -80 &&
+		    wl25_stale[1].frame[21] == 2 && wl25_stale_at == 1234 && wl25_stale_ok, "W25f merge: past 64 BSSIDs the strongest are kept, the newest frame of a known BSSID wins");
+		wl23_chmask = 0;
+		wl25_stale_n = 0; wl25_stale_ok = false;
+		wl25_stale_take();
+		CHECK(wl25_stale_n == 0 && !wl25_stale_ok, "W25f merge: without bit 29 the merge does nothing");
+	}
+	puts("W25f merge (b, c): without bit 29 no merge, no line and the cache as before; the 64-BSSID rule on the full table (stronger replaces the weakest, weaker dropped, newest frame of a known BSSID wins)");
+	reset();
+}
+
+static void
+s_w25f_long(void)
+{
+	static const uint16_t two[2] = {2437, 5180};
+	uint8_t a[400], b2[400];
+	uint32_t la = 0, lb = 0;
+	uint16_t l24[13], h5[25];
+	for (unsigned i = 0; i < 13; i++) { l24[i] = (uint16_t)m_chan(i); }
+	for (unsigned i = 0; i < 25; i++) { h5[i] = (uint16_t)m_chan(13 + i); }
+	/* (a) the encoders: the list encoder is the one W25 used (dwell 50..200); the long one gives its bytes for a dwell in that range and, above it, the same
+	 * bytes with the one dwell word written; it refuses what the list encoder refuses and a dwell outside 50..300 */
+	for (uint32_t d = 50; d <= 200; d += 3) {
+		CHECK(wlwmi_encode_start_scan_list(l24, 13, 0xa001, d, 13 * d * 3 / 2, a, sizeof(a), &la) == 0 &&
+		    wlwmi_encode_start_scan_list_long(l24, 13, 0xa001, d, 13 * d * 3 / 2, b2, sizeof(b2), &lb) == 0 && la == lb && !memcmp(a, b2, la), "W25f: long encoder, dwell 50..200: the list encoder's bytes");
+	}
+	CHECK(wlwmi_encode_start_scan_list(l24, 13, 0xa001, 201, 13 * 201 * 3 / 2, a, sizeof(a), &la) == 1 && wlwmi_encode_start_scan_list(h5, 25, 0xa002, 300, 11250, a, sizeof(a), &la) == 1,
+	    "W25f: the list encoder still refuses a dwell above 200");
+	CHECK(wlwmi_encode_start_scan_list(l24, 13, 0xa001, 150, 13 * 150 * 3 / 2, a, sizeof(a), &la) == 0 &&
+	    wlwmi_encode_start_scan_list_long(l24, 13, 0xa001, 300, 5850, b2, sizeof(b2), &lb) == 0 && la == lb, "W25f: long encoder, 300 ms: same length");
+	{
+		unsigned diff = 0, at = 0;
+		wlwmi_encode_start_scan_list(l24, 13, 0xa001, 150, 5850, a, sizeof(a), &la);
+		for (uint32_t i = 0; i < la; i++) { if (a[i] != b2[i]) { diff++; at = i; } }
+		CHECK(g32(b2 + 4 + 4 * WLWMI_SS_DWELL_PASSIVE) == 300 && g32(a + 4 + 4 * WLWMI_SS_DWELL_PASSIVE) == 150 && diff == 2 && at / 4 == (4 + 4 * WLWMI_SS_DWELL_PASSIVE) / 4 &&
+		    g32(b2 + 4 + 4 * WLWMI_SS_MAX_SCAN_TIME) == 5850, "W25f: 300 ms differs from 150 ms in the one dwell word (150 = 0x96, 300 = 0x12c: two bytes), max_scan_time as given");
+	}
+	CHECK(wlwmi_encode_start_scan_list_long(h5, 25, 0xa002, 300, 11250, b2, sizeof(b2), &lb) == 0 && g32(b2 + 4 + 4 * WLWMI_SS_MAX_SCAN_TIME) == 11250 &&
+	    wlwmi_encode_start_scan_list_long(l24, 13, 0xa001, 49, 5850, b2, sizeof(b2), &lb) == 1 && wlwmi_encode_start_scan_list_long(l24, 13, 0xa001, 301, 5850, b2, sizeof(b2), &lb) == 1 &&
+	    wlwmi_encode_start_scan_list_long(l24, 13, 0xa000, 300, 5850, b2, sizeof(b2), &lb) == 1 && wlwmi_encode_start_scan_list_long(l24, 13, 0xb000, 300, 5850, b2, sizeof(b2), &lb) == 1 &&
+	    wlwmi_encode_start_scan_list_long(NULL, 13, 0xa001, 300, 5850, b2, sizeof(b2), &lb) == 1 && wlwmi_encode_start_scan_list_long(l24, 13, 0xa001, 300, 5850, b2, 195, &lb) == 1,
+	    "W25f: long encoder refusals (dwell 49 and 301, ids, no list, no room)");
+	{
+		uint16_t mixed[2] = { 2437, 5180 };
+		CHECK(wlwmi_encode_start_scan_list_long(mixed, 2, 0xa001, 300, 900, b2, sizeof(b2), &lb) == 1, "W25f: long encoder: a list of both bands refused");
+	}
+	/* (b) bit 29 + 30: the prescan's two START_SCANs show dwell 300 and max 13 x 300 x 3/2 and 25 x 300 x 3/2; the wifid requests are unchanged (150 asked: 150, 120: 120, 200: 200,
+	 * 300 asked: 150) and answered from the merged table; a split of a request still ends at its dwell */
+	c3_reset();
+	wl23_chmask = WL23_CH_PRESCAN | WL23_CH_LONGPRE;
+	add_frame(5, 47, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	add_frame(13, 50, 8, B_OFF, 0x0011, "Office-5G", 9, 0, 36, true);
+	h_push_at(two, 2, true, 150, -1, 1000);
+	h_push_at(two, 2, true, 120, -1, 55000);
+	h_push_at(two, 2, true, 300, -1, 95000);
+	h_push_at(two, 2, true, 200, -1, 135000);
+	CHECK(run() == 0, "W25f long (b)");
+	CHECK(h_splits == 4 && h_hits == 1 && fw_c3_scans == 8 && fw_c3_log[1].max == 5850 && fw_c3_log[2].max == 11250 && fw_c3_log[1].n == 13 && fw_c3_log[2].n == 25,
+	    "W25f: the prescan's START_SCANs ask max 13 x 300 x 3/2 and 25 x 300 x 3/2 (the model checked their dwell word against the 300 it expects)");
+	{
+		static const char *const lines[] = {
+			"FUXI WLAN: W25 prescan full split at service ready\n",
+			"FUXI WLAN: W25 scan start id 0xa001 vdev 0 channels 13 passive dwell 300 ms max 5850 ms events 0x5f flags 0x11 ext 0x0 active dwell 50 ms first 2412 last 2472 MHz seq 0 part 1 of 2\n",
+			"FUXI WLAN: W25 scan start id 0xa002 vdev 0 channels 25 passive dwell 300 ms max 11250 ms events 0x5f flags 0x11 ext 0x0 active dwell 50 ms first 5180 last 5825 MHz seq 0 part 2 of 2\n",
+			"FUXI WLAN: W25 scan 1 seq 0: full split scan id 0xa001+0xa002: 13+25 channels passive dwell 300 ms, completed after ",
+			"FUXI WLAN: W25 scan 1 seq 0: merged 2 BSS (+2 new)\n",
+			"FUXI WLAN: W25 scan 2 seq 1: cache hit (age ",
+			"FUXI WLAN: W25 scan start id 0xa003 vdev 0 channels 13 passive dwell 120 ms max 2340 ms ",
+			"FUXI WLAN: W25 scan 3 seq 2: full split scan id 0xa003+0xa004: 13+25 channels passive dwell 120 ms, completed after ",
+			"FUXI WLAN: W25 scan start id 0xa005 vdev 0 channels 13 passive dwell 150 ms max 2925 ms ",
+			"FUXI WLAN: W25 scan 4 seq 3: full split scan id 0xa005+0xa006: 13+25 channels passive dwell 150 ms, completed after ",
+			"FUXI WLAN: W25 scan start id 0xa007 vdev 0 channels 13 passive dwell 200 ms max 3900 ms ",
+			"FUXI WLAN: W25 scan 5 seq 4: full split scan id 0xa007+0xa008: 13+25 channels passive dwell 200 ms, completed after ",
+		};
+		expect_order(lines, sizeof(lines) / sizeof(lines[0]));
+	}
+	CHECK(h_status[0] == 0 && h_status[1] == 0 && h_status[2] == 0 && h_status[3] == 0, "W25f: every request answered");
+	c3_lifetime_end();
+	contained_and_freed();
+	/* (c) bit 29 alone: the prescan keeps 150 (W25d); no bit 30 line */
+	c3_reset();
+	wl23_chmask = WL23_CH_PRESCAN;
+	add_frame(5, 47, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	h_push_at(two, 2, true, 300, -1, 60000);
+	CHECK(run() == 0, "W25f long (c)");
+	CHECK(fw_c3_log[1].max == 2925 && fw_c3_log[2].max == 5625 && count_text("passive dwell 300 ms") == 0, "W25f: bit 29 alone: the prescan is 150 ms, a request asking 300 gets 150");
+	c3_lifetime_end();
+	contained_and_freed();
+	puts("W25f long prescan (fuxiwlanch bits 29 + 30): the encoder gives the list encoder's bytes for 50..200 ms and the one dwell word otherwise; the prescan's START_SCANs say dwell 300 and max 5850 / 11250, "
+	     "wifid's requests keep 50..200 else 150 (300 asked: 150), bit 29 alone keeps the prescan at 150");
+	reset();
+}
+
 #endif
 
 #if defined(FUXI_WLAN_E2E)
@@ -8895,7 +9403,7 @@ s_split_pure(void)
 {
 	static uint8_t a[2048], b[2048];
 	uint32_t len = 0, len2 = 0, seed = 0x6d2b79f5u;
-	CHECK(WL23_CH_SPLIT == 0x4000000u && WL23_CH_KNOB == 0x3fffffffu && WL23_CH_PRESCAN == 0x20000000u && WL23_CH_VALID == 0x3ffffffu && WLSCAN_CH_SPLIT == WL23_CH_SPLIT &&
+	CHECK(WL23_CH_SPLIT == 0x4000000u && WL23_CH_KNOB == 0x7fffffffu && WL23_CH_LONGPRE == 0x40000000u && WL23_CH_PRESCAN == 0x20000000u && WL23_CH_VALID == 0x3ffffffu && WLSCAN_CH_SPLIT == WL23_CH_SPLIT &&
 	    WLWMI_SCAN_ID == 0xa000u && WLWMI_SCAN_ID2 == 0xa001u, "split bit layout and ids");
 	/* the split bit drops nothing: no list function reads it */
 	for (unsigned m = 0; m < 4096; m++) {
@@ -9225,7 +9733,7 @@ s_ext_pure(void)
 	static uint8_t a[2048], b[2048];
 	uint32_t len = 0, len2 = 0, seed = 0x1b873593u;
 	CHECK(WLSCAN_CH_NONDBS == 0x8000000u && WLSCAN_CH_IGNDUTY == 0x10000000u && WL23_CH_NONDBS == 0x8000000u && WL23_CH_IGNDUTY == 0x10000000u &&
-	    WL23_CH_KNOB == 0x3fffffffu && WL23_CH_VALID == 0x3ffffffu && WL23_CH_SPLIT == 0x4000000u && WLWMI_SS_CTRL_FLAGS_EXT == 35 &&
+	    WL23_CH_KNOB == 0x7fffffffu && WL23_CH_LONGPRE == 0x40000000u && WL23_CH_VALID == 0x3ffffffu && WL23_CH_SPLIT == 0x4000000u && WLWMI_SS_CTRL_FLAGS_EXT == 35 &&
 	    WLWMI_SS_PRIORITY == 4 && WLWMI_SCAN_FLAG_EXT_DBS_POLICY_MASK == 3u && WLWMI_SCAN_FLAG_EXT_FORCE_NONDBS == 1u &&
 	    WLWMI_SCAN_FLAG_EXT_IGNORE_DUTY == 2u, "ext bit layout and vendor policy values");
 	CHECK(wlscan_ext_flags(0) == 0 && wlscan_ext_flags(0x8000000u) == 1 && wlscan_ext_flags(0x10000000u) == 2 && wlscan_ext_flags(0x18000000u) == 3 &&
@@ -9455,6 +9963,7 @@ main(int argc, char **argv)
 			{"stopped", s_svc_ios_stopped}, {"otherid", s_svc_other_id}, {"credits", s_svc_credit_waits}, {"c2c", s_svc_c2c},
 			{"c2e", s_svc_c2e}, {"split", s_svc_split}, {"rungs", s_svc_rungs}, {"cache", s_svc_cache}, {"w25dpoll", s_w25d_poll},
 			{"w25dwidest", s_w25d_widest}, {"w25dprescan", s_w25d_prescan}, {"w25dstale", s_w25d_stale}, {"w25etrace", s_w25e_trace},
+			{"w25fcensus", s_w25f_census}, {"w25fmerge", s_w25f_merge}, {"w25flong", s_w25f_long},
 		};
 		for (unsigned i = 0; i < sizeof(one) / sizeof(one[0]); i++) {
 			if (!strcmp(one[i].n, argv[2])) { one[i].f(); reset(); puts("W25 model: scenario passed"); return 0; }
@@ -9464,7 +9973,7 @@ main(int argc, char **argv)
 	if (argc == 2 && !strcmp(argv[1], "c3")) {  /* the C3 scenarios alone */
 		s_svc_pure(); s_svc_requests(); s_svc_cache(); s_svc_cancel(); s_svc_failures(); s_svc_guard_and_credits(); s_svc_lifetime_and_band();
 		s_svc_ios_stopped(); s_svc_other_id(); s_svc_c2c(); s_svc_c2e(); s_svc_split(); s_svc_rungs();
-		s_w25d_poll(); s_w25d_widest(); s_w25d_prescan(); s_w25d_stale(); s_w25e_trace(); reset();
+		s_w25d_poll(); s_w25d_widest(); s_w25d_prescan(); s_w25d_stale(); s_w25e_trace(); s_w25f_census(); s_w25f_merge(); s_w25f_long(); reset();
 		puts("W25 model: all scenarios passed");
 		return 0;
 	}
@@ -9563,6 +10072,9 @@ main(int argc, char **argv)
 	s_w25d_prescan();
 	s_w25d_stale();
 	s_w25e_trace();
+	s_w25f_census();
+	s_w25f_merge();
+	s_w25f_long();
 #endif
 	reset();
 	puts("W20 model: all scenarios passed");

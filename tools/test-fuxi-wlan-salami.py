@@ -806,7 +806,7 @@ def gate_suite(tmp, mk):
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=16 fuxiwlanch=0', 1, 28,
          'W23 selected passive scan of 13 channels (2.4 GHz only), dwell 150 ms'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=16 fuxiwlanch=33554432', 0, 0,
-         'W20 fuxiwlanch 0x2000000 refused: bits 0..29 only, and at least one channel must stay (w20 0x10 counts too)'),
+         'W20 fuxiwlanch 0x2000000 refused: bits 0..30 only, and at least one channel must stay (w20 0x10 counts too)'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=16 fuxiwlanch=67108863', 0, 0, 'W20 fuxiwlanch 0x3ffffff refused'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanch=67108863', 0, 0, 'W20 fuxiwlanch 0x3ffffff refused'),
         # bit 26 (SPLIT): accepted, drops nothing; bits 27 / 28 (DBS scan policy) below; bit 29 (PRESCAN) with qrtr 8 only, bit 30 and above refused
@@ -825,7 +825,7 @@ def gate_suite(tmp, mk):
          'htt version asked'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32514 fuxiwlanch=67108864', 1, 28, 'passive scan of 38 channels (fuxiwlanch 0x4000000)'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=16 fuxiwlanch=100663296', 0, 0,
-         'W20 fuxiwlanch 0x6000000 refused: bits 0..29 only, and at least one channel must stay (w20 0x10 counts too)'),
+         'W20 fuxiwlanch 0x6000000 refused: bits 0..30 only, and at least one channel must stay (w20 0x10 counts too)'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanch=134217727', 0, 0, 'W20 fuxiwlanch 0x7ffffff refused'),
         # bit 27 (NONDBS) and bit 28 (IGNORE_DUTY): accepted, drop nothing, alone or with the others; both together, or a bit above 29, refused
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanch=134217728', 1, 28,
@@ -869,19 +869,43 @@ def gate_suite(tmp, mk):
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=8 fuxiwlanch=536870912', 1, 28,
          'W25 selected prescan (fuxiwlanch bit 29): one full split at service ready, before any request; a lane stop with that split cached keeps '
          'Wi-Fi on and serves it stale'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=8 fuxiwlanch=536870912', 1, 28,
+         'W25 selected merged results (fuxiwlanch bit 29): one table, the union of every completed split, answers the cache hits, the splits and the stale service'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=8 fuxiwlanch=738197504', 1, 28, 'passive scan of 38 channels (fuxiwlanch 0x2c000000)'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=8 fuxiwlanw20=16 fuxiwlanch=536870912', 1, 28, 'passive scan of 13 channels (fuxiwlanch 0x20000000)'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=8 fuxiwlanch=536928256', 1, 28, 'passive scan of 35 channels (fuxiwlanch 0x2000e000)'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=8 fuxiwlanch=939524096', 0, 0,
          'W20 fuxiwlanch 0x38000000 refused: bits 27 and 28 are two values of one scan policy, not both'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=8 fuxiwlanch=1073741824', 0, 0,
-         'W20 fuxiwlanch 0x40000000 refused: bits 0..29 only, and at least one channel must stay (w20 0x10 counts too)'),
+         'W20 fuxiwlanch 0x40000000 refused: bit 30 (LONG PRESCAN) needs bit 29 and fuxiwlanqrtr=8'),
+        # bit 30 (W25f LONG PRESCAN): qrtr 8 with bit 29 only. qrtr 7: bit 29's own refusal when 29 is there, else bit 30's; other qrtr: the knob needs qrtr 7
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanch=1073741824', 0, 0,
+         'W20 fuxiwlanch 0x40000000 refused: bit 30 (LONG PRESCAN) needs bit 29 and fuxiwlanqrtr=8'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanch=1610612736', 0, 0,
+         'W20 fuxiwlanch 0x60000000 refused: bit 29 (PRESCAN) needs fuxiwlanqrtr=8'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=8 fuxiwlanch=1073741825', 0, 0,
+         'W20 fuxiwlanch 0x40000001 refused: bit 30 (LONG PRESCAN) needs bit 29 and fuxiwlanqrtr=8'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw20=0x45 fuxiwlanch=1610612736', 0, 0, 'W20 fuxiwlanch 0x60000000 needs fuxiwlanqrtr=7; refused'),
+        ('fuxiwlan=11 fuxiwlansalami=1 fuxiwlanch=1073741824', 0, 0, 'W20 fuxiwlanch 0x40000000 needs fuxiwlanqrtr=7; refused'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=8 fuxiwlanch=1610612736', 1, 28,
+         'W23 selected passive scan of 38 channels (fuxiwlanch 0x60000000), dwell per request (50..200 ms, else 150), nothing transmitted; BSSIDs OUI only, '
+         'pdev 0, htt version not asked'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=8 fuxiwlanch=1610612736', 1, 28,
+         'W25 selected long prescan (fuxiwlanch bit 30): the prescan split dwells 300 ms passive, requests keep 50..200 ms'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=8 fuxiwlanch=1610612736', 1, 28,
+         'W25 selected merged results (fuxiwlanch bit 29): one table, the union of every completed split, answers the cache hits, the splits and the stale service'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=8 fuxiwlanw20=16 fuxiwlanch=1610612736', 1, 28, 'passive scan of 13 channels (fuxiwlanch 0x60000000)'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=8 fuxiwlanch=1610670080', 1, 28, 'passive scan of 35 channels (fuxiwlanch 0x6000e000)'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=8 fuxiwlanch=2147483648', 0, 0,
+         'W20 fuxiwlanch 0x80000000 refused: bits 0..30 only, and at least one channel must stay (w20 0x10 counts too)'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=8 fuxiwlanch=2147483647', 0, 0,
+         'W20 fuxiwlanch 0x7fffffff refused: bits 0..30 only, and at least one channel must stay (w20 0x10 counts too)'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=8 fuxiwlanch=536870911', 0, 0,
-         'W20 fuxiwlanch 0x1fffffff refused: bits 0..29 only, and at least one channel must stay (w20 0x10 counts too)'),
+         'W20 fuxiwlanch 0x1fffffff refused: bits 0..30 only, and at least one channel must stay (w20 0x10 counts too)'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=16 fuxiwlanch=167772160', 0, 0,
-         'W20 fuxiwlanch 0xa000000 refused: bits 0..29 only, and at least one channel must stay (w20 0x10 counts too)'),
+         'W20 fuxiwlanch 0xa000000 refused: bits 0..30 only, and at least one channel must stay (w20 0x10 counts too)'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanch=536870911', 0, 0,
-         'W20 fuxiwlanch 0x1fffffff refused: bits 0..29 only, and at least one channel must stay (w20 0x10 counts too)'),
+         'W20 fuxiwlanch 0x1fffffff refused: bits 0..30 only, and at least one channel must stay (w20 0x10 counts too)'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw20=0x45 fuxiwlanch=134217728', 0, 0, 'W20 fuxiwlanch 0x8000000 needs fuxiwlanqrtr=7; refused'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=5 fuxiwlanch=268435456', 0, 0, 'W20 fuxiwlanch 0x10000000 needs fuxiwlanqrtr=7; refused'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw20=0x45 fuxiwlanch=402653184', 0, 0, 'W20 fuxiwlanch 0x18000000 needs fuxiwlanqrtr=7; refused'),
@@ -989,10 +1013,14 @@ def gate_suite(tmp, mk):
             kept = (0 if mask & 1 << 25 else 13) + 25 - bin(drop5).count('1')
             dwell = 'dwell per request (50..200 ms, else 150)' if 'fuxiwlanqrtr=8' in args else 'dwell 150 ms'   # (qrtr 8: the iOS side's request names it)
             assert f'passive scan of {kept} channels (fuxiwlanch {mask:#x}), {dwell}' in out and 'refused' not in out, (args, kept, out)
-            if mask & 1 << 29:   # W25d: the prescan line, with qrtr 8 only (the knob is refused for any other qrtr)
-                assert 'fuxiwlanqrtr=8' in args and 'W25 selected prescan (fuxiwlanch bit 29)' in out, (args, out)
+            if mask & 1 << 29:   # W25d: the prescan line, with qrtr 8 only (the knob is refused for any other qrtr); W25f: the merged results line with it
+                assert 'fuxiwlanqrtr=8' in args and 'W25 selected prescan (fuxiwlanch bit 29)' in out and 'W25 selected merged results (fuxiwlanch bit 29)' in out, (args, out)
             else:
-                assert 'selected prescan' not in out, (args, out)
+                assert 'selected prescan' not in out and 'selected merged results' not in out, (args, out)
+            if mask & 1 << 30:   # W25f: the long prescan line, only with bit 29 and qrtr 8
+                assert mask & 1 << 29 and 'fuxiwlanqrtr=8' in args and 'W25 selected long prescan (fuxiwlanch bit 30)' in out, (args, out)
+            else:
+                assert 'selected long prescan' not in out, (args, out)
         if mask and not starts:
             assert f'W20 fuxiwlanch {mask:#x} ' in out and 'refused' in out and '(fuxiwlanch 0x' not in out, (args, out)
     # Firmware names: salami Android defaults, boot-arg overrides, bad names refused.
@@ -1289,7 +1317,7 @@ def gate_suite(tmp, mk):
           f'negative, bits outside 0xf, 0x02 without fuxiwlanw29 0x02, 0x08 without w20 0x800, without 0x4000 or qrtr 7 '
           f'refused; {len(vrx)} kit values from /defaults')
     print('CH1: fuxiwlanch parsed (cmdline and ADT /defaults), the W23 selected line counts the kept channels; absent or 0 = no mention; '
-          'bit 26 (the scan split) and bits 27 / 28 (the DBS scan policy) accepted; bits 27 and 28 together, bits above 29, bit 29 (the W25d prescan) accepted with qrtr 8 and refused with qrtr 7, an empty list '
+          'bit 26 (the scan split) and bits 27 / 28 (the DBS scan policy) accepted; bits 27 and 28 together, bits above 30, bit 29 (the W25d prescan) accepted with qrtr 8 and refused with qrtr 7, bit 30 (the W25f long prescan) accepted only with bit 29 and qrtr 8, an empty list '
           '(also with w20 0x10) and any qrtr but 7 refused')
     print(f'C2c..C2f kit route: r1c2 cmdline with fuxiwlanw20 from ADT /defaults for {len(kits)} kit values (512 .. 32514, '
           'including C2d/C2e/C2f 6402/15106/32514), each read from /defaults and giving its W26..W29 selection; the bits '

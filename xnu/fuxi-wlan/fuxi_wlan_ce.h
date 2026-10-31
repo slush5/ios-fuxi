@@ -1758,6 +1758,25 @@ wlwmi_encode_start_scan_list(const uint16_t *mhz, uint32_t n, uint32_t id, uint3
 	return 0;
 }
 
+/* W25f (fuxiwlanch bit 30, the prescan split only): the command above with a passive dwell of 50..WLSCAN_DWELL_LONG_MAX ms. A separate
+ * function with its own bound, so that wlwmi_encode_start_scan_list (dwell 50..200, the iOS side's range) is not touched and every
+ * caller of it gets the bytes it got before: this one builds the command with the default dwell through it (same refusals, same id,
+ * channel and band rules) and then writes the dwell word, the one word that differs. A dwell of 50..200 gives the bytes of the list
+ * encoder; the driver calls this one only above 200. WLSCAN_DWELL_LONG_MAX 300: ath12k (wmi.c:2549, 2718; wmi.h:3440, 3529) puts
+ * dwell_time_passive in a 32-bit word with no range check and its own single-channel passive scan uses 2 x max_remain_on_channel_duration
+ * = 10000 ms (mac.c:13445, 13465; 14377); the vendor's gPassiveMaxChannelTime is min 0, max 10000 ms, default
+ * PLATFORM_VALUE(110, 300) (qca-wifi-host-cmn umac/scan/dispatcher/inc/cfg_scan.h:305-322, ISC; docs-lanes/wlan-mgmt-rx-study.md). */
+#define WLSCAN_DWELL_LONG_MAX 300u
+static inline int
+wlwmi_encode_start_scan_list_long(const uint16_t *mhz, uint32_t n, uint32_t id, uint32_t dwell, uint32_t max_time,
+    uint8_t *out, uint32_t room, uint32_t *len)
+{
+	if (dwell < 50u || dwell > WLSCAN_DWELL_LONG_MAX) { return 1; }
+	if (wlwmi_encode_start_scan_list(mhz, n, id, WLSCAN_DWELL_PASSIVE, max_time, out, room, len)) { return 1; }
+	wlce_put32(out + 4 + 4 * WLWMI_SS_DWELL_PASSIVE, dwell);
+	return 0;
+}
+
 /* What the scan heard. One entry per BSSID: the strongest reception's
  * frequency and dBm, every flag seen, the first usable SSID. */
 enum { WLSCAN_SSID_NONE, WLSCAN_SSID_OK, WLSCAN_SSID_HIDDEN, WLSCAN_SSID_BAD };

@@ -55,7 +55,7 @@ file:line below is into that tree. UniXNU-sheng was not used for any line of cod
 | `fuxiwlansalami=2` | salami only | C3 profile (owner decision 7: recommended yes, pending owner): the gate of `=1`, plus the defaults `fuxiwlanclk=1`, `fuxiwlanprobe=civac`, `fuxiwlanseq=cycle,parf,dbi,eq,hostirq,msi,por,prefix` (the S4 set and the clock votes of the passing r1c1 kit). A boot-arg or ADT `/defaults` value of the same knob always wins; each default used prints `salami <knob> from the fuxiwlansalami=2 profile`. No `fuxiwlanmlo` default; never CLKON, cyclerails or `fuxiwlancnss=pdc`. Any value but 1 or 2 is refused as before (the refusal line still names `=1`, unchanged). |
 
 | `fuxiwlanvrx=N` | absent or 0 default | C2h, only with qrtr 7 and a valid w20 0x4000: 0x01 MGMTREO (read-only management-RX counts), 0x02 CCSTALE (cookie conversion over a stale PPT; needs `fuxiwlanw29` 0x02, in the 0x9f default), 0x04 IPADIS (WMI INIT flag1 IPA_DISABLE), 0x08 FSE (HTT RX_FSE_SETUP_CFG and RX_FISA_CFG; needs w20 0x800). Refused: negative, any other bit, without a valid 0x4000 or qrtr 7. See [C2h](#c2h-w30-the-vendors-kiwi-rx-extras-fuxiwlanvrx). |
-| `fuxiwlanch=N` | absent or 0 default | CH1, only with qrtr 7: a drop mask over the 38-entry passive scan list. Bits 0..24 drop the 5 GHz entries in list order (5180 ... 5825; bit 13 = 5600), bit 25 drops the 13 2.4 GHz channels; w20 0x10 applies on top. Bit 26 (SPLIT, 0x4000000) drops nothing: it runs the passive scan as two scans back to back, the kept 2.4 GHz channels and then the kept 5 GHz channels. Bits 27 (0x8000000) and 28 (0x10000000) drop nothing either: they set START_SCAN's `scan_ctrl_flags_ext` to the vendor's DBS scan policy FORCE_NONDBS (0x1) or IGNORE_DUTY (0x2) in every scan of the stage. Bit 29 (PRESCAN, 0x20000000, qrtr 8 only) drops nothing: W25 runs one full split at service ready and keeps a stale copy for a lane stop ([W25d](#w25d-pollce2credit-diagnostics-start_scan-lines-a-prescan-and-a-stale-cache-fuxiwlanch-bit-29)). Refused: any bit above 29, bit 29 with qrtr 7, bits 27 and 28 together, a mask (with w20 0x10) that leaves no channel, any other qrtr. See [CH1](#ch1-the-scan-channel-mask-fuxiwlanch) and [bits 27 and 28](#bits-27-and-28-start_scan-dbs-scan-policy). |
+| `fuxiwlanch=N` | absent or 0 default | CH1, only with qrtr 7: a drop mask over the 38-entry passive scan list. Bits 0..24 drop the 5 GHz entries in list order (5180 ... 5825; bit 13 = 5600), bit 25 drops the 13 2.4 GHz channels; w20 0x10 applies on top. Bit 26 (SPLIT, 0x4000000) drops nothing: it runs the passive scan as two scans back to back, the kept 2.4 GHz channels and then the kept 5 GHz channels. Bits 27 (0x8000000) and 28 (0x10000000) drop nothing either: they set START_SCAN's `scan_ctrl_flags_ext` to the vendor's DBS scan policy FORCE_NONDBS (0x1) or IGNORE_DUTY (0x2) in every scan of the stage. Bit 29 (PRESCAN, 0x20000000, qrtr 8 only) drops nothing: W25 runs one full split at service ready and keeps a stale copy for a lane stop ([W25d](#w25d-pollce2credit-diagnostics-start_scan-lines-a-prescan-and-a-stale-cache-fuxiwlanch-bit-29)). Bit 30 (LONG PRESCAN, 0x40000000, qrtr 8 with bit 29 only) gives the prescan split a 300 ms passive dwell ([W25f](#w25f-per-part-rx-ring-census-merged-scan-results-and-a-long-prescan-fuxiwlanch-bit-30)); with bit 29 the stale copy is the merged table of every completed split (W25f). Refused: any bit above 30, bit 29 with qrtr 7, bit 30 without bit 29 or with qrtr 7, bits 27 and 28 together, a mask (with w20 0x10) that leaves no channel, any other qrtr. See [CH1](#ch1-the-scan-channel-mask-fuxiwlanch) and [bits 27 and 28](#bits-27-and-28-start_scan-dbs-scan-policy). |
 
 Refusals set `wl_variant_invalid`; salami refuses at init before any access, the Fuxi build at step 17.
 Every boot without `fuxiwlanqrtr=6`, `7` or `8` logs and behaves as before C1, every boot with qrtr absent
@@ -2438,6 +2438,98 @@ the boot-arg sweeps of W25d are not run again): D1 the CE model's scenario logs:
 349 base logs 303 are equal as they are and 46 (the W25 ones) are equal once the 276 `W25 trace` lines are removed and the 148 part-line tails cut off;
 D5 the wire: 388 base scenarios, 227702 device events hashed with the model clock, count and hash equal; D4 source: fuxi_wlan.c outside the W25
 service block differs in 9 hunks, 0 lines removed, additions only; fuxi_wlan_ce.h, the iOS side and 0104 are identical.
+
+### W25f: per-part RX ring census, merged scan results and a long prescan (`fuxiwlanch` bit 30)
+
+Code and host tests only; nothing ran on the phone. W25d/W25e left two things open. The W26/W27/W28 watches of the FIRST scan show the RX data path
+completely static on the phone (refill taken 4095 left 0, mac0/mac1 rings full and unmoving, WBM idle avail 32535, REO reaped 0, monitor rings
+untouched), but a later scan part is the one that dies, and nothing looks at the rings then. And one 150 ms passive dwell a channel misses the owner's
+own AP, so the list freezes at the prescan. W25f adds three things, all on the W25 service (qrtr 8, W25 = the scan service for iOS).
+
+**1. The census (qrtr 8 only, no knob, always on, read-only).** At the end of EVERY scan part, completed or not, `wl25_part_end` calls `wl25_cen_take`: one
+snapshot with exactly the reads the first scan's watches make and no other.
+
+| piece | reads (the watches' own functions) |
+|---|---|
+| refill ring, MAC rings 161/169, error ring | `wlrx_watch_read`: the refill TP, each MAC ring's HP and TP, the error ring HP (6 host-memory loads, each with its read barrier), then `wlrx_watch_derive` |
+| WBM idle ring 120 | `wl26_wbm_rd(WLRX_WBM_IDLE_HP)`, `wl26_wbm_rd(WLRX_WBM_IDLE_TP)` (the two reads `wl26_watch` does, through the one window accessor), then derived |
+| REO (W27) | host counters only (`wl_rd`): reaped from the release, exception and destination rings, buffers returned |
+| monitor rings 185/193 (W28) | `wlms_watch`: the two TP words (2 loads with barriers) and the written count |
+
+No write, no publish, no shadow register, no other register; the window accessor moves the window for the two idle registers and restores it (the model
+counts the window selects). The derivations run on scratch copies of `struct wlrx` and `struct wlms` (`wl25_cen_rx`, `wl25_cen_ms`), so the watches' own slots
+(`wl_rx.w[]`, `wl_ms.w[]`, their `taken` flags, the refill head) are not touched and the first scan's W26/W27/W28 lines are what they were. A piece that is off (no RX
+path, no idle list, no REO path, no monitor rings, or the RX path latched) reads nothing and says `off`; a part the service ended in the middle of (`contained`: the RX
+path is being torn down) reads nothing at all and every piece says `off`. The snapshot is host RAM; nothing is printed while a scan runs. It is said with the part lines at
+the end of the request (`wl25_parts_say`, right after that part's two lines, before a W25e trace; the same requests as the part lines: 1..24, every 100th, the first 24
+failed ones), as two lines of at most 254 bytes (the model fills every field at its cap and measures 253):
+
+    FUXI WLAN: W25 census part 2 (5 GHz, id 0xa004, no end by max + 200 ms): refill tp 4046 taken 2023 left 240 mac0 hp 2044 tp 2144 avail 1998 mac1 hp 2002 tp 2384 avail 1857 err hp 0 fill 0 idle hp 65534 tp 1590 avail 31972
+    FUXI WLAN: W25 census part 2: reo rel 795 exc 1590 dst 3975 ret 6360; mon0 hp 2046 tp 520 taken 260 left 763 written 260 mon1 hp 2046 tp 540 taken 270 left 753 written 270; exhausted none
+
+(Values from the model's dying 5 GHz part.) Line 1: the part's label and the refill ring (`tp`, `taken` = tp/2, `left`), the two MAC rings (`hp`, `tp`,
+`avail`), the error ring (`hp`, `fill`) and the idle ring (`hp`, `tp`, `avail`). Line 2: the REO counters (`rel`, `exc`, `dst` reaped; `ret` buffers returned), the
+monitor rings (`hp`, `tp`, `taken`, `left`, `written`) and the exhausted flags (`refill`, `mac0`, `mac1`, `err`, `idle`, `mon0`, `mon1`, and `; refill-empty` as the watch says it).
+A ring word that is bad or unreadable says `bad hp H tp T` / `unreadable` as the watches do. Numbers are capped (ring words 99999, REO counts 9999999, monitor
+words 9999). With a piece off: `rx off idle off` / `reo off; mon0 off mon1 off; exhausted none`. These slots are not the watches' `taken` slots: the first scan's watches
+(setup, started, mid, completed) keep their lines and their once-only rule.
+
+Cost, to be read before the next boot: the census is taken where the part's window closes, before the host's STOP_SCAN and before the next part's START_SCAN. With the
+monitor rings on, `wlms_written` compares the 64 sentinel bytes of each of the 2046 monitor buffers (the W28 watch does the same at each of its watches), so the
+census adds that host-memory time between the 2.4 GHz COMPLETED and the 5 GHz START_SCAN (W25 keeps that gap at about 1 ms) on Normal-NC memory. The part lines say
+`started +N ms`, so the boot shows the gap it really had.
+
+**2. Merged results (`fuxiwlanch` bit 29 only).** The W25d stale copy (`wl25_stale`) becomes a merged table: the union of the frames of every completed full split, one
+frame a BSSID (address 3), the newest frame winning (even a weaker one), past 64 BSSIDs the strongest kept (the cache's rule: a stronger new BSSID replaces the weakest,
+a weaker one is dropped). It is updated by `wl25_stale_take` at each completed split (every part COMPLETED), by nothing else: a split that does not complete adds
+nothing. The cache hit, the answer of a completed split and the stale service (after a lane stop) all answer from this table (`wl25_tab`); the cache still decides
+whether a split is due (30 s, valid only after a completed split). The request's channels select which frames go to iOS, as before. Log, one short line after the
+request's own line when its split completed, with the usual request gating:
+
+    FUXI WLAN: W25 scan 2 seq 1: merged 3 BSS (+1 new)
+
+(`N` = size of the table, `K` = BSSIDs the split added.) The cache-hit line's `K of M frames match` has M = the table's size with the bit. Without bit 29 nothing
+changes: no table, no line, the answers come from the split's own cache. The boot prints `W25 selected merged results (fuxiwlanch bit 29)` with the prescan line.
+
+**3. Long prescan (`fuxiwlanch` bit 30 = 0x40000000).** The prescan split (the one at service ready, seq 0) uses a passive dwell of 300 ms; `max_scan_time` keeps its
+rule `cnt x dwell x 3/2`: 13 x 300 x 3/2 = 5850 ms (2.4 GHz part), 25 x 300 x 3/2 = 11250 ms (5 GHz part). Accepted only with bit 29 and qrtr 8
+(`W20 fuxiwlanch 0xN refused: bit 30 (LONG PRESCAN) needs bit 29 and fuxiwlanqrtr=8`); the general refusal now says `bits 0..30 only`. Requests from iOS keep their clamp (dwell 50..200, else
+150): `wl25_dwell` is the one place a scan's dwell is chosen and only a request with seq 0 under bit 30 can pass 300. The encoder is not changed for any existing caller:
+`wlwmi_encode_start_scan_list` (dwell 50..200) is byte for byte as it was, and `wlwmi_encode_start_scan_list_long` (its own bound, `WLSCAN_DWELL_LONG_MAX` 300) builds the command
+through it with the default dwell and writes the one dwell word; the driver calls it only above 200. Boot line: `W25 selected long prescan (fuxiwlanch bit 30)`.
+
+Firmware-side, 300 ms passive is inside the ranges of both references (the dwell is a 32-bit word in the command; nothing in ath12k clamps it):
+- ath12k, Linux v6.19, `drivers/net/wireless/ath/ath12k` (BSD-3-Clause-Clear): `wmi.c:2549` default `dwell_time_passive = 150`; `wmi.c:2718` copies it to the command's
+  `__le32 dwell_time_passive` (`wmi.h:3440`; `u32` in `wmi.h:3529`) with no range check anywhere on the way; and its own single-channel passive scan, remain-on-channel
+  (`mac.c:13445` `scan_time_msec = max_remain_on_channel_duration * 2`, `mac.c:13464-13466` dwell active, passive and `max_scan_time` all `scan_time_msec`, `mac.c:14377`
+  `max_remain_on_channel_duration = 5000`), asks the firmware for a 10000 ms passive dwell.
+- The vendor (OnePlus 11 vendor modules, github.com/LineageOS/android_kernel_oneplus_sm8550-modules, the commit of `wlan-mgmt-rx-study.md`), `qcom/opensource/wlan/qca-wifi-host-cmn/umac/scan/dispatcher/inc/cfg_scan.h:305-322`
+  (ISC): `gPassiveMaxChannelTime`, min 0, max 10000 ms, default `PLATFORM_VALUE(110, 300)`; the host scan request's `dwell_time_passive` is a `uint32_t`
+  (`wlan_scan_public_structs.h:1137`).
+
+Tests (tools/test-fuxi-wlan-ce.py, tools/fuxi-wlan-ce-model.c): the model's beacons gain a `splits` mask (heard only in the full splits whose bit it has) and the model keeps its own
+oracle of the merged table (`h_sh_copy`: a union, newest wins, 64 strongest) that `done()` compares every answer with (cache hit, split, stale). `s_w25f_census`: (a) w20
+0x3b02 with two requests, the second one's 5 GHz part silent after 2 channels: 4 parts, 8 census lines, each labelled with how its part ended; the first request's
+5 GHz census equals the first scan's completed W26/W27/W28 watches number for number (28 numbers and the exhausted flags: nothing moves between the part's end and the
+watch), the earlier part's counters are smaller, the dying part equals the model's own ring words (frozen once the firmware went silent), the order in the log (after the part's
+two lines, before the trace, after the request's first line and before its second request), one call of the census taken directly counts exactly 8 ring-word loads with 8 read barriers,
+2 window selects and no publish, shadow or WBM write, and leaves `wl_rx.w`, `wl_ms.w` and the refill head byte for byte; (b) the lane stopped in the middle of the 5 GHz part:
+`contained`, every piece off, no load; (c) no RX piece (w20 0) and rings plus idle list only (0x302): off where the piece is off; (d) the widest lines (every field at its cap, every
+flag, bad and unreadable, the widest label): 240 and 253 bytes. `s_w25f_merge`: (a) bit 29, the prescan plus three requests (disjoint and overlapping BSSIDs, the same BSSID with a weaker
+newer frame, a failed split whose 2.4 GHz part heard a BSSID), `merged 2 BSS (+2 new)`, `3 (+1)`, nothing for the failed split, `4 (+1)`; a cache hit of 4 of 4 frames; the lane stopped in a
+request, the stale service answering it and the next from the 4-BSS table; (b) without the bit: no table, no line, the cache is the last split's frames; (c) the 64-BSSID rule on the
+production function. `s_w25f_long`: the encoder grid (long equals list for 50..200, list plus the dwell word above, refusals), the prescan's START words (dwell 300, max 5850 and
+11250), requests asking 150, 120, 300 and 200 getting 150, 120, 150, 200, bit 29 alone keeping 150. `static_w25f`; the salami gate test learns bit 30 and the refusal texts. 7 new mutants in
+`MUTANTS` (a census read added in the scan loop, the merge running without bit 29, the answers from the cache with the bit, the merged table keeping the first frame, 300 ms on an
+iOS request, the bit 30 prescan at 150, the list encoder accepting 300); the old "stale cache served without bit 29" mutant is now caught by the model's pointer check.
+
+Proof that qrtr 0..7, the encoder and the wire did not move (scripts in `op11-tools/salami-port/wlan/r1/impl/w25f`, run on a `git archive` of c4f4a02; the 32400-run sweep of
+W25d is not run again, only the boots that name fuxiwlanch):
+- D1 model: 299 scenario logs before the first W25 scenario equal byte for byte (every qrtr 0..7 scenario); of the 353 base scenario logs 306 are equal as they are, 47 (the W25 ones, the W25d bit 29 prescan and stale scenarios among them) are equal once the 306 census lines and the 9 merged lines are removed, and 0 differ otherwise; 91 summary lines equal, the new tree adds 5 for the 8 scenario logs of the W25f scenarios; encoder dumps equal (dump-init 388, dump-c2 6512, dump-c2c 1410, dump-c2d 3347, dump-c2e 609, dump-c2f 4299)
+- D2b gate with fuxiwlanch: 11520 runs (4 sets x 5 qrtr x 4 w20 x 36 masks x salami/Fuxi x boot-args/ADT): 9760 byte for byte equal to the base boot, 1520 equal once the refusal text (bits 0..29 -> 0..30), the bit 29 / 30 refusal lines (680 of them) and the new "selected merged results" line are spelled back, 240 accepted bit 30 + 29 boots on qrtr 8 equal to the new tree's own boot with bit 30 cleared plus the one W25 selected long prescan line (the base refuses them: bit 30 was above the knob)
+- D3 encoder: wlwmi_encode_start_scan_list over the grid (6606 lines of hex output: 6 channel sets x dwell 40..310 x 7 ids, the room bound 190..200, null / zero / 39 channels), built from each tree's fuxi_wlan_ce.h: the output is the same file (471201 bytes), stderr "list encoder grid: 6594 cases, 6002 refused"; the function's text is identical in both headers and the header differs by 1 inserted block(s) (19 lines) only; the long encoder: list encoder grid: 6594 cases, 6002 refused long encoder: 1554 cases equal to the list encoder (dwell 50..200), 4200 above it (201..300) equal to it but for the dwell word (1600 accepted), 840 refused outside 50..300
+- D4 source: fuxi_wlan.c outside the W25 service block (426568 bytes compared) differs in 7 hunks, 5 lines removed (the knob mask define, its comment, the refusal text 0..29 -> 0..30, the mask static assertion) and 20 added; hunks at base lines 991, 1045, 1489, 1499, 1505, 1561, 7432; fuxi_wlan_ce.h differs by 1 insertion(s) of 19 lines (the long encoder) and no deletion; xnu/fuxi-wifi-ios and 0104 untouched
+- D5 wire: 392 base scenarios, 229452 device events (HTC frames received by the firmware with CE, endpoint and bytes hashed; BAR0 / window / containment register writes with value), each with the model clock: 390 scenarios event for event equal (341 of them without any W25 line: every qrtr 0..7 scenario), 2 W25 scenarios with the base events unchanged in order and time plus 40 extra window events (0x310c select / restore: {'select 0x40000014': 20, 'restore 0x40000010': 20}), the census reading the two WBM idle ring registers through the one window accessor; no HTC frame, no other register, no moment moved. The new tree runs 13 more scenarios (W25f)
 
 ### The fuxiwlansalami=3 profile
 
