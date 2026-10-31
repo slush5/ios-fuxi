@@ -5358,12 +5358,36 @@ static bool wl25_ci_off; /* C2b chan-info lines end with the first W25 scan (wl2
  * wl25_cmd_*: the first WL25_CMDS_MOST commands sent on the WMI endpoint from WMI READY on (id, HTC credits just before it),
  * wl25_cmd_n all of them (wl_ce_send). */
 #define WL25_CMDS_MOST 16u
+
+/* W25e (qrtr 8 only, read-only, always on in qrtr 8: host RAM only; docs-lanes/wlan-w20.md "W25e"): a ring of the last WL25_TR_MOST WMI
+ * events reaped (E) and WMI commands sent (C) from WMI READY on, each with the ms since WMI READY (mach time), the WMI id (low 24 bits),
+ * the HTC credits of the WMI endpoint at that moment and one detail word, so that the last things the firmware said before it went
+ * silent are known with their times. The detail is a word the parsers already took: SCAN_EVENT type and freq (wl_scan.ev_type and
+ * ev_freq, only when this very event was parsed, as wl_scan.events says), CHAN_INFO freq (wl_scan.ci), MGMT_RX freq and dBm (the
+ * wlscan.heard hook, wl25_heard, is handed both); for anything else, and for an event the parser did not take, the first word after
+ * the 4-byte WMI header when the message has one (length >= 8, else 0). Nothing more is parsed, nothing is read from the device and
+ * nothing is said while a part runs: wl25_part_end copies the ring when a part ends other than COMPLETED, and the copy is said with the
+ * part lines at the end of the request (wl25_tr_say). */
+#define WL25_TR_MOST 96u
+#define WL25_TRF_RAW 0u    /* detail: the first payload word after the WMI header */
+#define WL25_TRF_SCAN 1u   /* detail: SCAN_EVENT type (31:16) and freq (15:0) */
+#define WL25_TRF_CI 2u     /* detail: CHAN_INFO freq */
+#define WL25_TRF_MGMT 3u   /* detail: MGMT_RX freq (31:16) and dBm (15:0, signed) */
+struct wl25_tr_ent {
+	uint32_t ms, id, det;   /* ms since WMI READY, WMI id (low 24 bits), the detail word */
+	int16_t cr;             /* HTC credits of the WMI endpoint: just before a command, after the HTC trailer of an event */
+	char kind;              /* 'C' command sent, 'E' event reaped */
+	uint8_t form;           /* WL25_TRF_*: what the detail word holds */
+};
+
 struct wl25_win {
 	bool on;
 	uint64_t t0_ns, last_ns, gap_ns, t1_ns;                /* opened, the previous pass, the longest gap between two passes, closed */
 	unsigned passes, post_min, back_max, free_min;         /* passes; CE2 posted-unreaped buffers (min), entries written and not reaped (max) and buffers left to the device (min) */
 	int c0, cmin, cend;                                    /* WMI endpoint HTC credits at open, the lowest, at close */
 	unsigned ev_scan, ev_ci, ev_mgmt, ev_other;            /* WMI events reaped: scan, chan-info, mgmt-rx, the rest */
+	bool part, ev_any;                                     /* W25e: a scan part's window (its line says when it started and its last event); an event was reaped in it */
+	struct wl25_tr_ent ev;                                 /* W25e: the last one */
 };
 static struct wl25_win wl25_w;
 static bool wl25_cmd_on;
@@ -5371,6 +5395,14 @@ static uint64_t wl25_ready_ns;
 static uint32_t wl25_cmd_id[WL25_CMDS_MOST];
 static int wl25_cmd_cr[WL25_CMDS_MOST];
 static unsigned wl25_cmd_n;
+static bool wl25_tr_on;                           /* W25e: armed at WMI READY with qrtr 8, off at the service's end */
+static struct wl25_tr_ent wl25_tr[WL25_TR_MOST];
+static unsigned wl25_tr_n;                        /* entries written since READY; the ring holds the last WL25_TR_MOST */
+static unsigned wl25_tr_heard_n;                  /* W25e: frames the MGMT_RX hook was handed (wl25_heard), and the last one's freq and dBm */
+static uint32_t wl25_tr_mhz;
+static int32_t wl25_tr_dbm;
+static void wl25_tr_rx(const uint8_t *msg, uint32_t len);
+static void wl25_tr_parsed(uint32_t id, uint32_t events0, uint32_t ci0, uint32_t heard0);
 
 static uint64_t
 wl25_ns(void)
@@ -5602,8 +5634,11 @@ static int
 wl_ce_wmi_rx(void *ctx, const uint8_t *msg, uint32_t len)
 {
 	uint32_t id = 0, foreign = wl_scan.foreign, ci = wl_scan.ci_seen, other = wl_scan.wrong_id;
+	const uint32_t evn = wl_scan.events, heard = wl25_tr_heard_n;   /* W25e: what the parsers had counted before this event */
 	(void)ctx;
+	wl25_tr_rx(msg, len);   /* W25e: the ring entry of this event, with the first payload word (qrtr 8, from WMI READY on; nothing otherwise); one the parser fails on is in it */
 	if (wlwmi_rx(&wl_wmi, msg, len, &id)) { return 1; }
+	wl25_tr_parsed(id, evn, ci, heard);   /* W25e: the detail the parsers took, if they took this event */
 	if (wl25_w.on) {   /* W25d: events by kind inside a window */
 		if (id == WLWMI_EV_SCAN) { wl25_w.ev_scan++; } else if (id == WLWMI_EV_CHAN_INFO) { wl25_w.ev_ci++; }
 		else if (id == WLWMI_EV_MGMT_RX) { wl25_w.ev_mgmt++; } else { wl25_w.ev_other++; }
@@ -5641,6 +5676,78 @@ static int
 wl25_credits(void)
 {
 	return wl_htc.wmi_eid < WLHTC_EPS ? wl_htc.ep[wl_htc.wmi_eid].credits : -1;
+}
+
+/* W25e: ms since WMI READY of a mach time (0 before it). */
+static uint32_t
+wl25_rel_ms(uint64_t ns)
+{
+	const uint64_t ms = ns > wl25_ready_ns ? (ns - wl25_ready_ns) / 1000000ull : 0ull;
+	return ms > 0xffffffffull ? 0xffffffffu : (uint32_t)ms;
+}
+
+/* W25e: one entry of the ring (and the open window's last event when it is an event). Only from WMI READY to the service's end. */
+static void
+wl25_tr_note(char kind, uint32_t id, uint32_t form, uint32_t det)
+{
+	struct wl25_tr_ent *e;
+	int c;
+	if (!wl25_tr_on) { return; }
+	c = wl25_credits();
+	e = &wl25_tr[wl25_tr_n % WL25_TR_MOST];
+	e->ms = wl25_rel_ms(wl25_ns());
+	e->id = id & 0xffffffu; e->det = det; e->form = (uint8_t)form; e->kind = kind;
+	e->cr = (int16_t)(c < -9 ? -9 : c > 9999 ? 9999 : c);
+	if (kind == 'E' && wl25_w.on) { wl25_w.ev = *e; wl25_w.ev_any = true; }
+	wl25_tr_n++;
+}
+
+/* W25e: the entry of one WMI event reaped, written before the parsers see it (one they fail on is in the ring too): the id, and the first word
+ * after the 4-byte header when the message has one. */
+static void
+wl25_tr_rx(const uint8_t *msg, uint32_t len)
+{
+	wl25_tr_note('E', len >= 4u ? wlce_get32(msg) : 0u, WL25_TRF_RAW, len >= 8u ? wlce_get32(msg + 4) : 0u);
+}
+
+/* W25e: the parsers took the event wl25_tr_rx just wrote (ID, its low 24 bits): its detail is then the word they took, only when this very event
+ * moved their counters (EVENTS0, CI0, HEARD0: wl_scan.events, wl_scan.ci_seen and wl25_tr_heard_n before it). */
+static void
+wl25_tr_parsed(uint32_t id, uint32_t events0, uint32_t ci0, uint32_t heard0)
+{
+	struct wl25_tr_ent *e;
+	if (!wl25_tr_on || !wl25_tr_n || !wl_wmi.scan || !wlscan_known(id)) { return; }
+	e = &wl25_tr[(wl25_tr_n - 1u) % WL25_TR_MOST];
+	if (id == WLWMI_EV_SCAN && wl_scan.events != events0) {
+		e->form = WL25_TRF_SCAN; e->det = (wl_scan.ev_type & 0xffffu) << 16 | (wl_scan.ev_freq & 0xffffu);
+	} else if (id == WLWMI_EV_CHAN_INFO && wl_scan.ci_seen != ci0) {
+		e->form = WL25_TRF_CI; e->det = wl_scan.ci[WLWMI_CI_FREQ];
+	} else if (id == WLWMI_EV_MGMT_RX && wl25_tr_heard_n != heard0) {
+		e->form = WL25_TRF_MGMT; e->det = (wl25_tr_mhz & 0xffffu) << 16 | ((uint32_t)wl25_tr_dbm & 0xffffu);
+	} else {
+		return;
+	}
+	if (wl25_w.on) { wl25_w.ev = *e; }
+}
+
+/* W25e: the detail word as text (at most 15 bytes), and one entry as text: "ms C|E id credits detail", at most 41 bytes. */
+static void
+wl25_tr_det(char *out, size_t room, uint32_t form, uint32_t det)
+{
+	if (form == WL25_TRF_SCAN) { snprintf(out, room, "t%x f%u", det >> 16, det & 0xffffu); }
+	else if (form == WL25_TRF_CI) { snprintf(out, room, "f%u", det); }
+	else if (form == WL25_TRF_MGMT) { snprintf(out, room, "f%u s%d", det >> 16, (int)(int16_t)(det & 0xffffu)); }
+	else { snprintf(out, room, "w%x", det); }
+}
+
+static unsigned
+wl25_tr_fmt(char *out, size_t room, const struct wl25_tr_ent *e)
+{
+	char det[32];
+	int n;
+	wl25_tr_det(det, sizeof(det), e->form, e->det);
+	n = snprintf(out, room, "%u %c %x c%d %s", e->ms > 99999999u ? 99999999u : e->ms, e->kind, e->id, e->cr, det);
+	return n < 0 ? 0u : (unsigned)n;
 }
 
 /* W25d, the first thing of a poll pass inside a window: when it began (the gap to the pass before), how many CE2 RX buffers are posted
@@ -5729,6 +5836,9 @@ wl_ce_send(uint32_t eid, const uint8_t *payload, uint32_t len, const char *what)
 	if (wl25_cmd_on && eid == wl_htc.wmi_eid && len >= 4u) {   /* W25d: the command log, from WMI READY to the first START_SCAN (qrtr 8) */
 		if (wl25_cmd_n < WL25_CMDS_MOST) { wl25_cmd_id[wl25_cmd_n] = wlce_get32(payload); wl25_cmd_cr[wl25_cmd_n] = wl_htc.ep[eid].credits; }
 		wl25_cmd_n++;
+	}
+	if (eid == wl_htc.wmi_eid && len >= 4u) {   /* W25e: the ring (wl25_tr_note writes only from WMI READY to the service's end, qrtr 8): credits just before the command */
+		wl25_tr_note('C', wlce_get32(payload), WL25_TRF_RAW, len >= 8u ? wlce_get32(payload + 4) : 0u);
 	}
 	if (!wlhtc_has_credits(&wl_htc, eid, total)) {
 		wl_ce_need_eid = eid; wl_ce_need_len = total;
@@ -7475,6 +7585,7 @@ wl25_heard(void *ctx, const uint8_t *frame, uint32_t len, uint32_t mhz, int32_t 
 	unsigned i = 0;
 	struct wl25_cached *c;
 	(void)ctx;
+	wl25_tr_heard_n++; wl25_tr_mhz = mhz; wl25_tr_dbm = dbm;   /* W25e: freq and dBm of this frame, for its ring entry */
 	if (!wl25_fill) { return; }
 	const int16_t s = (int16_t)(dbm < -128 ? -128 : dbm > 127 ? 127 : dbm), f = (int16_t)(nf < -128 ? -128 : nf > 127 ? 127 : nf);
 	if (len < 22u || len > sizeof(c->frame)) { wl25_cache_lost++; return; }
@@ -7578,18 +7689,38 @@ wl25_win_close(struct wl25_win *out)
 /* A window's two lines, counts only. Every number is capped so that no line passes the console's 254 bytes (the host test says the
  * widest one). gap: tenths of a millisecond. A window with no pass has no minimum: 0. */
 #define WL25_CL(v, m) ((v) > (m) ? (m) : (v))
+
+/* W25e: what a scan part's second line adds: when the part started and when its last event arrived (ms since WMI READY), with that event
+ * (its id, then its detail as the trace says it); nothing for the idle wait. Called by wl25_win_say below, which keeps the 99999999 caps. */
+static void
+wl25_win_tail(char *out, size_t room, const struct wl25_win *w)
+{
+	const uint32_t from = wl25_rel_ms(w->t0_ns);
+	out[0] = 0;
+	if (!w->part) { return; }
+	if (w->ev_any) {
+		char det[32];
+		wl25_tr_det(det, sizeof(det), w->ev.form, w->ev.det);
+		snprintf(out, room, "; started +%u ms, last event +%u ms (id %x %s)", WL25_CL(from, 99999999u), WL25_CL(w->ev.ms, 99999999u), w->ev.id, det);
+	} else {
+		snprintf(out, room, "; started +%u ms, no event", WL25_CL(from, 99999999u));
+	}
+}
+
 static void
 wl25_win_say(const char *label, const struct wl25_win *w)
 {
 	const unsigned gap = (unsigned)WL25_CL(w->gap_ns / 100000ull, 99999999ull), polls = WL25_CL(w->passes, 99999999u);
 	const unsigned post = w->passes ? WL25_CL(w->post_min, 9999u) : 0u, left = w->passes ? WL25_CL(w->free_min, 9999u) : 0u;
 	const unsigned long long ms = WL25_CL((w->t1_ns - w->t0_ns) / 1000000ull, 99999999ull);
+	char tail[112];
+	wl25_win_tail(tail, sizeof(tail), w);
 	printf("FUXI WLAN: W25 %s: polls %u in %llu ms, gap max %u.%u ms, ce2 posted-unreaped min %u backlog max %u free min %u, "
 	    "wmi credits %d/%d/%d (start/min/end)\n", label, polls, ms, gap / 10u, gap % 10u, post, WL25_CL(w->back_max, 9999u), left,
 	    w->c0 < -99 ? -99 : w->c0 > 999 ? 999 : w->c0, w->cmin < -99 ? -99 : w->cmin > 999 ? 999 : w->cmin,
 	    w->cend < -99 ? -99 : w->cend > 999 ? 999 : w->cend);
-	printf("FUXI WLAN: W25 %s: wmi events scan %u chan-info %u mgmt-rx %u other %u\n", label, WL25_CL(w->ev_scan, 99999999u),
-	    WL25_CL(w->ev_ci, 99999999u), WL25_CL(w->ev_mgmt, 99999999u), WL25_CL(w->ev_other, 99999999u));
+	printf("FUXI WLAN: W25 %s: wmi events scan %u chan-info %u mgmt-rx %u other %u%s\n", label, WL25_CL(w->ev_scan, 99999999u),
+	    WL25_CL(w->ev_ci, 99999999u), WL25_CL(w->ev_mgmt, 99999999u), WL25_CL(w->ev_other, 99999999u), tail);
 }
 
 /* The windows of the request in flight (closed, their lines not said yet), and of the idle wait before the first START_SCAN. */
@@ -7601,30 +7732,79 @@ static const char *wl25_part_band[2];
 static uint32_t wl25_part_id[2];
 static bool wl25_part_pend[2], wl25_idle_on;
 static unsigned wl25_part_cur;     /* the part whose window is open */
+struct wl25_tr_snap { unsigned shown, total; struct wl25_tr_ent e[WL25_TR_MOST]; };   /* W25e: the ring as of the end of a part that did not COMPLETE, oldest first */
+static struct wl25_tr_snap wl25_tr_snap[2];
+static bool wl25_tr_pend[2];
 static uint64_t wl25_svc_ns;       /* when the service said ready, and how many WMI commands had been sent since READY */
 static unsigned wl25_svc_cmds;
 
 /* A part's window ends (HOW: how the part ended). Its lines are said at the end of the request, not here: console time between the 2.4 GHz
  * COMPLETED and the 5 GHz START_SCAN would change the gap W25 keeps at about 1 ms. */
 static void
-wl25_part_end(unsigned part, const char *how)
+wl25_part_end(unsigned part, const char *how, bool died)
 {
 	if (!wl25_win_close(&wl25_part_w[part])) { return; }
+	wl25_part_w[part].part = true;
+	if (died && wl25_tr_n) {   /* W25e: a copy of the ring, said with the part lines (host RAM only) */
+		struct wl25_tr_snap *s = &wl25_tr_snap[part];
+		const unsigned total = wl25_tr_n, shown = total < WL25_TR_MOST ? total : WL25_TR_MOST;
+		s->shown = shown; s->total = total;
+		for (unsigned i = 0; i < shown; i++) { s->e[i] = wl25_tr[(total - shown + i) % WL25_TR_MOST]; }
+		wl25_tr_pend[part] = true;
+	}
 	snprintf(wl25_part_label[part], sizeof(wl25_part_label[part]), "part %u (%s, id %#x, %s)", part + 1u, wl25_part_band[part],
 	    wl25_part_id[part], how);
 	wl25_part_pend[part] = true;
 }
 
+/* W25e: the ring of a part that did not COMPLETE, oldest first, in lines of at most WL25_TR_LINE bytes: "W25 trace i/n: " and, in the first
+ * line, the part's label, how many entries of how many since READY and when the part ended (ms since READY), then the entries, "; " apart,
+ * each "ms C|E id credits detail" (id in hex; detail: scan "t<type hex> f<MHz>", chan-info "f<MHz>", mgmt-rx "f<MHz> s<dBm>", else
+ * "w<first payload word hex>"). The lines are counted first (i/n), with the widest numbers in "i/n". */
+#define WL25_TR_LINE 250u
+static void
+wl25_tr_say(unsigned part)
+{
+	const struct wl25_tr_snap *s = &wl25_tr_snap[part];
+	uint8_t first[WL25_TR_MOST + 1u];
+	char head[168], line[WL25_TR_LINE + 6u], ent[64];
+	unsigned lines = 0, i = 0;
+	const int hn = snprintf(head, sizeof(head), "%s, last %u of %u since READY, ended +%u ms | ", wl25_part_label[part], s->shown, s->total,
+	    WL25_CL(wl25_rel_ms(wl25_part_w[part].t1_ns), 99999999u));
+	const unsigned hlen = hn < 0 ? 0u : (unsigned)hn;
+	while (i < s->shown) {
+		unsigned at = 28u + (lines ? 0u : hlen), top = i;
+		first[lines++] = (uint8_t)i;
+		for (; i < s->shown; i++) {
+			const unsigned n = wl25_tr_fmt(ent, sizeof(ent), &s->e[i]) + (i > top ? 2u : 0u);
+			if (i > top && at + n > WL25_TR_LINE) { break; }
+			at += n;
+		}
+	}
+	first[lines] = (uint8_t)s->shown;
+	for (unsigned k = 0; k < lines; k++) {
+		unsigned at = (unsigned)snprintf(line, sizeof(line), "FUXI WLAN: W25 trace %u/%u: %s", k + 1u, lines, k ? "" : head);
+		for (unsigned e = first[k]; e < first[k + 1u]; e++) {
+			if (e > first[k]) { at += (unsigned)snprintf(line + at, sizeof(line) - at, "; "); }
+			at += wl25_tr_fmt(line + at, sizeof(line) - at, &s->e[e]);
+		}
+		printf("%s\n", line);
+	}
+}
+
 /* The lines of the parts that ended and were not said yet, and the second part's START_SCAN line, first; SAY false drops them (the
- * request is not one of those said). */
+ * request is not one of those said). W25e: a part that did not COMPLETE says its ring after its two lines. */
 static void
 wl25_parts_say(bool say)
 {
 	if (wl25_start_late_pend && say) { printf("%s", wl25_start_late); }
 	wl25_start_late_pend = false;
 	for (unsigned p = 0; p < 2; p++) {
-		if (wl25_part_pend[p] && say) { wl25_win_say(wl25_part_label[p], &wl25_part_w[p]); }
-		wl25_part_pend[p] = false;
+		if (wl25_part_pend[p] && say) {
+			wl25_win_say(wl25_part_label[p], &wl25_part_w[p]);
+			if (wl25_tr_pend[p]) { wl25_tr_say(p); }
+		}
+		wl25_part_pend[p] = false; wl25_tr_pend[p] = false;
 	}
 }
 
@@ -7646,7 +7826,7 @@ static void
 wl25_diag_end(void)
 {
 	if (wl25_idle_on) { wl25_idle_say(); }
-	else if (wl25_w.on) { wl25_part_end(wl25_part_cur, "contained"); }
+	else if (wl25_w.on) { wl25_part_end(wl25_part_cur, "contained", true); }
 	wl25_parts_say(true);
 }
 
@@ -7916,7 +8096,7 @@ wl25_scan(const struct fuxi_wifi_radio_request *rq, uint32_t nlist)
 			}
 			wl_sleep(1);
 		}
-		wl25_part_end(part, how);   /* W25d */
+		wl25_part_end(part, how, status != 0);   /* W25d (W25e: the ring is kept when the part did not COMPLETE) */
 		if (stop || status != 0) { break; }  /* only a part that COMPLETED lets the next one start */
 	}
 	if (stop) {
@@ -7969,9 +8149,10 @@ wl25_scan(const struct fuxi_wifi_radio_request *rq, uint32_t nlist)
 static void
 wl25_end(void)
 {
-	if (!wl25_on) { return; }
+	if (!wl25_on) { wl25_tr_on = false; return; }
 	wl25_on = false;
 	wl25_diag_end();   /* W25d: a window still open, lines not said yet */
+	wl25_tr_on = false;   /* W25e: the ring is done */
 	/* two lines: the console keeps 254 bytes of a line (C2b's rule) */
 	printf("FUXI WLAN: W25 service end: %s after %llu s; scans %u (completed %u, failed %u, cancelled %u, refused %u), "
 	    "cache hits %u, frames to iOS %u kept %u; stops confirmed late %u, scan events of another id %u, credit waits %u;\n", wl25_why,
@@ -7996,6 +8177,7 @@ wl_w25_run(uint32_t n)
 	wl25_fill = false; wl25_proved = false; wl25_why = "a failure (above)";
 	wl25_nlist = n; wl25_stale_ok = wl25_ios_gone = wl25_live_on = wl25_idle_on = false; wl25_stale_n = wl25_stale_answers = 0;   /* W25d */
 	wl25_part_pend[0] = wl25_part_pend[1] = wl25_start_late_pend = false; bzero(&wl25_w, sizeof(wl25_w));
+	wl25_tr_pend[0] = wl25_tr_pend[1] = false;   /* W25e */
 	for (uint32_t i = 0; i < n && i < WLSCAN_NCHAN; i++) { list[i] = (uint16_t)wlscan_chan(i); low += list[i] < 3000u; }
 	/* The channels W23 gave the firmware: C2 records no regulatory event to intersect with (CC_EXT is logged only). */
 	fuxi_wifi_radio_ready(list, n);
@@ -8258,6 +8440,7 @@ wl_w22_run(void)
 	    wlce_get32(rc + 4 * WLWMI_RC_FLAGS2), wlce_get32(rc + 4 * WLWMI_RC_HOST_SERVICE_FLAGS));
 	if (wl_ce_wait(WL20_W_READY, 5000, "WMI READY")) { return 1; }
 	if (wl_w25) { wl25_cmd_on = true; wl25_cmd_n = 0; wl25_ready_ns = wl25_ns(); }   /* W25d: the clock and the command log start at WMI READY */
+	if (wl_w25) { wl25_tr_on = true; wl25_tr_n = 0; }   /* W25e: the ring starts there too (qrtr 8 only) */
 	unsigned mac_zero = !(wl_wmi.mac[0] | wl_wmi.mac[1] | wl_wmi.mac[2] | wl_wmi.mac[3] | wl_wmi.mac[4] | wl_wmi.mac[5]);
 	/* L19 stores the status and never acts on it (wmi.c:6910): logged only. */
 	printf("FUXI WLAN: W22 wmi ready status %u mac-zero %u peers %u\n", wl_wmi.ready_status, mac_zero, wl_wmi.num_total_peers);

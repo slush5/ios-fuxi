@@ -2391,6 +2391,54 @@ Proof that qrtr 0..7 and qrtr 8 without bit 29 do the same (scripts in `op11-too
 - D3 (the salami gate test, every boot it runs): 536 boots recorded in the base tree, all present in the new tree (545), stdout equal byte for byte: 518 untouched, 13 equal once the refusal text (bits 0..28 -> 0..29) is spelled back, 5 qrtr 7 boots with bit 29 equal once its new refusal line is spelled back
 - D4 (source): fuxi_wlan.c outside the W25 service block (414681 bytes compared) differs in 13 hunks, 4 lines removed (the knob mask define, its comment, the refusal text 0..28 -> 0..29, the fw_thread comment) and 92 added; hunks at base lines 1044, 1488, 1497, 1499, 1552, 5344, 5568, 5596, 5605, 5652, 7240, 7471, 8394; fuxi_wlan_ce.h is byte for byte identical (231383 bytes); xnu/fuxi-wifi-ios and 0104 untouched
 
+### W25e: a WMI event/command trace, dumped when a scan part dies (qrtr 8, read-only)
+
+Code and host tests only; nothing ran on the phone. W25d showed the host polling fine while a firmware scan part dies at a random point (the 5 GHz
+part after 2 channels in 3 boots, the 2.4 GHz part after about 8 channels): no COMPLETED, the firmware hits its thread assert, STOP_SCAN finds 0
+credits. W25e keeps what the firmware said and what the host sent, with times, so that the last events before the silence can be read.
+
+What it keeps (qrtr 8 only, no knob, always on: the ring is host RAM, nothing is written to or read from the device, nothing is printed while a
+part runs). A ring of the last 96 WMI entries from WMI READY on (the clock and the start of the W25d command line). An entry is
+`ms C|E id cN detail`:
+- `ms`: milliseconds since WMI READY (mach time), `C` a WMI command sent, `E` a WMI event reaped; `id` the WMI id, low 24 bits, hex;
+- `cN`: the HTC credits of the WMI endpoint: just before a command (before any credit wait, as the W25d command line), after the HTC trailer of an event;
+- the detail word, from fields the parsers already extract: a SCAN_EVENT `t<type hex> f<MHz>` (wl_scan.ev_type, ev_freq), a CHAN_INFO `f<MHz>`
+  (wl_scan.ci), a MGMT_RX the scan parser took `f<MHz> s<dBm>` (the wlscan.heard hook is handed both). Anything else (every command, an event the
+  parser did not take such as a bad TLV or a dropped frame, any other event) says `w<first payload word after the 4-byte WMI header, hex>`, 0 when
+  the message is shorter than 8 bytes. An event is entered before the parsers see it (one they fail on is in the ring), and its detail is patched
+  with what they took only when that very event moved their counters (wl_scan.events, ci_seen, the heard count).
+
+When it is said. Each time a scan part ends other than COMPLETED (no end by max + 200 ms, no STARTED, start failed, dequeued, cancelled), the ring is
+copied (host RAM, at the moment the part's window closes, so the host's STOP_SCAN and whatever follows are not in it), and at the service's end if
+it ends contained in the middle of a part (label `contained`). The copy is said with the part lines at the end of the request (`wl25_parts_say`,
+after that part's two lines; the same requests as the part lines: 1..24, every 100th, the first 24 failed ones), oldest first, in lines of at most
+250 bytes (the model checks 254), counted first so that each says `i/n`:
+
+    FUXI WLAN: W25 trace 1/12: part 2 (5 GHz, id 0xa004, no end by max + 200 ms), last 96 of 187 since READY, ended +48285 ms | 7113 E 3001 c3 t8 f5560; 7114 E 4002 c3 f5560; ...
+    FUXI WLAN: W25 trace 2/12: 7411 E 4002 c3 f5580; 7413 E 3001 c3 t8 f5600; 7414 E 4002 c3 f5600; ...
+    FUXI WLAN: W25 trace 12/12: 42763 E 4002 c3 f5200
+
+The first line carries the part, how many of how many entries since READY, and when the part ended (ms since READY). With qrtr 0..7 nothing is
+armed (the ring starts at WMI READY under `wl_w25` only and stops in `wl25_end`), so nothing is entered and nothing is said.
+
+Part lines. The second line of each scan part's window (`part N (...): wmi events ...`) gains `; started +N ms, last event +M ms (id 4002 f5200)`
+(when the window opened, just after its START_SCAN was sent; when its last WMI event of any kind arrived; that event's id and detail as above) or
+`; started +N ms, no event`. The idle wait's line is unchanged.
+
+Tests (tools/test-fuxi-wlan-ce.py, tools/fuxi-wlan-ce-model.c): the model's new `C.c3_silent_scan/c3_silent_n` makes START_SCAN number N heard for
+n channels and then never again. `s_w25e_trace`: (a) two requests, the second one's 5 GHz part silent after 2 FOREIGN_CHANNEL events: one trace, the
+dumped 96 entries equal the model's own oracle (`m_tr`: kind, id, ms on the model clock, HTC credits from its own count of connect, commands and credit
+trailers, detail from the message bytes), the entry after them is the host's STOP_SCAN, the part line's start and last event are the oracle's; (b) the
+lane stops in the middle of the 5 GHz part: the dump is said at the service's end, `contained`; (c) qrtr 7: ring never armed, empty, no W25 line;
+(d) the widest dump (96 entries of the widest numbers): every line within 254 bytes, packed. `static_w25e`; 4 mutants in `MUTANTS` (ring armed with
+qrtr 7, an entry written outside the service's window, the dump for a COMPLETED part, the dump said inside the part loop).
+
+Proof that qrtr 0..7 and the wire did not move (scripts in `op11-tools/salami-port/wlan/r1/impl/w25e`, run on a `git archive` of aa53101; no knob changed, so
+the boot-arg sweeps of W25d are not run again): D1 the CE model's scenario logs: 299 logs before the first W25 scenario equal byte for byte; of the
+349 base logs 303 are equal as they are and 46 (the W25 ones) are equal once the 276 `W25 trace` lines are removed and the 148 part-line tails cut off;
+D5 the wire: 388 base scenarios, 227702 device events hashed with the model clock, count and hash equal; D4 source: fuxi_wlan.c outside the W25
+service block differs in 9 hunks, 0 lines removed, additions only; fuxi_wlan_ce.h, the iOS side and 0104 are identical.
+
 ### The fuxiwlansalami=3 profile
 
 `fuxiwlansalami=3` is the salami gate plus everything `=2` sets (`fuxiwlanclk=1`, `fuxiwlanprobe=civac`,

@@ -334,6 +334,9 @@ struct cfg {
 	 * number slow_scan; every message that fell due meanwhile is delivered in the one tick that follows */
 	unsigned slow_scan, slow_at, slow_ms;
 	bool slow_done;
+	/* W25e: START_SCAN number c3_silent_scan (0: none) is heard for c3_silent_n channels (each a FOREIGN_CHANNEL, its CHAN_INFO pair and its
+	 * frames) and then never again: no COMPLETED, nothing at all, as the phone's firmware before its thread assert */
+	unsigned c3_silent_scan, c3_silent_n;
 };
 static struct cfg C;
 static unsigned restores;
@@ -544,6 +547,56 @@ ce_access(uint32_t off, bool wr, uint32_t *v, bool shadow)
 	if (r->kind == K_DST && r->ce == 1 && dr[1].enabled && dr[3].enabled) { fw_rings_ready(); }
 }
 
+/* ---- W25e: the oracle of the driver's WMI event/command ring ----
+ * What the ring must hold, worked out here and not from a driver counter: every WMI command the firmware takes and every WMI event it
+ * delivers to the host's CE2, from the moment it delivers READY (the host reaps it in the poll that follows the tick, at the same model time:
+ * that is the driver's WMI READY clock), with the model's clock and the model's own count of the host's WMI credits (the connect's, less what
+ * each command takes, plus the credit reports of the trailers it delivers: the host applies a trailer before the message it rides on). The
+ * detail word is read from the bytes of the message (SCAN_EVENT type and freq, CHAN_INFO freq, MGMT_RX freq and dBm = snr - 95, C2's fixed noise
+ * floor; else the first word after the id). A command's credits are those before it takes its own. */
+struct m_tr_e { uint32_t ms, id, det; int cr; unsigned form; char kind; };
+static struct m_tr_e m_tr[1024];
+static unsigned m_tr_n;
+static bool m_tr_on;
+static uint64_t m_tr_t0;
+static int m_tr_cr;
+
+static void
+m_tr_add(char kind, uint32_t id, unsigned form, uint32_t det)
+{
+	if (!m_tr_on || m_tr_n >= sizeof(m_tr) / sizeof(m_tr[0])) { return; }
+	m_tr[m_tr_n].ms = (uint32_t)(now - m_tr_t0); m_tr[m_tr_n].id = id; m_tr[m_tr_n].det = det; m_tr[m_tr_n].cr = m_tr_cr;
+	m_tr[m_tr_n].form = form; m_tr[m_tr_n].kind = kind;
+	m_tr_n++;
+}
+
+static void
+m_tr_deliver(const struct qmsg *m)
+{
+	const uint32_t w0 = m->len >= 8 ? g32(m->d) : 0u, total = w0 >> 16, tlen = (w0 >> 8) & 2u ? g32(m->d + 4) & 0xffu : 0u;
+	const uint8_t *p = m->d + 8;
+	uint32_t id, det, pl;
+	unsigned form = 0;
+	if (!wl_w25 || m->ce != 2 || m->len < 8 || (w0 & 0xffu) != C.wmi_eid || total + 8u > m->len || tlen > total) { return; }
+	if (tlen >= 8u && p[total - tlen] == 1 && p[total - tlen + 4] == C.wmi_eid) { m_tr_cr += p[total - tlen + 5]; }
+	pl = total - tlen;
+	if (pl < 4u) { return; }
+	id = g32(p) & 0xffffffu;
+	if (!m_tr_on) {
+		if (id == 0x2) { m_tr_on = true; m_tr_t0 = now; m_tr_n = 0; }   /* READY itself is not an entry */
+		return;
+	}
+	det = pl >= 8u ? g32(p + 4) : 0u;
+	if (id == 0x3001 && pl >= 20u) { form = 1; det = (g32(p + 8) & 0xffffu) << 16 | (g32(p + 16) & 0xffffu); }
+	else if (id == 0x4002 && pl >= 24u) {
+		form = 2; det = g32(p + 12);
+	} else if (id == 0x7001 && pl >= 16u) {
+		const uint32_t ch = g32(p + 8), freq = ch == 14u ? 2484u : ch < 14u ? 2407u + 5u * ch : 5000u + 5u * ch;
+		form = 3; det = freq << 16 | ((g32(p + 12) - 95u) & 0xffffu);   /* dBm = snr - 95: C2 keeps the noise floor at -95 */
+	}
+	m_tr_add('E', id, form, det);
+}
+
 /* ---- RX delivery ---- */
 static bool
 deliver(const struct qmsg *m)
@@ -564,6 +617,7 @@ deliver(const struct qmsg *m)
 		const uint32_t eid = g32(m->d + 8);
 		m_orc.ev[eid == 0x3001 ? 0 : eid == 0x4002 ? 1 : eid == 0x7001 ? 2 : 3]++;
 	}
+	m_tr_deliver(m);   /* W25e */
 	d->dev = (d->dev + 2) % d->size;
 	write_rdp(d, d->dev);
 	uint8_t *st = dev_mem(s->base + 4ull * s->dev, 16, 0x1000, 0x10000, "STATUS entry");
@@ -1814,7 +1868,8 @@ fw_c3_script(unsigned mode, uint32_t id, uint32_t n, uint32_t dwell)
 	const bool deliver_mgmt = C.rx_rule == 6 ? m_rx_live() : fw_rule_ok();  /* C2c; C2d rule 6: the whole RX path */
 	const bool wedged = C.wedge && !m_rx_live();  /* C2d: the phone's r1c2c-all readout */
 	const bool crash = C.mon_crash && fw_rx_ready && !(fw_mon_live[0] && fw_mon_live[1]);  /* C2e: the phone's crash */
-	const uint32_t stop_at = wedged ? 15u : crash ? (fw_sel_n ? 3u : 15u) : n;
+	const bool silent = C.c3_silent_scan && fw_c3_scans == C.c3_silent_scan;   /* W25e */
+	const uint32_t stop_at = wedged ? 15u : crash ? (fw_sel_n ? 3u : 15u) : silent ? C.c3_silent_n : n;
 	for (uint32_t i = 0; i < n && i < stop_at; i++) {
 		uint32_t t0 = 5 + dwell * i, k = 0, heard = 0, ix = 0;
 		while (ix < 38 && m_chan(ix) != fw_c3_chan[i]) { ix++; }
@@ -1838,7 +1893,7 @@ fw_c3_script(unsigned mode, uint32_t id, uint32_t n, uint32_t dwell)
 	}
 	if (crash) { act(now + 5 + dwell * stop_at, A_CRASH, 0, 0); }
 	const uint32_t end_at = mode == 5 ? n * dwell * 3u / 2u + 190u : 5 + dwell * n + 1;
-	if (mode != 3 && !wedged && !crash) { fw_scan_event_id(1u << 1, 0, 0, 0, id, end_at); fw_c3_ended_at = now + end_at; }
+	if (mode != 3 && !wedged && !crash && !silent) { fw_scan_event_id(1u << 1, 0, 0, 0, id, end_at); fw_c3_ended_at = now + end_at; }
 	fw_tag = 0;
 }
 
@@ -2236,6 +2291,7 @@ fw_rx(unsigned ce, uint32_t eid, const uint8_t *d, uint32_t len)
 				CHECK(svc == 0x100, "connect for an unexpected service");
 				CHECK(f == ((C.credits & 0xffu) << 8), "WMI connect flags are not RECV_ALLOC = all credits");
 				fw_credits = (int)(C.credits & 0xff);
+				m_tr_cr = (int)(C.credits & 0xff);   /* W25e */
 				p32(r, 3 | svc << 16); p32(r + 4, C.wmi_eid << 8 | C.max_msg << 16); p32(r + 8, 0);
 			}
 			htc_out(2, 0, r, 12, -1, 0, 2);
@@ -2273,6 +2329,8 @@ fw_rx(unsigned ce, uint32_t eid, const uint8_t *d, uint32_t len)
 	fw_wmi_msgs++;
 	uint32_t id = g32(pl) & 0xffffff;
 	if (fw_cmd_n < 64) { fw_cmd_log[fw_cmd_n++] = id; }  /* C2c: the WMI command stream, for comparisons */
+	m_tr_add('C', id, 0, plen >= 8 ? g32(pl + 4) : 0u);   /* W25e: the oracle's entry, with the credits before this command takes its own */
+	m_tr_cr -= need;
 	if (id == 0x1) {
 		static const uint8_t mac[6] = {0x02, 0x11, 0x22, 0x33, 0x44, 0x55};
 		/* L19 completes service ready only from EXT, or EXT2 when service 220 is set (wmi.c:4940-4941, 5645) */
@@ -2973,6 +3031,7 @@ reset(void)
 	memset(&wl_rx, 0, sizeof(wl_rx)); wl26_wbm_writes = 0; wl26_heard_none = false;
 	memset(&C, 0, sizeof(C));
 	memset(&m_orc, 0, sizeof(m_orc)); memset(m_orc_res, 0, sizeof(m_orc_res));   /* W25d */
+	m_tr_n = 0; m_tr_on = false; m_tr_cr = 0; wl25_tr_on = false; wl25_tr_n = wl25_tr_heard_n = 0;   /* W25e */
 	C.rx_take = 2048; C.rx_post[0] = C.rx_post[1] = 1024;
 	C.credits = 4; C.credit_size = 2048; C.ready_ce = 2; C.htt_eid = 1; C.wmi_eid = 2; C.max_msg = 2048; C.ready_stslen = -1;
 	C.phy_bands = 3; C.phy_mask = 3; C.htt_major = 3; C.htt_minor = 4; C.exp_n = 38; C.exp_pdev = 0;
@@ -7598,6 +7657,236 @@ s_w25d_poll(void)
 	     "channel), the 5 GHz one after its send; the lines of a part cut short by the lane's stop are said at the service's end");
 }
 
+/* ---- W25e: the WMI event/command ring, dumped when a scan part dies (the oracle is m_tr, above) ---- */
+struct t_ent { uint32_t ms, id, det; int cr; unsigned form; char kind; };
+
+/* The trace lines that start at FROM, all of them: well formed, i/n in order, none wider than 254 bytes; the entries, the first line's header. */
+static unsigned
+t_parse(const char *from, struct t_ent *out, unsigned room, char *label, unsigned *shown, unsigned *total, unsigned *ended, unsigned *nlines, unsigned *widest)
+{
+	const char *p = from;
+	unsigned n = 0, want = 1;
+	*widest = 0; *nlines = 0;
+	while (!strncmp(p, "FUXI WLAN: W25 trace ", 21)) {
+		const char *nl = strchr(p, '\n'), *body;
+		unsigned k = 0, kk = 0, len = (unsigned)(nl - p);
+		int adv = 0;
+		if (len > *widest) { *widest = len; }
+		CHECK(sscanf(p, "FUXI WLAN: W25 trace %u/%u: %n", &k, &kk, &adv) == 2 && adv > 0, "W25e: a trace line's prefix is 'W25 trace i/n: '");
+		CHECK(k == want && kk >= k && (k == 1 || kk == *nlines), "W25e: the trace lines are numbered i/n in order, one n");
+		if (k == 1) {
+			const char *lastp = strstr(p + adv, ", last ");
+			int adv2 = 0;
+			CHECK(lastp && lastp < nl, "W25e: the first line says the part and 'last N of M since READY'");
+			memcpy(label, p + adv, (size_t)(lastp - (p + adv))); label[lastp - (p + adv)] = 0;
+			CHECK(sscanf(lastp, ", last %u of %u since READY, ended +%u ms | %n", shown, total, ended, &adv2) == 3 && adv2 > 0, "W25e: the first line's header");
+			*nlines = kk; body = lastp + adv2;
+		} else {
+			body = p + adv;
+		}
+		while (body < nl) {
+			char e[96];
+			const char *sep = strstr(body, "; "), *d;
+			const size_t el = (sep && sep < nl) ? (size_t)(sep - body) : (size_t)(nl - body);
+			struct t_ent *t;
+			unsigned a = 0, b = 0;
+			int s = 0, dadv = 0;
+			CHECK(el < sizeof(e) && n < room, "W25e: an entry fits");
+			memcpy(e, body, el); e[el] = 0;
+			t = &out[n++];
+			CHECK(sscanf(e, "%u %c %x c%d %n", &t->ms, &t->kind, &t->id, &t->cr, &dadv) == 4 && dadv > 0, "W25e: an entry is 'ms C|E id cN detail'");
+			d = e + dadv;
+			if (d[0] == 't') { CHECK(sscanf(d, "t%x f%u", &a, &b) == 2, "W25e: scan detail"); t->form = 1; t->det = a << 16 | b; }
+			else if (d[0] == 'f' && strstr(d, " s")) { CHECK(sscanf(d, "f%u s%d", &a, &s) == 2, "W25e: mgmt-rx detail"); t->form = 3; t->det = a << 16 | ((uint32_t)s & 0xffffu); }
+			else if (d[0] == 'f') { CHECK(sscanf(d, "f%u", &a) == 1, "W25e: chan-info detail"); t->form = 2; t->det = a; }
+			else { CHECK(d[0] == 'w' && sscanf(d, "w%x", &a) == 1, "W25e: raw detail"); t->form = 0; t->det = a; }
+			if (!(sep && sep < nl)) { break; }
+			body += el + 2;
+		}
+		p = nl + 1; want++;
+	}
+	CHECK(want - 1 == *nlines && n == *shown, "W25e: as many lines as the first one says, as many entries as it says");
+	return n;
+}
+
+/* The dumped entries are the oracle's TOTAL-SHOWN .. TOTAL-1: same kind, id, ms, credits and detail, in the same order. */
+static void
+t_vs_oracle(const struct t_ent *g, unsigned shown, unsigned total)
+{
+	CHECK(total <= m_tr_n && shown == (total < 96u ? total : 96u) && shown > 0, "W25e: the trace shows the last 96 of the entries since READY");
+	for (unsigned i = 0; i < shown; i++) {
+		const struct m_tr_e *o = &m_tr[total - shown + i];
+		if (g[i].kind != o->kind || g[i].id != o->id || g[i].ms != o->ms || g[i].cr != o->cr || g[i].form != o->form || g[i].det != o->det) {
+			fprintf(stderr, "entry %u (oracle %u): got %u %c %x c%d form %u det %x, oracle %u %c %x c%d form %u det %x\n", i, total - shown + i,
+			    g[i].ms, g[i].kind, g[i].id, g[i].cr, g[i].form, g[i].det, o->ms, o->kind, o->id, o->cr, o->form, o->det);
+		}
+		CHECK(g[i].kind == o->kind && g[i].id == o->id, "W25e: the trace's ids and kinds are the model's, in order");
+		CHECK(g[i].ms == o->ms, "W25e: the trace's times are the model's clock since READY");
+		CHECK(g[i].cr == o->cr, "W25e: the trace's HTC credits are the model's count");
+		CHECK(g[i].form == o->form && g[i].det == o->det, "W25e: the trace's detail words are the model's");
+	}
+}
+
+static unsigned
+t_count_scan(const struct t_ent *g, unsigned from, unsigned to, unsigned type)
+{
+	unsigned n = 0;
+	for (unsigned i = from; i < to; i++) { n += g[i].kind == 'E' && g[i].id == 0x3001 && g[i].form == 1 && (g[i].det >> 16) == type; }
+	return n;
+}
+
+static void
+s_w25e_trace(void)
+{
+	static const uint16_t two[2] = {2437, 5180};
+	struct t_ent g[128];
+	char label[96];
+	unsigned shown, total, ended, nlines, widest, n, last_start = 0, ev_after = 0, all_widest = 0;
+	const char *l;
+	/* (a) two requests, the second's 5 GHz part (START_SCAN 4) goes silent after 2 channels: no COMPLETED. The first request completes
+	 * (no trace); the trace of the second is said once, with its part lines, and ends with the 2nd channel's CHAN_INFO END, the one
+	 * before the host's STOP_SCAN. The ring wrapped (more than 96 entries since READY). */
+	c3_reset();
+	C.c3_silent_scan = 4; C.c3_silent_n = 2;
+	add_frame(2, 40, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	add_frame(3, 35, 8, B_CAFE, 0x0401, "Cafe", 4, 1, 0, false);
+	add_frame(13, 50, 8, B_OFF, 0x0011, "Office-5G", 9, 0, 36, true);
+	add_frame(21, 33, 8, B_LAB, 0x0011, "Lab DFS", 7, 0, 100, true);
+	h_push_at(two, 2, true, 150, -1, 3000);
+	h_push_at(two, 2, true, 150, -1, 40000);   /* the 30 s result cache is over: a second full split */
+	CHECK(run() == 0, "W25e (a)");
+	CHECK(fw_c3_scans == 4 && fw_stop_cmds == 1, "W25e: the second request's 5 GHz part was the 4th START_SCAN, and the host stopped it");
+	c3_lifetime_end();
+	CHECK(count_text("FUXI WLAN: W25 trace 1/") == 1, "W25e: one trace, for the one part that did not COMPLETE");
+	CHECK(count_text("FUXI WLAN: W25 part ") == 8, "W25e: two requests, two parts, two lines each");
+	l = d_line("FUXI WLAN: W25 trace 1/", 0);
+	n = t_parse(l, g, 128, label, &shown, &total, &ended, &nlines, &widest);
+	CHECK(!strcmp(label, "part 2 (5 GHz, id 0xa004, no end by max + 200 ms)"), "W25e: the trace is the second request's 5 GHz part's");
+	CHECK(total > 96 && shown == 96 && n == 96 && nlines > 1, "W25e: the ring wrapped: the last 96 of more");
+	t_vs_oracle(g, shown, total);
+	CHECK(m_tr[total].kind == 'C' && m_tr[total].id == 0x3002, "W25e: the trace ends right before the host's STOP_SCAN (not after it)");
+	CHECK(m_tr[total - 1].kind == 'E' && m_tr[total - 1].id == 0x4002 && m_tr[total - 1].form == 2 && m_tr[total - 1].det == 5200, "W25e: the last thing the firmware said: CHAN_INFO of its 2nd channel (5200)");
+	for (unsigned i = 0; i < shown; i++) { if (g[i].kind == 'C' && g[i].id == 0x3001) { last_start = i; } }
+	CHECK(g[last_start].kind == 'C' && t_count_scan(g, last_start, shown, 8) == 2 && t_count_scan(g, last_start, shown, 2) == 0 &&
+	    t_count_scan(g, last_start, shown, 1) == 1, "W25e: the 5 GHz part: STARTED, 2 FOREIGN_CHANNEL, then nothing (no COMPLETED)");
+	for (unsigned i = last_start + 1; i < shown; i++) { ev_after += g[i].kind == 'E'; }
+	CHECK(ev_after + 1 == shown - last_start, "W25e: after the START_SCAN only events, no command");
+	CHECK(g[last_start].cr >= 0 && g[last_start].cr <= (int)M_CREDITS, "W25e: START_SCAN went out with credits");
+	/* the part line: when it started and its last event, in the oracle's terms */
+	{
+		const char *pl = d_line("FUXI WLAN: W25 part 2 (5 GHz, id 0xa004, no end by max + 200 ms): wmi events scan ", 0);
+		unsigned es, ec, em, eo, from = 0, lastev = 0, lid = 0, f = 0;
+		CHECK(pl != NULL, "W25e: the dying part's line");
+		CHECK(sscanf(pl, "FUXI WLAN: W25 part 2 (5 GHz, id 0xa004, no end by max + 200 ms): wmi events scan %u chan-info %u mgmt-rx %u other %u; started +%u ms, "
+		    "last event +%u ms (id %x f%u)", &es, &ec, &em, &eo, &from, &lastev, &lid, &f) == 8, "W25e: the part line says when the part started and its last event");
+		CHECK(from == g[last_start].ms && lastev == m_tr[total - 1].ms && lid == 0x4002 && f == 5200 && es == 3 && ec == 4,
+		    "W25e: started when its START_SCAN went out, last event the 2nd CHAN_INFO END of the model's clock; 3 scan events, 4 chan-info");
+		CHECK(from + 1u <= lastev && ended >= from + 5825u && ended <= from + 5835u, "W25e: the part ended 5825 ms (max_scan_time + 200) after it started");
+	}
+	CHECK(count_text("FUXI WLAN: W25 part 1 (2.4 GHz, id 0xa003, completed): wmi events scan ") == 1, "W25e: a part that completed keeps its two lines");
+	{
+		const char *pl = d_line("FUXI WLAN: W25 part 1 (2.4 GHz, id 0xa003, completed): wmi events scan ", 0);
+		unsigned x[4], from = 0, lastev = 0, lid = 0;
+		CHECK(pl && sscanf(pl, "FUXI WLAN: W25 part 1 (2.4 GHz, id 0xa003, completed): wmi events scan %u chan-info %u mgmt-rx %u other %u; started +%u ms, last event +%u ms (id %x ",
+		    &x[0], &x[1], &x[2], &x[3], &from, &lastev, &lid) == 7 && lid == 0x3001, "W25e: the completed part's last event is its COMPLETED");
+	}
+	{   /* every trace line and every part line within the console's 254 bytes */
+		const char *q = logbuf;
+		while (*q) {
+			const char *nl2 = strchr(q, '\n');
+			if (!strncmp(q, "FUXI WLAN: W25 ", 15) && (unsigned)(nl2 - q) > all_widest) { all_widest = (unsigned)(nl2 - q); }
+			q = nl2 + 1;
+		}
+		CHECK(all_widest <= 254 && widest <= 254, "W25e: no W25 line passes 254 bytes");
+	}
+	{   /* the start of the dump is the part lines' place: after the second part's two lines and before the request's own W25 line */
+		static const char *const order[] = {
+			"FUXI WLAN: W25 scan start id 0xa004 ", "FUXI WLAN: W25 part 2 (5 GHz, id 0xa004, no end by max + 200 ms): polls ",
+			"FUXI WLAN: W25 part 2 (5 GHz, id 0xa004, no end by max + 200 ms): wmi events scan ", "FUXI WLAN: W25 trace 1/",
+		};
+		expect_order(order, sizeof(order) / sizeof(order[0]));
+		CHECK(strstr(logbuf, "FUXI WLAN: W25 trace 1/") > strstr(logbuf, "FUXI WLAN: W25 part 2 (5 GHz, id 0xa004, no end by max + 200 ms): wmi events scan "), "W25e: after the part lines");
+	}
+	{
+		const unsigned n0 = wl25_tr_n;
+		CHECK(wl25_tr_on, "W25e: the ring is armed until the service's end");
+		contained_and_freed();
+		wl25_tr_note('E', 0x3001, WL25_TRF_RAW, 0);   /* a late event, a later command: the ring is off */
+		wl25_tr_note('C', 0x3002, WL25_TRF_RAW, 0);
+		CHECK(wl25_tr_n == n0 && !wl25_tr_on, "W25e: nothing is written after the service's end (a late event, a later command)");
+	}
+	{
+		char msg[400];
+		snprintf(msg, sizeof(msg), "W25e trace (a): %u of %u entries in %u lines, the widest %u bytes (all W25 lines %u); the last 96 equal the model's oracle (kind, id, ms, credits, detail); "
+		    "the dying 5 GHz part: START_SCAN +%u ms, 2 FOREIGN_CHANNEL, last event +%u ms, ended +%u ms", shown, total, nlines, widest, all_widest, g[last_start].ms,
+		    m_tr[total - 1].ms, ended);
+		puts(msg);
+	}
+	/* (b) the lane stops in the middle of the 5 GHz part (the W11 guard fails): the trace is said at the service's end with the part lines,
+	 * 'contained'. The model delivered a few messages the host had not reaped yet: the dump is a prefix of the oracle. */
+	c3_reset();
+	C.on_line = 3;
+	add_frame(2, 40, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	h_push_at(two, 2, true, 150, -1, 0);
+	CHECK(run() == 1, "W25e (b)");
+	{
+		const unsigned tn = m_tr_n;
+		contained_and_freed();
+		CHECK(count_text("FUXI WLAN: W25 trace 1/") == 1, "W25e: one trace, at the service's end");
+		l = d_line("FUXI WLAN: W25 trace 1/", 0);
+		n = t_parse(l, g, 128, label, &shown, &total, &ended, &nlines, &widest);
+		CHECK(!strcmp(label, "part 2 (5 GHz, id 0xa002, contained)"), "W25e: the part that was running is 'contained'");
+		CHECK(total >= 96 && shown == 96 && total <= tn && tn - total <= 8, "W25e: the dump is the ring as of the containment (a few delivered messages were not reaped)");
+		t_vs_oracle(g, shown, total);
+		for (unsigned i = total; i < tn; i++) { CHECK(m_tr[i].kind == 'E' && m_tr[i].ms >= m_tr[total - 1].ms, "W25e: what the host had not reaped is events delivered later"); }
+		static const char *const order[] = {
+			"FUXI WLAN: W25 failure: ", "FUXI WLAN: W25 part 1 (2.4 GHz, id 0xa001, completed): polls ",
+			"FUXI WLAN: W25 part 2 (5 GHz, id 0xa002, contained): wmi events scan ", "FUXI WLAN: W25 trace 1/", "FUXI WLAN: W25 service end: a failure (above) after ",
+		};
+		expect_order(order, sizeof(order) / sizeof(order[0]));
+		{
+			char msg[300];
+			snprintf(msg, sizeof(msg), "W25e trace (b): the lane stopped mid-part: %u of %u entries dumped at the service's end, the model delivered %u more the host had not reaped",
+			    shown, total, tn - total);
+			puts(msg);
+		}
+	}
+	/* (c) qrtr 7: nothing is armed, nothing is traced, nothing is said, whatever happens to the scan */
+	c2_reset(); C.scan_mode = 3;
+	add_frame(5, 47, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	CHECK(run() == 1, "W25e (c)");
+	CHECK(!wl25_tr_on && wl25_tr_n == 0 && wl25_tr_heard_n == 0 && m_tr_n == 0 && !m_tr_on, "W25e: with qrtr 7 the ring is never armed and holds nothing");
+	contained_and_freed();
+	CHECK(count_text("FUXI WLAN: W25 trace ") == 0 && count_text("FUXI WLAN: W25 ") == 0, "W25e: with qrtr 7 no W25 line, no trace");
+	/* (d) the widest dump: 96 entries of the widest numbers, the longest label */
+	reset();
+	memset(&wl25_tr_snap[0], 0, sizeof(wl25_tr_snap[0]));
+	wl25_tr_snap[0].shown = WL25_TR_MOST; wl25_tr_snap[0].total = 4000000000u;
+	for (unsigned i = 0; i < WL25_TR_MOST; i++) {
+		struct wl25_tr_ent *e = &wl25_tr_snap[0].e[i];
+		e->ms = 0xffffffffu; e->id = 0xffffffffu; e->det = 0xffffffffu; e->cr = (int16_t)(-32768 + (int)(i & 1u)); e->kind = 'E'; e->form = (uint8_t)(i % 4u);
+	}
+	snprintf(wl25_part_label[0], sizeof(wl25_part_label[0]), "part 2 (2.4 GHz, id 0xafff, no end by max + 200 ms)");
+	wl25_part_w[0].t1_ns = ~0ull; wl25_ready_ns = 0;
+	wl25_tr_say(0);
+	{
+		const char *q = logbuf;
+		unsigned longest = 0, lines = 0;
+		while (*q) {
+			const char *nl2 = strchr(q, '\n');
+			if (!strncmp(q, "FUXI WLAN: W25 trace ", 21)) { lines++; if ((unsigned)(nl2 - q) > longest) { longest = (unsigned)(nl2 - q); } }
+			q = nl2 + 1;
+		}
+		CHECK(lines >= 10 && lines <= 96 && longest > 200 && longest <= 254, "W25e: the widest dump: every line within 254 bytes, packed");
+		{
+			char msg[200];
+			snprintf(msg, sizeof(msg), "W25e trace lines: at most %u of 254 bytes (96 entries of the widest numbers in %u lines)", longest, lines);
+			puts(msg);
+		}
+	}
+	wl25_ready_ns = 0; memset(&wl25_part_w[0], 0, sizeof(wl25_part_w[0])); memset(&wl25_tr_snap[0], 0, sizeof(wl25_tr_snap[0]));
+}
+
 /* The widest every new line can be: all numbers at their caps, the longest labels. The model fails any FUXI WLAN line over 254 bytes. */
 static void
 s_w25d_widest(void)
@@ -7608,8 +7897,9 @@ s_w25d_widest(void)
 	unsigned longest = 0;
 	reset();
 	memset(&w, 0xff, sizeof(w));
-	w.on = false; w.t0_ns = 0; w.c0 = (int)0x80000000u; w.cmin = 0x7fffffff; w.cend = (int)0x80000000u;
+	w.on = false; w.part = true; w.ev_any = true; w.t0_ns = 0; w.c0 = (int)0x80000000u; w.cmin = 0x7fffffff; w.cend = (int)0x80000000u;
 	wl25_win_say("part 2 (2.4 GHz, id 0xafff, no end by max + 200 ms)", &w);
+	w.part = false;   /* W25e: the idle wait's lines have no tail */
 	wl25_win_say("idle (service ready +99999999 ms after READY, 999 cmds sent)", &w);
 	for (unsigned i = 0; i < WL25_CMDS_MOST; i++) { wl25_cmd_id[i] = 0xffffffffu; wl25_cmd_cr[i] = 0x7fffffff; }
 	wl25_cmd_n = 4000000000u; wl25_ready_ns = 0; now = 3000000000000ull;
@@ -9164,7 +9454,7 @@ main(int argc, char **argv)
 			{"guard", s_svc_guard_and_credits}, {"band", s_svc_lifetime_and_band}, {"recycle", s_svc_recycle},
 			{"stopped", s_svc_ios_stopped}, {"otherid", s_svc_other_id}, {"credits", s_svc_credit_waits}, {"c2c", s_svc_c2c},
 			{"c2e", s_svc_c2e}, {"split", s_svc_split}, {"rungs", s_svc_rungs}, {"cache", s_svc_cache}, {"w25dpoll", s_w25d_poll},
-			{"w25dwidest", s_w25d_widest}, {"w25dprescan", s_w25d_prescan}, {"w25dstale", s_w25d_stale},
+			{"w25dwidest", s_w25d_widest}, {"w25dprescan", s_w25d_prescan}, {"w25dstale", s_w25d_stale}, {"w25etrace", s_w25e_trace},
 		};
 		for (unsigned i = 0; i < sizeof(one) / sizeof(one[0]); i++) {
 			if (!strcmp(one[i].n, argv[2])) { one[i].f(); reset(); puts("W25 model: scenario passed"); return 0; }
@@ -9174,7 +9464,7 @@ main(int argc, char **argv)
 	if (argc == 2 && !strcmp(argv[1], "c3")) {  /* the C3 scenarios alone */
 		s_svc_pure(); s_svc_requests(); s_svc_cache(); s_svc_cancel(); s_svc_failures(); s_svc_guard_and_credits(); s_svc_lifetime_and_band();
 		s_svc_ios_stopped(); s_svc_other_id(); s_svc_c2c(); s_svc_c2e(); s_svc_split(); s_svc_rungs();
-		s_w25d_poll(); s_w25d_widest(); s_w25d_prescan(); s_w25d_stale(); reset();
+		s_w25d_poll(); s_w25d_widest(); s_w25d_prescan(); s_w25d_stale(); s_w25e_trace(); reset();
 		puts("W25 model: all scenarios passed");
 		return 0;
 	}
@@ -9272,6 +9562,7 @@ main(int argc, char **argv)
 	s_w25d_widest();
 	s_w25d_prescan();
 	s_w25d_stale();
+	s_w25e_trace();
 #endif
 	reset();
 	puts("W20 model: all scenarios passed");

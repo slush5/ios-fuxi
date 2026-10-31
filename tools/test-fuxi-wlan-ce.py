@@ -102,6 +102,11 @@ delivered events, with a stalled host poll thread; s_w25d_widest), and fuxiwlanc
 request) and a stale copy of the last completed split answering requests after the lane stopped, Wi-Fi staying reported on (model
 s_w25d_prescan, s_w25d_stale; the end-to-end runs e2estale and e2enocache against the real fuxi_wifi_radio.c; static_w25d; the W25d entries of
 MUTANTS). tools/test-fuxi-wlan-salami.py learns the knob's bit 29.
+W25e (qrtr 8, docs-lanes/wlan-w20.md "W25e"): a read-only ring of the last 96 WMI events reaped and commands sent from WMI READY on (ms since READY, C|E,
+id, HTC credits, one detail word), copied when a scan part ends other than COMPLETED and said with the part lines at the end of the request ("W25 trace
+i/n"), the part lines also saying when the part started and its last event (model s_w25e_trace against an oracle the model works out from its own clock,
+messages and credit reports, a silent 5 GHz part, the lane stopped mid-part, qrtr 7 traced nothing, the widest dump; static_w25e; the W25e entries of
+MUTANTS).
 No device, no network.
 """
 from pathlib import Path
@@ -2534,6 +2539,7 @@ def c3_static_checks():
           'defines) equals sys/fuxi_wifi_radio.h; the iOS side\'s stop ends the service only while idle; an unconfirmed '
           'stop answers iOS first, then waits up to 3 s for the end')
     static_w25d()
+    static_w25e()
 
 
 def c3_split_static(scan):
@@ -2659,7 +2665,7 @@ def static_w25d():
     # windows: opened in the part loop after the send (once) and in the idle wait (once); the idle one closes before the first START_SCAN
     assert code.count('wl25_win_open();') == 2 and scan.count('wl25_win_open();') == 1 and run.count('wl25_win_open();') == 1
     assert scan.index('wl_ce_send(wl_htc.wmi_eid, cmd, len, "WMI START_SCAN")') < scan.index('wl25_win_open();') < scan.index('if (wl25_rq_cancelled(rq)) { status = ECANCELED; how = "cancelled"; break; }')
-    assert scan.index('wl25_win_open();') < scan.index('wl25_part_end(part, how);') < scan.index('if (stop || status != 0) { break; }')
+    assert scan.index('wl25_win_open();') < scan.index('wl25_part_end(part, how, status != 0);') < scan.index('if (stop || status != 0) { break; }')
     assert scan.index('if (first && !part) { wl25_idle_say(); wl25_cmds_say(); }') < scan.index('wl_ce_send(wl_htc.wmi_eid, cmd, len, "WMI START_SCAN")')
     assert run.index('wl25_idle_on = true; wl25_win_open();') > run.index('W25 service ready:')
     # the START_SCAN line: before the send for the first part, after it for the others; the part lines at the end of the request
@@ -2671,7 +2677,7 @@ def static_w25d():
         strip_comments(between(drv, 'static void\nwl25_parts_say(bool say)\n{', '\n}\n')).index('wl25_win_say(')
     assert 'printf(' not in scan   # the request's lines go through the helpers, the START line of the first part before its send, the rest at the end
     assert scan.index('wl25_parts_say(wl25_said(number, failed));') < scan.index('wl25_say(number, rq->seq, ids, n24, n, dwell, ms, status, how, said, failed);')
-    assert 'wl25_parts_say' not in between(drv, 'static void\nwl25_part_end(unsigned part, const char *how)\n{', '\n}\n')
+    assert 'wl25_parts_say' not in between(drv, 'static void\nwl25_part_end(unsigned part, const char *how, bool died)\n{', '\n}\n')
     # every new line has a prefix of its own and says counts only (no SSID, no BSSID)
     new_fmt = {'W25 %s: polls', 'W25 %s: wmi events', 'W25 cmds id:credits', 'W25 scan start id', 'W25 prescan full split', 'W25 selected prescan',
                'W25 lane stopped, serving stale cache', 'W25 stale answer', 'W25 stale cache service over'}
@@ -2738,6 +2744,65 @@ def static_w25d():
           'prescan is a request-less split (seq 0: no frame, no done, no cancel) between "service ready" and the request loop; the stale copy is plain '
           'kernel data taken only after a completed split with bit 29, the stale service touches no device, ring or scan state and fw_thread reports '
           'STOPPED after it')
+
+
+def static_w25e():
+    """W25e: the WMI event/command ring. Armed once, at WMI READY with qrtr 8, off in wl25_end; one writer (wl25_tr_note, guarded by the flag first)
+    called from the event hook (before the parsers, then patched with what they took) and the command hook (before the credit wait); copied only
+    when a part ends other than COMPLETED; said only by wl25_parts_say, after the part's own lines; nothing printed, sent or read from the device
+    while a part runs; the lines counted first and packed under WL25_TR_LINE."""
+    drv = DRIVER
+    code = strip_comments(drv)
+    note = strip_comments(between(drv, 'static void\nwl25_tr_note(', '\n}\n'))
+    rxh = strip_comments(between(drv, 'static void\nwl25_tr_rx(', '\n}\n'))
+    parsed = strip_comments(between(drv, 'static void\nwl25_tr_parsed(', '\n}\n'))
+    tail = strip_comments(between(drv, 'static void\nwl25_win_tail(', '\n}\n'))
+    say = strip_comments(between(drv, 'static void\nwl25_tr_say(', '\n}\n'))
+    pend = strip_comments(between(drv, 'static void\nwl25_part_end(', '\n}\n'))
+    parts = strip_comments(between(drv, 'static void\nwl25_parts_say(bool say)\n{', '\n}\n'))
+    endf = strip_comments(between(drv, 'static void\nwl25_end(void)\n{', '\n}\n'))
+    rx = strip_comments(between(drv, 'static int\nwl_ce_wmi_rx(void *ctx, const uint8_t *msg, uint32_t len)\n{', '\n}\n'))
+    send = strip_comments(between(drv, 'static int\nwl_ce_send(uint32_t eid, const uint8_t *payload, uint32_t len, const char *what)\n{', '\n}\n'))
+    w22 = strip_comments(between(drv, 'static int\nwl_w22_run(void)\n{', '\n}\n'))
+    assert '#define WL25_TR_MOST 96u' in drv and '#define WL25_TR_LINE 250u' in drv
+    # armed once, at WMI READY, for qrtr 8 only; off in the service's end only (after its last diagnostics)
+    assert code.count('wl25_tr_on = true') == 1 and 'if (wl_w25) { wl25_tr_on = true; wl25_tr_n = 0; }' in w22
+    assert w22.index('wl_ce_wait(WL20_W_READY, 5000, "WMI READY")') < w22.index('wl25_tr_on = true') < w22.index('wlwmi_encode_hw_mode(')
+    assert code.count('wl25_tr_on = false') == 2 and endf.count('wl25_tr_on = false') == 2 and endf.index('wl25_diag_end();') < endf.rindex('wl25_tr_on = false')
+    assert endf.split('{', 1)[1].lstrip().startswith('if (!wl25_on) { wl25_tr_on = false; return; }')
+    # one writer, its flag first; the ring is stored in three places only (the writer, the patch of the last entry, the copy of a dying part)
+    assert 'if (!wl25_tr_on) { return; }' in note and note.index('if (!wl25_tr_on) { return; }') < note.index('wl25_credits()') < note.index('wl25_tr_n++')
+    assert code.count('wl25_tr[') == 4 and code.count('wl25_tr_note(') == 3 and code.count('wl25_tr_n++') == 1 and code.count('wl25_tr_n = 0') == 1
+    assert code.count("wl25_tr_note('C'") == 1 and code.count("wl25_tr_note('E'") == 1
+    # the event hook: the entry before the parsers see the event (one they fail on is in the ring), the patch after, then the W25d counts
+    assert rx.index('wl25_tr_rx(msg, len);') < rx.index('if (wlwmi_rx(&wl_wmi, msg, len, &id)) { return 1; }') < rx.index('wl25_tr_parsed(id, evn, ci, heard);') < rx.index('if (wl25_w.on) {')
+    assert 'const uint32_t evn = wl_scan.events, heard = wl25_tr_heard_n;' in rx
+    # the command hook: the WMI endpoint, before the credit wait (credits just before the command), the word after the id only when the message has one
+    assert send.index('if (eid == wl_htc.wmi_eid && len >= 4u) {') < send.index("wl25_tr_note('C', wlce_get32(payload), WL25_TRF_RAW, len >= 8u ? wlce_get32(payload + 4) : 0u);") < \
+        send.index('if (!wlhtc_has_credits(&wl_htc, eid, total)) {')
+    assert "wl25_tr_note('E', len >= 4u ? wlce_get32(msg) : 0u, WL25_TRF_RAW, len >= 8u ? wlce_get32(msg + 4) : 0u);" in rxh
+    # the detail comes from the parsers' own fields, only when this very event moved their counters; no new parsing
+    for field in ('wl_scan.events != events0', 'wl_scan.ev_type', 'wl_scan.ev_freq', 'wl_scan.ci_seen != ci0', 'wl_scan.ci[WLWMI_CI_FREQ]', 'wl25_tr_heard_n != heard0',
+                  'wl25_tr_mhz', 'wl25_tr_dbm'):
+        assert field in parsed, field
+    assert not re.search(r'wlce_get32|wlwmi_|wlscan_(?!known)|msg', parsed), 'the patch parses device data'
+    assert 'wl25_tr_heard_n++; wl25_tr_mhz = mhz; wl25_tr_dbm = dbm;' in strip_comments(between(drv, 'static void\nwl25_heard(', '\n}\n'))
+    # read-only and silent: no send, no device or ring access, no console output in anything a part runs through
+    for name, body in (('note', note), ('rx', rxh), ('parsed', parsed), ('tail', tail), ('part_end', pend)):
+        assert not re.search(r'wl_ce_send|wlce_send|wlce_publish|wlce_wr\b|wlce_rd\b|wl_pwr|wl_mwr|wl_win|wl_soc|wlce_post|wlce_reap|wl_sleep|WLCE_RDP|wl_ce_rbarrier|wl_ce_poll',
+                             body), name
+        assert not re.search(r'(?<!sn)printf', body), name
+    # the dump: the copy is taken only for a part that did not COMPLETE; the lines are said in wl25_parts_say only, after the part's own two
+    assert pend.index('if (died && wl25_tr_n) {') < pend.index('wl25_tr_pend[part] = true;') and 'wl25_tr_say' not in pend
+    assert code.count('wl25_part_end(') == 3 and 'wl25_part_end(part, how, status != 0);' in code and 'wl25_part_end(wl25_part_cur, "contained", true);' in code
+    assert code.count('wl25_tr_say(') == 2 and parts.index('wl25_win_say(') < parts.index('if (wl25_tr_pend[p]) { wl25_tr_say(p); }')
+    assert len(re.findall(r'(?<!sn)printf', say)) == 1 and 'printf("%s\\n", line);' in say
+    # the lines are counted first, then packed under the same limit; every ring number is capped or bounded in the text
+    assert say.index('first[lines++] = (uint8_t)i;') < say.index('printf("%s') and 'at + n > WL25_TR_LINE' in say
+    assert 'e->ms > 99999999u ? 99999999u : e->ms' in strip_comments(between(drv, 'static unsigned\nwl25_tr_fmt(', '\n}\n'))
+    print('W25e static: the ring is armed once at WMI READY with qrtr 8 and off at the service end, written by one flag-guarded function from the event '
+          'hook (before the parsers, patched with what they took) and the command hook (before the credit wait), copied only when a part does not '
+          'COMPLETE, said once by wl25_parts_say after the part lines; no send, device access or console output while a part runs')
 
 
 def header_free_count(text, name):
@@ -4056,6 +4121,15 @@ MUTANTS = [
      '\twl25_parts_say(wl25_said(number, failed));', '\twl25_parts_say(true);', 'model', "W25d lines: a START_SCAN line and two part lines for the same requests"),
     ('a full cache drops every new BSSID', 'xnu/fuxi-wlan/fuxi_wlan.c', '\t\t\ti = weakest;\n', '\t\t\twl25_cache_lost++; return;\n', 'model',
      'a cached frame of the request\'s channels was not handed over (or twice, or changed)'),
+    # W25e: the WMI event/command ring and its dump
+    ('the W25e ring is armed with qrtr 7 too', 'xnu/fuxi-wlan/fuxi_wlan.c', '\tif (wl_w25) { wl25_tr_on = true; wl25_tr_n = 0; }',
+     '\twl25_tr_on = true; wl25_tr_n = 0;', 'model', 'W25e: with qrtr 7 the ring is never armed and holds nothing'),
+    ('a W25e entry is written outside the ring\'s window (after the service ended)', 'xnu/fuxi-wlan/fuxi_wlan.c', '\tif (!wl25_tr_on) { return; }\n\tc = wl25_credits();',
+     '\tc = wl25_credits();', 'model', "W25e: nothing is written after the service's end"),
+    ('the W25e trace is dumped for a part that COMPLETED', 'xnu/fuxi-wlan/fuxi_wlan.c', 'wl25_part_end(part, how, status != 0);', 'wl25_part_end(part, how, true);',
+     'model', 'W25e: one trace, for the one part that did not COMPLETE'),
+    ('the W25e trace is said inside the part loop (console time in the scan)', 'xnu/fuxi-wlan/fuxi_wlan.c', '\t\twl25_tr_pend[part] = true;\n\t}\n',
+     '\t\twl25_tr_pend[part] = true; wl25_tr_say(part);\n\t}\n', 'static', 'AssertionError'),
 ]
 
 
