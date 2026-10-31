@@ -218,6 +218,12 @@ static unsigned arena_allocs, arena_frees;
 static uint32_t bar_win, epcmd, perst_io, devctl, mhictrl;
 static unsigned win_selects, ce_writes, ce_reads, shadow_writes, direct_publishes, shadow_publishes, sleeps, stops;
 static unsigned sleeps_1, sleeps_10;        /* C3: wl_sleep(1) and wl_sleep(10) calls */
+/* W25d: what the driver's poll/CE2 lines must say, worked out here and not from its counters. Armed when the firmware takes a START_SCAN, off
+ * at the tick that delivers its COMPLETED; kept by START_SCAN number (1..16). gap: the most the clock moved in one wl_sleep (poll to poll);
+ * sleeps: the wl_sleep calls (a pass follows each and one more starts the window); back: the most entries the CE2 STATUS ring held after
+ * a tick (the device's HP ahead of the host's TP); ev: the events delivered to the WMI endpoint, scan / chan-info / mgmt-rx / other. */
+struct m_orc_s { bool armed; unsigned gap, sleeps, back, ev[4]; };
+static struct m_orc_s m_orc, m_orc_res[17];
 static char last_ev;
 static unsigned n_ev[128];
 
@@ -324,6 +330,10 @@ struct cfg {
 	unsigned c3_fail_at;                /* this START_SCAN number (past 16) gets START_FAILED (0: none) */
 	unsigned c3_hold;                   /* the first N START_SCAN credits are never refunded */
 	bool c3_refund_at_end;              /* a START_SCAN credit comes back only after its scan's COMPLETED */
+	/* W25d: the host's poll thread stalls once (iOS CPU load): wl_sleep takes slow_ms longer than asked, slow_at ms after START_SCAN
+	 * number slow_scan; every message that fell due meanwhile is delivered in the one tick that follows */
+	unsigned slow_scan, slow_at, slow_ms;
+	bool slow_done;
 };
 static struct cfg C;
 static unsigned restores;
@@ -550,6 +560,10 @@ deliver(const struct qmsg *m)
 	uint32_t slot = (uint32_t)(a - arena_iova);
 	(void)dev_mem(a, m->len, slot, slot + 2048u, "RX write past its own 2 KiB buffer");
 	memcpy(buf, m->d, m->len);
+	if (m_orc.armed && m->ce == 2 && m->len >= 12 && (g32(m->d) >> 16) >= g32(m->d + 4) + 4u) {   /* W25d: a WMI event, by kind */
+		const uint32_t eid = g32(m->d + 8);
+		m_orc.ev[eid == 0x3001 ? 0 : eid == 0x4002 ? 1 : eid == 0x7001 ? 2 : 3]++;
+	}
 	d->dev = (d->dev + 2) % d->size;
 	write_rdp(d, d->dev);
 	uint8_t *st = dev_mem(s->base + 4ull * s->dev, 16, 0x1000, 0x10000, "STATUS entry");
@@ -563,6 +577,7 @@ deliver(const struct qmsg *m)
 static void
 dev_tick(void)
 {
+	if (wl_ce.stopping && !arena_host) { q_head = q_tail; return; }   /* W25d: contained and freed: the device is off, the stale service only sleeps */
 	dev_acts();  /* C2c: RXDMA, WBM and the firmware's ring use, in time order */
 	while (q_head != q_tail) {
 		struct qmsg *m = &q[q_head % 512];
@@ -1885,6 +1900,7 @@ fw_c3_start(const uint8_t *pl, uint32_t plen, unsigned need)
 	if (!held && !C.c3_refund_at_end) { fw_refund(need, 1); }
 	fw_c3_script(fw_c3_mode_now, id, n, dwell);
 	if (!held && C.c3_refund_at_end) { fw_refund(need, 5 + dwell * n + 2); }   /* right after its COMPLETED */
+	memset(&m_orc, 0, sizeof(m_orc)); m_orc.armed = true;   /* W25d */
 }
 
 static void
@@ -2347,6 +2363,12 @@ static struct { uint8_t bssid[6]; uint16_t mhz; int16_t rssi; } h_mh[64];
 static unsigned h_mh_lost, h_hits, h_splits;
 static bool h_cache_valid, h_oracle = true;
 static uint64_t h_cache_at;
+/* W25d: the prescan (fuxiwlanch bit 29) is a full split with no request: set up at ready(), settled at the first take(). The stale phase
+ * (m_stale_phase, set by a scenario just before it calls wl25_stale_serve) answers from the last COMPLETED full split's frames: h_sh, a
+ * copy taken whenever the model's cache becomes valid. */
+static bool h_prescan, m_stale_phase;
+static struct { uint8_t bssid[6]; uint16_t mhz; int16_t rssi; } h_sh[64];
+static unsigned h_sh_n;
 
 static void
 h_reset(void)
@@ -2357,6 +2379,7 @@ h_reset(void)
 	h_worst = h_worst_limit = 0;
 	h_gap_ms = h_last_due = 0; h_auto_mhz = 2437; h_req_n = h_cur_frames = h_mh_n = h_mh_lost = h_hits = h_splits = 0;
 	h_req_valid = h_must_hit = h_must_scan = h_cache_valid = false; h_oracle = true; h_cache_at = 0;
+	h_prescan = m_stale_phase = false; h_sh_n = 0;
 	for (unsigned i = 0; i < 256; i++) { h_status[i] = H_NONE; }
 }
 
@@ -2398,6 +2421,17 @@ fuxi_wifi_radio_ready(const uint16_t *freqs, unsigned count)
 	CHECK(!h_ready && count && count <= 64 && !h_live, "ready() twice, empty, or with a request in flight");
 	memcpy(h_ready_f, freqs, count * sizeof(freqs[0]));
 	h_ready = 1; h_ready_n = count; h_ready_at = now; h_ready_s1 = sleeps_1; h_ready_s10 = sleeps_10;
+	if (wl23_chmask & WL23_CH_PRESCAN) {   /* W25d: the firmware must be asked for the whole kept list now, with no request behind it */
+		h_expect_n = h_exp24 = h_part_off = 0;
+		for (unsigned i = 0; i < 38 && m_chan_k(i); i++) {
+			const uint32_t f = m_chan_k(i);
+			if ((wl20_bits & WL20_BAND24) && f >= 3000u) { continue; }
+			h_expect[h_expect_n++] = (uint16_t)f;
+			h_exp24 += f < 3000u;
+		}
+		h_prescan = true; h_req_passive = true; h_req_valid = true; h_req_n = 0; h_must_hit = false; h_must_scan = true;
+		h_expect_dwell = 150;
+	}
 }
 
 /* As fuxi_wifi_radio.c: nothing before READY, one request at a time. */
@@ -2440,9 +2474,26 @@ h_in_req(unsigned mhz)
 	return false;
 }
 
+/* W25d: the model's copy of the cache just became valid (a completed full split): keep its frames as the stale cache's */
+static void
+h_sh_copy(void)
+{
+	memcpy(h_sh, h_mh, sizeof(h_sh));
+	h_sh_n = h_mh_n;
+}
+
 bool
 fuxi_wifi_radio_take(struct fuxi_wifi_radio_request *out)
 {
+	if (h_prescan) {   /* W25d: the prescan is over when the lane asks for its first request: settled like a request that was answered */
+		h_prescan = false;
+		if (h_part_off && h_part_off == h_expect_n && fw_c3_ended_at != ~0ull) {
+			h_cache_valid = true; h_cache_at = fw_c3_ended_at; h_splits++; h_sh_copy();
+		} else {
+			h_cache_valid = false;
+		}
+		h_part_off = 0;
+	}
 	if (!h_ready || h_live || h_gone() || (hq_next == hq_n && !h_auto)) { return false; }
 	if (hq_next < hq_n && now < h_ready_at + hq[hq_next].due_ms) { return false; }
 	if (hq_next == hq_n) {  /* a generated request: {h_auto_mhz}, passive, 150 ms, seq 1000 + k */
@@ -2492,8 +2543,9 @@ int
 fuxi_wifi_radio_frame(uint32_t seq, const uint8_t *frame, size_t length, uint16_t rx_mhz, int16_t rssi_dbm, int16_t noise_dbm)
 {
 	CHECK(seq && seq == h_live, "a frame for a request not in flight");
-	CHECK(frame >= (const uint8_t *)wl25_cache && frame + length <= (const uint8_t *)(wl25_cache + WL25_CACHE_BSS),
-	    "a frame not from the result cache");
+	CHECK(m_stale_phase ? (frame >= (const uint8_t *)wl25_stale && frame + length <= (const uint8_t *)(wl25_stale + WL25_CACHE_BSS)) :
+	    (frame >= (const uint8_t *)wl25_cache && frame + length <= (const uint8_t *)(wl25_cache + WL25_CACHE_BSS)),
+	    m_stale_phase ? "a frame not from the stale copy" : "a frame not from the result cache");
 	CHECK(length >= 36 && length <= WLCE_BUF, "frame length");
 	CHECK(h_req_valid && h_in_req(rx_mhz), "a frame heard outside the request's channels, or for a refused request");
 	h_cur_frames++;
@@ -2510,14 +2562,33 @@ fuxi_wifi_radio_done(uint32_t seq, int status)
 {
 	CHECK(seq && seq == h_live && (h_live_idx == H_AUTO || h_status[h_live_idx] == H_NONE),
 	    "done() for a request not in flight, or twice");
-	if (!h_req_valid) {
+	if (m_stale_phase) {   /* W25d: the stale service: EINVAL for a request that is not valid, else done(0) with the last completed split's frames */
+		unsigned want = 0;
+		if (!h_req_valid) {
+			CHECK(status == EINVAL && !h_cur_frames, "stale: a request that is not valid: EINVAL, no frame");
+		} else {
+			CHECK(status == 0, "stale: a valid request is answered with status 0");
+			for (unsigned i = 0; i < h_sh_n; i++) { want += h_in_req(h_sh[i].mhz); }
+			CHECK(h_cur_frames == want, "stale: frames handed over differ from the stale copy's frames of the request's channels");
+			if (h_live_idx != H_AUTO) {
+				for (unsigned i = 0; i < h_sh_n; i++) {
+					unsigned found = 0;
+					if (!h_in_req(h_sh[i].mhz)) { continue; }
+					for (unsigned k = h_fr_n - h_cur_frames; k < h_fr_n; k++) {
+						found += !memcmp(h_fr[k].bssid, h_sh[i].bssid, 6) && h_fr[k].mhz == h_sh[i].mhz && h_fr[k].rssi == h_sh[i].rssi;
+					}
+					CHECK(found == 1, "stale: a frame of the stale copy was not handed over (or twice, or changed)");
+				}
+			}
+		}
+	} else if (!h_req_valid) {
 		CHECK(status == EINVAL && h_part_off == 0 && !h_cur_frames, "a request that is not valid: EINVAL, nothing sent, no frame");
 	} else if (status == 0) {
 		unsigned want = 0;
 		if (h_part_off) {   /* a full split ran: every part of it */
 			CHECK(h_expect_n && h_part_off == h_expect_n, "done(0) before every part of the full split was scanned");
 			CHECK(!h_must_hit, "a full split though the cache was young enough");
-			h_cache_valid = true; h_cache_at = fw_c3_ended_at; h_splits++;
+			h_cache_valid = true; h_cache_at = fw_c3_ended_at; h_splits++; h_sh_copy();
 		} else {
 			CHECK(!h_must_scan, "done(0) from the cache though it was empty or too old (a full split was due)");
 			CHECK(h_cache_valid, "done(0) with nothing sent and no cache");
@@ -2561,6 +2632,8 @@ static bool fw_c3_first_req(void) { return fw_c3_scans == 1; }   /* (no C2c fram
 void e2e_ios_start(void);
 void e2e_tick(uint64_t ms);
 int e2e_ios_finish(void);
+void e2e2_ios_start(bool stale);   /* W25d: the second consumer script */
+int e2e2_ios_finish(bool stale);
 #endif
 
 /* ---- stubs of the fuxi_wlan.c functions the excerpts call ---- */
@@ -2827,11 +2900,25 @@ static void wl_w11_stop(void) { CHECK(!wl_ce_arena.va || wl_ce.stopping, "W11 st
 static void
 wl_sleep(unsigned ms)
 {
+	unsigned adv = ms;
 	now += ms; sleeps += ms;
 	sleeps_1 += ms == 1; sleeps_10 += ms == 10;
+	if (C.slow_ms && !C.slow_done && wl_w25 && fw_c3_scans == C.slow_scan && now >= fw_c3_start_at + C.slow_at) {   /* W25d */
+		C.slow_done = true; now += C.slow_ms; sleeps += C.slow_ms; adv += C.slow_ms;
+	}
 	/* C3: no service outlives its lifetime by more than a scan */
 	CHECK(!wl_w25 || now < 1830000u, "the W25 service ran past its 1800 s lifetime");
 	dev_tick();
+	if (m_orc.armed) {   /* W25d */
+		const unsigned occ = ((dr[4].dev + dr[4].size - dr[4].host) % dr[4].size) / dr[4].edw;
+		m_orc.sleeps++;
+		if (adv > m_orc.gap) { m_orc.gap = adv; }
+		if (occ > m_orc.back) { m_orc.back = occ; }
+		if (fw_c3_ended_at != ~0ull && now >= fw_c3_ended_at) {
+			if (fw_c3_scans < 17) { m_orc_res[fw_c3_scans] = m_orc; }
+			m_orc.armed = false;
+		}
+	}
 #if defined(FUXI_WLAN_E2E)
 	e2e_tick(now);
 #endif
@@ -2885,6 +2972,7 @@ reset(void)
 	wl30_mask = 0; memset(&wl30_reo, 0, sizeof(wl30_reo)); fw_fse_n = fw_fisa_n = 0;  /* C2h */
 	memset(&wl_rx, 0, sizeof(wl_rx)); wl26_wbm_writes = 0; wl26_heard_none = false;
 	memset(&C, 0, sizeof(C));
+	memset(&m_orc, 0, sizeof(m_orc)); memset(m_orc_res, 0, sizeof(m_orc_res));   /* W25d */
 	C.rx_take = 2048; C.rx_post[0] = C.rx_post[1] = 1024;
 	C.credits = 4; C.credit_size = 2048; C.ready_ce = 2; C.htt_eid = 1; C.wmi_eid = 2; C.max_msg = 2048; C.ready_stslen = -1;
 	C.phy_bands = 3; C.phy_mask = 3; C.htt_major = 3; C.htt_minor = 4; C.exp_n = 38; C.exp_pdev = 0;
@@ -3785,6 +3873,16 @@ model_line(const char *l, size_t len)
 	if (C.on_line == 3 && len >= 37 && !strncmp(l, "FUXI WLAN: W23 scan foreign freq 5825", 37)) {
 		C.on_line = 0;
 		guard_bad = true;  /* the W11 guard fails in the scan wait after the last channel */
+	}
+	if (len >= 32 && !strncmp(l, "FUXI WLAN: W25 scan start id 0xa", 32) && fw_c3_scans < 4000) {   /* W25d: part 1's line before its START_SCAN is sent, part 2's after */
+		unsigned id = 0, pt = 0, pts = 0;
+		const char *at = strstr(l, " part ");
+		CHECK(sscanf(l + 28, "%x", &id) == 1 && at && sscanf(at, " part %u of %u", &pt, &pts) == 2, "a W25 START_SCAN line's shape");
+		CHECK(pt == 1 ? fw_c3_scans == (id & 0xfffu) - 1u : fw_c3_scans >= (id & 0xfffu), "a W25 START_SCAN line printed on the wrong side of its send");
+	}
+	if (C.on_line == 4 && len >= 39 && !strncmp(l, "FUXI WLAN: W25 scan 1 seq 0: full split", 39)) {   /* W25d: a network appears once the prescan is over */
+		C.on_line = 0;
+		add_frame(13, 44, 8, B_X1, 0x0011, "NewNet", 6, 0, 36, true);
 	}
 	if (C.on_line == 2 && len >= 44 && !strncmp(l, "FUXI WLAN: W23 stats request pdev-stat ", 39) && !strncmp(l + len - 5, " sent", 5)) {
 		C.on_line = 0;
@@ -6690,7 +6788,8 @@ s_svc_recycle(void)
 	    wl_ce.pipe[2].reaped >= 4100u * 9u, "RX: 62 buffers out on each pipe after 36900+ messages");
 	CHECK(wl_ce.pipe[3].posted == wl_ce.pipe[3].reaped && wl_ce.pipe[3].posted > 4100 &&
 	    wl_htc.ep[wl_htc.wmi_eid].credits == M_CREDITS, "TX: every START_SCAN reaped; every credit refunded");
-	CHECK(count_text("FUXI WLAN: W25 scan ") == 24 + 41 && count_text("W24 scan summary") == 1, "W25 lines: 1..24, then every 100th");
+	CHECK(count_text("FUXI WLAN: W25 scan ") - count_text("FUXI WLAN: W25 scan start id ") == 24 + 41 && count_text("W24 scan summary") == 1, "W25 lines: 1..24, then every 100th");
+	CHECK(count_text("FUXI WLAN: W25 scan start id ") == 24 + 41 && count_text("FUXI WLAN: W25 part ") == 2 * (24 + 41), "W25d lines: a START_SCAN line and two part lines for the same requests (1..24, every 100th)");
 	expect("FUXI WLAN: W25 scan 4100 seq 5099: full split scan id 0xa005: 1 channels passive dwell 150 ms, completed after 156 ms, reason 0, "
 	    "status 0; frames 3 bss 2, to iOS 2 kept 2; scan events 3, of another id 0 (last 0)\n");
 	c3_lifetime_end();
@@ -6767,7 +6866,7 @@ s_svc_credit_waits(void)
 	CHECK(run() == 0, "250 scans with late credits");
 	CHECK(h_auto_ok == 249 && fw_c3_scans == 250, "every scan but the 30th completed");
 	CHECK(count_text("W25 WMI START_SCAN waits for 1 HTC credits (has 0)") == 18, "W25 credit-wait lines past the cap");
-	CHECK(count_text("FUXI WLAN: W25 scan ") == 24 + 2 + 1, "W25 lines: 1..24, every 100th and the failed 30th");
+	CHECK(count_text("FUXI WLAN: W25 scan ") - count_text("FUXI WLAN: W25 scan start id ") == 24 + 2 + 1, "W25 lines: 1..24, every 100th and the failed 30th");
 	expect(SAY("FUXI WLAN: W25 scan 30 seq 1029: full split scan id 0xa01e: 1 channels passive dwell 150 ms, start failed after 2 ms, reason 4, "
 	    "status %d; ", EIO));
 	expect_not("FUXI WLAN: W25 scan 31 ");
@@ -7294,6 +7393,523 @@ s_svc_c2e(void)
 	     "scans, 13680 C2d frames on 4095 refill buffers all returned and posted again, W27/W28 watches and reports after "
 	     "the first scan only, no pdev stats request, every arena zeroed and freed");
 }
+
+/* ---- W25d: the poll/CE2/credit lines, the START_SCAN line, the command line, the prescan (fuxiwlanch bit 29) and the stale cache ----
+ * The numbers the driver prints are compared with the ones the model works out for itself (m_orc_res: the model's own clock, CE2 STATUS ring and
+ * delivered events, never the driver's counters). The host's poll thread is stalled by C.slow_*: wl_sleep takes slow_ms longer than asked, and
+ * every message that fell due meanwhile is delivered in the one tick that follows (the backlog the driver must see). */
+struct d_win { unsigned polls, ms, gap10, post, back, left, ev[4]; int c0, cmin, cend; };
+
+static const char *
+d_line(const char *prefix, unsigned nth)
+{
+	const char *p = logbuf;
+	for (unsigned i = 0; (p = strstr(p, prefix)) != NULL; i++, p++) { if (i == nth) { return p; } }
+	return NULL;
+}
+
+static bool
+d_parse(const char *line, struct d_win *w)
+{
+	unsigned gi = 0, gf = 0;
+	const char *q = strstr(line, ": polls "), *e;
+	if (!q || sscanf(q, ": polls %u in %u ms, gap max %u.%u ms, ce2 posted-unreaped min %u backlog max %u free min %u, wmi credits %d/%d/%d (start/min/end)",
+	    &w->polls, &w->ms, &gi, &gf, &w->post, &w->back, &w->left, &w->c0, &w->cmin, &w->cend) != 10) { return false; }
+	w->gap10 = gi * 10u + gf;
+	e = strstr(q, ": wmi events scan ");
+	return e && sscanf(e, ": wmi events scan %u chan-info %u mgmt-rx %u other %u", &w->ev[0], &w->ev[1], &w->ev[2], &w->ev[3]) == 4;
+}
+
+/* One part's line against the oracle of START_SCAN number SCAN_NO. */
+static void
+d_part(const char *prefix, unsigned scan_no, struct d_win *w)
+{
+	const char *l = d_line(prefix, 0);
+	const struct m_orc_s *o = &m_orc_res[scan_no];
+	CHECK(l && d_parse(l, w), "W25d: a part's two lines are there and well formed");
+	CHECK(w->polls == o->sleeps + 1u, "W25d: poll passes are the model's sleeps + 1");
+	CHECK(w->gap10 == 10u * o->gap, "W25d: the longest gap between two passes is the model's longest sleep");
+	CHECK(w->back == o->back, "W25d: the CE2 backlog is the most entries the model's STATUS ring held after a tick");
+	CHECK(w->post == WLCE_RX_POST && w->left == WLCE_RX_POST - w->back, "W25d: posted-unreaped stays at the 62 buffers, free = 62 - backlog");
+	for (unsigned i = 0; i < 4; i++) { CHECK(w->ev[i] == o->ev[i], "W25d: WMI events by kind are the model's"); }
+}
+
+/* The first START_SCAN's command line: ids in the model's order, then the count and the time since READY (MS_LO..MS_HI). */
+static void
+d_cmds(unsigned *credits_at_start, unsigned ms_lo, unsigned ms_hi)
+{
+	const char *l = d_line("FUXI WLAN: W25 cmds id:credits", 0), *p;
+	unsigned ids[16], k = 0, sent = 0, ms = 0, first_start = 0;
+	int cr = 0, cs[16];
+	CHECK(l != NULL, "W25d: the command line is there");
+	p = l + strlen("FUXI WLAN: W25 cmds id:credits");
+	while (*p == ' ' && p[1] != '(' && k < 16) {
+		int adv = 0;
+		CHECK(sscanf(p, " %x:%d%n", &ids[k], &cs[k], &adv) == 2, "W25d: id:credits tokens");
+		p += adv; k++;
+	}
+	CHECK(sscanf(p, " (%u sent since WMI READY); first START_SCAN +%u ms, credits %d", &sent, &ms, &cr) == 3, "W25d: the command line's tail");
+	while (first_start < fw_cmd_n && fw_cmd_log[first_start] != 0x3001) { first_start++; }
+	CHECK(first_start >= 2 && first_start < fw_cmd_n, "W25d: the model saw a START_SCAN");
+	CHECK(k == first_start - 1u && sent == first_start - 1u, "W25d: every WMI command since READY (INIT was before it) is in the line");
+	for (unsigned i = 0; i < k; i++) { CHECK(ids[i] == fw_cmd_log[1 + i], "W25d: the command ids are the firmware's, in order"); }
+	CHECK(cs[0] == (int)M_CREDITS, "W25d: the first command after READY went out with all the credits there were");
+	*credits_at_start = (unsigned)cr;
+	CHECK(ms >= ms_lo && ms <= ms_hi, "W25d: the first START_SCAN came after the 500 ms of observing after READY, and the request's wait");
+}
+
+/* A START_SCAN line against what the model's firmware took. */
+static void
+d_start(unsigned scan_no, unsigned seq, unsigned part, unsigned parts, unsigned dwell, unsigned ext)
+{
+	unsigned id, vdev, n, pd, mx, ev, fl, ex, ad, first, last, sq, pt, pts;
+	char key[48];
+	const char *l;
+	snprintf(key, sizeof(key), "FUXI WLAN: W25 scan start id %#x ", fw_c3_log[scan_no].id);
+	l = d_line(key, 0);
+	CHECK(l != NULL, "W25d: a START_SCAN line per START_SCAN");
+	CHECK(sscanf(l, "FUXI WLAN: W25 scan start id %x vdev %u channels %u passive dwell %u ms max %u ms events %x flags %x ext 0x%x active dwell %u ms "
+	    "first %u last %u MHz seq %u part %u of %u", &id, &vdev, &n, &pd, &mx, &ev, &fl, &ex, &ad, &first, &last, &sq, &pt, &pts) == 14,
+	    "W25d: the START_SCAN line's shape");
+	CHECK(id == fw_c3_log[scan_no].id && vdev == 0 && n == fw_c3_log[scan_no].n && pd == dwell && mx == fw_c3_log[scan_no].max && ev == 0x5f &&
+	    fl == 0x11 && ex == ext && ad == 50 && first == fw_c3_log[scan_no].chan0 && sq == seq && pt == part && pts == parts,
+	    "W25d: the START_SCAN line says the words the firmware took");
+	CHECK(mx == n * dwell * 3 / 2 && last == (part == 1 ? 2472u : 5825u), "W25d: max_scan_time n x dwell x 3/2, the last channel of the band");
+}
+
+static void
+s_w25d_poll(void)
+{
+	static const uint16_t two[2] = {2437, 5180};
+	struct d_win wi, w1, w2;
+	unsigned cr = 0;
+	/* (a) no stall: the request is 3 s after READY of the service, so the wait is 301 idle passes 10 ms apart; each part: one pass a ms */
+	c3_reset();
+	add_frame(2, 40, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	add_frame(3, 35, 8, B_CAFE, 0x0401, "Cafe", 4, 1, 0, false);
+	add_frame(13, 50, 8, B_OFF, 0x0011, "Office-5G", 9, 0, 36, true);
+	add_frame(21, 33, 8, B_LAB, 0x0011, "Lab DFS", 7, 0, 100, true);
+	h_push_at(two, 2, true, 150, -1, 3000);
+	CHECK(run() == 0, "W25d poll (a)");
+	CHECK(d_line("FUXI WLAN: W25 idle (", 0) && d_parse(d_line("FUXI WLAN: W25 idle (", 0), &wi), "W25d: the idle wait's lines");
+	/* (the one message that is still on its way at service ready is the last command's credit: backlog 1 at the first pass, credits 2 -> 3) */
+	CHECK(wi.polls == 301 && wi.ms == 3000 && wi.gap10 == 100 && wi.post == WLCE_RX_POST && wi.back == 1 && wi.left == WLCE_RX_POST - 1 &&
+	    wi.c0 == (int)M_CREDITS - 1 && wi.cmin == wi.c0 && wi.cend == (int)M_CREDITS && wi.ev[0] + wi.ev[1] + wi.ev[2] + wi.ev[3] == 0,
+	    "W25d: idle: 301 passes, 10.0 ms apart, the last command's credit coming back, no event");
+	expect("FUXI WLAN: W25 idle (service ready +50");
+	expect(" ms after READY, 8 cmds sent): polls 301 in 3000 ms, gap max 10.0 ms, ce2 posted-unreaped min 62 backlog max 1 free min 61, wmi credits 2/2/3 (start/min/end)\n");
+	d_cmds(&cr, 3500, 3520);
+	d_part("FUXI WLAN: W25 part 1 (2.4 GHz, id 0xa001, completed)", 1, &w1);
+	d_part("FUXI WLAN: W25 part 2 (5 GHz, id 0xa002, completed)", 2, &w2);
+	CHECK(m_orc_res[1].gap == 1 && m_orc_res[2].gap == 1 && w1.gap10 == 10 && w2.gap10 == 10, "W25d: a poll every ms: 1.0 ms");
+	CHECK(w1.c0 == (int)cr - 1 && w1.cmin == w1.c0 && w1.cend == (int)M_CREDITS, "W25d: part 1 credits: START_SCAN took one, the refund came back by the end");
+	CHECK(w2.c0 == (int)M_CREDITS - 1 && w2.cmin == w2.c0 && w2.cend == (int)M_CREDITS, "W25d: part 2 credits: 2 / 2 / 3");
+	CHECK(w1.ev[0] == 13 + 2 && w1.ev[1] == 2 * 13 && w2.ev[0] == 25 + 2 && w2.ev[1] == 2 * 25,
+	    "W25d: events: STARTED, one foreign channel each, COMPLETED; chan-info twice a channel");
+	d_start(1, 1, 1, 2, 150, 0);
+	d_start(2, 1, 2, 2, 150, 0);
+	/* the order: the idle lines and the command line before the first START_SCAN, the 5 GHz START_SCAN line before anything of part 1's, the part
+	 * lines after both parts and before the request's own line */
+	{
+		static const char *const lines[] = {
+			"FUXI WLAN: W25 service ready: 38 channels",
+			"FUXI WLAN: W25 idle (",
+			"FUXI WLAN: W25 cmds id:credits",
+			"FUXI WLAN: W25 scan start id 0xa001 ",
+			"FUXI WLAN: W25 scan start id 0xa002 ",
+			"FUXI WLAN: W25 part 1 (2.4 GHz, id 0xa001, completed): polls ",
+			"FUXI WLAN: W25 part 1 (2.4 GHz, id 0xa001, completed): wmi events scan 15 chan-info 26 mgmt-rx ",
+			"FUXI WLAN: W25 part 2 (5 GHz, id 0xa002, completed): polls ",
+			"FUXI WLAN: W25 part 2 (5 GHz, id 0xa002, completed): wmi events scan 27 chan-info 50 mgmt-rx ",
+			"FUXI WLAN: W25 scan 1 seq 1: full split scan id 0xa001+0xa002: ",
+		};
+		expect_order(lines, sizeof(lines) / sizeof(lines[0]));
+	}
+	CHECK(count_text("FUXI WLAN: W25 cmds id:credits") == 1 && count_text("FUXI WLAN: W25 scan start id ") == 2 && count_text("FUXI WLAN: W25 idle (") == 2,
+	    "W25d: one command line, one START_SCAN line each, the idle wait's two lines");
+	c3_lifetime_end();
+	contained_and_freed();
+	/* (b) the host's poll thread stalls for 400 ms, 300 ms into the 2.4 GHz part: 401 ms between two passes, and the events that fell due
+	 * meanwhile (channels 1..4 of the script) wait in the CE2 STATUS ring until the pass that follows */
+	c3_reset();
+	C.slow_scan = 1; C.slow_at = 300; C.slow_ms = 400;
+	add_frame(2, 40, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	add_frame(3, 35, 8, B_CAFE, 0x0401, "Cafe", 4, 1, 0, false);
+	add_frame(4, 45, 8, B_X1, 0x0401, "Net4", 4, 6, 0, false);
+	add_frame(13, 50, 8, B_OFF, 0x0011, "Office-5G", 9, 0, 36, true);
+	h_push_at(two, 2, true, 150, -1, 0);
+	CHECK(run() == 0, "W25d poll (b)");
+	CHECK(C.slow_done, "W25d: the stall happened");
+	d_part("FUXI WLAN: W25 part 1 (2.4 GHz, id 0xa001, completed)", 1, &w1);
+	d_part("FUXI WLAN: W25 part 2 (5 GHz, id 0xa002, completed)", 2, &w2);
+	CHECK(m_orc_res[1].gap == 401 && w1.gap10 == 4010 && m_orc_res[2].gap == 1 && w2.gap10 == 10, "W25d: 401.0 ms in the stalled part, 1.0 in the other");
+	CHECK(w1.back >= 10 && w1.back <= 20 && w1.left == WLCE_RX_POST - w1.back && w2.back < 4, "W25d: the stall left a backlog of the events that fell due (more than 10), the other part none");
+	CHECK(w1.polls == 1957 - 400 && w2.polls == 3757, "W25d: 1956 ms of part 1 with one 401 ms sleep in it: 400 passes fewer than a pass a ms");
+	expect("FUXI WLAN: W25 part 1 (2.4 GHz, id 0xa001, completed): polls ");
+	expect(", gap max 401.0 ms, ce2 posted-unreaped min 62 backlog max ");
+	c3_lifetime_end();
+	contained_and_freed();
+	/* (c) a START_SCAN credit that comes back only after its scan's COMPLETED: the window ends before it, so start = min = end; the ext word of a
+	 * DBS policy bit and a request dwell of 110 ms show on the START_SCAN lines */
+	c3_reset();
+	wl23_chmask = WL23_CH_NONDBS; m_ext = 1;
+	C.c3_refund_at_end = true;
+	add_frame(2, 40, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	h_push_at(two, 2, true, 110, -1, 0);
+	CHECK(run() == 0, "W25d poll (c)");
+	d_part("FUXI WLAN: W25 part 1 (2.4 GHz, id 0xa001, completed)", 1, &w1);
+	d_part("FUXI WLAN: W25 part 2 (5 GHz, id 0xa002, completed)", 2, &w2);
+	CHECK(w1.c0 == w1.cmin && w1.cend == w1.c0 + 1, "W25d: part 1: only the last setup command's credit came back inside its window, not its own START_SCAN's");
+	CHECK(w2.c0 == w2.cmin && w2.cend == w2.c0 + 1 && w2.c0 == w1.c0, "W25d: part 2: part 1's credit (back 1 ms after its COMPLETED) arrives inside part 2's window, its own START took another");
+	d_start(1, 1, 1, 2, 110, 1);
+	d_start(2, 1, 2, 2, 110, 1);
+	expect("flags 0x11 ext 0x1 active dwell 50 ms first 2412 last 2472 MHz seq 1 part 1 of 2\n");
+	c3_lifetime_end();
+	contained_and_freed();
+	/* (d) the lane stops in the middle of a part (the W11 guard fails as the last 5 GHz channel is reported): the open window and the part lines
+	 * not said yet are said by the service's end, before its lines */
+	c3_reset();
+	C.on_line = 3;
+	add_frame(2, 40, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	h_push_at(two, 2, true, 150, -1, 0);
+	CHECK(run() == 1, "W25d poll (d)");
+	contained_and_freed();
+	{
+		static const char *const lines[] = {
+			"FUXI WLAN: W25 failure: ",
+			"FUXI WLAN: W25 part 1 (2.4 GHz, id 0xa001, completed): polls ",
+			"FUXI WLAN: W25 part 2 (5 GHz, id 0xa002, contained): polls ",
+			"FUXI WLAN: W25 part 2 (5 GHz, id 0xa002, contained): wmi events scan ",
+			"FUXI WLAN: W25 service end: a failure (above) after ",
+		};
+		expect_order(lines, sizeof(lines) / sizeof(lines[0]));
+	}
+	/* (e) no START_SCAN at all: the idle wait is said once, at the service's end */
+	c3_reset();
+	CHECK(run() == 0, "W25d poll (e)");
+	c3_lifetime_end();
+	contained_and_freed();
+	CHECK(count_text("FUXI WLAN: W25 idle (") == 2 && !d_line("FUXI WLAN: W25 cmds", 0) && !d_line("FUXI WLAN: W25 part ", 0), "W25d: an idle service says its wait at its end only");
+	expect("ms after READY, 8 cmds sent): polls 180001 in 1800000 ms, gap max 10.0 ms, ce2 posted-unreaped min 62 backlog max 1 free min 61");
+	puts("W25d poll lines: per firmware part one line of passes, the longest gap between two passes (1.0 ms; 401.0 with the host stalled for 400 ms), "
+	     "the CE2 posted-unreaped minimum and the backlog the stall left (the model's own ring count), the free buffers, the credits start/min/end, and "
+	     "the WMI events by kind (the model's counts); the idle wait's (301 passes 10.0 ms apart); the command line (every WMI command since READY, "
+	     "the firmware's ids in order); a START_SCAN line each with the words the firmware took (id, dwell, max, events, flags, ext, first/last "
+	     "channel), the 5 GHz one after its send; the lines of a part cut short by the lane's stop are said at the service's end");
+}
+
+/* The widest every new line can be: all numbers at their caps, the longest labels. The model fails any FUXI WLAN line over 254 bytes. */
+static void
+s_w25d_widest(void)
+{
+	struct wl25_win w;
+	uint8_t buf[WLCE_BUF];
+	const char *p;
+	unsigned longest = 0;
+	reset();
+	memset(&w, 0xff, sizeof(w));
+	w.on = false; w.t0_ns = 0; w.c0 = (int)0x80000000u; w.cmin = 0x7fffffff; w.cend = (int)0x80000000u;
+	wl25_win_say("part 2 (2.4 GHz, id 0xafff, no end by max + 200 ms)", &w);
+	wl25_win_say("idle (service ready +99999999 ms after READY, 999 cmds sent)", &w);
+	for (unsigned i = 0; i < WL25_CMDS_MOST; i++) { wl25_cmd_id[i] = 0xffffffffu; wl25_cmd_cr[i] = 0x7fffffff; }
+	wl25_cmd_n = 4000000000u; wl25_ready_ns = 0; now = 3000000000000ull;
+	wl_htc.wmi_eid = 0; wl_htc.ep[0].credits = 100000;
+	wl25_cmds_say();
+	memset(buf, 0xff, sizeof(buf));
+	p32(buf + 4 + 4 * WLWMI_SS_NUM_CHAN, 38);
+	wl25_start_say(buf, 0xffffffffu, 1, 2);
+	for (p = logbuf; *p;) {
+		const char *nl = strchr(p, '\n');
+		unsigned len = (unsigned)(nl - p);
+		if (!strncmp(p, "FUXI WLAN: W25 ", 15) && len > longest) { longest = len; }
+		p = nl + 1;
+	}
+	CHECK(longest > 200 && longest <= 254, "W25d: the widest new line is within the console's 254 bytes");
+	CHECK(count_text("FUXI WLAN: W25 cmds id:credits") == 1 && strstr(logbuf, "(999 sent since WMI READY); first START_SCAN +99999999 ms, credits 99") != NULL,
+	    "W25d: the command line's numbers are capped");
+	expect(" fffff:99 fffff:99 fffff:99 fffff:99 fffff:99 fffff:99 fffff:99 fffff:99 fffff:99 fffff:99 fffff:99 fffff:99 fffff:99 fffff:99 fffff:99 fffff:99 (999 sent");
+	now = 0;
+	memset(&w, 0, sizeof(w));
+	wl25_cmd_n = 0; wl25_cmd_on = false; wl_htc.ep[0].credits = 0;
+	{
+		char msg[160];
+		snprintf(msg, sizeof(msg), "W25d lines: at most %u of 254 bytes (all numbers capped, the widest labels)", longest);
+		puts(msg);
+	}
+}
+
+/* ---- the prescan (fuxiwlanch bit 29) ---- */
+static void
+s_w25d_prescan(void)
+{
+	static const uint16_t two[2] = {2437, 5180};
+	uint16_t all[38];
+	for (unsigned i = 0; i < 38; i++) { all[i] = (uint16_t)m_chan(i); }
+	/* (a) a full split at service ready, before any request, handing nothing to iOS; the first request (due at once, taken when the prescan is over) is
+	 * answered from the cache with no START_SCAN; 28 s on still the cache; 34 s on a new split */
+	c3_reset();
+	wl23_chmask = WL23_CH_PRESCAN;
+	add_frame(5, 47, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	add_frame(13, 50, 8, B_OFF, 0x0011, "Office-5G", 9, 0, 36, true);
+	add_frame(21, 33, 8, B_LAB, 0x0011, "Lab DFS", 7, 0, 100, true);
+	h_push_at(two, 2, true, 150, -1, 0);
+	h_push_at(all, 38, true, 150, -1, 33000);
+	h_push_at(two, 2, true, 150, -1, 40000);
+	CHECK(run() == 0, "W25d prescan (a)");
+	CHECK(h_takes == 3 && h_dones == 3 && h_status[0] == 0 && h_status[1] == 0 && h_status[2] == 0, "W25d prescan: three requests answered");
+	CHECK(fw_c3_scans == 4 && fw_c3_log[1].at == h_ready_at && fw_c3_log[1].n == 13 && fw_c3_log[1].chan0 == 2412 && fw_c3_log[2].n == 25 &&
+	    fw_c3_log[2].chan0 == 5180 && fw_c3_log[3].at - h_ready_at >= 40000 && fw_c3_log[3].at - h_ready_at < 40100,
+	    "W25d prescan: the first split is at service ready (13 channels from 2412 then 25 from 5180), the next at 40 s");
+	CHECK(h_splits == 2 && h_hits == 2, "W25d prescan: the prescan's cache answered the first two requests, a new split the third");
+	CHECK(h_fr_n == 2 + 3 + 2, "W25d prescan: the frames of the requests only (2, 3 and 2), none for the prescan");
+	{
+		static const char *const lines[] = {
+			"FUXI WLAN: W25 service ready: 38 channels",
+			"FUXI WLAN: W25 prescan full split at service ready\n",
+			"FUXI WLAN: W25 scan start id 0xa001 vdev 0 channels 13 passive dwell 150 ms max 2925 ms",
+			"seq 0 part 1 of 2\n",
+			"FUXI WLAN: W24 scan summary frames 3 bss 3 ssids 3\n",
+			"FUXI WLAN: W25 scan start id 0xa002 vdev 0 channels 25 passive dwell 150 ms max 5625 ms",
+			"seq 0 part 2 of 2\n",
+			"FUXI WLAN: W25 scan 1 seq 0: full split scan id 0xa001+0xa002: 13+25 channels passive dwell 150 ms, completed after ",
+			"status 0; frames 3 bss 3, to iOS 0 kept 0;",
+			"FUXI WLAN: W25 scan 2 seq 1: cache hit (age ",
+			" ms, 2 of 3 frames match), nothing sent, status 0; to iOS 2 kept 2\n",
+			"FUXI WLAN: W25 scan 3 seq 2: cache hit (age 27",
+			" ms, 3 of 3 frames match), nothing sent, status 0; to iOS 3 kept 3\n",
+			"FUXI WLAN: W25 scan 4 seq 3: full split scan id 0xa003+0xa004: 13+25 channels passive dwell 150 ms, completed after ",
+		};
+		expect_order(lines, sizeof(lines) / sizeof(lines[0]));
+	}
+	CHECK(count_text("W25 prescan full split") == 1 && count_text("FUXI WLAN: W23 scan foreign freq") == 38 && count_text("FUXI WLAN: W24 scan summary") == 1,
+	    "W25d prescan: one prescan, the first-scan lines (foreign channels, W24) from it and only it");
+	CHECK(!d_line("FUXI WLAN: W25 idle (", 0), "W25d prescan: no idle wait to say (the split began at service ready)");
+	c3_lifetime_end();
+	contained_and_freed();
+	expect("scans 4 (completed 4, failed 0, cancelled 0, refused 0), cache hits 2, frames to iOS 7 kept 7;");
+	/* (b) the prescan fails (START_FAILED): no cache, the first request scans; the prescan counts as a failed scan, never as a request */
+	c3_reset();
+	wl23_chmask = WL23_CH_PRESCAN;
+	C.c3_mode[1] = 1;
+	add_frame(5, 47, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	h_push_at(two, 2, true, 150, -1, 0);
+	CHECK(run() == 0, "W25d prescan (b)");
+	CHECK(fw_c3_scans == 3 && h_splits == 1 && h_hits == 0 && h_status[0] == 0 && h_fr_n == 1, "W25d prescan: START_FAILED, then the request is a split of its own");
+	expect("FUXI WLAN: W25 scan 1 seq 0: full split scan id 0xa001+-: 13+25 channels passive dwell 150 ms, start failed after ");
+	expect("FUXI WLAN: W25 scan 2 seq 1: full split scan id 0xa002+0xa003: ");
+	c3_lifetime_end();
+	contained_and_freed();
+	expect("scans 2 (completed 1, failed 1, cancelled 0, refused 0), cache hits 0,");
+	/* (c) 2.4 GHz only (w20 0x10): a prescan of one part */
+	c3_reset();
+	wl23_chmask = WL23_CH_PRESCAN; wl20_bits = WL20_BAND24; C.exp_n = 13;
+	add_frame(5, 47, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	h_push_at(two, 2, true, 150, -1, 0);
+	CHECK(run() == 0, "W25d prescan (c)");
+	CHECK(fw_c3_scans == 1 && h_splits == 1 && h_hits == 1 && h_status[0] == 0, "W25d prescan: one 13-channel part at service ready, the request answered from it");
+	c3_lifetime_end();
+	contained_and_freed();
+	/* (d) without the bit nothing of it: no prescan line, no START_SCAN before the first request */
+	c3_reset();
+	add_frame(5, 47, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	h_push_at(two, 2, true, 150, -1, 3000);
+	CHECK(run() == 0, "W25d prescan (d)");
+	CHECK(fw_c3_log[1].at - h_ready_at >= 3000 && !d_line("prescan", 0), "W25d: no bit 29, no prescan: the first START_SCAN is the request's, 3 s on");
+	c3_lifetime_end();
+	contained_and_freed();
+	puts("W25d prescan (fuxiwlanch bit 29): one full split (13 channels from 2412, 25 from 5180) at service ready, before any request, handing nothing "
+	     "to iOS and giving the first-scan lines; the first requests answered from its cache with no START_SCAN, a new split after 30 s; a failed prescan "
+	     "leaves no cache; one part with w20 0x10; without the bit nothing happens before the first request");
+}
+
+/* ---- the stale cache (fuxiwlanch bit 29) ---- */
+static unsigned
+d_sum(void)
+{
+	unsigned s = 5381u;
+	for (unsigned i = 0; i < wl25_stale_n; i++) {
+		s = s * 33u + wl25_stale[i].len + wl25_stale[i].mhz + (unsigned)(wl25_stale[i].dbm + 200);
+		for (uint32_t j = 0; j < wl25_stale[i].len; j++) { s = s * 33u + wl25_stale[i].frame[j]; }
+	}
+	return s;
+}
+
+/* What the stale service may not touch: the device, the arena, the scan state. */
+struct d_dev { unsigned writes, wins, scans, tx, stops, shadow, direct, allocs, frees, ev_l; uint64_t win; };
+static struct d_dev
+d_dev_now(void)
+{
+	struct d_dev d = { ce_writes, win_selects, fw_c3_scans, fw_tx_msgs, fw_stop_cmds, shadow_writes, direct_publishes, arena_allocs, arena_frees, n_ev['L'], bar_win };
+	return d;
+}
+
+static void
+d_dev_same(const struct d_dev *a, const char *what)
+{
+	const struct d_dev b = d_dev_now();
+	CHECK(a->writes == b.writes && a->wins == b.wins && a->scans == b.scans && a->tx == b.tx && a->stops == b.stops && a->shadow == b.shadow &&
+	    a->direct == b.direct && a->allocs == b.allocs && a->frees == b.frees && a->ev_l == b.ev_l && a->win == b.win && !wl_ce_arena.va, what);
+}
+
+static void
+s_w25d_stale(void)
+{
+	static const uint16_t two[2] = {2437, 5180}, h5[1] = {5500}, bad[1] = {2484}, one24[1] = {2437};
+	uint16_t all[38];
+	struct d_dev dv;
+	unsigned sum, loglen0, takes0;
+	uint64_t now0;
+	for (unsigned i = 0; i < 38; i++) { all[i] = (uint16_t)m_chan(i); }
+	/* (a) bit 29: the prescan, a normal split (a new network appears once the prescan is over), then three splits fail in a row and the lane stops.
+	 * The stale service answers from the LAST COMPLETED split (the second one: four networks, not the prescan's three), valid requests with
+	 * done(0), the others EINVAL, until the iOS side stops (9 requests done); nothing reaches the device */
+	c3_reset();
+	wl23_chmask = WL23_CH_PRESCAN; C.on_line = 4;
+	C.c3_mode[5] = C.c3_mode[6] = C.c3_mode[7] = 1;
+	add_frame(5, 47, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	add_frame(13, 50, 8, B_OFF, 0x0011, "Office-5G", 9, 0, 36, true);
+	add_frame(21, 33, 8, B_LAB, 0x0011, "Lab DFS", 7, 0, 100, true);
+	h_push_at(two, 2, true, 150, -1, 0);
+	h_push_at(all, 38, true, 150, -1, 40000);
+	h_push_at(two, 2, true, 150, -1, 80000);
+	h_push_at(two, 2, true, 150, -1, 90000);
+	h_push_at(two, 2, true, 150, -1, 100000);
+	h_push_at(two, 2, true, 150, -1, 110000);   /* after the lane stopped */
+	h_push_at(bad, 1, true, 150, -1, 120000);
+	h_push_at(h5, 1, true, 150, -1, 130000);
+	h_push_at(two, 2, false, 150, -1, 140000);
+	h_gone_after = 9;
+	CHECK(run() == 1, "W25d stale (a): the lane stops after three failed splits");
+	CHECK(h_takes == 5 && h_status[2] == EIO && h_status[3] == EIO && h_status[4] == EIO && h_splits == 2 && wl25_stale_ok && wl25_stale_n == 4 &&
+	    !wl25_cache_ok && wl25_cache_n == 0, "W25d stale: the cache was emptied by the failures, the stale copy holds the last completed split's four networks");
+	expect("FUXI WLAN: W25 failure: W25 3 failed scans in a row; contain, no retry\n");
+	sum = d_sum();
+	contained_and_freed();
+	CHECK(d_sum() == sum && wl25_stale_n == 4, "W25d stale: the copy survived the lane's containment and the freeing of the arena, byte for byte");
+	expect_not("serving stale");
+	dv = d_dev_now(); loglen0 = (unsigned)loglen; now0 = now;
+	m_stale_phase = true;
+	wl25_stale_serve();
+	m_stale_phase = false;
+	d_dev_same(&dv, "W25d stale: the stale service touched the device, the arena, a ring or the scan state");
+	CHECK(h_takes == 9 && h_dones == 9 && h_status[5] == 0 && h_status[6] == EINVAL && h_status[7] == 0 && h_status[8] == EINVAL && d_sum() == sum &&
+	    wl25_stale_n == 4 && wl25_stale_answers == 4, "W25d stale: four answers, the copy as it was");
+	CHECK(now >= h_ready_at + 140000u, "W25d stale: the service slept until the last request was due");
+	{
+		unsigned per[10] = {0}, fresh = 0;
+		for (unsigned i = 0; i < h_fr_n; i++) {
+			if (h_fr[i].seq < 10) { per[h_fr[i].seq]++; }
+			if (h_fr[i].seq == 6 && h_fr[i].mhz == 5180 && !memcmp(h_fr[i].bssid, B_X1, 6)) { fresh++; }
+		}
+		CHECK(per[6] == 3 && per[7] == 0 && per[8] == 1 && per[9] == 0, "W25d stale: frames of the request's channels only: 2437, 5180 (Office and the new network), 5500, none");
+		CHECK(fresh == 1, "W25d stale: the network that appeared after the prescan is in the stale answer (the last completed split, not the prescan's)");
+	}
+	{
+		const char *l = d_line("FUXI WLAN: W25 lane stopped, serving stale cache of 4 BSS (completed ", 0);
+		unsigned s = 0;
+		CHECK(l && sscanf(l, "FUXI WLAN: W25 lane stopped, serving stale cache of 4 BSS (completed %u s ago)", &s) == 1, "W25d stale: the engage line");
+		CHECK(s + 1u >= (unsigned)((now0 - h_cache_at) / 1000u) && s <= (unsigned)((now0 - h_cache_at) / 1000u), "W25d stale: the age of the copy, from the last completed split");
+	}
+	expect("FUXI WLAN: W25 stale answer 1 seq 6: 3 of 4 frames match (cache ");
+	expect(" s old), nothing sent, status 0; to iOS 3 kept 3\n");
+	expect(SAY("FUXI WLAN: W25 stale answer 2 seq 7: no listed channel, refused, status %d\n", EINVAL));
+	expect("FUXI WLAN: W25 stale answer 3 seq 8: 1 of 4 frames match (cache ");
+	expect(SAY("FUXI WLAN: W25 stale answer 4 seq 9: not passive, refused, status %d\n", EINVAL));
+	expect("FUXI WLAN: W25 stale cache service over: the iOS side stopped, 4 answers\n");
+	CHECK((unsigned)loglen > loglen0 && count_text("serving stale") == 1, "W25d stale: one engage line");
+	reset();
+	/* (b) the lane stops in the middle of a request (the W11 guard fails once the 2.4 GHz part of its split is taken): that request is answered first from
+	 * the stale copy (the prescan's), then the next */
+	c3_reset();
+	wl23_chmask = WL23_CH_PRESCAN;
+	C.c3_guard_after = 3;
+	add_frame(5, 47, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	add_frame(13, 50, 8, B_OFF, 0x0011, "Office-5G", 9, 0, 36, true);
+	h_push_at(two, 2, true, 150, -1, 0);
+	h_push_at(two, 2, true, 150, -1, 40000);
+	h_push_at(h5, 1, true, 150, -1, 60000);
+	h_gone_after = 3;
+	CHECK(run() == 1, "W25d stale (b)");
+	CHECK(h_takes == 2 && h_dones == 1 && h_live != 0 && wl25_live_on && wl25_stale_ok && wl25_stale_n == 2, "W25d stale: request 2 was in flight when the lane stopped");
+	contained_and_freed();
+	dv = d_dev_now();
+	m_stale_phase = true;
+	wl25_stale_serve();
+	m_stale_phase = false;
+	d_dev_same(&dv, "W25d stale (b): the stale service touched the device");
+	CHECK(h_takes == 3 && h_dones == 3 && h_status[1] == 0 && h_status[2] == 0 && !wl25_live_on, "W25d stale: the request the lane died on was answered first, then the next");
+	expect("FUXI WLAN: W25 stale answer 1 seq 2: 2 of 2 frames match (cache ");
+	expect("FUXI WLAN: W25 stale answer 2 seq 3: 0 of 2 frames match (cache ");
+	reset();
+	/* (c) bit 29 but no completed split (the prescan and two requests fail): the lane stops with nothing to serve, and the stale service does nothing
+	 * and says nothing (fw_thread then reports STOPPED, as without the bit) */
+	c3_reset();
+	wl23_chmask = WL23_CH_PRESCAN;
+	C.c3_mode[1] = C.c3_mode[2] = C.c3_mode[3] = 1;
+	add_frame(5, 47, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	h_push_at(two, 2, true, 150, -1, 0); h_push_at(two, 2, true, 150, -1, 10000); h_push_at(one24, 1, true, 150, -1, 60000);
+	h_gone_after = 3;
+	CHECK(run() == 1, "W25d stale (c)");
+	CHECK(!wl25_stale_ok && wl25_stale_n == 0 && wl25_scans == 3, "W25d stale: no completed split, no copy");
+	contained_and_freed();
+	dv = d_dev_now(); loglen0 = (unsigned)loglen; now0 = now; takes0 = h_takes;
+	wl25_stale_serve();
+	d_dev_same(&dv, "W25d stale (c): touched the device");
+	CHECK((unsigned)loglen == loglen0 && now == now0 && h_takes == takes0 && h_dones == 2, "W25d stale: nothing said, no sleep, no request taken: Wi-Fi is reported off as today");
+	reset();
+	/* (d) no bit 29, completed splits, the lane stops: nothing is copied and nothing served (a mutant that serves the stale cache without the
+	 * bit fails here) */
+	c3_reset();
+	C.c3_mode[3] = C.c3_mode[4] = C.c3_mode[5] = 1;
+	add_frame(5, 47, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	h_push_at(two, 2, true, 150, -1, 0); h_push_at(two, 2, true, 150, -1, 40000); h_push_at(two, 2, true, 150, -1, 60000);
+	h_push_at(two, 2, true, 150, -1, 70000); h_push_at(two, 2, true, 150, -1, 80000); h_push_at(two, 2, true, 150, -1, 90000);
+	h_gone_after = 6;
+	CHECK(run() == 1, "W25d stale (d)");
+	CHECK(h_splits == 1 && h_takes == 4 && !wl25_stale_ok && wl25_stale_n == 0, "W25d stale: without bit 29 no stale copy is taken");
+	contained_and_freed();
+	dv = d_dev_now(); loglen0 = (unsigned)loglen; now0 = now; takes0 = h_takes;
+	m_stale_phase = true;
+	wl25_stale_serve();
+	m_stale_phase = false;
+	d_dev_same(&dv, "W25d stale (d): touched the device");
+	CHECK((unsigned)loglen == loglen0 && now == now0 && h_takes == takes0, "W25d stale: without bit 29 nothing is served: the lane stops and Wi-Fi is reported off as today");
+	reset();
+	/* (e) the iOS side stopped before the lane: nothing to serve (the service ended on "the iOS side stopped") */
+	c3_reset();
+	wl23_chmask = WL23_CH_PRESCAN;
+	add_frame(5, 47, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	h_push_at(two, 2, true, 150, -1, 0);
+	h_gone_after = 1;
+	CHECK(run() == 0 && wl25_ios_gone && wl25_stale_ok, "W25d stale (e)");
+	contained_and_freed();
+	loglen0 = (unsigned)loglen; now0 = now;
+	wl25_stale_serve();
+	CHECK((unsigned)loglen == loglen0 && now == now0, "W25d stale: the iOS side had stopped: nothing to serve");
+	reset();
+	/* (f) the lifetime end (1800 s) counts as a lane stop: the copy keeps answering */
+	c3_reset();
+	wl23_chmask = WL23_CH_PRESCAN;
+	add_frame(5, 47, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	h_push_at(two, 2, true, 150, -1, 0);
+	h_push_at(one24, 1, true, 150, -1, 1805000);
+	h_gone_after = 2;
+	CHECK(run() == 0, "W25d stale (f)");
+	c3_lifetime_end();
+	contained_and_freed();
+	dv = d_dev_now();
+	m_stale_phase = true;
+	wl25_stale_serve();
+	m_stale_phase = false;
+	d_dev_same(&dv, "W25d stale (f): touched the device");
+	CHECK(h_takes == 2 && h_status[1] == 0, "W25d stale: after the lifetime end the copy answers");
+	expect("FUXI WLAN: W25 lane stopped, serving stale cache of 1 BSS (completed 17");
+	reset();
+	puts("W25d stale cache (fuxiwlanch bit 29): after three failed splits the lane stops and the copy of the LAST COMPLETED split (kept in plain kernel "
+	     "memory, intact after containment and the arena's free) answers requests with done(0) and the frames of their channels, the invalid ones "
+	     "EINVAL, until the iOS side stops, nothing sent to the device and no ring touched; the request the lane died on is answered first; with no "
+	     "completed split, without the bit, or with the iOS side already stopped the service does nothing and says nothing; the lifetime end counts");
+}
 #endif
 
 #if defined(FUXI_WLAN_E2E)
@@ -7328,6 +7944,41 @@ s_e2e(void)
 	     "came out as ONE full split on the wire (13 channels from 2412, then 25 from 5180) and two answers, the second from the cache; "
 	     "each network beaconed on the asked channels came back through fuxi_wifi_radio_results with SSID, BSSID, channel and RSSI, "
 	     "and only that; EXITED turned Wi-Fi off");
+}
+
+/* W25d END TO END, the stale cache with the real fuxi_wifi_radio.c: fuxiwlanch bit 29, the prescan, then splits that fail until the lane stops
+ * (three START_FAILED). A consumer asks six times at model times (its script is e2e2_consumer in tools/test-fuxi-wlan-ce.py). STALE: the first answer
+ * comes from the prescan's cache, three asks fail with EIO (the lane's three failed splits, the third ends the lane), then two asks are answered
+ * from the stale copy with the radio still READY and the consumer told nothing but READY, until the iOS side stops by itself. Not STALE: the
+ * prescan itself fails too (no completed split to keep), so after the lane stops, fw_thread's tail (this scenario's: stale service, then STOPPED
+ * with EXITED) reports Wi-Fi off and the later asks get ENETDOWN. */
+static void
+s_e2e_stale(bool stale)
+{
+	c3_reset();
+	wl23_chmask = WL23_CH_PRESCAN;
+	if (stale) { C.c3_mode[3] = C.c3_mode[4] = C.c3_mode[5] = 1; } else { C.c3_mode[1] = C.c3_mode[2] = C.c3_mode[3] = 1; }
+	add_frame(5, 47, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	add_frame(13, 50, 8, B_OFF, 0x0011, "Office-5G", 9, 0, 36, true);
+	e2e2_ios_start(stale);
+	CHECK(run() == 1, "e2e stale: the lane stops after three failed splits");
+	expect("FUXI WLAN: W25 failure: W25 3 failed scans in a row; contain, no retry\n");
+	contained_and_freed();
+	wl25_stale_serve();                                     /* as fw_thread: before it reports STOPPED */
+	fuxi_wifi_radio_stopped(FUXI_WIFI_RADIO_EXITED | 0x1c01);   /* and then, as fw_thread does (a no-op when the iOS side stopped first) */
+	CHECK(e2e2_ios_finish(stale) == 0, "the iOS side");
+	if (stale) {
+		expect("FUXI WLAN: W25 lane stopped, serving stale cache of 2 BSS (completed ");
+		expect("FUXI WLAN: W25 stale answer 2 seq 6: ");
+		expect("FUXI WLAN: W25 stale cache service over: the iOS side stopped, 2 answers\n");
+		puts("W25d end to end (stale): with the real fuxi_wifi_radio.c, after three failed splits the lane stopped and the radio stayed READY: the "
+		     "consumer was told READY only, two asks (2437 and 5180, then 5180) were answered with status 0 from the copy of the last completed split "
+		     "(its networks, by channel), until the iOS side's own stop reported Wi-Fi off");
+	} else {
+		expect_not("serving stale"); expect_not("stale answer");
+		puts("W25d end to end (no completed split): the prescan and two splits failed, nothing to keep: the lane stopped and Wi-Fi was reported off "
+		     "(EXITED) as without bit 29, the later asks got ENETDOWN, no stale line");
+	}
 }
 #endif
 
@@ -7954,7 +8605,7 @@ s_split_pure(void)
 {
 	static uint8_t a[2048], b[2048];
 	uint32_t len = 0, len2 = 0, seed = 0x6d2b79f5u;
-	CHECK(WL23_CH_SPLIT == 0x4000000u && WL23_CH_KNOB == 0x1fffffffu && WL23_CH_VALID == 0x3ffffffu && WLSCAN_CH_SPLIT == WL23_CH_SPLIT &&
+	CHECK(WL23_CH_SPLIT == 0x4000000u && WL23_CH_KNOB == 0x3fffffffu && WL23_CH_PRESCAN == 0x20000000u && WL23_CH_VALID == 0x3ffffffu && WLSCAN_CH_SPLIT == WL23_CH_SPLIT &&
 	    WLWMI_SCAN_ID == 0xa000u && WLWMI_SCAN_ID2 == 0xa001u, "split bit layout and ids");
 	/* the split bit drops nothing: no list function reads it */
 	for (unsigned m = 0; m < 4096; m++) {
@@ -8284,7 +8935,7 @@ s_ext_pure(void)
 	static uint8_t a[2048], b[2048];
 	uint32_t len = 0, len2 = 0, seed = 0x1b873593u;
 	CHECK(WLSCAN_CH_NONDBS == 0x8000000u && WLSCAN_CH_IGNDUTY == 0x10000000u && WL23_CH_NONDBS == 0x8000000u && WL23_CH_IGNDUTY == 0x10000000u &&
-	    WL23_CH_KNOB == 0x1fffffffu && WL23_CH_VALID == 0x3ffffffu && WL23_CH_SPLIT == 0x4000000u && WLWMI_SS_CTRL_FLAGS_EXT == 35 &&
+	    WL23_CH_KNOB == 0x3fffffffu && WL23_CH_VALID == 0x3ffffffu && WL23_CH_SPLIT == 0x4000000u && WLWMI_SS_CTRL_FLAGS_EXT == 35 &&
 	    WLWMI_SS_PRIORITY == 4 && WLWMI_SCAN_FLAG_EXT_DBS_POLICY_MASK == 3u && WLWMI_SCAN_FLAG_EXT_FORCE_NONDBS == 1u &&
 	    WLWMI_SCAN_FLAG_EXT_IGNORE_DUTY == 2u, "ext bit layout and vendor policy values");
 	CHECK(wlscan_ext_flags(0) == 0 && wlscan_ext_flags(0x8000000u) == 1 && wlscan_ext_flags(0x10000000u) == 2 && wlscan_ext_flags(0x18000000u) == 3 &&
@@ -8503,6 +9154,8 @@ main(int argc, char **argv)
 	}
 #if defined(FUXI_WLAN_E2E)
 	if (argc == 2 && !strcmp(argv[1], "e2e")) { s_e2e(); return 0; }
+	if (argc == 2 && !strcmp(argv[1], "e2estale")) { s_e2e_stale(true); return 0; }
+	if (argc == 2 && !strcmp(argv[1], "e2enocache")) { s_e2e_stale(false); return 0; }
 	return 2;
 #else
 	if (argc == 3 && !strcmp(argv[1], "c3one")) {  /* one C3 scenario by name (for work on the model) */
@@ -8510,7 +9163,8 @@ main(int argc, char **argv)
 			{"pure", s_svc_pure}, {"requests", s_svc_requests}, {"cancel", s_svc_cancel}, {"failures", s_svc_failures},
 			{"guard", s_svc_guard_and_credits}, {"band", s_svc_lifetime_and_band}, {"recycle", s_svc_recycle},
 			{"stopped", s_svc_ios_stopped}, {"otherid", s_svc_other_id}, {"credits", s_svc_credit_waits}, {"c2c", s_svc_c2c},
-			{"c2e", s_svc_c2e}, {"split", s_svc_split}, {"rungs", s_svc_rungs}, {"cache", s_svc_cache},
+			{"c2e", s_svc_c2e}, {"split", s_svc_split}, {"rungs", s_svc_rungs}, {"cache", s_svc_cache}, {"w25dpoll", s_w25d_poll},
+			{"w25dwidest", s_w25d_widest}, {"w25dprescan", s_w25d_prescan}, {"w25dstale", s_w25d_stale},
 		};
 		for (unsigned i = 0; i < sizeof(one) / sizeof(one[0]); i++) {
 			if (!strcmp(one[i].n, argv[2])) { one[i].f(); reset(); puts("W25 model: scenario passed"); return 0; }
@@ -8519,7 +9173,8 @@ main(int argc, char **argv)
 	}
 	if (argc == 2 && !strcmp(argv[1], "c3")) {  /* the C3 scenarios alone */
 		s_svc_pure(); s_svc_requests(); s_svc_cache(); s_svc_cancel(); s_svc_failures(); s_svc_guard_and_credits(); s_svc_lifetime_and_band();
-		s_svc_ios_stopped(); s_svc_other_id(); s_svc_c2c(); s_svc_c2e(); s_svc_split(); s_svc_rungs(); reset();
+		s_svc_ios_stopped(); s_svc_other_id(); s_svc_c2c(); s_svc_c2e(); s_svc_split(); s_svc_rungs();
+		s_w25d_poll(); s_w25d_widest(); s_w25d_prescan(); s_w25d_stale(); reset();
 		puts("W25 model: all scenarios passed");
 		return 0;
 	}
@@ -8613,6 +9268,10 @@ main(int argc, char **argv)
 	s_svc_c2e();
 	s_svc_split();
 	s_svc_rungs();
+	s_w25d_poll();
+	s_w25d_widest();
+	s_w25d_prescan();
+	s_w25d_stale();
 #endif
 	reset();
 	puts("W20 model: all scenarios passed");

@@ -96,6 +96,12 @@ CH1 DBS scan policy (fuxiwlanch bits 27 / 28, default off): START_SCAN scan_ctrl
 in every START_SCAN of the stage (both scans of a split), the vendor's two non-default values of one 2-bit policy field (the driver
 refuses both bits together); the word is written only when a bit is set, the scan start line gains " ext 0x1" / " ext 0x2" only then
 (model s_ext_*: the firmware checks word 35 and the other 39 words of every START_SCAN; static_ext; mutants in C2CH_MUTANTS).
+W25d (qrtr 8, docs-lanes/wlan-w20.md "W25d"): read-only poll / CE2 / HTC credit lines per firmware scan part and for the idle wait, the WMI
+command line and one START_SCAN line each (model s_w25d_poll against an oracle the model works out from its own clock, CE2 STATUS ring and
+delivered events, with a stalled host poll thread; s_w25d_widest), and fuxiwlanch bit 29: a prescan (one full split at service ready, no iOS
+request) and a stale copy of the last completed split answering requests after the lane stopped, Wi-Fi staying reported on (model
+s_w25d_prescan, s_w25d_stale; the end-to-end runs e2estale and e2enocache against the real fuxi_wifi_radio.c; static_w25d; the W25d entries of
+MUTANTS). tools/test-fuxi-wlan-salami.py learns the knob's bit 29.
 No device, no network.
 """
 from pathlib import Path
@@ -226,7 +232,7 @@ def static_checks():
 
 def static_ch1():
     """CH1 (fuxiwlanch): the scan channel mask. The knob is read like every fuxiwlan* knob, is 0 unless given valid
-    (bits 0..28, 27 and 28 not together, at least one channel left with w20 0x10 counted, qrtr 7 only), lives in one variable that only the
+    (bits 0..29, 27 and 28 not together, bit 29 with qrtr 8 only, at least one channel left with w20 0x10 counted, qrtr 7 only), lives in one variable that only the
     parser sets and only the scan stage reads, and the filtered list is set once, before the first encoder call; the
     header never writes the mask and bounds both encoders by the kept count; nothing in the CH1 lines sends or touches
     a register."""
@@ -239,7 +245,8 @@ def static_ch1():
     assert ('} else if (chm_given && chm && (chm < 0 || ((unsigned)chm & ~WL23_CH_KNOB) ||\n'
             '\t\t    !WL23_CH_KEPT(WL23_CH_EFF((unsigned)chm, !!(wl20_bits & WL20_BAND24))))) {') in cfg
     assert cfg.index('wl30_mask = (unsigned)vrx;') < cfg.index('wl23_chmask = (unsigned)chm;') < cfg.index('W20 selected qrtr=%d')
-    assert cfg.count('W20 fuxiwlanch %#x needs fuxiwlanqrtr=7; refused') == 2 and cfg.count('W20 fuxiwlanch %#x refused: bits 0..28 only') == 1
+    assert cfg.count('W20 fuxiwlanch %#x needs fuxiwlanqrtr=7; refused') == 2 and cfg.count('W20 fuxiwlanch %#x refused: bits 0..29 only') == 1
+    assert cfg.count('W20 fuxiwlanch %#x refused: bit 29 (PRESCAN) needs fuxiwlanqrtr=8') == 1 and 'bits 0..28' not in strip_comments(cfg)
     # the scan stage: one filtered list, set before the stage state and every encoder call; n, max time and the counts from it
     w23 = between(drv, 'static int\nwl_w23_run(void)\n{', '\n}\n')
     assert code.count('wlscan_chmask = ') == 1 and w23.count('wlscan_chmask = ') == 1
@@ -251,7 +258,11 @@ def static_ch1():
     assert w23.index('W23 chan mask 0x%x') < w23.index('if (!n) { return wl_w11_fail(') < w23.index('W23 htt version %u.%u (w20 0x02)')
     assert 'n24 += mhz < 3000u ? 1u : 0u;' in w23 and 'n24, n - n24, dfs, wl23_pdev, sends, bytes);' in w23
     # nothing else reads or sets the knob; the CH1 lines send nothing and touch no register
-    assert code.count('wl23_chmask') == 1 + strip_comments(cfg).count('wl23_chmask') + strip_comments(w23).count('wl23_chmask')
+    # (W25d: besides those, bit 29 alone is read, by the two one-line functions wl25_prescan_on and wl25_stale_on)
+    w25d = [strip_comments(l).count('wl23_chmask') for l in drv.splitlines() if l.startswith('static bool wl25_prescan_on(void)') or
+            l.startswith('static bool wl25_stale_on(void)')]
+    assert w25d == [1, 1]
+    assert code.count('wl23_chmask') == 1 + strip_comments(cfg).count('wl23_chmask') + strip_comments(w23).count('wl23_chmask') + sum(w25d)
     for body in (cfg, w23):
         for line in strip_comments(body).splitlines():
             if 'chmask' in line or 'W23 chan mask' in line:
@@ -265,7 +276,7 @@ def static_ch1():
     assert '_Static_assert(WLSCAN_NCHAN == WLSCAN_NCHAN_24 + WLSCAN_CH_5G_BITS' in HEADER and \
         '_Static_assert(WL23_CH_24 == WLSCAN_CH_24 && WL23_CH_ALL5 == WLSCAN_CH_ALL5 && WL23_CH_VALID == WLSCAN_CH_VALID,' in drv
     assert '#define WLSCAN_FLAGS (WLWMI_SCAN_FLAG_PASSIVE | WLWMI_SCAN_CHAN_STAT_EVENT)' in HEADER   # still passive, whatever the mask
-    print('CH1 static: fuxiwlanch read like every knob, 0 unless valid (bits 0..28, 27 and 28 not together, a channel left with w20 0x10 counted, qrtr 7 only), '
+    print('CH1 static: fuxiwlanch read like every knob, 0 unless valid (bits 0..29, 27 and 28 not together, 29 with qrtr 8 only, a channel left with w20 0x10 counted, qrtr 7 only), '
           'set in one place, the filtered list fixed once before the first encoder call, n / max time / counts from it, the line silent '
           'while off, the header never writes the mask and bounds both encoders by it, the CH1 lines send nothing')
 
@@ -286,10 +297,10 @@ def static_split():
     loop = w23.split(loop_head, 1)[1].split('\n\t}\n', 1)[0]
     before, after = w23.split(loop_head, 1)[0], w23.split(loop_head, 1)[1].split('\n\t}\n', 1)[1]
     # the bit: parsed with the others (WL23_CH_KNOB), read only by the scan stage, never by a list function or the header
-    assert '#define WL23_CH_SPLIT (1u << 26)' in drv and '#define WL23_CH_KNOB (WL23_CH_VALID | WL23_CH_SPLIT | WL23_CH_NONDBS | WL23_CH_IGNDUTY)' in drv
+    assert '#define WL23_CH_SPLIT (1u << 26)' in drv and ('#define WL23_CH_KNOB (WL23_CH_VALID | WL23_CH_SPLIT | WL23_CH_NONDBS | WL23_CH_IGNDUTY | WL23_CH_PRESCAN)') in drv
     assert 'WL23_CH_SPLIT == WLSCAN_CH_SPLIT && !(WL23_CH_SPLIT & WL23_CH_VALID)' in drv
     assert '#define WLSCAN_CH_SPLIT (WLSCAN_CH_24 << 1)' in HEADER and 'WLSCAN_CH_SPLIT' not in re.sub(r'#define WLSCAN_CH_SPLIT[^\n]*', '', strip_comments(HEADER))
-    assert w23c.count('WL23_CH_SPLIT') == 2 and code.count('WL23_CH_SPLIT') == 5 + w23c.count('WL23_CH_SPLIT')   # + the bits 27 / 28 static assertion
+    assert w23c.count('WL23_CH_SPLIT') == 2 and code.count('WL23_CH_SPLIT') == 6 + w23c.count('WL23_CH_SPLIT')   # + the bits 27 / 28 and 29 static assertions
     assert 'const bool split = (wl23_chmask & WL23_CH_SPLIT) && nb24 && n > nb24;' in before and 'const unsigned nscans = split ? 2u : 1u;' in before
     assert 'const uint32_t nb24 = wlscan_kept24(wlscan_chmask);' in before
     # one SCAN_CHAN_LIST of the whole kept list, before the loop, never again; the scans only name their band
@@ -352,7 +363,7 @@ def static_ext():
     assert '#define WLWMI_SCAN_FLAG_EXT_IGNORE_DUTY 0x2u' in HEADER
     assert '#define WLSCAN_CH_NONDBS (WLSCAN_CH_24 << 2)' in HEADER and '#define WLSCAN_CH_IGNDUTY (WLSCAN_CH_24 << 3)' in HEADER
     assert '#define WL23_CH_NONDBS (1u << 27)' in drv and '#define WL23_CH_IGNDUTY (1u << 28)' in drv
-    assert '#define WL23_CH_KNOB (WL23_CH_VALID | WL23_CH_SPLIT | WL23_CH_NONDBS | WL23_CH_IGNDUTY)' in drv
+    assert ('#define WL23_CH_KNOB (WL23_CH_VALID | WL23_CH_SPLIT | WL23_CH_NONDBS | WL23_CH_IGNDUTY | WL23_CH_PRESCAN)') in drv
     assert 'WL23_CH_NONDBS == WLSCAN_CH_NONDBS && WL23_CH_IGNDUTY == WLSCAN_CH_IGNDUTY' in drv
     # the header: the word from the mask in one function, written in one place, nowhere else; no list function and no other encoder reads the bits
     fn = between(HEADER, 'static inline uint32_t\nwlscan_ext_flags(', '\n}\n')
@@ -369,8 +380,9 @@ def static_ext():
     # the parser: two refusals, in this order, before the accepting branch; the first one's text names the new range
     assert cfg.count('bits 27 and 28 are two values of one scan policy, not both') == 1
     assert '} else if (chm_given && chm && ((unsigned)chm & WL23_CH_NONDBS) && ((unsigned)chm & WL23_CH_IGNDUTY)) {' in cfg
-    assert cfg.index('refused: bits 0..28 only') < cfg.index('bits 27 and 28 are two values') < cfg.index('else if (chm_given) { wl23_chmask = (unsigned)chm; }')
-    assert 'W20 fuxiwlanch %#x refused: bits 0..28 only, and at least one channel must stay (w20 0x10 counts too)\\n' in cfg
+    assert cfg.index('refused: bits 0..29 only') < cfg.index('bit 29 (PRESCAN) needs fuxiwlanqrtr=8') < cfg.index('bits 27 and 28 are two values') < \
+        cfg.index('else if (chm_given) { wl23_chmask = (unsigned)chm; }')
+    assert 'W20 fuxiwlanch %#x refused: bits 0..29 only, and at least one channel must stay (w20 0x10 counts too)\\n' in cfg
     # the stage: the word once, from the same mask the encoder reads, after it is set and before the scan loop; the line shows it only when set
     assert code.count('wlscan_ext_flags(') == 1 and w23c.count('wlscan_ext_flags(') == 1
     assert w23.index('wlscan_chmask = wlscan_mask_eff(wl23_chmask, !!(wl20_bits & WL20_BAND24));') < \
@@ -379,13 +391,13 @@ def static_ext():
     assert w23.count('W23 scan start id') == 1 and (
         'events %#x flags %#x%s\\n",\n\t\t    sid, cnt, WLSCAN_DWELL_PASSIVE, cmax, WLSCAN_EVENTS, WLSCAN_FLAGS, ext_s);') in w23
     # nothing else reads the bits (the defines, the knob mask, the parse refusal and the two static assertions), and the lines send nothing
-    assert code.count('WL23_CH_NONDBS') == 5 and code.count('WL23_CH_IGNDUTY') == 5
+    assert code.count('WL23_CH_NONDBS') == 6 and code.count('WL23_CH_IGNDUTY') == 6   # + the bit 29 static assertion
     assert code.count('ext_s') == 4 and 'wl23_chmask & WL23_CH_NONDBS' not in code and 'wl23_chmask & WL23_CH_IGNDUTY' not in code
     for line in w23c.splitlines():
         if 'ext_s' in line or 'wlscan_ext_flags' in line:
             assert not re.search(r'wl_ce_send|wl_pwr|wl_mwr|wl_prd|wl_win|wl_soc|wlwmi_encode|wl_contain_wr', line), line
     assert '#define WLSCAN_FLAGS (WLWMI_SCAN_FLAG_PASSIVE | WLWMI_SCAN_CHAN_STAT_EVENT)' in HEADER
-    print('CH1 ext static: fuxiwlanch bits 27 / 28 parsed with the others (0..28, never both), scan_ctrl_flags_ext written in the one place '
+    print('CH1 ext static: fuxiwlanch bits 27 / 28 parsed with the others (0..29, never both), scan_ctrl_flags_ext written in the one place '
           'the encoder keeps for it, only from wlscan_ext_flags() and only when set, computed once before the scan loop, " ext 0x%x" on the '
           'scan start line only when set, nothing else reads the bits, scan_priority and the passive flags untouched')
     c3_static_checks()
@@ -2440,7 +2452,8 @@ def c3_static_checks():
     # passive refused before anything is sent; the request's channels only through the list check
     scan = between(DRIVER, 'static int\nwl25_scan(const struct fuxi_wifi_radio_request *rq, uint32_t nlist)\n{', '\n}\n')
     assert scan.index('if (!rq->passive || !asked) {') < scan.index('wlwmi_encode_start_scan_list(') < scan.index('wl_ce_send(')
-    assert 'wlscan_listed(rq->freqs[i], nlist)' in scan and scan.count('fuxi_wifi_radio_done(') == 3
+    assert 'asked = wl25_asked(rq, nlist);' in scan and scan.count('wl25_done(') == 3 and 'fuxi_wifi_radio_done(' not in scan
+    assert 'wlscan_listed(rq->freqs[i], nlist)' in between(DRIVER, 'static unsigned\nwl25_asked(', '\n}\n')
     # every pass of both loops polls (W11 events/guard, RX, TX, credits); 1 ms while scanning, 10 ms idle
     run = between(DRIVER, 'static int\nwl_w25_run(uint32_t n)\n{', '\n}\n')
     assert run.index('if (wl_ce_poll()) { return 1; }') < run.index('if (wl25_ms() - wl25_t0 >= WL25_LIFETIME_MS) {') < \
@@ -2473,9 +2486,9 @@ def c3_static_checks():
     c3_cache_static(svc, scan)
     # the iOS side's stop ends the service only while idle (nothing in flight), never mid-scan
     idle = run.split('if (!fuxi_wifi_radio_take(&rq)) {', 1)[1].split('\n\t\t}\n', 1)[0]
-    assert 'if (!fuxi_wifi_radio_wanted()) {' in idle and 'return 0;' in idle and DRIVER.count('fuxi_wifi_radio_wanted()') == 1
+    assert 'if (!fuxi_wifi_radio_wanted()) {' in idle and 'return 0;' in idle and DRIVER.count('fuxi_wifi_radio_wanted()') == 2   # + W25d's stale service loop
     # an unconfirmed stop: done() first (the iOS side's margin), then the wait for the end, before the next take()
-    assert scan.index('fuxi_wifi_radio_done(rq->seq, status);\n\tif (!ended) {') < \
+    assert scan.index('wl25_done(rq, status);\n\tif (!ended) {') < \
         scan.index('wl25_wait_end(WL25_ABORT_MS - WL25_STOP_MS)')
     assert '#define WL25_STOP_MS 300u' in DRIVER and '#define WL25_ABORT_MS 3000u' in DRIVER
     # what W25 says: never an SSID or a BSSID (the W24 proof lines come only from wl24_report, once)
@@ -2520,6 +2533,7 @@ def c3_static_checks():
           'thread, STOPPED at each exit and after "thread exit"; the handoff copy (8 prototypes, the struct, 5 '
           'defines) equals sys/fuxi_wifi_radio.h; the iOS side\'s stop ends the service only while idle; an unconfirmed '
           'stop answers iOS first, then waits up to 3 s for the end')
+    static_w25d()
 
 
 def c3_split_static(scan):
@@ -2535,15 +2549,15 @@ def c3_split_static(scan):
     # each part: its own range, max_scan_time and id; a cancel since the last part ends the request before an encode
     assert 'const uint32_t off = part || !n24 ? n24 : 0u, cnt = part || !n24 ? n - n24 : n24, max_ms = cnt * dwell * 3u / 2u;' in body
     assert 'const uint32_t id = WLSCAN_ID_FIRST + wl25_sent % (WLSCAN_ID_LAST - WLSCAN_ID_FIRST + 1u);' in body
-    assert body.index('if (part && fuxi_wifi_radio_cancelled(rq->seq)) {') < body.index('wlwmi_encode_start_scan_list(mhz + off, cnt, id,') < \
+    assert body.index('if (part && wl25_rq_cancelled(rq)) {') < body.index('wlwmi_encode_start_scan_list(mhz + off, cnt, id,') < \
         body.index('wl25_sent++;') < body.index('wl_scan.want_id = id;') < body.index('wl23_scan_id = id;') < \
         body.index('wl23_scan_sent = true;') < body.index('wl_ce_send(wl_htc.wmi_eid, cmd, len, "WMI START_SCAN")')
     # the bounds are the C3 ones, per part; only a COMPLETED part lets the next start
     assert 't >= max_ms + WL25_OVERRUN_MS || (!wl_scan.started && t >= WL25_STARTED_MS)' in body
     assert body.rstrip().endswith('if (stop || status != 0) { break; }')
     # one STOP_SCAN at most (the part in flight), one done() after the loop, none inside it
-    assert 'fuxi_wifi_radio_done(' not in body and 'wl25_stop(' not in body
-    assert after.index('if (stop) {') < after.index('fuxi_wifi_radio_done(rq->seq, status);') and after.count('fuxi_wifi_radio_done(') == 1
+    assert 'wl25_done(' not in body and 'wl25_stop(' not in body
+    assert after.index('if (stop) {') < after.index('wl25_done(rq, status);') and after.count('wl25_done(') == 1
     # the encoder refuses a list of both bands
     enc = strip_comments(between(HEADER, 'static inline int\nwlwmi_encode_start_scan_list(', '\n}\n'))
     assert '(mhz[i] < 3000u) != (mhz[0] < 3000u)' in enc
@@ -2571,9 +2585,10 @@ def c3_cache_static(svc, scan):
     assert DRIVER.count('#ifndef WL25_CACHE_MS\n#define WL25_CACHE_MS 30000u\n#endif') == 1
     assert header_free_count(DRIVER, 'WL25_CACHE_MS') >= 3
     # the one place frames go to the iOS side is the answer, from the cache; the MGMT_RX hook only copies into the cache
-    answer = strip_comments(between(DRIVER, 'static unsigned\nwl25_answer(const struct fuxi_wifi_radio_request *rq)\n{', '\n}\n'))
+    answer = strip_comments(between(DRIVER, 'static unsigned\nwl25_answer(const struct fuxi_wifi_radio_request *rq, const struct wl25_cached *tab, unsigned count)\n{', '\n}\n'))
     heard = strip_comments(between(DRIVER, 'static void\nwl25_heard(void *ctx, const uint8_t *frame, uint32_t len, uint32_t mhz, int32_t dbm, int32_t nf)\n{', '\n}\n'))
     assert code.count('fuxi_wifi_radio_frame(') == 1 and 'fuxi_wifi_radio_frame(rq->seq, c->frame, c->len, c->mhz, c->dbm, c->nf)' in answer
+    assert 'if (!rq->seq) { return 0; }' in answer and answer.index('if (!rq->seq) { return 0; }') < answer.index('fuxi_wifi_radio_frame(')   # the prescan hands nothing over
     assert 'fuxi_wifi_radio_frame' not in heard and 'fuxi_wifi_radio_done' not in heard and 'wl25_cache[' in heard
     # only the cached frames heard on a channel the request names
     assert 'asked |= rq->freqs[j] == c->mhz;' in answer and 'if (!asked) { continue; }' in answer
@@ -2581,21 +2596,21 @@ def c3_cache_static(svc, scan):
     # the cache: one frame a BSSID (address 3), 64 of them (WLSCAN_BSS_MAX), whole RX buffers, a stronger frame replaces the weakest
     assert '#define WL25_CACHE_BSS WLSCAN_BSS_MAX' in DRIVER and 'uint8_t frame[WLCE_BUF];' in DRIVER
     assert 'wlscan_same(wl25_cache[i].frame + 16, frame + 16, 6)' in heard and 'if (s <= wl25_cache[weakest].dbm) { wl25_cache_lost++; return; }' in heard
-    assert 'if (!wl25_seq) { return; }' in heard
+    assert 'if (!wl25_fill) { return; }' in heard
     # served only when young: age < WL25_CACHE_MS (never with 0), from the end of the last part of the split that filled it,
     # before any START_SCAN, with no send of its own
     hit = 'if (wl25_cache_ok && wl25_ms() - wl25_cache_at + 1u <= WL25_CACHE_MS) {'
     assert sc.count(hit) == 1 and sc.index('if (!rq->passive || !asked) {') < sc.index(hit) < sc.index('wlwmi_encode_start_scan_list(')
     hit_body = sc.split(hit, 1)[1].split('\n\t}\n', 1)[0]
-    assert 'wl25_answer(rq)' in hit_body and 'fuxi_wifi_radio_done(rq->seq, 0)' in hit_body and 'wl_ce_send' not in hit_body \
+    assert 'wl25_answer(rq, wl25_cache, wl25_cache_n)' in hit_body and 'wl25_done(rq, 0)' in hit_body and 'wl_ce_send' not in hit_body \
         and 'wlwmi_' not in hit_body and 'wl25_stop' not in hit_body and 'wl_scan' not in hit_body
     # the scan: the cache is emptied before the first part is sent, valid again only when every part completed (status 0), dated
     # at that moment, answered before done(); a split that did not complete leaves it empty
     assert sc.index('wl25_cache_ok = false; wl25_cache_n = 0;') < sc.index('wl_ce_send(')
-    tail = sc.split('wl25_seq = 0;', 1)[1]
-    assert 'if (status == 0) {\n\t\twl25_cache_ok = true; wl25_cache_at = wl25_ms();' in tail and 'matched = wl25_answer(rq);' in tail
-    assert tail.index('wl25_cache_ok = true;') < tail.index('matched = wl25_answer(rq);') < tail.index('} else {\n\t\twl25_cache_n = 0;') < \
-        tail.index('fuxi_wifi_radio_done(rq->seq, status);')
+    tail = sc.split('wl25_fill = false;', 1)[1]
+    assert 'if (status == 0) {\n\t\twl25_cache_ok = true; wl25_cache_at = wl25_ms();' in tail and 'matched = wl25_answer(rq, wl25_cache, wl25_cache_n);' in tail
+    assert tail.index('wl25_cache_ok = true;') < tail.index('matched = wl25_answer(rq, wl25_cache, wl25_cache_n);') < tail.index('wl25_stale_take();') < \
+        tail.index('} else {\n\t\twl25_cache_n = 0;') < tail.index('wl25_done(rq, status);')
     assert sc.count('wl25_cache_ok = true') == 1 and sc.count('wl25_cache_ok = false') == 1
     # the lines: a request says "cache hit (age N ms, K of M frames match)" or "full split scan" with both part ids; counts only
     assert 'cache hit (age %llu ms, %u of %u frames match), nothing sent, status 0; to iOS %u kept %u' in svc
@@ -2607,6 +2622,122 @@ def c3_cache_static(svc, scan):
           'cache, only those heard on a request channel; the cache emptied before a split, valid and dated only when the '
           'last part completed, served only when younger than WL25_CACHE_MS with no send; one frame a BSSID, 64 at most; '
           'the first request after service start scans')
+
+def static_w25d():
+    """W25d: the poll/CE2/credit windows, the START_SCAN and command lines, the prescan (fuxiwlanch bit 29) and the stale cache. The windows
+    are read-only (the poll note loads one rdp word with its barrier and writes only its own record, nothing else of the driver), open only
+    in wl25_scan's part loop and wl_w25_run's idle wait, and noted into only inside wl_ce_poll / wl_ce_wmi_rx / wl_ce_send behind qrtr 8's
+    flags; the lines have new prefixes and are said at the places that keep the 2.4 / 5 GHz gap; the prescan has no request (seq 0: no frame,
+    no done, no cancel); the stale copy is plain kernel data, taken only at a completed split with the bit, served after the containment with
+    no device access, and fw_thread reports STOPPED after it."""
+    drv = DRIVER
+    code = strip_comments(drv)
+    note = strip_comments(between(drv, 'static void\nwl25_poll_note(void)\n{', '\n}\n'))
+    poll = strip_comments(between(drv, 'static int\nwl_ce_poll(void)\n{', '\n}\n'))
+    rx = strip_comments(between(drv, 'static int\nwl_ce_wmi_rx(void *ctx, const uint8_t *msg, uint32_t len)\n{', '\n}\n'))
+    send = strip_comments(between(drv, 'static int\nwl_ce_send(uint32_t eid, const uint8_t *payload, uint32_t len, const char *what)\n{', '\n}\n'))
+    w22 = strip_comments(between(drv, 'static int\nwl_w22_run(void)\n{', '\n}\n'))
+    scan = strip_comments(between(drv, 'static int\nwl25_scan(const struct fuxi_wifi_radio_request *rq, uint32_t nlist)\n{', '\n}\n'))
+    run = strip_comments(between(drv, 'static int\nwl_w25_run(uint32_t n)\n{', '\n}\n'))
+    # the poll note: read-only (one rdp load + the read barrier, its own record), the first statement of a pass, behind the window flag
+    assert poll.split('{', 1)[1].lstrip().startswith('if (wl25_w.on) { wl25_poll_note(); }')
+    assert note.count('WLCE_RDP_LOAD(&wl_ce, s->id)') == 1 and note.index('WLCE_RDP_LOAD(') < note.index('wl_ce_rbarrier(NULL);') < note.index('wlce_dist(')
+    assert not re.search(r'wl_ce_send|wlce_send|wlce_publish|wlce_wr\b|wlce_rd\b|wl_pwr|wl_mwr|wl_win|wl_soc|wlce_post|wlce_reap|wl_sleep|printf|wl_ce\.\w+\s*(=|\+\+)',
+                         note), 'the poll note writes or sends'
+    assert sorted(set(re.findall(r'\bw->(\w+)\s*(?:=|\+\+)', note))) == sorted(['passes', 'gap_ns', 'last_ns', 'post_min', 'back_max', 'free_min', 'cmin'])
+    # the event counts: behind the window flag, after wlwmi_rx, four kinds
+    assert rx.index('if (wlwmi_rx(&wl_wmi, msg, len, &id)) { return 1; }') < rx.index('if (wl25_w.on) {') < rx.index('wlvrx_note(')
+    assert rx.count('wl25_w.ev_scan++') == 1 and rx.count('wl25_w.ev_ci++') == 1 and rx.count('wl25_w.ev_mgmt++') == 1 and rx.count('wl25_w.ev_other++') == 1
+    assert 'id == WLWMI_EV_SCAN' in rx and 'id == WLWMI_EV_CHAN_INFO' in rx and 'id == WLWMI_EV_MGMT_RX' in rx
+    # the command log: behind its flag, the WMI endpoint only, 16 entries, before the credit wait; the flag is set at WMI READY for qrtr 8 only
+    assert send.index('if (wl25_cmd_on && eid == wl_htc.wmi_eid && len >= 4u) {') < send.index('if (!wlhtc_has_credits(&wl_htc, eid, total)) {')
+    assert 'if (wl25_cmd_n < WL25_CMDS_MOST) { wl25_cmd_id[wl25_cmd_n] = wlce_get32(payload); wl25_cmd_cr[wl25_cmd_n] = wl_htc.ep[eid].credits; }' in send
+    assert 'wl25_cmd_n++;' in send and '#define WL25_CMDS_MOST 16u' in drv
+    assert code.count('wl25_cmd_on = true') == 1 and 'if (wl_w25) { wl25_cmd_on = true; wl25_cmd_n = 0; wl25_ready_ns = wl25_ns(); }' in w22
+    assert w22.index('wl_ce_wait(WL20_W_READY, 5000, "WMI READY")') < w22.index('wl25_cmd_on = true') < w22.index('wlwmi_encode_hw_mode(')
+    assert code.count('wl25_cmd_on = false') == 1
+    # windows: opened in the part loop after the send (once) and in the idle wait (once); the idle one closes before the first START_SCAN
+    assert code.count('wl25_win_open();') == 2 and scan.count('wl25_win_open();') == 1 and run.count('wl25_win_open();') == 1
+    assert scan.index('wl_ce_send(wl_htc.wmi_eid, cmd, len, "WMI START_SCAN")') < scan.index('wl25_win_open();') < scan.index('if (wl25_rq_cancelled(rq)) { status = ECANCELED; how = "cancelled"; break; }')
+    assert scan.index('wl25_win_open();') < scan.index('wl25_part_end(part, how);') < scan.index('if (stop || status != 0) { break; }')
+    assert scan.index('if (first && !part) { wl25_idle_say(); wl25_cmds_say(); }') < scan.index('wl_ce_send(wl_htc.wmi_eid, cmd, len, "WMI START_SCAN")')
+    assert run.index('wl25_idle_on = true; wl25_win_open();') > run.index('W25 service ready:')
+    # the START_SCAN line: before the send for the first part, after it for the others; the part lines at the end of the request
+    assert scan.count('wl25_start_say(') == 1 and scan.count('wl25_start_fmt(') == 1 and scan.index('if (!part && wl25_said(number, false)) { wl25_start_say(cmd, rq->seq, part, parts); }') < \
+        scan.index('wl_ce_send(wl_htc.wmi_eid, cmd, len, "WMI START_SCAN")') < \
+        scan.index('wl25_start_fmt(wl25_start_late, sizeof(wl25_start_late), cmd, rq->seq, part, parts);') < scan.index('wl25_win_open();')
+    assert 'if (part && wl25_said(number, false)) {' in scan and 'wl25_start_late_pend = true;' in scan
+    assert strip_comments(between(drv, 'static void\nwl25_parts_say(bool say)\n{', '\n}\n')).index('printf("%s", wl25_start_late);') < \
+        strip_comments(between(drv, 'static void\nwl25_parts_say(bool say)\n{', '\n}\n')).index('wl25_win_say(')
+    assert 'printf(' not in scan   # the request's lines go through the helpers, the START line of the first part before its send, the rest at the end
+    assert scan.index('wl25_parts_say(wl25_said(number, failed));') < scan.index('wl25_say(number, rq->seq, ids, n24, n, dwell, ms, status, how, said, failed);')
+    assert 'wl25_parts_say' not in between(drv, 'static void\nwl25_part_end(unsigned part, const char *how)\n{', '\n}\n')
+    # every new line has a prefix of its own and says counts only (no SSID, no BSSID)
+    new_fmt = {'W25 %s: polls', 'W25 %s: wmi events', 'W25 cmds id:credits', 'W25 scan start id', 'W25 prescan full split', 'W25 selected prescan',
+               'W25 lane stopped, serving stale cache', 'W25 stale answer', 'W25 stale cache service over'}
+    seen = set()
+    for fmt in re.findall(r'printf\((?:out, room, )?"((?:[^"\\]|\\.)*)"', code):   # (the START line is built by snprintf(out, room, ...))
+        for pre in new_fmt:
+            if fmt.startswith('FUXI WLAN: ' + pre):
+                seen.add(pre)
+    assert seen == new_fmt, new_fmt - seen
+    # the prescan: after "service ready", before the request loop, no request (seq 0), through wl25_scan like any split; nothing handed over
+    assert run.index('W25 service ready:') < run.index('if (wl25_prescan_on()) {') < run.index('printf("FUXI WLAN: W25 prescan full split at service ready\\n");') < \
+        run.index('if (wl25_scan(&pre, n)) { return 1; }') < run.index('for (;;) {')
+    assert 'bzero(&pre, sizeof(pre));' in run and 'pre.seq' not in run and run.count('wl25_scan(') == 2 and run.count('fuxi_wifi_radio_take(') == 1
+    assert run.index('if (wl25_scan(&pre, n)) { return 1; }') < run.index('fuxi_wifi_radio_take(')
+    answer = strip_comments(between(drv, 'static unsigned\nwl25_answer(', '\n}\n'))
+    assert 'if (!rq->seq) { return 0; }' in answer
+    assert 'if (rq->seq) { fuxi_wifi_radio_done(rq->seq, status); }' in strip_comments(between(drv, 'static void\nwl25_done(', '\n}\n'))
+    assert 'return rq->seq && fuxi_wifi_radio_cancelled(rq->seq);' in strip_comments(between(drv, 'static bool\nwl25_rq_cancelled(', '\n}\n'))
+    svc = strip_comments(between(drv, '/* ---- W25: the scan service for iOS (fuxiwlanqrtr=8, C3) ----', 'static int\nwl_w23_run(void)'))
+    assert svc.count('fuxi_wifi_radio_done(') == 3 and svc.count('fuxi_wifi_radio_cancelled(') == 1   # wl25_done, wl25_stale_one twice; wl25_rq_cancelled
+    # the stale copy: plain kernel data (no DMA, no allocation), taken only after a completed split (cache valid) with the bit, never refreshed after the lane stopped
+    assert 'static struct wl25_cached wl25_stale[WL25_CACHE_BSS];' in drv
+    for bad in ('wl_dma_alloc(&wl25', 'kalloc', 'wl_dma_free(&wl25', 'IOMalloc'):
+        assert bad not in code, bad
+    owned = between(drv, 'wl_owned_alias(uint64_t pa, unsigned bytes, bool tables_only)\n{', '\n}\n')
+    assert 'wl25_' not in owned
+    take = strip_comments(between(drv, 'static void\nwl25_stale_take(void)\n{', '\n}\n'))
+    assert take.split('{', 1)[1].lstrip().startswith('if (!wl25_stale_on()) { return; }') and 'wl25_stale_ok = true;' in take and code.count('wl25_stale_take();') == 1
+    assert scan.index('wl25_cache_ok = true; wl25_cache_at = wl25_ms();') < scan.index('wl25_stale_take();') < scan.index('wl25_done(rq, status);')
+    assert 'static bool wl25_prescan_on(void) { return (wl23_chmask & WL23_CH_PRESCAN) != 0; }' in drv
+    assert 'static bool wl25_stale_on(void) { return (wl23_chmask & WL23_CH_PRESCAN) != 0; }' in drv
+    assert code.count('wl25_stale_on()') == 2 and code.count('wl25_prescan_on()') == 1   # take + serve; the prescan
+    # the stale service: no device access of any kind, no scan state, no other lane code; only the handoff, the sleep and its own helpers
+    serve = strip_comments(between(drv, 'static void\nwl25_stale_serve(void)\n{', '\n}\n'))
+    one = strip_comments(between(drv, 'static void\nwl25_stale_one(const struct fuxi_wifi_radio_request *rq)\n{', '\n}\n'))
+    for body in (serve, one, take):
+        assert not re.search(r'wl_ce_|wlce_|wlhtc_|wlwmi_|wl23_|wl26_|wl27_|wl28_|wl29_|wl30_|wl5_|wl11|wl_w11|wl_pwr|wl_mwr|wl_win|wl_soc|wl_contain|wl_dma|wl_scan|wl_htc|wl_wmi|mach_',
+                             body), body
+    assert sorted(set(re.findall(r'\b(fuxi_wifi_radio_\w+|wl_sleep|wl25_\w+)\(', serve.split('{', 1)[1]))) == sorted(['fuxi_wifi_radio_take',
+        'fuxi_wifi_radio_wanted', 'wl_sleep', 'wl25_stale_on', 'wl25_ms', 'wl25_stale_one'])
+    assert sorted(set(re.findall(r'\b(fuxi_wifi_radio_\w+|wl_sleep|wl25_\w+)\(', one.split('{', 1)[1]))) == sorted(['fuxi_wifi_radio_done', 'wl25_asked',
+        'wl25_answer', 'wl25_ms'])
+    assert serve.index('wl25_stale_one(&wl25_live);') < serve.index('while (fuxi_wifi_radio_wanted()) {')
+    assert 'wl_sleep(WL25_STALE_POLL_MS);' in serve and '#define WL25_STALE_POLL_MS 50u' in drv
+    assert 'if (!wl25_stale_on() || !wl25_stale_ok || wl25_ios_gone) { return; }' in serve and serve.count('wl25_stale_one(') == 2
+    assert 'wl25_answer(rq, wl25_stale, wl25_stale_n)' in one and 'wl25_answer(rq, wl25_cache' not in one
+    # the live request is kept for the stale service, cleared by its done(); the iOS side's stop is remembered
+    assert 'wl25_live = *rq; wl25_live_on = rq->seq != 0;' in scan and 'wl25_live_on = false;' in strip_comments(between(drv, 'static void\nwl25_done(', '\n}\n'))
+    assert 'wl25_why = "the iOS side stopped"; wl25_ios_gone = true;' in run
+    # fw_thread: the stale service first, then STOPPED; nothing else of W25 there
+    thread = between(drv, 'static void\nfw_thread(void *arg, wait_result_t result)\n{', '\n}\n')
+    assert thread.index('printf("FUXI WLAN: thread exit\\n");') < thread.index('\twl25_stale_serve();\n') < thread.index('fuxi_wifi_radio_stopped(FUXI_WIFI_RADIO_EXITED | detail);') < \
+        thread.index('thread_terminate(')
+    assert drv.count('wl25_stale_serve();') == 1
+    # the service's end says what is left
+    assert strip_comments(between(drv, 'static void\nwl25_end(void)\n{', '\n}\n')).index('wl25_diag_end();') < \
+        strip_comments(between(drv, 'static void\nwl25_end(void)\n{', '\n}\n')).index('W25 service end:')
+    # the console's 254 bytes: the model prints the widest of every new line (s_w25d_widest); here the caps they rest on
+    win = strip_comments(between(drv, 'static void\nwl25_win_say(', '\n}\n'))
+    assert 'WL25_CL(' in win and 'w->c0 < -99 ? -99 : w->c0 > 999 ? 999 : w->c0' in win and win.count('printf(') == 2
+    print('W25d static: the poll note is read-only (one rdp load with its barrier, its own record) and runs only behind the window flag, the windows open '
+          'only in the part loop (after the send) and the idle wait, the event and command counts sit behind qrtr 8 flags, the START_SCAN line is said '
+          'before the first part\'s send and after the second\'s, the part lines at the end of the request, every new line has a prefix of its own; the '
+          'prescan is a request-less split (seq 0: no frame, no done, no cancel) between "service ready" and the request loop; the stale copy is plain '
+          'kernel data taken only after a completed split with bit 29, the stale service touches no device, ring or scan state and fw_thread reports '
+          'STOPPED after it')
 
 
 def header_free_count(text, name):
@@ -3621,6 +3752,91 @@ int e2e_ios_finish(void) {
  assert(!e2e_said("HomeNet") && !e2e_said("Office") && !e2e_said("Cafe") && !e2e_said("3c:84") && !e2e_said("74:83"));
  return 0;
 }
+/* ---- W25d: a second consumer script, for the stale cache (fuxiwlanch bit 29): six asks at model times, then (stale) the iOS side's own stop ----
+   asks: {2437} at once (answered from the prescan's cache), {2437, 5180} at 40 s, {5180} at 50 s, {2437} at 60 s (each a split of its own, which
+   the model's firmware fails: EIO; the third ends the lane), then {2437, 5180} at 70 s and {5180} at 80 s: STALE the lane's copy of the last
+   completed split answers them (status 0) with the radio still READY and nothing but READY told to the consumer; not STALE (no completed split
+   was ever kept) the lane has reported Wi-Fi off and they get ENETDOWN. Each ask is waited for as rscan_scan waits (9750 ms at 150 ms). */
+static int e2e2_status[6] = { -1, -1, -1, -1, -1, -1 };
+static unsigned e2e2_n[6], e2e2_which, e2e2_changed_after[6];
+static bool e2e2_stale, e2e2_ready_after[6];
+static struct fuxi_wifi_sta_bss e2e2_got[6][8];
+static void e2e2_each(const struct fuxi_wifi_sta_bss *b, void *ctx) { (void)ctx; if (e2e2_n[e2e2_which] < 8) e2e2_got[e2e2_which][e2e2_n[e2e2_which]++] = *b; }
+static void *e2e2_consumer(void *a) {
+ static const uint16_t ask[6][2] = { { 2437, 0 }, { 2437, 5180 }, { 5180, 0 }, { 2437, 0 }, { 2437, 5180 }, { 5180, 0 } };
+ static const unsigned nask[6] = { 1, 2, 1, 1, 2, 1 }, at_ms[6] = { 0, 40000, 50000, 60000, 70000, 80000 };
+ struct timespec pause = { .tv_nsec = 200000 };
+ (void)a;
+ for (unsigned i = 0; i < 100000 && fuxi_wifi_radio_state(NULL) != FUXI_WIFI_RADIO_READY; i++) nanosleep(&pause, NULL);
+ assert(fuxi_wifi_radio_state(NULL) == FUXI_WIFI_RADIO_READY);
+ for (unsigned k = 0; k < 6; k++) {
+  struct fuxi_wifi_radio_request rq = { .passive = true, .dwell_ms = 150, .freq_count = nask[k] };
+  memcpy(rq.freqs, ask[k], nask[k] * sizeof(ask[k][0]));
+  if (!e2e2_stale && k >= 2) {   /* the lane stopped and will say so: its clock is over, so wait (real time) for the report, then ask */
+   atomic_store(&e2e_phase, 3);
+   for (unsigned i = 0; i < 100000 && fuxi_wifi_radio_state(NULL) != FUXI_WIFI_RADIO_STOPPED; i++) nanosleep(&pause, NULL);
+  } else if (at_ms[k]) {
+   uint64_t until = at_ms[k] * NSEC_PER_MSEC;
+   e2e_until = until;
+   atomic_store(&e2e_phase, 4);
+   while (__atomic_load_n(&now_abs, __ATOMIC_SEQ_CST) < until) nanosleep(&pause, NULL);
+  }
+  atomic_store(&e2e_phase, 1);
+  e2e2_status[k] = fuxi_wifi_radio_scan(&rq, 1000 + 38 * 150 * 3 / 2 + 200, NULL);
+  atomic_store(&e2e_phase, 2);
+  e2e2_which = k;
+  (void)fuxi_wifi_radio_results(e2e2_each, NULL);
+  other_settle();
+  e2e2_ready_after[k] = fuxi_wifi_radio_state(NULL) == FUXI_WIFI_RADIO_READY;
+  e2e2_changed_after[k] = e2e_changed_calls;
+ }
+ if (e2e2_stale) fuxi_wifi_radio_stopped(FUXI_WIFI_RADIO_GAVE_UP | 3);   /* the iOS side's own stop (3 timeouts): the only thing that ends the stale service */
+ atomic_store(&e2e_phase, 3);
+ return NULL;
+}
+void e2e2_ios_start(bool stale) {
+ e2e2_stale = stale;
+ fuxi_wifi_radio_starting();
+ assert(fuxi_wifi_radio_use(false, e2e_changed));
+ fuxi_wifi_radio_attached();
+ other_settle();
+ assert(!pthread_create(&e2e_thread, NULL, e2e2_consumer, NULL));
+}
+int e2e2_ios_finish(bool stale) {
+ static const uint8_t home[6] = {0x3c, 0x84, 0x6a, 0x11, 0x22, 0x33}, office[6] = {0x74, 0x83, 0xc2, 0xaa, 0xbb, 0xcc};
+ struct timespec pause = { .tv_nsec = 1000000 };
+ pthread_join(e2e_thread, NULL);
+ for (unsigned i = 0; i < 5000 && !e2e_said("Wi-Fi reported off"); i++) nanosleep(&pause, NULL);
+ other_settle();
+ /* the first ask: the prescan's cache; the next three: the lane's failed splits */
+ assert(e2e2_status[0] == (stale ? 0 : EIO) && e2e2_status[1] == EIO);
+ assert(stale ? (e2e2_status[2] == EIO && e2e2_status[3] == EIO) : (e2e2_status[2] == ENETDOWN && e2e2_status[3] == ENETDOWN));
+ assert(e2e2_n[1] == 0 && e2e2_n[2] == 0 && e2e2_n[3] == 0);
+ if (stale) {
+  const struct fuxi_wifi_sta_bss *b = &e2e2_got[0][0];
+  assert(e2e2_n[0] == 1 && !memcmp(b->bssid, home, 6) && b->frequency == 2437 && b->rssi == -48);
+  /* after the lane stopped: status 0 from the stale copy, the radio READY, nothing told to the consumer but READY */
+  assert(e2e2_status[4] == 0 && e2e2_status[5] == 0 && e2e2_n[4] == 2 && e2e2_n[5] == 1);
+  for (unsigned i = 0; i < 2; i++) {
+   b = &e2e2_got[4][i];
+   assert((!memcmp(b->bssid, home, 6) && b->frequency == 2437 && b->rssi == -48) || (!memcmp(b->bssid, office, 6) && b->frequency == 5180 && b->rssi == -45));
+  }
+  b = &e2e2_got[5][0];
+  assert(!memcmp(b->bssid, office, 6) && b->ssid_length == 9 && !memcmp(b->ssid, "Office-5G", 9) && b->frequency == 5180 && b->rssi == -45 && b->noise == -95);
+  assert(e2e2_ready_after[4] && e2e2_ready_after[5] && e2e2_changed_after[4] == 1 && e2e2_changed_after[5] == 1);
+  assert(e2e_said("FUXI WIFI IOS: radio: scans timed out 3 times in a row (code 0x60003); Wi-Fi reported off, no retry this boot\n"));
+  assert(e2e_changed_calls == 2 && e2e_changed_last == FUXI_WIFI_RADIO_STOPPED);
+ } else {
+  assert(e2e2_n[0] == 0 && e2e2_status[4] == ENETDOWN && e2e2_status[5] == ENETDOWN);
+  assert(!e2e2_ready_after[2] && !e2e2_ready_after[5]);
+  assert(e2e_said("FUXI WIFI IOS: radio: the radio lane stopped (code 0x41c01); Wi-Fi reported off, no retry this boot\n"));
+  assert(e2e_changed_calls == 2 && e2e_changed_last == FUXI_WIFI_RADIO_STOPPED);
+ }
+ assert(fuxi_wifi_radio_state(NULL) == FUXI_WIFI_RADIO_STOPPED && fuxi_wifi_radio_results(e2e_each, NULL) == 0);
+ assert(!e2e_said("3c:84") && !e2e_said("74:83"));
+ return 0;
+}
+
 '''
 
 
@@ -3673,6 +3889,13 @@ def e2e(tmp):
         print(res.stdout[-3000:], res.stderr[-6000:])
         raise SystemExit(f'W25 end-to-end test failed with status {res.returncode}')
     print(line[0])
+    for mode in ('e2estale', 'e2enocache'):   # W25d: the stale cache and the lane stop with nothing to keep, the real fuxi_wifi_radio.c at the other end
+        res = subprocess.run([str(exe), mode], capture_output=True, text=True, timeout=600)
+        line = [l for l in res.stdout.splitlines() if l.startswith('W25d end to end')]
+        if res.returncode or not line:
+            print(res.stdout[-3000:], res.stderr[-6000:])
+            raise SystemExit(f'W25d end-to-end test {mode} failed with status {res.returncode}')
+        print(line[0])
 
 
 # ---- C3 mutants: each must fail a test for its own reason ----
@@ -3722,8 +3945,8 @@ MUTANTS = [
     ('the encoder takes a list of both bands', 'xnu/fuxi-wlan/fuxi_wlan_ce.h',
      ' || (mhz[i] < 3000u) != (mhz[0] < 3000u)) { return 1; }   /* one band */', ') { return 1; }',
      'model', 'a list of both bands refused'),
-    ('no cancel check between the parts', 'xnu/fuxi-wlan/fuxi_wlan.c', 'if (part && fuxi_wifi_radio_cancelled(rq->seq)) {',
-     'if (false && part && fuxi_wifi_radio_cancelled(rq->seq)) {', 'model',
+    ('no cancel check between the parts', 'xnu/fuxi-wlan/fuxi_wlan.c', 'if (part && wl25_rq_cancelled(rq)) {',
+     'if (false && part && wl25_rq_cancelled(rq)) {', 'model',
      'split cancel between the parts: no STOP_SCAN, no 5 GHz START_SCAN'),
     ('the 5 GHz part after a failed 2.4 GHz part', 'xnu/fuxi-wlan/fuxi_wlan.c', 'if (stop || status != 0) { break; }',
      'if (stop) { break; }', 'model', "the 5 GHz START_SCAN before the 2.4 GHz part's COMPLETED"),
@@ -3766,14 +3989,71 @@ MUTANTS = [
      'asked |= (rq->freqs[j] < 3000u) != (c->mhz < 3000u);', 'model', "a frame heard outside the request's channels, or for a refused request"),
     ('no channel filter on the answer', 'xnu/fuxi-wlan/fuxi_wlan.c', '\t\tif (!asked) { continue; }\n', '', 'model',
      "a frame heard outside the request's channels, or for a refused request"),
-    ('a cache hit hands nothing over', 'xnu/fuxi-wlan/fuxi_wlan.c', '\t\tmatched = wl25_answer(rq);\n\t\tfuxi_wifi_radio_done(rq->seq, 0);',
-     '\t\tfuxi_wifi_radio_done(rq->seq, 0);', 'model', 'frames handed over differ from the cache\'s frames of the request\'s channels'),
+    ('a cache hit hands nothing over', 'xnu/fuxi-wlan/fuxi_wlan.c', '\t\tmatched = wl25_answer(rq, wl25_cache, wl25_cache_n);\n\t\twl25_done(rq, 0);',
+     '\t\twl25_done(rq, 0);', 'model', 'frames handed over differ from the cache\'s frames of the request\'s channels'),
     ('one cached frame per frame, not per BSSID', 'xnu/fuxi-wlan/fuxi_wlan.c',
      '\twhile (i < wl25_cache_n && !wlscan_same(wl25_cache[i].frame + 16, frame + 16, 6)) { i++; }\n', '', 'model',
      'frames handed over differ from the cache\'s frames of the request\'s channels'),
     ('the cache keeps the oldest frame of a BSSID', 'xnu/fuxi-wlan/fuxi_wlan.c', '\tif (i == wl25_cache_n) {\n\t\tif (wl25_cache_n < WL25_CACHE_BSS) {',
      '\tif (i < wl25_cache_n) { return; }\n\tif (i == wl25_cache_n) {\n\t\tif (wl25_cache_n < WL25_CACHE_BSS) {', 'model',
      'a cached frame of the request\'s channels was not handed over (or twice, or changed)'),
+    # W25d: the diagnostics, the prescan and the stale cache
+    ('the stale cache served without bit 29', 'xnu/fuxi-wlan/fuxi_wlan.c', 'static bool wl25_stale_on(void) { return (wl23_chmask & WL23_CH_PRESCAN) != 0; }',
+     'static bool wl25_stale_on(void) { return true; }', 'model', 'W25d stale: without bit 29 no stale copy is taken'),
+    ('the stale service engages without bit 29 (the copy taken regardless, served on the lane stop)', 'xnu/fuxi-wlan/fuxi_wlan.c',
+     'if (!wl25_stale_on() || !wl25_stale_ok || wl25_ios_gone) { return; }', 'if (!wl25_stale_ok || wl25_ios_gone) { return; }', 'static',
+     'AssertionError'),
+    ('the prescan runs without bit 29', 'xnu/fuxi-wlan/fuxi_wlan.c', 'static bool wl25_prescan_on(void) { return (wl23_chmask & WL23_CH_PRESCAN) != 0; }',
+     'static bool wl25_prescan_on(void) { return true; }', 'model',
+     'a request that was not passive, or named no listed channel, reached the firmware as a START_SCAN'),
+    ('no stale copy at a completed split', 'xnu/fuxi-wlan/fuxi_wlan.c',
+     '\t\twl25_stale_take();   /* W25d, fuxiwlanch bit 29: a copy that a later failing split cannot empty */\n', '', 'static', 'AssertionError'),
+    ('the stale copy is the cache itself (emptied by a failing split)', 'xnu/fuxi-wlan/fuxi_wlan.c', '\twl25_stale_n = wl25_cache_n;\n',
+     '\twl25_stale_n = wl25_cache_n; wl25_cache_n = 0;\n', 'model', "frames handed over differ from the cache's frames of the request's channels"),
+    ('the containment empties the stale copy', 'xnu/fuxi-wlan/fuxi_wlan.c', '\twl25_diag_end();   /* W25d: a window still open, lines not said yet */\n',
+     '\twl25_diag_end(); wl25_stale_n = 0;\n', 'model', "W25d stale: the copy survived the lane's containment"),
+    ('the request the lane died on is not answered', 'xnu/fuxi-wlan/fuxi_wlan.c', '\t\twl25_stale_one(&wl25_live);\n', '\t\t(void)wl25_live;\n', 'static',
+     'AssertionError'),
+    ('the stale service polls the device', 'xnu/fuxi-wlan/fuxi_wlan.c', '\t\t\twl_sleep(WL25_STALE_POLL_MS);\n',
+     '\t\t\twl_sleep(WL25_STALE_POLL_MS); (void)wl_ce_poll();\n', 'static', 'AssertionError'),
+    ('the stale service engages after the iOS side stopped', 'xnu/fuxi-wlan/fuxi_wlan.c', ' || !wl25_stale_ok || wl25_ios_gone) { return; }',
+     ' || !wl25_stale_ok) { return; }', 'model', "W25d stale: the iOS side had stopped: nothing to serve"),
+    ('the stale service answers a request that is not passive', 'xnu/fuxi-wlan/fuxi_wlan.c', '\tif (!rq->passive || !wl25_asked(rq, wl25_nlist)) {\n\t\tfuxi_wifi_radio_done(rq->seq, EINVAL);',
+     '\tif (!wl25_asked(rq, wl25_nlist)) {\n\t\tfuxi_wifi_radio_done(rq->seq, EINVAL);', 'model', "a frame heard outside the request's channels, or for a refused request"),
+    ('the prescan hands frames to iOS', 'xnu/fuxi-wlan/fuxi_wlan.c', '\tif (!rq->seq) { return 0; }\n', '', 'static', 'AssertionError'),
+    ('the prescan calls done()', 'xnu/fuxi-wlan/fuxi_wlan.c', '\tif (rq->seq) { fuxi_wifi_radio_done(rq->seq, status); }',
+     '\tfuxi_wifi_radio_done(rq->seq, status);', 'static', 'AssertionError'),
+    ('the prescan asks whether it was cancelled', 'xnu/fuxi-wlan/fuxi_wlan.c', '\treturn rq->seq && fuxi_wifi_radio_cancelled(rq->seq);',
+     '\treturn fuxi_wifi_radio_cancelled(rq->seq);', 'static', 'AssertionError'),
+    ('the poll gap is the shortest, not the longest', 'xnu/fuxi-wlan/fuxi_wlan.c', 'if (t > w->last_ns && t - w->last_ns > w->gap_ns) {',
+     'if (t > w->last_ns && t - w->last_ns < w->gap_ns) {', 'model', 'W25d: idle: 301 passes, 10.0 ms apart'),
+    ('the CE2 backlog is never sampled', 'xnu/fuxi-wlan/fuxi_wlan.c', '\tif (hp < size && !(hp % s->entry_dw)) { back = wlce_dist(s->tp, hp, size) / s->entry_dw; }\n',
+     '\tif (hp < size && !(hp % s->entry_dw)) { back = 0u; }\n', 'model', 'W25d: idle: 301 passes, 10.0 ms apart'),
+    ('posted-unreaped counts the reaped', 'xnu/fuxi-wlan/fuxi_wlan.c', '\tconst unsigned out = p->posted - p->reaped;\n',
+     '\tconst unsigned out = p->reaped;\n', 'model', 'W25d: idle: 301 passes, 10.0 ms apart'),
+    ('chan-info events counted as scan events', 'xnu/fuxi-wlan/fuxi_wlan.c', '} else if (id == WLWMI_EV_CHAN_INFO) { wl25_w.ev_ci++; }',
+     '} else if (id == WLWMI_EV_CHAN_INFO) { wl25_w.ev_scan++; }', 'model', 'W25d: WMI events by kind are the model\'s'),
+    ('the credits at the window start are not read', 'xnu/fuxi-wlan/fuxi_wlan.c', '\tw->c0 = w->cmin = wl25_credits();\n', '\tw->c0 = w->cmin = 0;\n',
+     'model', 'W25d: idle: 301 passes, 10.0 ms apart'),
+    ('the credits at the window end are the start', 'xnu/fuxi-wlan/fuxi_wlan.c', '\tw->cend = wl25_credits();\n', '\tw->cend = w->c0;\n',
+     'model', 'W25d: idle: 301 passes, 10.0 ms apart'),
+    ('the command log counts 17 entries (past its arrays)', 'xnu/fuxi-wlan/fuxi_wlan.c', 'if (wl25_cmd_n < WL25_CMDS_MOST) { wl25_cmd_id[wl25_cmd_n]',
+     'if (wl25_cmd_n <= WL25_CMDS_MOST) { wl25_cmd_id[wl25_cmd_n]', 'static', 'AssertionError'),
+    ('the command log takes the credits after the wait', 'xnu/fuxi-wlan/fuxi_wlan.c',
+     '\tif (wl25_cmd_on && eid == wl_htc.wmi_eid && len >= 4u) {', '\tif (wl25_cmd_on && eid == wl_htc.wmi_eid && len >= 4u && wlhtc_has_credits(&wl_htc, eid, total)) {', 'model',
+     'missing log text:  ms after READY, 8 cmds sent)'),
+    ('the 5 GHz START_SCAN line before its send (console time between the parts)', 'xnu/fuxi-wlan/fuxi_wlan.c',
+     '\t\tif (!part && wl25_said(number, false)) { wl25_start_say(cmd, rq->seq, part, parts); }\n',
+     '\t\tif (wl25_said(number, false)) { wl25_start_say(cmd, rq->seq, part, parts); }\n', 'static', 'AssertionError'),
+    ('the 5 GHz START_SCAN line said when it is built (console time inside the scan)', 'xnu/fuxi-wlan/fuxi_wlan.c', '\t\t\twl25_start_late_pend = true;\n',
+     '\t\t\twl25_start_late_pend = true; printf("%s", wl25_start_late);\n', 'static', 'AssertionError'),
+    ('the idle wait is not closed at the first START_SCAN', 'xnu/fuxi-wlan/fuxi_wlan.c', '\t\tif (first && !part) { wl25_idle_say(); wl25_cmds_say(); }',
+     '\t\tif (first && !part) { wl25_cmds_say(); }', 'model', "W25d: the idle wait's lines"),
+    ('the START_SCAN line shows the request\'s dwell, not the encoded word', 'xnu/fuxi-wlan/fuxi_wlan.c',
+     'wlce_get32(f + 4u * WLWMI_SS_DWELL_PASSIVE), wlce_get32(f + 4u * WLWMI_SS_MAX_SCAN_TIME),', 'WLSCAN_DWELL_PASSIVE, wlce_get32(f + 4u * WLWMI_SS_MAX_SCAN_TIME),',
+     'model', 'W25d: the START_SCAN line says the words the firmware took'),
+    ('the part lines are said even when the request is not one of those said', 'xnu/fuxi-wlan/fuxi_wlan.c',
+     '\twl25_parts_say(wl25_said(number, failed));', '\twl25_parts_say(true);', 'model', "W25d lines: a START_SCAN line and two part lines for the same requests"),
     ('a full cache drops every new BSSID', 'xnu/fuxi-wlan/fuxi_wlan.c', '\t\t\ti = weakest;\n', '\t\t\twl25_cache_lost++; return;\n', 'model',
      'a cached frame of the request\'s channels was not handed over (or twice, or changed)'),
 ]
@@ -3795,7 +4075,7 @@ def c3_mutants(tmp):
             if how == 'static':
                 try:
                     c3_static_checks()
-                except AssertionError as e:
+                except (AssertionError, ValueError, IndexError, KeyError) as e:   # (a mutant that removes text may fail a .index() instead of an assert)
                     out = 'AssertionError: ' + str(e)
             elif how == 'gate':
                 spec = importlib.util.spec_from_file_location('sal_mut', ROOT / 'tools/test-fuxi-wlan-salami.py')
