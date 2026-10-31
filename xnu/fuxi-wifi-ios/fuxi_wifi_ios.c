@@ -335,6 +335,7 @@ static LCK_MTX_DECLARE(rscan_backend_lock, &fake_group);
 static const struct fuxi_wifi_input *rscan_input;       /* kept, never called: nothing is received */
 static int rscan_refused;                               /* EOPNOTSUPP once a join was refused (state()) */
 static unsigned rscan_joins;
+static bool rscan_full_wait;                            /* fuxiwifiios=3 (not the canned =4): every request waits for a full split */
 
 static void
 rscan_start(const struct fuxi_wifi_input *in)
@@ -353,17 +354,22 @@ rscan_power(bool on)
 }
 
 /* The listed channels wifid asked for (all of them for "any"), passive, 150 ms each unless it asked for
- * 50 to 200; waited for at most 1 s plus one and a half dwells a channel, plus 200 ms when the request has
- * channels of both bands (15 s at most), so that the radio lane always finishes or aborts first: it scans
+ * 50 to 200; waited for at most 1 s plus one and a half dwells a channel, plus 200 ms when the channels
+ * counted have both bands (15 s at most), so that the radio lane always finishes or aborts first: it scans
  * one band at a time (2.4 GHz, then 5 GHz), gives each part n_part * dwell * 3 / 2 and stops a part 200 ms
  * past that, then waits 300 ms for the stop, so n * dwell * 3 / 2 + 500 ms for one band and + 700 ms for
- * two (docs-lanes/wlan-w20.md, C3 on the split). */
+ * two (docs-lanes/wlan-w20.md, C3 on the split).
+ * The channels counted: with fuxiwifiios=3 (rscan_full_wait) the whole 38-channel list for every request,
+ * whatever the request asked, because the W25 radio lane (C3, full split) always scans all its kept 2.4 GHz
+ * channels and then all its kept 5 GHz channels (or answers from its 30 s cache, which is quicker), so even
+ * a 2.4 GHz-only or a 5 GHz-only request can take a full split (38 channels at 150 ms: 9750 ms; at 200 ms:
+ * 12600 ms). With fuxiwifiios=4 (the canned producer) the request's own channels, as before. */
 static int
 rscan_scan(const struct fuxi_wifi_sta_scan *what)
 {
 	struct fuxi_wifi_radio_request request = { .passive = what->passive };
 	struct fuxi_wifi_sta_channel channels[FUXI_WIFI_RADIO_CHANNELS];
-	unsigned count = fuxi_wifi_radio_channels(channels, FUXI_WIFI_RADIO_CHANNELS), dwell, timeout;
+	unsigned count = fuxi_wifi_radio_channels(channels, FUXI_WIFI_RADIO_CHANNELS), dwell, timeout, waited;
 	bool low, high;
 
 	for (unsigned i = 0; i < count; i++) {
@@ -381,11 +387,14 @@ rscan_scan(const struct fuxi_wifi_sta_scan *what)
 	dwell = what->dwell_ms >= 50 && what->dwell_ms <= 200 ? what->dwell_ms : FUXI_WIFI_RADIO_DWELL_MS;
 	request.dwell_ms = (uint16_t)dwell;
 	low = high = false;
-	for (unsigned i = 0; i < request.freq_count; i++) {
-		low |= request.freqs[i] < 3000;
-		high |= request.freqs[i] >= 3000;
+	waited = rscan_full_wait ? count : request.freq_count;
+	for (unsigned i = 0; i < waited; i++) {
+		unsigned frequency = rscan_full_wait ? channels[i].frequency : request.freqs[i];
+
+		low |= frequency < 3000;
+		high |= frequency >= 3000;
 	}
-	timeout = 1000 + request.freq_count * dwell * 3 / 2 + (low && high ? 200 : 0);
+	timeout = 1000 + waited * dwell * 3 / 2 + (low && high ? 200 : 0);
 	return fuxi_wifi_radio_scan(&request, timeout < FUXI_WIFI_RADIO_WAIT_MOST_MS ? timeout : FUXI_WIFI_RADIO_WAIT_MOST_MS,
 	           fuxi_wifi_sta_power_pending);
 }
@@ -459,6 +468,7 @@ rscan_init(bool canned)
 	printf("FUXI WIFI IOS: enabled, %s; Apple80211 16.7 ABI unverified\n", canned ? "canned scan backend (no radio)" :
 	    "radio scan backend (scan only, no join)");
 	link.name = "radio-scan";
+	rscan_full_wait = !canned;
 	fuxi_wifi_apple80211_backend(canned ? "Fuxi Wi-Fi iOS shim (canned scan backend)" :
 	    "Fuxi Wi-Fi iOS shim (radio backend, scan only)", true);
 	if (!fuxi_wifi_radio_use(canned, rscan_changed)) {

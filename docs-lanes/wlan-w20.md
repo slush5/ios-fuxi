@@ -14,8 +14,9 @@ RXDMA ring pointers live, read-only pointer-word lines, the relaxed cookie-conve
 management-RX study `docs-lanes/wlan-mgmt-rx-study.md`) is host-tested only; CH1 (`fuxiwlanch`, a default-off drop mask over
 the passive scan channel list, and its bit 26, which runs the scan as two scans, one per band,
 [below](#ch1-the-scan-channel-mask-fuxiwlanch)) is host-tested only. C3 (W25, the scan service for iOS, on salami
-2622e7a, which it carries under qrtr 8 as under qrtr 7: W26 to W30 and `fuxiwlanch`; every W25 scan single-band,
-[below](#c3-on-the-split-every-w25-scan-single-band)) is host-tested only. Every line below that
+2622e7a, which it carries under qrtr 8 as under qrtr 7: W26 to W30 and `fuxiwlanch`; every W25 scan single-band parts,
+[below](#c3-on-the-split-every-w25-scan-single-band), and since W25c always a full split of the whole list, answered from a 30 s
+result cache, [below](#w25c-full-split-scans-only-with-a-30-s-result-cache)) is host-tested only. Every line below that
 says what the target does is what
 the model does, built from Linux ath12k v6.19. C2, C2b, C2c to C2h, CH1 and C3 are described in their own sections below
 ([C2: W23/W24](#c2-w23w24-one-passive-scan-fuxiwlanqrtr7),
@@ -2141,8 +2142,12 @@ asserts in a mixed scan run in DBS (the CH1 split, `fuxiwlanch` bit 26, 674c0da)
 2622e7a (C2f to C2h, HD1, `fuxiwlanch` with its split and DBS-policy bits) and every W25 scan is
 single-band, whatever the bits:
 
-- `wl25_scan` keeps a request's channels as before (listed, each once) but in two parts: the 2.4 GHz ones
-  in request order, then the 5 GHz ones in request order. Each part that has a channel is one START_SCAN
+(W25c, below, changes what a request chooses: the scan is always the whole list, never the request's channels. What
+follows about the parts, their ids, bounds and statuses still holds, with "the request's channels" read as "the kept
+list".)
+
+- `wl25_scan` scans the channels in two parts: the 2.4 GHz ones, then the 5 GHz ones (before W25c: the request's own,
+  in request order). Each part that has a channel is one START_SCAN
   with a scan id of its own (the next of 0xa001..0xafff), its own max_scan_time n_part x dwell x 3/2 and
   its own bounds (no STARTED in 1000 ms, no end by max_scan_time + 200 ms). The 5 GHz START_SCAN goes out
   only after the 2.4 GHz part's COMPLETED; the scan state is re-armed between the parts (`wlscan_rearm`,
@@ -2160,7 +2165,8 @@ single-band, whatever the bits:
   STARTED at the first part's, MID at foreign >= (n + 1) / 2 over the request, COMPLETED and the W26 to W28
   reports after it, and C2h's `W30 mgmtreo counts` line there too (where qrtr 7 prints it after its scan).
   C2b's stats stay qrtr 7 only.
-- A request of one band is exactly C3's scan: the same START_SCAN words, id, bounds and W25 line.
+- Before W25c a request of one band was exactly C3's scan (the same START_SCAN words, id, bounds and W25 line); since W25c
+  it is a full split too.
 
 W26, W27, W28, W29 (C2f/C2g) and W30 (C2h) apply to qrtr 8 exactly as to qrtr 7: their bits are in
 `WL23_BITS` (now with 0x4000), `fuxiwlanw29` and `fuxiwlanvrx` are parsed with the same rules whenever
@@ -2188,11 +2194,11 @@ gave the one scan. The 200 ms per extra part is the overrun bound of the second 
 past its max_scan_time, the 5 GHz part never ends and its STOP_SCAN is never answered: done() at about
 12090 ms of 12600).
 
-Log: a request of both bands names both parts on its W25 line,
-`W25 scan K seq S id 0xa001+0xa002: 13+25 channels passive dwell 150 ms, completed after T ms, ...`
+Log: a scan names both parts on its W25 line,
+`W25 scan K seq S: full split scan id 0xa001+0xa002: 13+25 channels passive dwell 150 ms, completed after T ms, ...`
 (`id 0xa001+-` when the 5 GHz part was never sent: a failure or a cancel in the first part, or a cancel
-between the parts, `cancelled before the 5 GHz part`); a one-band request's line is C3's. `W25 selected ...`
-adds `one band a scan (2.4 GHz, then 5 GHz)`. The SCAN_EVENTs of the first part that arrive in the second are
+between the parts, `cancelled before the 5 GHz part`; one id and one count when the kept list has a single band).
+`W25 selected ...` says `full splits only, 30 s cache` (W25c; before it `one band a scan (2.4 GHz, then 5 GHz)`). The SCAN_EVENTs of the first part that arrive in the second are
 ignored by the id filter as any stale event (`W25 ignored scan event ...`).
 
 Host tests: `s_svc_split` (a cancel 100 ms into the first part, a cancel between the parts, a timeout in the
@@ -2204,6 +2210,65 @@ scans), the end-to-end test against the real `fuxi_wifi_radio.c` ({2437, 5180}: 
 set), the fake firmware's checks (every START_SCAN single-band, one whole band of the request, 2.4 GHz first,
 the 5 GHz one only after the 2.4 GHz COMPLETED, `done(0)` only after every band), static checks
 (`c3_split_static`, the timeout margins from the constants) and 7 new C3 mutants.
+
+### W25c: full split scans only, with a 30 s result cache
+
+Phone facts (WCN7850, upstream firmware): a full split scan (the 13 2.4 GHz channels, then the 25 5 GHz channels, the second
+started about 1 ms after the first's COMPLETED) is clean, and so is a 5 GHz-only scan as the first scan of a boot. But in a
+qrtr 8 service wifid asked for 2.4 GHz only (the lane scanned it; 9 networks reached wifid) and about 1 s later for 5 GHz
+only, and that lone 5 GHz scan made the firmware assert (thread assert, no more WMI events, the STOP_SCAN then waited
+forever for an HTC credit); the lane stopped and iOS showed Wi-Fi off. So the service never starts a scan that is not a
+full split, and a later lone-band request never reaches the firmware. qrtr 0..7 and every other `fuxiwifiios` backend are
+untouched (differentials below).
+
+- **Full split.** Every START_SCAN of the service is a part of a full split: the whole list W23 gave the firmware
+  (`wlscan_chan(0..nlist)`, so `fuxiwlanch` and w20 0x10 apply), 2.4 GHz channels first (one START_SCAN, its own id and
+  bounds), then, after its COMPLETED and unless the iOS side cancelled meanwhile, the 5 GHz channels (a second one). The
+  request decides nothing about what is scanned except the dwell (50..200 ms, else 150). The existing split rules are
+  unchanged: ids, per-part max_scan_time n_part x dwell x 3/2, STARTED 1000 ms, end by max + 200 ms, STOP_SCAN of the
+  part in flight with its id, 300 ms for its end, the 3 s rule for an unconfirmed stop, a cancel between the parts sends
+  nothing, `done()` once after the last part. A kept list with a single band is one part.
+- **Result cache.** While a split runs, `wl25_heard` copies every beacon or probe response the parser keeps (the MGMT_RX
+  payload, up to 2048 bytes, with its RX MHz, dBm and noise floor) into `wl25_cache`: one frame a BSSID (address 3), the
+  newest replacing the older as the iOS side's own table does, at most 64 BSSIDs (`WLSCAN_BSS_MAX`, the table size on
+  both sides, 132 KiB); a new BSSID past them replaces the weakest if it is stronger, else it is dropped and counted
+  (`cache frames not kept` in the service end). The cache is emptied when a split starts and is valid again only when the 5 GHz part
+  (the last) has completed, dated at that moment; a split that does not complete (START_FAILED, DEQUEUED, a timeout, a
+  cancel) leaves it empty and answers with its status and no frame.
+- **Answers.** A request is answered by `fuxi_wifi_radio_frame` for the cached frames whose RX MHz is a channel of the
+  request, in cache order, then `done(0)`. If the cache is younger than `WL25_CACHE_MS` (30000 ms, from the 5 GHz part's
+  COMPLETED; hits do not renew it) the answer is immediate and nothing is sent; otherwise a new full split runs first and
+  refills the cache. The first request after the service starts always scans. A request that is not passive or names
+  no channel of the list is refused as before, nothing sent. `WL25_CACHE_MS` 0 (a host-test build only) never serves the cache.
+- **Consumer wait.** `fuxiwifiios=3` (the radio backend, `rscan_scan`) waits for every request as for the whole list:
+  1000 + 38 x dwell x 3/2 + 200 ms, **9750 ms at 150 ms, 12600 ms at 200 ms** (cap 15000, never reached), also for a 13-channel or
+  a 5 GHz-only request; the radio lane answers a scan by 38 x dwell x 3/2 + 700 (9250 ms, 12100 ms), a cache hit at once. `fuxiwifiios=4`
+  (the canned producer) keeps the request's own channels and its old formula.
+- **Log.** One W25 line a request: `cache hit (age N ms, K of M frames match), nothing sent, status 0; to iOS K kept K` or
+  `full split scan id A+B: a+b channels ...` (with both part ids), counts only, no SSID or BSSID (the first scan's W24 proof
+  lines as before); the service end adds `cache hits` and `cache frames not kept`. All lines stay within 254 bytes.
+- **Safety unchanged.** Passive only, nothing transmitted, no register access added, containment and the 30 minute lifetime as before.
+
+Host tests (tools/test-fuxi-wlan-ce.py, tools/fuxi-wlan-ce-model.c, the end-to-end test against the real fuxi_wifi_radio.c,
+tools/test-fuxi-wifi-radio.py): the fake iOS side now works out for itself, from the firmware's frames and clock, whether
+each request must scan or be answered from the cache (30 s, a few ms of slack) and which frames it must get, and checks
+every START_SCAN to be a whole band of the kept list (2.4 GHz part first, the 5 GHz one only after its COMPLETED), every frame to be from
+the cache and on a request channel, every answer within the iOS wait. Scenarios: `s_svc_cache` (a 2.4 GHz request then a 5 GHz one 1 s later:
+one full split, two answers, the second from the cache with 5 GHz frames only; a request for a channel nothing was heard on gets no
+frame; 28 s on a hit, 31 s on a new split, then 29 s on a hit again counted from the new split; a cancel in the 2.4 GHz part and in the 5 GHz
+part empty the cache; START_FAILED and a timeout of the 5 GHz part empty it, the next request within 30 s scans; 74 frames of 70 BSSIDs
+fill and replace the 64 entries and count what they drop), the end to end ({2437} then {5180} 1 s of model time later through the real consumer:
+ONE full split, 13 then 25 channels, two answers, the second from the cache), every older scenario re-run with full splits (long runs
+without the cache: `c3nocache`, the model built with -DWL25_CACHE_MS=0u, 4100 and 250 scans on a one-channel kept list), the static checks
+(`c3_cache_static`) and 15 new mutants (a lone-band scan on the wire, the request's channels as the scan list, the cache served past its age,
+renewed by a hit, dated at the split's start, left valid by a failed split, whole-band / other-band / no channel filter, a hit that hands
+nothing over, no BSSID dedupe, the oldest frame kept, a full cache that drops everything).
+
+Differentials against da62109 (scripts in op11-tools/salami-port/wlan/r1/impl/w25c, run on a `git archive` of da62109):
+- D1 (the CE model, every scenario log): 299 scenario logs (3232531 bytes) before the first W25 scenario and all 300 logs without a W25 line equal byte for byte, 71 summary lines and the six wire dumps equal (qrtr 6 and 7 included).
+- D2 (the gate boot-arg sweep): 8100 boot-arg sets x salami/Fuxi x boot-args/ADT /defaults = 32400 runs, stdout byte for byte equal: 28350 untouched, 4050 (the qrtr 8 ones) equal after spelling back the one W25 selected line.
+- D3 (the salami gate test, every boot it runs): 536 boots of the salami gate test, all present in the new tree, stdout equal byte for byte: 457 untouched, 79 equal after spelling back the W25 selected line.
+- D4 (source): fuxi_wlan.c is identical outside the W25 service block, the W25 selected message and the WL25_CACHE_MS define; fuxi_wlan_ce.h is byte for byte identical.
 
 ### The fuxiwlansalami=3 profile
 
@@ -2254,19 +2319,23 @@ gate harness records the calls).
    own 3 timeouts in a row, no usable channel; terminal, so no request can come): the service ends there.
    With `fuxiwifiios=3` absent, or with the user's Wi-Fi switch off, it stays true (the radio idles to its
    lifetime, as before).
-3. One request: not passive -> `done(seq, EINVAL)`, nothing sent; its channels kept only where the W23 list
-   has them, each once, in its order; none left -> `done(seq, EINVAL)`, nothing sent. Else (C3 on the split,
-   above) one START_SCAN per band, the 2.4 GHz part first, each as follows: a START_SCAN
+3. One request: not passive -> `done(seq, EINVAL)`, nothing sent; its channels counted only where the W23 list
+   has them, each once; none -> `done(seq, EINVAL)`, nothing sent. Else (W25c) a cache younger than 30 s answers it
+   at once with no firmware scan (step 4); otherwise a FULL SPLIT of the whole list W23 gave the firmware, whatever the
+   request names: one START_SCAN for every kept 2.4 GHz channel, the 2.4 GHz part first, and, right after its COMPLETED
+   (about 1 ms), one for every kept 5 GHz channel. Each START_SCAN
    (`wlwmi_encode_start_scan_list`: the C2 command with only the scan id, the passive dwell and the channel
    array changed; PASSIVE | CHAN_STAT_EVENT forced, no SSID, IE or probe), dwell = the request's when
    50..200 ms (the iOS side's own rule, so both sides compute the same number), else 150; max_scan_time
-   n_part x dwell x 3/2 (the iOS side waits 1000 ms more, 1200 for two bands); scan id 0xa001..0xafff in turn (ATH12K_SCAN_ID's block
+   n_part x dwell x 3/2 (the iOS side with fuxiwifiios=3 waits 1000 ms + 38 x dwell x 3/2 + 200 for every request); scan id 0xa001..0xafff in turn (ATH12K_SCAN_ID's block
    with a 12-bit counter; SCAN_EVENTs of another id are counted in `wrong_id` and ignored, so a late event of
    a stopped scan never ends the next one; they are said: `W25 ignored scan event` lines, 8 in the service,
    the count and the last such id on each W25 line, the total in the service end, the count in a snapshot).
-4. While it runs, a poll pass every 1 ms. Every beacon or probe response the MGMT_RX parser keeps goes to
-   `fuxi_wifi_radio_frame(seq, frame, len, rx MHz, snr + noise floor, noise floor)` inside the call that has
-   its RX buffer, before the buffer is posted again (the iOS side parses and copies during the call).
+4. While a split runs, a poll pass every 1 ms. Every beacon or probe response the MGMT_RX parser keeps is copied, inside the
+   call that has its RX buffer and before the buffer is posted again, into the result cache (`wl25_heard`). When the
+   split has completed the request is answered: the cached frames heard on a channel of the request go to
+   `fuxi_wifi_radio_frame(seq, frame, len, rx MHz, snr + noise floor, noise floor)` (the iOS side parses and copies
+   during the call), then `done(seq, 0)`.
 5. The end: COMPLETED -> `done(seq, 0)`; START_FAILED or DEQUEUED -> `done(seq, EIO)`;
    `fuxi_wifi_radio_cancelled(seq)` -> STOP_SCAN (ath12k_scan_stop's values with this scan's id), at most
    300 ms for its COMPLETED or DEQUEUED, `done(seq, ECANCELED)`; no STARTED in 1000 ms (L19 mac.c:5046-5053)
@@ -2295,7 +2364,7 @@ difference of 64-bit milliseconds; the rest are only printed.
 ### Logs
 
 ```
-FUXI WLAN: W25 selected scan service for iOS (fuxiwifiios=3): passive only, nothing transmitted; 1800 s, or 3 failed scans in a row, then contain; one band a scan (2.4 GHz, then 5 GHz); first scan W24 lines, then one W25 line a scan   (at init)
+FUXI WLAN: W25 selected scan service for iOS (fuxiwifiios=3): passive only, nothing transmitted; 1800 s, or 3 failed scans in a row, then contain; full splits only, 30 s cache; first scan W24 lines, then one W25 line a request   (at init)
   ... W15, W20..W22 and the W23 chan list / vdev lines as for qrtr 7 ...
 FUXI WLAN: W25 service ready: 38 channels passive to iOS (2.4 GHz 13, 5 GHz 25), lifetime 1800 s
 FUXI WLAN: W23 scan foreign freq F                                         (the first scan sent only)
@@ -2305,12 +2374,13 @@ FUXI WLAN: W26 rx watch completed ... / W26 idle watch completed ...       (the 
 FUXI WLAN: W24 bss aa:bb:cc:xx:xx:xx ch C freq F dBm S privacy P rsn R beacon frames N ssid "NAME"   (the first completed scan only)
 FUXI WLAN: W24 scan summary frames N bss M ssids K
 FUXI WLAN: W24 scan detail mgmt-rx N ...
-FUXI WLAN: W25 scan K seq S id 0xa001+0xa002: 13+25 channels passive dwell 150 ms, completed after T ms, reason 0, status 0; frames N bss M, to iOS N kept K; scan events E, of another id 0 (last 0)   (scans 1..24, every 100th, the first 24 failed ones)
+FUXI WLAN: W25 scan K seq S: full split scan id 0xa001+0xa002: 13+25 channels passive dwell 150 ms, completed after T ms, reason 0, status 0; frames N bss M, to iOS N kept K; scan events E, of another id 0 (last 0)   (scans 1..24, every 100th, the first 24 failed ones)
+FUXI WLAN: W25 scan K seq S: cache hit (age 1088 ms, 2 of 4 frames match), nothing sent, status 0; to iOS 2 kept 2   (same rule; no START_SCAN)
 FUXI WLAN: W26 rx content ... / rx guard ... / rxdma err ... / link content ... / counters ...   (C2c, after the first scan's W25 line only)
 FUXI WLAN: W25 scan K seq S: not passive, refused, nothing sent, status 22      (or "no listed channel, refused")
 FUXI WLAN: W25 complete: lifetime over (1800 s); stop/contain                  (or "the iOS side stopped")
-FUXI WLAN: W25 service end: lifetime over after 1800 s; scans N (completed A, failed F, cancelled C, refused R), frames to iOS N kept K; stops confirmed late L, scan events of another id W, credit waits H;
-FUXI WLAN: W25 service end rings: rx CE1 P/R CE2 P/R tx CE3 P/R credits N
+FUXI WLAN: W25 service end: lifetime over after 1800 s; scans N (completed A, failed F, cancelled C, refused R), cache hits Y, frames to iOS N kept K; stops confirmed late L, scan events of another id W, credit waits H;
+FUXI WLAN: W25 service end rings: rx CE1 P/R CE2 P/R tx CE3 P/R credits N, cache frames not kept X
 FUXI WLAN: W26 rx contain: host writes off; arenas held until bus master off, PERST and SMMU undo   (with a W26 arena)
 FUXI WLAN: W23 contain: scan over, no STOP_SCAN
 ```

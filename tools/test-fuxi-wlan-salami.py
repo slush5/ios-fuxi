@@ -540,8 +540,8 @@ def gate_suite(tmp, mk):
         ('fuxiwlan=28 fuxiwlansalami=2 fuxiwlanqrtr=8', 1, 28,
          'W20 selected qrtr=8 (CE/HTC/WMI init, then the W25 scan service for iOS) w20 0 valid 1'),
         ('fuxiwlan=28 fuxiwlansalami=2 fuxiwlanqrtr=8', 1, 28, 'W25 selected scan service for iOS (fuxiwifiios=3): passive '
-         'only, nothing transmitted; 1800 s, or 3 failed scans in a row, then contain; one band a scan (2.4 GHz, then 5 GHz); '
-         'first scan W24 lines, then one W25 line a scan'),
+         'only, nothing transmitted; 1800 s, or 3 failed scans in a row, then contain; full splits only, 30 s cache; '
+         'first scan W24 lines, then one W25 line a request'),
         ('fuxiwlan=28 fuxiwlansalami=2 fuxiwlanqrtr=8', 1, 28, 'W23 selected passive scan of 38 channels'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=8', 1, 28, 'W12 selected qrtr=8 target memory cap'),
         ('fuxiwlan=1 fuxiwlansalami=2 fuxiwlanqrtr=8 fuxiwlanw20=0x92', 1, 28, 'w20 0x92 valid 1'),

@@ -610,16 +610,19 @@ static void scenario_radio(void) {
  memset(name,1,sizeof(name));
  assert(!request(false,43,name,sizeof(name),NULL) && !strcmp(name,"Fuxi Wi-Fi iOS shim (radio backend, scan only)"));
  /* 3 scans in a row that the radio takes and never answers: each times out (9750 ms: 1000 + 38 x 150 x 3/2 + 200, both
-    bands, C3 on the split), then Wi-Fi is off */
+    bands, C3 on the split), then Wi-Fi is off. With fuxiwifiios=3 the wait is the full-list one for EVERY request: the
+    radio lane runs a full split whatever was asked (W25 full-split scans only), so a 5 GHz-only request (scan 6), a
+    2.4 GHz-only one (scan 7) and a 38-channel one (scan 8) are all waited for 9750 ms, not 1000 + 1 x 150 x 3/2 = 1225 */
  assert(fuxi_wifi_radio_wanted());
  atomic_store(&lane_mode,LANE_SILENT);
  for (unsigned i=0;i<3;i++) {
   takes=atomic_load(&lane_takes); uint64_t start=(uint64_t)(60+20*i)*NSEC_PER_SEC; now_abs=start;
-  assert(!scan_ask(3,0,0)); wait_count(&lane_takes,takes+1);
+  assert(!(i==0 ? scan_ask(1,36,CHANNEL_5GHZ) : i==1 ? scan_ask(1,6,CHANNEL_2GHZ) : scan_ask(3,0,0)));
+  wait_count(&lane_takes,takes+1);
   now_abs=start+9749*1000000ull; struct timespec pause={.tv_nsec=5000000}; nanosleep(&pause,NULL);
   assert(fuxi_wifi_sta_busy());
   now_abs=start+9750*1000000ull; settle(); wait_count(&lane_cancels,i+1);
-  assert(said(SAY("FUXI WIFI IOS: radio: scan %u: 38 channels passive, 0 heard (0 at 2.4 GHz, 0 at 5 GHz, 0 RSN, 0 hidden), 9750 ms, status %d\n",6+i,ETIMEDOUT)));
+  assert(said(SAY("FUXI WIFI IOS: radio: scan %u: %u channels passive, 0 heard (0 at 2.4 GHz, 0 at 5 GHz, 0 RSN, 0 hidden), 9750 ms, status %d\n",6+i,i<2?1u:38u,ETIMEDOUT)));
  }
  wait_said("FUXI WIFI IOS: radio: scans timed out 3 times in a row (code 0x60003); Wi-Fi reported off, no retry this boot\n");
  other_settle();
@@ -981,6 +984,16 @@ def static_rules(src=SRC):
         for m in re.finditer(r'#define (FUXI_WIFI_RADIO_\w+)\s+([^\n]+)', wlan):
             if f'#define {m.group(1)} {m.group(2).strip()} ' not in header + ' ':
                 problems.append(f'fuxi_wlan.c {m.group(1)} differs from the header')
+    # the wait of rscan_scan: fuxiwifiios=3 (not the canned =4) counts the whole channel list for every request (W25 full
+    # split); =4 keeps the request's own channels. The =3 side is run (the 3-timeout scenario); =4 answers at once, so
+    # its formula is pinned here.
+    ios = uncomment((Path(src) / 'fuxi_wifi_ios.c').read_text())
+    if ios.count('rscan_full_wait = !canned;') != 1 or ios.count('rscan_full_wait = ') != 1:
+        problems.append('fuxi_wifi_ios.c: rscan_full_wait is not set from !canned in rscan_init alone')
+    if ios.count('waited = rscan_full_wait ? count : request.freq_count;') != 1 or \
+            ios.count('timeout = 1000 + waited * dwell * 3 / 2 + (low && high ? 200 : 0);') != 1:
+        problems.append('fuxi_wifi_ios.c: the rscan_scan wait is not 1000 + n x dwell x 3/2 (+ 200 for both bands), '
+                        'n = the whole list for =3, the request\'s channels for =4')
     return problems
 
 
@@ -997,6 +1010,11 @@ MUTANTS = [
     ('no timeout', 'fuxi_wifi_radio.c', 'return late ? ETIMEDOUT : -1;', 'return -1;'),
     ('ACTIVE in the channel flags', 'fuxi_wifi_radio.c', '#define RADIO_P         FUXI_WIFI_STA_CHANNEL_PASSIVE',
      '#define RADIO_P         0'),
+    ('=3 waits only for the channels asked (not the full list)', 'fuxi_wifi_ios.c',
+     '\twaited = rscan_full_wait ? count : request.freq_count;', '\twaited = request.freq_count;'),
+    ('=3 full-list wait without the both-bands 200 ms', 'fuxi_wifi_ios.c',
+     '\ttimeout = 1000 + waited * dwell * 3 / 2 + (low && high ? 200 : 0);', '\ttimeout = 1000 + waited * dwell * 3 / 2;'),
+    ('=4 (canned) takes the full-list wait too', 'fuxi_wifi_ios.c', '\trscan_full_wait = !canned;', '\trscan_full_wait = true;'),
     ('EAUTH from join', 'fuxi_wifi_ios.c', '\treturn EOPNOTSUPP;\n}\n\nstatic int\nrscan_leave(void)',
      '\treturn EAUTH;\n}\n\nstatic int\nrscan_leave(void)'),
     ('SSID in the log', 'fuxi_wifi_radio.c', '\t\teach(radio_copy, context);',

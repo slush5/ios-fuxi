@@ -988,6 +988,11 @@ static bool wl16_large, wl16_redrive;
 #define WL20_QRTR_MAX 8
 #define WL25_LIFETIME_MS (30u * 60u * 1000u)
 #define WL25_FAILS_MOST 3u
+/* W25c: a result cache younger than this answers a request with no firmware scan (the host tests build with 0, never served, for
+ * their 4000-scan runs) */
+#ifndef WL25_CACHE_MS
+#define WL25_CACHE_MS 30000u
+#endif
 /* C2f bisect (fuxiwlanw29, only with a valid qrtr 7 or 8 w20 0x4000): which W29
  * pieces run, each in its L19 place. Absent = WL29_DEFAULT (C2g: 0x9f, every
  * piece but LRO 0x20 and IDLE_PS 0x40; the fuxiwlanw29 bisect showed each of
@@ -1541,9 +1546,9 @@ wl_probe_configure(void)
 		}
 		if (wl_w25) {
 			printf("FUXI WLAN: W25 selected scan service for iOS (fuxiwifiios=3): passive only, nothing transmitted; "
-			    "%u s, or %u failed scans in a row, then contain; one band a scan (2.4 GHz, then 5 GHz); first scan W24 lines, "
-			    "then one W25 line a scan\n",
-			    WL25_LIFETIME_MS / 1000u, WL25_FAILS_MOST);
+			    "%u s, or %u failed scans in a row, then contain; full splits only, %u s cache; first scan W24 lines, "
+			    "then one W25 line a request\n",
+			    WL25_LIFETIME_MS / 1000u, WL25_FAILS_MOST, WL25_CACHE_MS / 1000u);
 		}
 	} else if (w20_given && w20) {
 		wl_variant_invalid = true;
@@ -7253,23 +7258,45 @@ wl30_counts(void)
  *   - not passive: done EINVAL, nothing sent (nothing is ever transmitted);
  *     its channels are kept only where the W23 list has them, each once;
  *     none left: done EINVAL, nothing sent;
- *   - every scan is single-band (C3 on the split: a mixed list scanned in DBS
- *     stalls the phone's firmware, docs-lanes/wlan-w20.md CH1): the channels
- *     kept are the 2.4 GHz part (request order) then the 5 GHz part, and each
- *     part that has a channel is one START_SCAN (wlwmi_encode_start_scan_list,
+ *   - every scan the service starts is a FULL SPLIT (C3 on the split, W25c): the
+ *     whole list W23 gave the firmware, whatever the request asked for, as the
+ *     2.4 GHz part (every kept 2.4 GHz channel) and, started right after that
+ *     part's COMPLETED (about 1 ms), the 5 GHz part (every kept 5 GHz channel).
+ *     Never a lone-band scan: on the phone's firmware (WCN7850) a full split is
+ *     clean and a 5 GHz-only scan as the first scan of a boot is clean, but a
+ *     5 GHz-only scan one second after a 2.4 GHz-only one asserts the firmware
+ *     (thread assert, no more WMI events, the STOP_SCAN then waits forever for an
+ *     HTC credit), and a mixed list scanned in DBS stalls it (docs-lanes/
+ *     wlan-w20.md CH1). Each part is one START_SCAN (wlwmi_encode_start_scan_list,
  *     PASSIVE forced, one band only) with the request's dwell when 50..200 ms
  *     (the iOS side's own rule; 150 otherwise), max_scan_time n_part x dwell x
  *     3/2 and a scan id of its own (SCAN_EVENTs of another id are ignored,
- *     counted and said: wl_ce_wmi_rx); the 5 GHz START_SCAN goes out only after
- *     the 2.4 GHz one's COMPLETED, and not if the iOS side cancelled by then.
- *     Worst case before done(): the sum over the parts of max_scan_time +
- *     200 ms, plus 300 ms for a STOP_SCAN, that is n x dwell x 3/2 + 500 ms for
- *     one band and + 700 ms for two; the iOS side waits 1000 ms more than
- *     n x dwell x 3/2, and 200 ms more again for a request of both bands
- *     (fuxi_wifi_ios.c rscan_scan), so a scan always ends or is stopped first;
- *   - every beacon or probe response the MGMT_RX parser keeps goes to
- *     fuxi_wifi_radio_frame while its RX buffer is in hand (the iOS side parses
- *     and copies it during that call; nothing points back here);
+ *     counted and said: wl_ce_wmi_rx); a cancel between the parts ends the
+ *     request there. A request is valid when it is passive and names at least one
+ *     channel the W23 list has (each once); it picks the frames it is answered
+ *     with, never what the firmware scans;
+ *   - the result cache: the beacons and probe responses the MGMT_RX parser keeps
+ *     are copied, while their RX buffer is in hand, into wl25_cache (one frame a
+ *     BSSID, the newest wins as in the iOS side's table, 64 BSSIDs at most
+ *     (WLSCAN_BSS_MAX): a new BSSID past them replaces the weakest if it is
+ *     stronger, else is not cached; a frame is at most WLCE_BUF bytes, so none
+ *     is too long), each with its RX MHz, dBm and noise floor. A request is
+ *     answered by handing fuxi_wifi_radio_frame only the cached frames whose RX
+ *     MHz is a channel of the request (the iOS side parses and copies each
+ *     during that call; nothing points back here), then done(): when the cache
+ *     is younger than WL25_CACHE_MS (30 s, counted from the COMPLETED of the
+ *     5 GHz part of the split that filled it) with no firmware scan at all, else
+ *     after a new full split, which refills the cache. The first request after
+ *     the service starts always scans. A split that does not complete
+ *     (START_FAILED, DEQUEUED, a timeout, a cancel) empties the cache and
+ *     answers with its status and no frames;
+ *   - worst case before done() for a request that scans: the sum over the two
+ *     parts of max_scan_time + 200 ms, plus 300 ms for a STOP_SCAN, that is
+ *     N x dwell x 3/2 + 700 ms for the N channels of the list (9250 ms for 38 at
+ *     150 ms); the iOS side with fuxiwifiios=3 waits 1000 ms + N x dwell x 3/2 +
+ *     200 ms for every request, a single-band one too (9750 ms; fuxi_wifi_ios.c
+ *     rscan_scan), so a scan always ends or is stopped first; a cache hit
+ *     answers at once;
  *   - COMPLETED of the last part: done 0; START_FAILED or DEQUEUED of a part:
  *     done EIO, no further part; cancelled by the iOS side while a part runs:
  *     STOP_SCAN (L19's values with that part's id), at most 300 ms
@@ -7293,8 +7320,10 @@ wl30_counts(void)
  * reports EXITED and iOS turns Wi-Fi off. Logs: the first scan sent prints
  * its foreign-channel lines, the first completed one the W24 proof lines
  * (SSIDs in clear, BSSIDs OUI-only, as C2), every scan one W25 line of counts,
- * the firmware's reason and scan ids (no SSID, no BSSID): the first 24, every
- * hundredth and the first 24 failed ones. Elapsed time is mach_absolute_time,
+ * the firmware's reason and scan ids (no SSID, no BSSID), "full split scan" with
+ * both part ids, or "cache hit (age N ms, K of M frames match)" for a request
+ * answered from the cache: the first 24, every hundredth and the first 24
+ * failed ones. Elapsed time is mach_absolute_time,
  * not counted sleeps. Adapted from Linux ath12k mac.c and wmi.c
  * (BSD-3-Clause-Clear), v6.19, as W23. */
 #define WL25_STARTED_MS 1000u
@@ -7309,6 +7338,21 @@ static bool wl25_on, wl25_proved;
 static uint64_t wl25_t0;
 static const char *wl25_why;
 
+/* The result cache (the block comment above): one frame a BSSID of the last completed full split. Bounded: 64
+ * BSSIDs (WLSCAN_BSS_MAX, the iOS side's table size too), each at most WLCE_BUF bytes (the RX buffer), 132 KiB in
+ * all. WL25_CACHE_MS 0 never serves the cache (the host tests build with it for their 4000-scan runs). */
+#define WL25_CACHE_BSS WLSCAN_BSS_MAX
+struct wl25_cached {
+	uint32_t len;
+	uint16_t mhz;
+	int16_t dbm, nf;
+	uint8_t frame[WLCE_BUF];
+};
+static struct wl25_cached wl25_cache[WL25_CACHE_BSS];
+static unsigned wl25_cache_n, wl25_cache_lost, wl25_hits;
+static bool wl25_cache_ok;      /* the cache holds a whole full split */
+static uint64_t wl25_cache_at;  /* when that split's 5 GHz part (its last part) completed */
+
 static uint64_t
 wl25_ms(void)
 {
@@ -7318,16 +7362,52 @@ wl25_ms(void)
 }
 
 /* The MGMT_RX hook (wlscan.heard), inside wlce_reap_rx's call for this RX
- * buffer, before the buffer is posted again. dBm and noise as int16 (the iOS
- * side clamps them to -127..0); fuxi_wifi_radio_frame returns 0 when kept. */
+ * buffer, before the buffer is posted again: into the result cache while a
+ * full split runs (wl25_seq set), one frame a BSSID (address 3), the newest
+ * replacing the older as the iOS side's table does; past 64 BSSIDs a stronger
+ * one replaces the weakest, a weaker one is counted and dropped. dBm and noise
+ * as int16 (the iOS side clamps them to -127..0). */
 static void
 wl25_heard(void *ctx, const uint8_t *frame, uint32_t len, uint32_t mhz, int32_t dbm, int32_t nf)
 {
+	unsigned i = 0;
+	struct wl25_cached *c;
 	(void)ctx;
 	if (!wl25_seq) { return; }
-	int16_t s = (int16_t)(dbm < -128 ? -128 : dbm > 127 ? 127 : dbm), f = (int16_t)(nf < -128 ? -128 : nf > 127 ? 127 : nf);
-	wl25_scan_handed++; wl25_handed++;
-	if (fuxi_wifi_radio_frame(wl25_seq, frame, len, (uint16_t)mhz, s, f) == 0) { wl25_scan_kept++; wl25_kept++; }
+	const int16_t s = (int16_t)(dbm < -128 ? -128 : dbm > 127 ? 127 : dbm), f = (int16_t)(nf < -128 ? -128 : nf > 127 ? 127 : nf);
+	if (len < 22u || len > sizeof(c->frame)) { wl25_cache_lost++; return; }
+	while (i < wl25_cache_n && !wlscan_same(wl25_cache[i].frame + 16, frame + 16, 6)) { i++; }
+	if (i == wl25_cache_n) {
+		if (wl25_cache_n < WL25_CACHE_BSS) {
+			wl25_cache_n++;
+		} else {
+			unsigned weakest = 0;
+			for (unsigned j = 1; j < WL25_CACHE_BSS; j++) { weakest = wl25_cache[j].dbm < wl25_cache[weakest].dbm ? j : weakest; }
+			if (s <= wl25_cache[weakest].dbm) { wl25_cache_lost++; return; }
+			i = weakest;
+		}
+	}
+	c = &wl25_cache[i];
+	c->len = len; c->mhz = (uint16_t)mhz; c->dbm = s; c->nf = f;
+	memcpy(c->frame, frame, len);
+}
+
+/* A request's answer: the cached frames heard on a channel the request names, in cache order, to fuxi_wifi_radio_frame
+ * under its seq (the iOS side parses and copies each during that call); how many matched. */
+static unsigned
+wl25_answer(const struct fuxi_wifi_radio_request *rq)
+{
+	unsigned matched = 0;
+	wl25_scan_handed = wl25_scan_kept = 0;
+	for (unsigned i = 0; i < wl25_cache_n; i++) {
+		const struct wl25_cached *c = &wl25_cache[i];
+		bool asked = false;
+		for (uint32_t j = 0; j < rq->freq_count && j < FUXI_WIFI_RADIO_FREQS_MOST; j++) { asked |= rq->freqs[j] == c->mhz; }
+		if (!asked) { continue; }
+		matched++; wl25_scan_handed++; wl25_handed++;
+		if (fuxi_wifi_radio_frame(rq->seq, c->frame, c->len, c->mhz, c->dbm, c->nf) == 0) { wl25_scan_kept++; wl25_kept++; }
+	}
+	return matched;
 }
 
 /* A poll pass every 1 ms, at most MS ms from now, until the scan the id
@@ -7358,8 +7438,8 @@ wl25_stop(void)
 
 /* One W25 line: counts, the firmware's reason and scan ids only, never an
  * SSID or a BSSID; scans 1..24, every 100th and the first 24 failed ones.
- * IDS[0] 0: nothing sent. A request of both bands says both parts:
- * "id A+B: a+b channels" (B "-" when the 5 GHz part was never sent). */
+ * IDS[0] 0: nothing sent. A full split says both parts:
+ * "full split scan id A+B: a+b channels" (B "-" when the 5 GHz part was never sent). */
 static void
 wl25_say(unsigned number, uint32_t seq, const uint32_t ids[2], uint32_t n24, uint32_t n, uint32_t dwell, uint64_t ms, int status,
     const char *how, const char *stop, bool failed)
@@ -7377,48 +7457,68 @@ wl25_say(unsigned number, uint32_t seq, const uint32_t ids[2], uint32_t n24, uin
 		snprintf(idt, sizeof(idt), "%#x", ids[0]);
 		snprintf(cht, sizeof(cht), "%u", n);
 	}
-	printf("FUXI WLAN: W25 scan %u seq %u id %s: %s channels passive dwell %u ms, %s%s after %llu ms, reason %u, status %d; "
+	printf("FUXI WLAN: W25 scan %u seq %u: full split scan id %s: %s channels passive dwell %u ms, %s%s after %llu ms, reason %u, status %d; "
 	    "frames %u bss %u, to iOS %u kept %u; scan events %u, of another id %u (last %#x)\n", number, seq, idt, cht, dwell, how,
 	    stop, (unsigned long long)ms, wl_scan.reason, status, wl_scan.frames, wl_scan.nbss, wl25_scan_handed, wl25_scan_kept,
 	    wl_scan.events, wl_scan.wrong_id, wl25_other_id);
 }
 
+/* A request answered from the cache: its age, how many of the cached frames matched the request's channels. */
+static void
+wl25_say_hit(unsigned number, uint32_t seq, uint64_t age, unsigned matched)
+{
+	if (number > WL25_SAID_MOST && number % 100u) { return; }
+	printf("FUXI WLAN: W25 scan %u seq %u: cache hit (age %llu ms, %u of %u frames match), nothing sent, status 0; to iOS %u kept %u\n",
+	    number, seq, (unsigned long long)age, matched, wl25_cache_n, wl25_scan_handed, wl25_scan_kept);
+}
+
 /* One request (see the block comment): 0 served (whatever its status), 1
  * contained. NLIST: the channels W23 gave the firmware (38, or fewer with
- * w20 0x10 or fuxiwlanch). At most two parts, the 2.4 GHz one first. */
+ * w20 0x10 or fuxiwlanch). A fresh cache answers it with no scan; else a full
+ * split of the whole list, the 2.4 GHz part first, then the answer. */
 static int
 wl25_scan(const struct fuxi_wifi_radio_request *rq, uint32_t nlist)
 {
 	static uint8_t cmd[WLCE_BUF];
 	uint16_t mhz[WLSCAN_NCHAN];
 	uint32_t n = 0, n24 = 0, len = 0, dwell, ids[2] = { 0, 0 };
-	unsigned number = ++wl25_scans, parts;
+	unsigned number = ++wl25_scans, parts, asked = 0, matched = 0;
 	const char *how = "-", *said = "";
 	int status = EIO;
 	bool stop = false, ended = true, failed, first;
 	uint64_t ms, r0 = 0;
-	/* listed, each once, in request order within a band: the 2.4 GHz channels, then the 5 GHz ones */
-	for (unsigned band = 0; band < 2u; band++) {
-		for (uint32_t i = 0; i < rq->freq_count && i < FUXI_WIFI_RADIO_FREQS_MOST; i++) {
-			bool again = false;
-			if ((rq->freqs[i] < 3000u) != (band == 0u)) { continue; }
-			for (uint32_t j = 0; j < n; j++) { again |= mhz[j] == rq->freqs[i]; }
-			if (!again && n < WLSCAN_NCHAN && wlscan_listed(rq->freqs[i], nlist)) { mhz[n++] = rq->freqs[i]; }
-		}
-		if (band == 0u) { n24 = n; }
+	/* the request names channels: each listed one once (it picks the frames it is answered with, never what is scanned) */
+	for (uint32_t i = 0; i < rq->freq_count && i < FUXI_WIFI_RADIO_FREQS_MOST; i++) {
+		bool again = false;
+		for (uint32_t j = 0; j < i; j++) { again |= rq->freqs[j] == rq->freqs[i]; }
+		if (!again && wlscan_listed(rq->freqs[i], nlist)) { asked++; }
 	}
-	if (!rq->passive || !n) {
+	if (!rq->passive || !asked) {
 		wl25_refused++;
 		fuxi_wifi_radio_done(rq->seq, EINVAL);
 		wl25_say(number, rq->seq, ids, 0, 0, 0, 0, EINVAL, !rq->passive ? "not passive, refused" : "no listed channel, refused", "",
 		    false);
 		return 0;
 	}
+	if (wl25_cache_ok && wl25_ms() - wl25_cache_at + 1u <= WL25_CACHE_MS) {   /* age < WL25_CACHE_MS (never with 0) */
+		/* the last full split is young enough: no firmware scan, its frames of the request's channels */
+		matched = wl25_answer(rq);
+		fuxi_wifi_radio_done(rq->seq, 0);
+		wl25_hits++; wl25_ok++; wl25_fails = 0;
+		wl25_say_hit(number, rq->seq, wl25_ms() - wl25_cache_at, matched);
+		return 0;
+	}
+	/* the scan: the whole list W23 gave the firmware, the 2.4 GHz channels first (the list is in band order) */
+	for (uint32_t i = 0; i < nlist && i < WLSCAN_NCHAN; i++) {
+		mhz[n] = (uint16_t)wlscan_chan(i);
+		n24 += mhz[n++] < 3000u;
+	}
 	dwell = rq->dwell_ms >= 50u && rq->dwell_ms <= 200u ? rq->dwell_ms : WLSCAN_DWELL_PASSIVE;
 	parts = (n24 ? 1u : 0u) + (n > n24 ? 1u : 0u);
 	first = wl25_sent == 0u;  /* the first request that sends a START_SCAN: its parts take the watches and the first-scan lines */
 	wlscan_init(&wl_scan, n);
 	wl_scan.heard = wl25_heard;
+	wl25_cache_ok = false; wl25_cache_n = 0;  /* refilled by this split; whole only if it completes */
 	wl25_seq = rq->seq;
 	wl25_scan_handed = wl25_scan_kept = 0;
 	wl25_other_id = 0;
@@ -7465,6 +7565,12 @@ wl25_scan(const struct fuxi_wifi_radio_request *rq, uint32_t nlist)
 	}
 	wl25_seq = 0;
 	ms = wl25_ms() - r0;
+	if (status == 0) {
+		wl25_cache_ok = true; wl25_cache_at = wl25_ms();   /* the 5 GHz part (the last) has completed */
+		matched = wl25_answer(rq);
+	} else {
+		wl25_cache_n = 0;   /* a split that did not complete is no result: nothing cached, nothing handed over */
+	}
 	fuxi_wifi_radio_done(rq->seq, status);
 	if (!ended) {
 		/* iOS has its answer; the next START_SCAN waits for this scan's end, 3 s after its STOP_SCAN at most */
@@ -7503,12 +7609,12 @@ wl25_end(void)
 	wl25_on = false;
 	/* two lines: the console keeps 254 bytes of a line (C2b's rule) */
 	printf("FUXI WLAN: W25 service end: %s after %llu s; scans %u (completed %u, failed %u, cancelled %u, refused %u), "
-	    "frames to iOS %u kept %u; stops confirmed late %u, scan events of another id %u, credit waits %u;\n", wl25_why,
+	    "cache hits %u, frames to iOS %u kept %u; stops confirmed late %u, scan events of another id %u, credit waits %u;\n", wl25_why,
 	    (unsigned long long)((wl25_ms() - wl25_t0) / 1000u), wl25_scans, wl25_ok, wl25_failed, wl25_cancelled, wl25_refused,
-	    wl25_handed, wl25_kept, wl25_late, wl25_other, wl25_waits);
-	printf("FUXI WLAN: W25 service end rings: rx CE1 %u/%u CE2 %u/%u tx CE3 %u/%u credits %d\n", wl_ce.pipe[1].posted,
-	    wl_ce.pipe[1].reaped, wl_ce.pipe[2].posted, wl_ce.pipe[2].reaped, wl_ce.pipe[3].posted, wl_ce.pipe[3].reaped,
-	    wl_htc.wmi_eid < WLHTC_EPS ? wl_htc.ep[wl_htc.wmi_eid].credits : -1);
+	    wl25_hits, wl25_handed, wl25_kept, wl25_late, wl25_other, wl25_waits);
+	printf("FUXI WLAN: W25 service end rings: rx CE1 %u/%u CE2 %u/%u tx CE3 %u/%u credits %d, cache frames not kept %u\n",
+	    wl_ce.pipe[1].posted, wl_ce.pipe[1].reaped, wl_ce.pipe[2].posted, wl_ce.pipe[2].reaped, wl_ce.pipe[3].posted,
+	    wl_ce.pipe[3].reaped, wl_htc.wmi_eid < WLHTC_EPS ? wl_htc.ep[wl_htc.wmi_eid].credits : -1, wl25_cache_lost);
 }
 
 static int
@@ -7520,6 +7626,7 @@ wl_w25_run(uint32_t n)
 	wl12_stage = WL25_SERVICE;
 	wl25_scans = wl25_sent = wl25_ok = wl25_failed = wl25_cancelled = wl25_refused = wl25_fails = wl25_late = 0;
 	wl25_handed = wl25_kept = wl25_scan_handed = wl25_scan_kept = 0;
+	wl25_hits = wl25_cache_n = wl25_cache_lost = 0; wl25_cache_ok = false; wl25_cache_at = 0;   /* the first request always scans */
 	wl25_other = wl25_id_lines = wl25_waits = 0; wl25_other_id = 0; wl25_ci_off = false;
 	wl25_seq = 0; wl25_proved = false; wl25_why = "a failure (above)";
 	for (uint32_t i = 0; i < n && i < WLSCAN_NCHAN; i++) { list[i] = (uint16_t)wlscan_chan(i); low += list[i] < 3000u; }
