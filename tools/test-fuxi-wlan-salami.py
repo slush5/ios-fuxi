@@ -52,6 +52,9 @@ Host-only, synthetic cmd-db and RSC registers, fake boot-args and a fake ADT
     0x04 INIT IPA_DISABLE, 0x08 FSE/FISA) and lists them in a W30 line; absent or
     0 = none and no W30 line; negative, bits outside 0xf, 0x02 without fuxiwlanw29
     0x02, 0x08 without w20 0x800, without 0x4000 or qrtr 7 refused.
+  - HD1: fuxiwlandiag (cmdline and ADT /defaults), any stage: 0x01 hang window,
+    0x02 force-wake reads, listed in the HD1 selected line; absent or 0 = no HD1
+    line; negative or bits outside 0x3 refused before any access.
 """
 from pathlib import Path
 import importlib.util
@@ -713,6 +716,15 @@ def gate_suite(tmp, mk):
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=5 fuxiwlanvrx=1', 0, 0,
          'W20 fuxiwlanvrx 0x1 needs fuxiwlanqrtr=7 with w20 0x4000; refused'),
         ('fuxiwlan=11 fuxiwlansalami=1 fuxiwlanvrx=4', 0, 0, 'W20 fuxiwlanvrx 0x4 needs fuxiwlanqrtr=7 with w20 0x4000; refused'),
+        # HD1: fuxiwlandiag at any stage, 0x01 hang window, 0x02 force-wake reads; 0 = none (no HD1 line); other bits refused
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=5 fuxiwlandiag=3', 1, 28,
+         'HD1 selected fuxiwlandiag 0x3: hang window hexdump yes, force-wake reads yes; read-only, no register write, nothing sent'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32514 fuxiwlandiag=1', 1, 28,
+         'fuxiwlandiag 0x1: hang window hexdump yes, force-wake reads no'),
+        ('fuxiwlan=11 fuxiwlansalami=1 fuxiwlandiag=2', 1, 11, 'fuxiwlandiag 0x2: hang window hexdump no, force-wake reads yes'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlandiag=0', 1, 28, 'W20 selected qrtr=7'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlandiag=4', 0, 0, 'HD1 fuxiwlandiag 0x4 refused: bits 0x3 only'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlandiag=-1', 0, 0, 'HD1 fuxiwlandiag 0xffffffff refused'),
     ]
     for args, starts, limit, text in cases:
         s, lim, names, out, reads = run(salami, args)
@@ -748,6 +760,8 @@ def gate_suite(tmp, mk):
         assert ('W30' in out) == w30, (args, out)
         if mvrx and int(mvrx[1], 0) and not w30:
             assert 'fuxiwlanvrx' in out and 'refused' in out, (args, out)
+        mhd = re.search(r'fuxiwlandiag=(\S+)', args)  # HD1: a line only with a non-zero fuxiwlandiag
+        assert ('HD1' in out) == bool(mhd and int(mhd[1], 0)), (args, out)
     # Firmware names: salami Android defaults, boot-arg overrides, bad names refused.
     s, _, names, out, _ = run(salami, f'fuxiwlan=1 fuxiwlansalami=1 {W14}')
     assert s == 1 and names == {'bdf': 'bdwlan.b0e', 'regdb': 'regdb.bin', 'm3': 'phy_ucode20.elf', 'amss': ''}, names
@@ -794,6 +808,8 @@ def gate_suite(tmp, mk):
         'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw20=0x45 fuxiwlanmlo=0x17d',
         'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7',
         'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=0x92',
+        'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlandiag=3',
+        'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlandiag=8',
         'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=8',
         'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=5 fuxiwlanw20=4',
         # C2c: every kit value (3- and 4-digit w20) and two refusals

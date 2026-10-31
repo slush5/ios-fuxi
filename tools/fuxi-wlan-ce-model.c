@@ -155,6 +155,7 @@ static void wl_sleep(unsigned ms);
 static unsigned wl_m6o_cap(unsigned id);
 static void wl_wlfw_diagnostics(const char *label);
 static void wl5_status(unsigned step);
+static void wl_hd_diag(const char *where);  /* HD1: fuxiwlandiag is off here; tools/test-fuxi-wlan-hd.py runs it */
 static int wl_smmu_fault(unsigned step);
 static int wl_m6o_msi_undo(void);
 static int wl_m6o_undo(bool contained);
@@ -2296,6 +2297,7 @@ static void wl_sleep(unsigned ms) { now += ms; sleeps += ms; dev_tick(); }
 static unsigned wl_m6o_cap(unsigned id) { CHECK(id == 0x10, "capability other than PCIe"); return 0x70; }
 static void wl_wlfw_diagnostics(const char *label) { printf("FUXI WLAN: %s diagnostic (model)\n", label); }
 static void wl5_status(unsigned step) { (void)step; }
+static void wl_hd_diag(const char *where) { (void)where; }
 static int wl_smmu_fault(unsigned step) { (void)step; return 0; }
 static int wl_m6o_msi_undo(void) { return 0; }
 static int wl_m6o_undo(bool contained) { (void)contained; return 0; }

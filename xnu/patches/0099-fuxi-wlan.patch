@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,7983 @@
+@@ -0,0 +1,8193 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -86,6 +86,10 @@
 + *                 fuxiwlanw29 0x02; 0x04 WMI INIT flag1 IPA_DISABLE; 0x08 HTT FSE_SETUP/FISA_CFG,
 + *                 needs w20 0x800); absent or 0 = none; unknown bits or any other use refused
 + *                 (docs-lanes/wlan-mgmt-rx-study.md)
++ *   fuxiwlandiag=N  HD1, any stage, read-only: 0x01 hexdump of the QMI hang window in our
++ *                 first type-1 segment, 0x02 raw BAR 0x3004 / SoC 0x01E04040 force-wake state,
++ *                 at every BHI ERRDBG line and before the MHI reset; absent or 0 = none;
++ *                 other bits refused (docs-lanes/wlan-hd1.md)
 + * Salami (FUXI_SALAMI, OnePlus 11, K-W1): the driver runs only when
 + * fuxiwlansalami=1 is present as well; its absence or any other value refuses
 + * before the thread starts, as do fuxiwlanseq with cyclerails and any invalid
@@ -731,6 +735,8 @@
 +}
 +/* ---- end milestone 6i ---- */
 +
++static void wl_hd_diag(const char *where);   /* HD1 (fuxiwlandiag), defined after wl_soc_read */
++
 +/* ---- milestone 4 ---- */
 +#define WL4_MAGIC   0x574c0004u
 +#define WL4_STEPS   16u
@@ -861,6 +867,7 @@
 +		r[38] = wl_prd(WL_DBI + 0x04);
 +		r[39] = wl_prd(WL_EPCFG + 0x04);
 +		printf("FUXI WLAN: RC cmd/status %#x EP cmd/status %#x\n", r[38], r[39]);
++		wl_hd_diag("M4 step 16");   /* HD1: silent without fuxiwlandiag */
 +		return wl3_faults ? 4 : 0;
 +	}
 +	}
@@ -972,6 +979,17 @@
 +static bool wl_w20, wl_w23;
 +static unsigned wl20_bits;
 +static unsigned wl20_qrtr; /* 6 or 7 when wl_w20, for the init lines */
++/* HD1 (fuxiwlandiag, docs-lanes/wlan-fw-hang-study.md 4.1 and 4.3): read-only
++ * lines at every BHI ERRDBG print and once more before the MHI reset. Absent
++ * or 0 = none, the boot exactly as without the knob; bits outside WLHD_ALL
++ * refuse the run before any access. */
++#define WLHD_HANG 0x01u       /* hexdump of the hang window in our first type-1 (HOST_DDR) segment */
++#define WLHD_WAKE 0x02u       /* raw BAR 0x3004 and SoC 0x01E04040 (PCIE_SCRATCH_0) reads, no write */
++#define WLHD_ALL 0x03u
++static unsigned wlhd_bits;
++static bool wlhd_cap_off_seen, wlhd_cap_len_seen;   /* QMI CAP TLV 0x1e / 0x1f, this boot */
++static uint32_t wlhd_cap_off;
++static unsigned wlhd_cap_len;
 +/* ---- P17: opt-in WCN7850 MODE-silence probes (fuxiwlanmlo bits >= 4) ----
 + * Low two bits keep the W12 meaning (1 PHY_CAP, 2 omit MLO). Bits:
 + *   0x004 HOSTMEM   HOST_CAP vendor TLV 0x33 (u8 1, "host memory on demand")
@@ -1409,6 +1427,21 @@
 +		printf("FUXI WLAN: W20 fuxiwlanvrx %#x needs fuxiwlanqrtr=7 with w20 0x4000; refused\n", (unsigned)vrx);
 +	}
 +	wl_stop22 = stop22 == 1; wl_keep = keep == 1;
++	wlhd_bits = 0; wlhd_cap_off_seen = wlhd_cap_len_seen = false; wlhd_cap_off = 0; wlhd_cap_len = 0;
++	{   /* HD1: fuxiwlandiag, any stage; absent or 0 = no HD1 line and no HD1 access */
++		int diag = 0;
++		if (PE_parse_boot_argn("fuxiwlandiag", &diag, sizeof(diag)) && diag) {
++			if (diag < 0 || ((unsigned)diag & ~WLHD_ALL)) {
++				wl_variant_invalid = true;
++				printf("FUXI WLAN: HD1 fuxiwlandiag %#x refused: bits 0x3 only\n", (unsigned)diag);
++			} else {
++				wlhd_bits = (unsigned)diag;
++				printf("FUXI WLAN: HD1 selected fuxiwlandiag %#x: hang window hexdump %s, force-wake reads %s; "
++				    "read-only, no register write, nothing sent\n", wlhd_bits, (wlhd_bits & WLHD_HANG) ? "yes" : "no",
++				    (wlhd_bits & WLHD_WAKE) ? "yes" : "no");
++			}
++		}
++	}
 +	if (wl_w14) {
 +		bzero(wl14_bdf_name, sizeof(wl14_bdf_name));
 +		if (!PE_parse_boot_arg_str("fuxiwlanbdf", wl14_bdf_name, sizeof(wl14_bdf_name))) {
@@ -1817,6 +1850,172 @@
 +	return e || fw_faults;
 +}
 +
++/* ---- HD1 (fuxiwlandiag): read-only hang window and force-wake state ----
++ * Called where the lane prints its BHI ERRDBG lines (M4 step 16, wl5_status
++ * and so wl_bhi_diag, the M6f boot logs, wl_wlfw_diagnostics, the W28 crash
++ * line) and in wl5_abort once more before the MHI reset; every call returns at
++ * once without the knob.
++ * 0x01: the first type-1 (HOST_DDR) segment we allocated for QMI
++ * REQUEST_MEM/RESPOND_MEM (wl_target, freed only in wl5_abort after the MHI
++ * reset, never reallocated: a duplicate REQUEST_MEM is refused), 384 bytes at
++ * CAP TLV 0x1e hang_data_addr_offset (offset 0 without the TLV), cut to the
++ * segment; our own Normal-NC DMA memory, read with byte loads, never written.
++ * Rows of 64 bytes, then the printable ASCII runs of 4 or more on one line.
++ * 0x02: two device reads through wlhd_reg_ok's allowlist, nothing else:
++ *   BAR 0x3004 PCIE_SOC_WAKE: L19 pci.h:26 PCIE_SOC_WAKE_PCIE_LOCAL_REG (written
++ *     only at pci.c:342-346); vendor if_pci.h:36 PCIE_REG_WAKE_UMAC_OFFSET, the
++ *     force-wake write of if_pci.c:4063. Below the 512 KiB unwindowed range,
++ *     in our mapped first 16 KiB: one wl_mrd.
++ *   SoC 0x01E04040 PCIE_SCRATCH_0: vendor if_pci.h:38 (0x01E04000 + 0x40), read
++ *     by hif_read32_mb through the register window (hif_io32.h:33-45, :279-296),
++ *     polled for 0x2 = UMAC awake, 0x1 while powered down (if_pci.c:4011-4023,
++ *     :4070-4078). L19 names it pci.h:23 PCIE_SCRATCH_0_SOC_PCIE_REG as BAR
++ *     offset 0x4040 (its comments on pci.h:22/25 are swapped) and never uses it;
++ *     0x4040 is outside our 16 KiB map, so the vendor path through wl_soc_read:
++ *     window 0x3c, the read, the window restored and read back. L19 selects the
++ *     same dynamic window on WCN7850 (pci.c:163-182, :1214-1238,
++ *     static_window_map false at :1635).
++ *   The window register 0x310c is read before and after to show it restored;
++ *   wl_soc_read's own select and restore are its only writes (the existing
++ *   helper; refused after a latched fault). No force-wake request, no MHI wake
++ *   vote, no doorbell, nothing sent to the firmware. */
++#define WLHD_LEN 384u                 /* QMI CAP hang_data_length on this firmware */
++#define WLHD_ROW 64u
++#define WLHD_RUN 4u
++#define WLHD_ASCII 192u               /* run text per line: the ascii line stays within 254 bytes */
++#define WLHD_SOC_WAKE 0x3004u
++#define WLHD_SCRATCH0 0x01e04040u
++#define WLHD_WINREG 0x310cu
++
++static bool
++wlhd_reg_ok(uint32_t off, bool window)
++{
++	return window ? off == WLHD_SCRATCH0 : (off == WLHD_SOC_WAKE || off == WLHD_WINREG);
++}
++
++/* One allowlisted read; ~0u and *err set otherwise. */
++static uint32_t
++wlhd_rd(uint32_t off, bool window, int *err)
++{
++	uint32_t v = ~0u;
++	const unsigned before = fw_faults;
++	if (!wlhd_reg_ok(off, window)) { *err = 1; return ~0u; }
++	if (window) { *err = wl_soc_read(off, &v); }
++	else { v = wl_mrd(off); *err = fw_faults != before; }
++	return v;
++}
++
++/* The first type-1 segment that holds an allocation, or -1. */
++static int
++wlhd_segment(void)
++{
++	for (unsigned i = 0; i < wl_target_n && i < WL_TARGET_MAX; i++) {
++		if (wl_target_type[i] == 1u && wl_target[i].va && wl_target[i].nc && wl_target_size[i] &&
++		    wl_target[i].size >= wl_target_size[i]) { return (int)i; }
++	}
++	return -1;
++}
++
++/* One row: n <= WLHD_ROW bytes as hex pairs, a space after every four; cap >= 2*WLHD_ROW + WLHD_ROW/4. */
++static void
++wlhd_hex(char *out, unsigned cap, const uint8_t *p, unsigned n)
++{
++	static const char digit[] = "0123456789abcdef";
++	unsigned o = 0;
++	for (unsigned i = 0; i < n && i < WLHD_ROW && o + 4 <= cap; i++) {
++		if (i && !(i & 3u)) { out[o++] = ' '; }
++		out[o++] = digit[p[i] >> 4]; out[o++] = digit[p[i] & 15u];
++	}
++	out[o < cap ? o : cap - 1] = 0;
++}
++
++/* The printable (0x20..0x7e) runs of at least WLHD_RUN bytes joined by '|' into
++ * out (cap - 1 characters at most); counts every run and character; true when cut. */
++static bool
++wlhd_ascii(char *out, unsigned cap, const uint8_t *p, unsigned n, unsigned *runs, unsigned *chars)
++{
++	unsigned o = 0;
++	bool cut = false;
++	*runs = *chars = 0;
++	for (unsigned i = 0; i < n;) {
++		unsigned j = i;
++		while (j < n && p[j] >= 0x20u && p[j] <= 0x7eu) { j++; }
++		if (j - i >= WLHD_RUN) {
++			if ((*runs)++ && !cut) {
++				if (o + 1 < cap) { out[o++] = '|'; } else { cut = true; }
++			}
++			*chars += j - i;
++			for (unsigned k = i; k < j && !cut; k++) {
++				if (o + 1 < cap) { out[o++] = (char)p[k]; } else { cut = true; }
++			}
++		}
++		i = j + 1;   /* past the run and the byte that ended it */
++	}
++	out[o] = 0;
++	return cut;
++}
++
++static void
++wlhd_hang(const char *where)
++{
++	const int s = wlhd_segment();
++	if (s < 0) {
++		printf("FUXI WLAN: HD1 hang %.40s: no type-1 segment allocated (requested %u); nothing read\n", where, wl_target_n);
++		return;
++	}
++	const struct wl_dma *d = &wl_target[s];
++	const uint32_t size = wl_target_size[s], off = wlhd_cap_off_seen ? wlhd_cap_off : 0;
++	const unsigned len = off < size ? (size - off < WLHD_LEN ? size - off : WLHD_LEN) : 0;
++	printf("FUXI WLAN: HD1 hang %.40s: segment %d type 1 size %u IOVA %#llx; offset %#x (%s), cap length %u%s; dump %u bytes\n",
++	    where, s, size, (unsigned long long)d->iova, off, wlhd_cap_off_seen ? "cap 0x1e" : "no cap 0x1e, 0", wlhd_cap_len,
++	    wlhd_cap_len_seen ? "" : " (no cap 0x1f)", len);
++	if (!len) {
++		printf("FUXI WLAN: HD1 hang %.40s: offset %#x not inside the segment; nothing read\n", where, off);
++		return;
++	}
++	uint8_t buf[WLHD_LEN];
++	const volatile uint8_t *src = (const volatile uint8_t *)(d->va + off);
++	__asm__ volatile("dsb sy" ::: "memory");
++	for (unsigned i = 0; i < len; i++) { buf[i] = src[i]; }   /* loads only: our NC DMA buffer is never written here */
++	char text[WLHD_ASCII];
++	_Static_assert(sizeof(text) > 2 * WLHD_ROW + WLHD_ROW / 4, "a hex row fits the text buffer");
++	for (unsigned r = 0; r < len; r += WLHD_ROW) {
++		wlhd_hex(text, sizeof(text), buf + r, len - r < WLHD_ROW ? len - r : WLHD_ROW);
++		printf("FUXI WLAN: HD1 hex +%#x: %s\n", off + r, text);
++	}
++	unsigned runs, chars;
++	const bool cut = wlhd_ascii(text, sizeof(text), buf, len, &runs, &chars);
++	printf("FUXI WLAN: HD1 ascii %u runs %u chars%s: %s\n", runs, chars, cut ? " (cut)" : "", runs ? text : "-");
++}
++
++static void
++wlhd_wake(const char *where)
++{
++	if (!wl_mhi_valid) {
++		printf("FUXI WLAN: HD1 wake %.40s: not read (BAR/MHI not established)\n", where);
++		return;
++	}
++	const unsigned before = fw_faults;
++	int e_win0 = 0, e_wake = 0, e_scr = 0, e_win1 = 0;
++	const uint32_t win0 = wlhd_rd(WLHD_WINREG, false, &e_win0);
++	const uint32_t wake = wlhd_rd(WLHD_SOC_WAKE, false, &e_wake);
++	const uint32_t scr = wlhd_rd(WLHD_SCRATCH0, true, &e_scr);
++	const uint32_t win1 = wlhd_rd(WLHD_WINREG, false, &e_win1);
++	printf("FUXI WLAN: HD1 wake %.40s: soc-wake 0x3004 %#x%s, scratch0 0x1e04040 %#x%s (%s); win %#x->%#x %s; "
++	    "faults %u; read-only\n", where, wake, e_wake ? " (failed)" : "", scr, e_scr ? " (not read)" : "",
++	    e_scr ? "unknown" : scr == 0x2u ? "umac awake" : scr == 0x1u ? "umac down" : "other",
++	    win0, win1, e_win0 || e_win1 || win0 != win1 ? "NOT restored" : "restored", fw_faults - before);
++}
++
++static void
++wl_hd_diag(const char *where)
++{
++	if (!wlhd_bits) { return; }
++	if (wlhd_bits & WLHD_HANG) { wlhd_hang(where); }
++	if (wlhd_bits & WLHD_WAKE) { wlhd_wake(where); }
++}
++/* ---- end HD1 ---- */
++
 +static int
 +wl_pre_bhi(void)
 +{
@@ -1885,6 +2084,7 @@
 +static void
 +wl_boot_logs(void)
 +{
++	wl_hd_diag("M6f boot logs");   /* HD1: before the PCIE_BHI_ERRDBG2/3 lines; silent without fuxiwlandiag */
 +	uint32_t ee = wl_mrd(wl_bhi + 0x28);
 +	if (fw_faults || (ee != 0 && ee != 1)) {
 +		printf("FUXI WLAN: M6f boot logs skipped EE %#x faults %u\n", ee, fw_faults); return;
@@ -1934,6 +2134,11 @@
 +	printf("FUXI WLAN: M6 step %u EE %#x (%s) MHISTATUS %#x (%s ready %u) MHICTRL %#x BHI %#x ERRCODE %#x ERRDBG %#x/%#x/%#x BHIE %#x EPcmd %#x\n",
 +	    step, r[64], wl_mhi_ee(r[64]), r[65], wl_mhi_state((r[65] >> 8) & 255),
 +	    r[65] & 1, r[66], r[67], r[68], r[69], r[70], r[71], r[72], r[73]);
++	if (wlhd_bits) {   /* HD1 (also wl_bhi_diag's point, through its wl5_status(22)) */
++		char where[16];
++		snprintf(where, sizeof(where), "M6 step %u", step);
++		wl_hd_diag(where);
++	}
 +}
 +
 +enum {
@@ -3831,9 +4036,11 @@
 +			break;
 +		case 0x1e:
 +			if (n != 4) { return wl_w11_fail("hang_data_addr_offset size"); }
++			wlhd_cap_off = wl_get32(v); wlhd_cap_off_seen = true;   /* HD1: kept for the hang window, no other use */
 +			printf("FUXI WLAN: W14 cap hang_data_addr_offset %#x (reported only)\n", wl_get32(v)); break;
 +		case 0x1f:
 +			if (n != 2) { return wl_w11_fail("hang_data_length size"); }
++			wlhd_cap_len = wl_get16(v); wlhd_cap_len_seen = true;
 +			printf("FUXI WLAN: W14 cap hang_data_length %u (reported only)\n", wl_get16(v)); break;
 +		case 0x22:
 +			/* Vendor protocol fact: u8 count, then 32-byte name + four u32s.
@@ -4681,6 +4888,7 @@
 +		printf("FUXI WLAN: %s RDDM observed; dump not collected; contain\n", wl_w15 && wl12_stage >= WL15_INI ? "W15" : "W13");
 +	}
 +	if ((wl17_bits & WL17_ERRDEC) && !fw_faults) { wl17_errdec(label, ee, code, d1, d2, d3); }
++	wl_hd_diag(label);   /* HD1: silent without fuxiwlandiag */
 +}
 +
 +static void
@@ -6310,6 +6518,7 @@
 +	printf("FUXI WLAN: W28 crash %s: mhistatus %#x (state %#x syserr %u) ee %#x bhi errcode %#x errdbg %#x/%#x/%#x; "
 +	    "access-faults %u; read-only\n", where, v[0], (v[0] >> 8) & 0xffu, (v[0] >> 2) & 1u, v[1], v[2], v[3], v[4], v[5],
 +	    fw_faults - before);
++	wl_hd_diag(where);   /* HD1: silent without fuxiwlandiag */
 +}
 +
 +/* One monitor status SRING_SETUP through wl_ce_send on the HTT endpoint (CE4,
@@ -7656,6 +7865,7 @@
 +	wl5_status(step);
 +	(void)wl_smmu_fault(step);
 +	wl28_crash("contain before MHI reset");  /* C2e: read-only; silent without w20 0x2000 */
++	wl_hd_diag("contain before MHI reset");  /* HD1: read-only, before the reset and every free; silent without fuxiwlandiag */
 +	int reset_bad = 0;
 +	if (wl_mhi_valid) {
 +		reset_bad = wl_contain_wr((uint64_t)WL_BAR0 + 0x38, 2);
