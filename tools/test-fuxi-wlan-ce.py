@@ -87,6 +87,11 @@ $KIWI_VENDOR_SRC, else skipped; mutants).
 CH1 (fuxiwlanch): a default-off drop mask over the 38-entry passive scan list (bits 0..24 the 5 GHz entries in list
 order, bit 25 the 2.4 GHz channels, w20 0x10 applied on top); the one filtered list reaches SCAN_CHAN_LIST, START_SCAN
 and every printed count (model s_ch1_*; static_ch1; mutants).
+CH1 split (fuxiwlanch bit 26, default off): two passive scans back to back on the same vdev, the kept 2.4 GHz channels
+(id 0xa000) and then the kept 5 GHz channels (id 0xa001), after one SCAN_CHAN_LIST of the whole kept list; the second only
+after the first one's COMPLETED (or DEQUEUED); one BSS table, one report, one set of stats; containment's STOP_SCAN names the
+scan in flight (model s_split_*: the firmware expects the scans, ids, ranges and order from the owner's description;
+static_split; mutants in C2CH_MUTANTS).
 No device, no network.
 """
 from pathlib import Path
@@ -160,7 +165,9 @@ def static_checks():
     assert DRIVER.count('WL20_FULLBSSID') == 1  # the define only: refused at every qrtr
     # Passive only: the flags, no SSID/IE/probe words, the broadcast placeholder BSSID only.
     assert '#define WLSCAN_FLAGS (WLWMI_SCAN_FLAG_PASSIVE | WLWMI_SCAN_CHAN_STAT_EVENT)' in HEADER
-    enc = between(HEADER, 'static inline int\nwlwmi_encode_start_scan(', '\n}\n')
+    enc = between(HEADER, 'static inline int\nwlwmi_encode_start_scan_range(', '\n}\n')   # CH1 split: the encoder body takes the id and the range
+    assert 'return wlwmi_encode_start_scan_range(WLWMI_SCAN_ID, 0, n, max_time, out, room, len);' in \
+        between(HEADER, 'static inline int\nwlwmi_encode_start_scan(', '\n}\n')   # the one-scan form is id 0xa000 from the start of the list
     for word in ('WLWMI_SS_NUM_SSIDS', 'WLWMI_SS_IE_LEN', 'WLWMI_SS_N_PROBES', 'WLWMI_SS_PRIORITY', 'WLWMI_SS_IE_BITMAP',
                  'WLWMI_SS_MAC_ADDR', 'WLWMI_SS_CTRL_FLAGS_EXT'):
         assert word not in enc, word
@@ -208,6 +215,7 @@ def static_checks():
     static_c2f()
     static_c2h()
     static_ch1()
+    static_split()
 
 
 def static_ch1():
@@ -222,15 +230,15 @@ def static_ch1():
     assert cfg.count('PE_parse_boot_argn("fuxiwlanch", &chm, sizeof(chm))') == 1 and 'wl23_chmask = 0;' in cfg
     assert 'else if (chm_given) { wl23_chmask = (unsigned)chm; }' in cfg and strip_comments(cfg).count('wl23_chmask = ') == 2
     assert 'if (chm_given && chm && !wl_w23) {' in cfg and 'if (!wl_w20 && chm_given && chm) {' in cfg
-    assert ('} else if (chm_given && chm && (chm < 0 || ((unsigned)chm & ~WL23_CH_VALID) ||\n'
+    assert ('} else if (chm_given && chm && (chm < 0 || ((unsigned)chm & ~WL23_CH_KNOB) ||\n'
             '\t\t    !WL23_CH_KEPT(WL23_CH_EFF((unsigned)chm, !!(wl20_bits & WL20_BAND24))))) {') in cfg
     assert cfg.index('wl30_mask = (unsigned)vrx;') < cfg.index('wl23_chmask = (unsigned)chm;') < cfg.index('W20 selected qrtr=%d')
-    assert cfg.count('W20 fuxiwlanch %#x needs fuxiwlanqrtr=7; refused') == 2 and cfg.count('W20 fuxiwlanch %#x refused: bits 0..25 only') == 1
+    assert cfg.count('W20 fuxiwlanch %#x needs fuxiwlanqrtr=7; refused') == 2 and cfg.count('W20 fuxiwlanch %#x refused: bits 0..26 only') == 1
     # the scan stage: one filtered list, set before the stage state and every encoder call; n, max time and the counts from it
     w23 = between(drv, 'static int\nwl_w23_run(void)\n{', '\n}\n')
     assert code.count('wlscan_chmask = ') == 1 and w23.count('wlscan_chmask = ') == 1
     assert w23.index('wlscan_chmask = wlscan_mask_eff(wl23_chmask, !!(wl20_bits & WL20_BAND24));') < w23.index('wlscan_init(&wl_scan, n);') < \
-        w23.index('wlwmi_encode_chan_list(') < w23.index('wlwmi_encode_start_scan(n, max_ms,')
+        w23.index('wlwmi_encode_chan_list(') < w23.index('wlwmi_encode_start_scan_range(sid, first, cnt, cmax,')
     assert 'n = wlscan_kept(wlscan_chmask), max_ms = wlscan_max_time(n)' in w23
     assert w23.count('printf("FUXI WLAN: W23 chan mask 0x%x: %u channels kept (2.4 GHz %u, 5 GHz %u)\\n"') == 1
     assert 'if (wl23_chmask) {   /* CH1: silent while the knob is off */' in w23
@@ -245,14 +253,77 @@ def static_ch1():
     # the header: the mask is written only by the driver; both encoders are bounded by the kept count; the list is the same function
     assert 'static uint32_t wlscan_chmask;' in HEADER and HEADER.count('wlscan_chmask =') == 0
     assert 'uint32_t kept = wlscan_kept(wlscan_chmask);\n\tif (!n || n > kept || first > kept - n || total > room) { return 1; }' in HEADER
-    assert 'if (!n || n > wlscan_kept(wlscan_chmask) || total > room) { return 1; }' in HEADER
+    assert ('uint32_t total = wlwmi_start_scan_total(n), kept = wlscan_kept(wlscan_chmask);\n'
+            '\tif (!n || first > kept || n > kept - first || total > room) { return 1; }') in HEADER
     assert HEADER.count('wlscan_chan_full(') == 2 and HEADER.count('wlscan_chan(') >= 3
     assert '_Static_assert(WLSCAN_NCHAN == WLSCAN_NCHAN_24 + WLSCAN_CH_5G_BITS' in HEADER and \
         '_Static_assert(WL23_CH_24 == WLSCAN_CH_24 && WL23_CH_ALL5 == WLSCAN_CH_ALL5 && WL23_CH_VALID == WLSCAN_CH_VALID,' in drv
     assert '#define WLSCAN_FLAGS (WLWMI_SCAN_FLAG_PASSIVE | WLWMI_SCAN_CHAN_STAT_EVENT)' in HEADER   # still passive, whatever the mask
-    print('CH1 static: fuxiwlanch read like every knob, 0 unless valid (bits 0..25, a channel left with w20 0x10 counted, qrtr 7 only), '
+    print('CH1 static: fuxiwlanch read like every knob, 0 unless valid (bits 0..26, a channel left with w20 0x10 counted, qrtr 7 only), '
           'set in one place, the filtered list fixed once before the first encoder call, n / max time / counts from it, the line silent '
           'while off, the header never writes the mask and bounds both encoders by it, the CH1 lines send nothing')
+
+
+def static_split():
+    """CH1 split (fuxiwlanch bit 26): the W23 stage runs one scan, or two with the bit and both bands kept. Bit 26 is read in
+    one place (the scan stage); SCAN_CHAN_LIST is built and sent once, before the scan loop; the loop holds the one START_SCAN
+    send, the id, the range and the max time per scan; the state is re-armed (not re-initialised) after the encode and before
+    the send; only a first scan that ended lets the second start; the report, the W26 COMPLETED watch and the C2b stats are
+    after the loop; containment names the scan in flight; no command, tag or flag is new and nothing here touches a register."""
+    drv = DRIVER
+    code = strip_comments(drv)
+    w23 = between(drv, 'static int\nwl_w23_run(void)\n{', '\n}\n')
+    w23c = strip_comments(w23)
+    stop = strip_comments(between(drv, 'static void\nwl23_stop_scan(void)\n{', '\n}\n'))
+    loop_head = 'for (unsigned sc = 0; ; sc++) {'
+    assert w23.count(loop_head) == 1
+    loop = w23.split(loop_head, 1)[1].split('\n\t}\n', 1)[0]
+    before, after = w23.split(loop_head, 1)[0], w23.split(loop_head, 1)[1].split('\n\t}\n', 1)[1]
+    # the bit: parsed with the others (WL23_CH_KNOB), read only by the scan stage, never by a list function or the header
+    assert '#define WL23_CH_SPLIT (1u << 26)' in drv and '#define WL23_CH_KNOB (WL23_CH_VALID | WL23_CH_SPLIT)' in drv
+    assert 'WL23_CH_SPLIT == WLSCAN_CH_SPLIT && !(WL23_CH_SPLIT & WL23_CH_VALID)' in drv
+    assert '#define WLSCAN_CH_SPLIT (WLSCAN_CH_24 << 1)' in HEADER and 'WLSCAN_CH_SPLIT' not in re.sub(r'#define WLSCAN_CH_SPLIT[^\n]*', '', strip_comments(HEADER))
+    assert w23c.count('WL23_CH_SPLIT') == 2 and code.count('WL23_CH_SPLIT') == 4 + w23c.count('WL23_CH_SPLIT')
+    assert 'const bool split = (wl23_chmask & WL23_CH_SPLIT) && nb24 && n > nb24;' in before and 'const unsigned nscans = split ? 2u : 1u;' in before
+    assert 'const uint32_t nb24 = wlscan_kept24(wlscan_chmask);' in before
+    # one SCAN_CHAN_LIST of the whole kept list, before the loop, never again; the scans only name their band
+    assert w23c.count('wlwmi_encode_chan_list(') == 1 and strip_comments(before).count('wlwmi_encode_chan_list(') == 1
+    assert 'wlwmi_encode_chan_list' not in strip_comments(loop) and 'WMI SCAN_CHAN_LIST' not in loop
+    assert strip_comments(loop).count('wlwmi_encode_start_scan_range(') == 1 and w23c.count('wlwmi_encode_start_scan') == 1
+    assert strip_comments(loop).count('wl_ce_send(eid, cmd, len, "WMI START_SCAN")') == 1 and w23c.count('"WMI START_SCAN"') == 1
+    assert ('const uint32_t first = sc ? nb24 : 0u, cnt = !split ? n : sc ? n - nb24 : nb24, cmax = split ? wlscan_max_time(cnt) : max_ms;') in loop
+    assert 'const uint32_t sid = sc ? WLWMI_SCAN_ID2 : WLWMI_SCAN_ID, fo0 = sc ? wl_scan.foreign : 0u, ci0 = sc ? wl_scan.ci_start : 0u;' in loop
+    assert 'wlwmi_encode_start_scan_range(sid, first, cnt, cmax, cmd, sizeof(cmd), &len)' in loop
+    # per-scan lines carry the id only when there are two; every wait is bounded as before (STARTED 1000 ms, max time + 200 ms)
+    assert 'if (split) { snprintf(tag, sizeof(tag), ", scan id %#x", sid); }' in loop and loop.count('tag);') == 4
+    assert 'wl_ce_wait(WL23_W_STARTED, 1000, "scan STARTED")' in loop and 'w = wl23_wait_done(cmax + 200u, &took);' in loop
+    assert strip_comments(loop).count('wl_ce_wait(') == 1 and strip_comments(loop).count('wl23_wait_done(') == 1
+    # order inside the loop: encode, then the id for containment and the re-arm, then scan_sent, then the send, the STARTED wait, the COMPLETED wait
+    assert loop.index('wlwmi_encode_start_scan_range(') < loop.index('wl23_scan_id = sid;') < loop.index('if (sc) { wlscan_rearm(&wl_scan); }') < \
+        loop.index('wl23_scan_sent = true;') < loop.index('wl_ce_send(eid, cmd, len, "WMI START_SCAN")') < \
+        loop.index('wl23_wait_done(') < loop.index('if (w != 0 || sc + 1u >= nscans) { break; }')
+    assert code.count('wlscan_rearm(') == 1 and strip_comments(HEADER).count('wlscan_rearm(') == 1 and 'wlscan_init' not in loop
+    assert code.count('wl23_scan_id = ') == 2 and strip_comments(loop).count('wl23_scan_id = sid;') == 1
+    # a failure of the first scan leaves the loop through return (START_FAILED, STARTED wait, a failed poll) or break (COMPLETED timeout)
+    assert strip_comments(loop).count('return') == 4 and strip_comments(loop).count('break;') == 1
+    # the single report and the one set of C2b stats come after the last scan
+    assert 'wl26_watch(WLRX_P_STARTED);' in loop and 'wl26_watch(WLRX_P_COMPLETED);' in after and 'wl24_report();' in after
+    assert 'wl24_report' not in loop and 'wl23_stats' not in loop and 'wl26_watch(WLRX_P_COMPLETED)' not in loop
+    assert after.index('wl26_watch(WLRX_P_COMPLETED);') < after.index('wl24_report();') < after.index('if (w == 2) {') < after.index('wl23_stats()')
+    assert w23c.count('wl24_report()') == 1 and w23c.count('wl23_stats()') == 1
+    # containment names the scan in flight, never the first one's constant
+    assert 'const uint32_t w[5] = { 0, wl23_scan_id, WLWMI_SCAN_STOP_ONE, WLWMI_VDEV_ID, wl23_pdev };' in stop and 'WLWMI_SCAN_ID' not in stop
+    # nothing new on the wire: the same WMI encoders, no register access and no allocation in the split lines
+    assert set(re.findall(r'wlwmi_encode_\w+', w23c)) == {'wlwmi_encode_chan_list', 'wlwmi_encode_vdev_create', 'wlwmi_encode_start_scan_range'}
+    assert '#define WLSCAN_FLAGS (WLWMI_SCAN_FLAG_PASSIVE | WLWMI_SCAN_CHAN_STAT_EVENT)' in HEADER
+    for part in (before.split('const uint32_t nb24', 1)[1], loop):
+        assert not re.search(r'wl_pwr|wl_mwr|wl_prd|wl_win|wl_soc|wl_contain_wr|kalloc|malloc|IOMalloc', strip_comments(part))
+    assert '#define WLWMI_SCAN_ID2 0xa001u' in HEADER and '#define WLWMI_SCAN_ID 0xa000u' in HEADER
+    assert 'static uint32_t wl23_scan_id = WLWMI_SCAN_ID;' in drv
+    print('CH1 split static: bit 26 parsed with the others and read only by the scan stage, one SCAN_CHAN_LIST before the loop, one START_SCAN send '
+          'per scan with its own id (0xa000, 0xa001), range and max time, the state re-armed (not re-initialised) after the encode, the second scan '
+          'only after a first that ended, one report, one W26 COMPLETED watch and one set of stats after the loop, containment names the scan in '
+          'flight, no new encoder, command or register access')
 
 
 def c_calls(body, name):
@@ -819,7 +890,8 @@ def static_c2e():
                                                                     'wl_bhi+0x3c'])
     assert code.count('wl28_crash(') == 4  # the declaration, the definition, the timeout, wl5_abort
     w23 = between(drv, 'static int\nwl_w23_run(void)\n{', '\n}\n')
-    assert 'printf("FUXI WLAN: W23 timeout scan COMPLETED (%u ms); report, contain, no retry\\n", took);\n\t\twl28_crash("scan COMPLETED timeout");' in w23
+    assert ('printf("FUXI WLAN: W23 timeout scan COMPLETED (%u ms); report, contain, no retry%s\\n", took, tag);\n'
+            '\t\t\twl28_crash("scan COMPLETED timeout");') in w23
     abort = between(drv, 'static void\nwl5_abort(unsigned step)\n{', '\n}\n')
     assert abort.index('wl_ce_contain(step);') < abort.index('wl28_crash("contain before MHI reset");') < \
         abort.index('reset_bad = wl_contain_wr((uint64_t)WL_BAR0 + 0x38, 2);')
@@ -2124,7 +2196,8 @@ C2CH_MUTANTS = [
      'mask line with the knob off'),
     ('d', 'if (!n) { return wl_w11_fail("W23 chan mask leaves no channel (init refuses this)"); }', '', 'an empty list runs'),
     ('d', 'if (chm_given && chm && !wl_w23) {', 'if (chm_given && chm && 0) {', 'the knob accepted without qrtr 7'),
-    ('d', '((unsigned)chm & ~WL23_CH_VALID)', '((unsigned)chm & ~0x7ffffffu)', 'bit 26 accepted'),
+    ('d', '((unsigned)chm & ~WL23_CH_KNOB)', '((unsigned)chm & ~0xfffffffu)', 'bit 27 accepted'),
+    ('d', '((unsigned)chm & ~WL23_CH_KNOB)', '((unsigned)chm & ~WL23_CH_VALID)', 'bit 26 refused'),
     ('h', 'for (uint32_t i = 0; i < WLSCAN_NCHAN; i++) { n += wlscan_dropped(mask, i) ? 0u : 1u; }',
      'for (uint32_t i = 0; i < WLSCAN_NCHAN; i++) { n += 1u; }', 'kept count ignores the mask'),
     ('h', '((mask >> (i - WLSCAN_NCHAN_24)) & 1u) != 0;', '((mask >> (i - WLSCAN_NCHAN_24 + 1u)) & 1u) != 0;', '5 GHz bits shifted by one'),
@@ -2132,12 +2205,45 @@ C2CH_MUTANTS = [
      'bit 25 is bit 0'),
     ('h', 'if (!n || n > kept || first > kept - n || total > room) { return 1; }',
      'if (!n || n > WLSCAN_NCHAN || first > WLSCAN_NCHAN - n || total > room) { return 1; }', 'chan list bound ignores the mask'),
-    ('h', 'if (!n || n > wlscan_kept(wlscan_chmask) || total > room) { return 1; }',
-     'if (!n || n > WLSCAN_NCHAN || total > room) { return 1; }', 'START_SCAN bound ignores the mask'),
-    ('h', 'wlce_put32(p + 4 + 4 * i, wlscan_chan(i)); }', 'wlce_put32(p + 4 + 4 * i, wlscan_chan_full(i)); }', 'START_SCAN array unfiltered'),
+    ('h', 'if (!n || first > kept || n > kept - first || total > room) { return 1; }',
+     'if (!n || first > kept || n > WLSCAN_NCHAN || total > room) { return 1; }', 'START_SCAN bound ignores the mask'),
+    ('h', 'wlce_put32(p + 4 + 4 * i, wlscan_chan(first + i)); }', 'wlce_put32(p + 4 + 4 * i, wlscan_chan_full(i)); }', 'START_SCAN array unfiltered'),
     ('h', 'uint32_t mhz = wlscan_chan(first + i);', 'uint32_t mhz = wlscan_chan_full(first + i);', 'chan list entries unfiltered'),
     ('h', 'return knob | (band24 ? WLSCAN_CH_ALL5 : 0u);', 'return knob;', 'w20 0x10 not in the effective mask'),
     ('h', '#define WLSCAN_CH_ALL5 (WLSCAN_CH_24 - 1u)', '#define WLSCAN_CH_ALL5 (WLSCAN_CH_24 - 2u)', 'mask layout disagrees with the parser'),
+    # CH1 split (fuxiwlanch bit 26)
+    ('d', 'const bool split = (wl23_chmask & WL23_CH_SPLIT) && nb24 && n > nb24;', 'const bool split = false;', 'the split bit ignored'),
+    ('d', '&& nb24 && n > nb24;', '&& n > nb24;', 'split with no 2.4 GHz channel kept (bit 25)'),
+    ('d', '&& nb24 && n > nb24;', '&& nb24;', 'split with no 5 GHz channel kept (w20 0x10)'),
+    ('d', 'const unsigned nscans = split ? 2u : 1u;', 'const unsigned nscans = 1u;', 'only the first scan runs'),
+    ('d', 'const uint32_t sid = sc ? WLWMI_SCAN_ID2 : WLWMI_SCAN_ID,', 'const uint32_t sid = WLWMI_SCAN_ID,', 'both scans have id 0xa000'),
+    ('d', 'const uint32_t sid = sc ? WLWMI_SCAN_ID2 : WLWMI_SCAN_ID,', 'const uint32_t sid = WLWMI_SCAN_ID2,', 'both scans have id 0xa001'),
+    ('d', 'cnt = !split ? n : sc ? n - nb24 : nb24, cmax', 'cnt = n, cmax', 'every scan carries the whole list'),
+    ('d', 'cnt = !split ? n : sc ? n - nb24 : nb24, cmax', 'cnt = !split ? n : nb24, cmax', 'the second scan repeats the 2.4 GHz range size'),
+    ('d', 'cmax = split ? wlscan_max_time(cnt) : max_ms;', 'cmax = max_ms;', 'max scan time from the whole list in each scan'),
+    ('d', 'const uint32_t first = sc ? nb24 : 0u,', 'const uint32_t first = 0u,', 'the second scan starts at the first channel'),
+    ('d', 'w = wl23_wait_done(cmax + 200u, &took);', 'w = split && !sc ? 0 : wl23_wait_done(cmax + 200u, &took);',
+     'the second START_SCAN is sent before the first COMPLETED'),
+    ('d', 'if (w != 0 || sc + 1u >= nscans) { break; }', 'if (sc + 1u >= nscans) { break; }', 'a second scan after a first that timed out'),
+    ('d', '\t\t\treturn wl_w11_fail("W23 scan START_FAILED");', '\t\t\tif (!sc && split) { continue; }\n\t\t\treturn wl_w11_fail("W23 scan START_FAILED");',
+     'a second scan after a first START_FAILED'),
+    ('d', 'wl23_scan_id = sid;', 'wl23_scan_id = WLWMI_SCAN_ID;', 'containment names the first scan whichever is in flight'),
+    ('d', 'const uint32_t w[5] = { 0, wl23_scan_id, WLWMI_SCAN_STOP_ONE', 'const uint32_t w[5] = { 0, WLWMI_SCAN_ID, WLWMI_SCAN_STOP_ONE',
+     'wrong scan id in the containment STOP_SCAN'),
+    ('d', 'if (sc) { wlscan_rearm(&wl_scan); }', 'if (sc) { wlscan_init(&wl_scan, n); }', 'table not merged: the second scan starts a fresh one'),
+    ('d', 'if (sc) { wlscan_rearm(&wl_scan); }', '', 'the second scan starts on the first one\'s finished state'),
+    ('d', 'fo0 = sc ? wl_scan.foreign : 0u', 'fo0 = 0u', 'the second scan line counts both scans'),
+    ('d', 'if (split) { snprintf(tag, sizeof(tag), ", scan id %#x", sid); }', '', 'no scan id on the per-scan lines'),
+    ('d', '#define WL23_CH_SPLIT (1u << 26)', '#define WL23_CH_SPLIT (1u << 27)', 'the split bit in the wrong place'),
+    ('d', 'wl28_crash("scan COMPLETED timeout");  /* C2e: read-only, before anything else touches the device */',
+     'if (!sc) { wl28_crash("scan COMPLETED timeout"); }', 'the crash line only for the first scan'),
+    ('h', 'wlce_put32(f + 4 * WLWMI_SS_SCAN_ID, id);', 'wlce_put32(f + 4 * WLWMI_SS_SCAN_ID, id ? WLWMI_SCAN_ID : 0u);', 'START_SCAN id fixed'),
+    ('h', 'wlce_put32(p + 4 + 4 * i, wlscan_chan(first + i)); }', 'wlce_put32(p + 4 + 4 * i, wlscan_chan(i)); }', 'START_SCAN range ignores FIRST'),
+    ('h', 's->started = s->done = s->start_failed = s->dequeued = false;', 's->started = s->start_failed = s->dequeued = false;', 'rearm keeps done'),
+    ('h', '\ts->started = s->done = s->start_failed = s->dequeued = false;\n\ts->reason = 0;',
+     '\ts->started = s->done = s->start_failed = s->dequeued = false;\n\ts->reason = 0;\n\ts->nbss = 0; s->frames = 0;', 'rearm drops the table'),
+    ('h', '#define WLWMI_SCAN_ID2 0xa001u', '#define WLWMI_SCAN_ID2 0xa002u', 'the second scan id'),
+    ('h', '#define WLSCAN_CH_SPLIT (WLSCAN_CH_24 << 1)', '#define WLSCAN_CH_SPLIT (WLSCAN_CH_24 << 2)', 'split bit disagrees with the parser'),
 ]
 
 
@@ -3150,7 +3256,7 @@ def main():
     mutants(C2CH_MUTANTS, 'c2ch')
     dash_check()
     print('W20 (fuxiwlanqrtr=6) CE/HTC/WMI, W23 (fuxiwlanqrtr=7) passive scan, C2c (W26), C2d (W27), C2e (W28), C2f (W29), '
-          'C2h (W30) and CH1 (fuxiwlanch) host tests passed')
+          'C2h (W30) and CH1 (fuxiwlanch, with its bit 26 split) host tests passed')
 
 
 if __name__ == '__main__':

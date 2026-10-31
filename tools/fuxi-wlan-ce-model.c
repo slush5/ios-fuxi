@@ -281,6 +281,10 @@ struct cfg {
 	bool mac_hp_silent;                 /* the phone: the firmware fills MAC rings 161/169 but writes no HP into wrp[1]/[9] */
 	bool svc299;                        /* C2h: the firmware advertises WMI_SERVICE_MGMT_RX_REO_SUPPORTED (ext word 1 bit 11) */
 	unsigned srng_reap;                 /* C2h: MGMT_SRNG_REAP events at STARTED */
+	/* CH1 split (fuxiwlanch bit 26) */
+	bool split;                         /* the firmware expects the kept 2.4 GHz channels in one scan (id 0xa000), then the kept 5 GHz ones (0xa001) */
+	unsigned scan_mode2;                /* with split: scan_mode of the second START_SCAN (0 = normal) */
+	bool dequeue_first;                 /* with split: the first scan ends with DEQUEUED instead of COMPLETED */
 };
 static struct cfg C;
 static unsigned restores;
@@ -297,6 +301,10 @@ static bool fw_svc281, guard_bad;
 static uint32_t fw_chains = 2;
 /* C2 firmware: command order step, channels seen, counters */
 static unsigned fw_c2_step, fw_chan_seen, fw_chan_cmds, fw_scan_cmds, fw_stop_cmds, fw_htt_req, fw_stop_pdev;
+/* CH1 split: the id of the scan the firmware last accepted (its events carry it), the one a STOP_SCAN named, and the queue
+ * position of that scan's COMPLETED (delivered once q_head passed it; ~0u = none is coming) */
+static uint32_t fw_scan_id = 0xa000, fw_stop_id = ~0u;
+static unsigned fw_scan_done_q = ~0u;
 static unsigned fw_stats_req;
 static uint64_t fw_stats_at;
 static uint32_t fw_stats_pdev = 1;  /* the pdev the last REQUEST_STATS named; UPDATE_STATS carries it back */
@@ -1524,7 +1532,7 @@ fw_rule_ok(void)  /* C.rx_rule: what the firmware needs before it hands MGMT_RX 
 static void
 fw_scan_event(uint32_t type, uint32_t reason, uint32_t freq, uint32_t vdev, uint32_t at)
 {
-	m_reset(); m_tlv(0x24, 28); m_u32(type); m_u32(reason); m_u32(freq); m_u32(1); m_u32(0xa000); m_u32(vdev); m_u32(at);
+	m_reset(); m_tlv(0x24, 28); m_u32(type); m_u32(reason); m_u32(freq); m_u32(1); m_u32(fw_scan_id); m_u32(vdev); m_u32(at);
 	if (C.bad_scan_tlv && type == 8 && freq == 2437) { mb[0] = 0x40; }  /* TLV length 64: past the event */
 	wmi_out(0x3001, 0, at);
 }
@@ -1606,12 +1614,14 @@ add_frame(unsigned idx, uint32_t snr, unsigned sub, const uint8_t *bssid, uint16
 /* START_SCAN accepted: the scan as a script in time order. Per channel I (150 ms): FOREIGN_CHAN at t0,
  * CHAN_INFO START at t0 + 1, the frames heard there from t0 + 2, CHAN_INFO END at t0 + 148. */
 static void
-fw_scan_script(unsigned n)
+fw_scan_script(unsigned n, unsigned first)
 {
 	uint32_t t = 2;
-	if (C.scan_mode == 1) { fw_scan_event(1u << 6, 4, 0, 0, t); return; }
-	if (C.scan_mode == 2) { return; }
-	if (C.scan_mode == 4) { fw_scan_event(1u << 1, 0, 0, 0, t); return; }
+	const unsigned mode = fw_scan_cmds > 1 && C.scan_mode2 ? C.scan_mode2 : C.scan_mode;   /* CH1 split: the second scan has its own mode */
+	fw_scan_done_q = ~0u;
+	if (mode == 1) { fw_scan_event(1u << 6, 4, 0, 0, t); return; }
+	if (mode == 2) { return; }
+	if (mode == 4) { fw_scan_event(1u << 1, 0, 0, 0, t); return; }
 	fw_scan_event(1u << 0, 0, 0, 0, t);
 	for (unsigned i = 0; i < C.srng_reap; i++) { m_reset(); m_tlv(0x400, 4); m_zero(4); wmi_out(0x700e, 0, t); }  /* C2h */
 	if (C.wrong_vdev) { fw_scan_event(1u << 3, 0, 2412, 3, t); }
@@ -1622,7 +1632,7 @@ fw_scan_script(unsigned n)
 	const unsigned stop_at = wedged ? 15u : crash ? (fw_sel_n ? 3u : 15u) : n;
 	for (unsigned i = 0; i < n && i < stop_at; i++) {
 		uint32_t t0 = 5 + 150 * i, k = 0, heard = 0;
-		const unsigned fi = m_kidx(i);   /* CH1: the full-list index of the i-th scanned channel (i itself with mask 0) */
+		const unsigned fi = m_kidx(first + i);   /* CH1: the full-list index of the i-th scanned channel (i itself with mask 0; FIRST: the split's 5 GHz scan) */
 		for (unsigned j = 0; j < n_beacons; j++) { heard += beacons[j].idx == fi; }
 		/* C2c device actions on this channel (RXDMA frames, error entries, spills, raw pointer words, takes) */
 		if (C.rx_frames) { act(now + t0 + 3, A_FRAMES, fi < 13 ? 0u : 1u, C.rx_frames); }
@@ -1653,7 +1663,10 @@ fw_scan_script(unsigned n)
 		fw_chan_info(1, m_chan(fi), 0, i, 0, t0 + 148);
 	}
 	if (crash) { act(now + 5 + 150 * stop_at, A_CRASH, 0, 0); }
-	if (C.scan_mode != 3 && !wedged && !crash) { fw_scan_event(1u << 1, 0, 0, 0, 5 + 150 * n + 1); }
+	if (mode != 3 && !wedged && !crash) {
+		fw_scan_done_q = q_tail;
+		fw_scan_event(C.dequeue_first && fw_scan_cmds == 1 ? 1u << 4 : 1u << 1, 0, 0, 0, 5 + 150 * n + 1);
+	}
 	if (C.d_late && m_rx_live()) { act(now + C.d_late, A_D2, 0, 20); }  /* C2d: frames while the host contains */
 }
 
@@ -1736,33 +1749,42 @@ fw_c2_cmd(uint32_t id, const uint8_t *pl, uint32_t plen, unsigned need)
 		fw_c2_step = 7;
 	} else if (id == 0x3001) {  /* START_SCAN (wmi.c:2541-2830, mac.c:5335-5366) */
 		uint32_t want[40] = {0};
-		want[0] = 0x4du << 16 | 156u; want[1] = 0xa000; want[2] = 1; want[3] = 0; want[4] = 0; want[5] = 0x5f;
-		want[6] = 50; want[7] = 150; want[8] = 50; want[9] = 500; want[13] = exp_n * 150 * 3 / 2; want[14] = 5;
-		want[15] = 0x11; want[17] = exp_n; want[18] = 1; want[36] = 0; want[37] = 70; want[38] = 70;
-		CHECK(fw_c2_step == 7, "START_SCAN before the vdev was set up");
-		CHECK(plen == 4 + 160 + 4 + 4 * exp_n + 4 + 4 + 8 + 4, "START_SCAN length");
+		/* CH1 split: the scans the owner asked for, written down here from the description: the kept 2.4 GHz channels as
+		 * scan 0xa000, then the kept 5 GHz channels as 0xa001, the second only after the first one's COMPLETED reached
+		 * the host; without the bit one scan over the whole kept list */
+		const unsigned kept24 = (m_chmask >> 25) & 1u ? 0u : 13u, nscans = C.split && kept24 && exp_n > kept24 ? 2u : 1u;
+		const unsigned sc = fw_scan_cmds;
+		CHECK(sc < nscans, "a START_SCAN beyond the scans that were asked for");
+		const unsigned first = sc ? kept24 : 0u, cnt = nscans == 1 ? exp_n : sc ? exp_n - kept24 : kept24;
+		const uint32_t sid = 0xa000u + sc;
+		CHECK(sc == 0 || (fw_scan_done_q != ~0u && q_head > fw_scan_done_q), "START_SCAN before the previous scan's COMPLETED reached the host");
+		want[0] = 0x4du << 16 | 156u; want[1] = sid; want[2] = 1; want[3] = 0; want[4] = 0; want[5] = 0x5f;
+		want[6] = 50; want[7] = 150; want[8] = 50; want[9] = 500; want[13] = cnt * 150 * 3 / 2; want[14] = 5;
+		want[15] = 0x11; want[17] = cnt; want[18] = 1; want[36] = 0; want[37] = 70; want[38] = 70;
+		CHECK(fw_c2_step == (sc ? 8u : 7u), "START_SCAN before the vdev was set up");
+		CHECK(plen == 4 + 160 + 4 + 4 * cnt + 4 + 4 + 8 + 4, "START_SCAN length");
 		for (unsigned i = 0; i < 40; i++) {
 			if (g32(pl + 4 + 4 * i) != want[i]) { fprintf(stderr, "START_SCAN word %u = %#x, want %#x\n", i, g32(pl + 4 + 4 * i), want[i]); fail("START_SCAN"); }
 		}
 		const uint8_t *p = pl + 164;
-		CHECK(g32(p) == (0x10u << 16 | 4 * exp_n), "START_SCAN channel array header");
-		for (unsigned i = 0; i < exp_n; i++) { CHECK(g32(p + 4 + 4 * i) == m_chan_k(i), "START_SCAN channel"); }
-		p += 4 + 4 * exp_n;
+		CHECK(g32(p) == (0x10u << 16 | 4 * cnt), "START_SCAN channel array header");
+		for (unsigned i = 0; i < cnt; i++) { CHECK(g32(p + 4 + 4 * i) == m_chan_k(first + i), "START_SCAN channel"); }
+		p += 4 + 4 * cnt;
 		CHECK(g32(p) == (0x13u << 16), "START_SCAN SSID array is not empty");
 		CHECK(g32(p + 4) == (0x13u << 16 | 8u) && !memcmp(p + 8, "\xff\xff\xff\xff\xff\xff\0\0", 8), "START_SCAN BSSID array");
 		CHECK(g32(p + 16) == (0x11u << 16), "START_SCAN IE array is not empty");
-		fw_scan_cmds++; fw_c2_step = 8;
+		fw_scan_cmds++; fw_c2_step = 8; fw_scan_id = sid;
 		if (C.guard_after_start) { guard_bad = true; }  /* e.g. AMSS left EE 2 or an SMMU CB fault */
 		if (!C.no_start_refund) { fw_refund(need, 1); }
-		fw_scan_script(exp_n);
+		fw_scan_script(cnt, first);
 		/* C2b: a credit drought that ends; queued after the script (the queue is delivered in order) */
 		if (C.no_start_refund && C.start_refund_at) { fw_refund(need, C.start_refund_at); }
 		return;
 	} else if (id == 0x3002) {  /* STOP_SCAN (mac.c:4883-4896, wmi.c:2832-2878) */
 		CHECK(fw_c2_step == 8 && !wl_ce.stopping, "STOP_SCAN without a scan, or after the latch");
-		CHECK(plen == 28 && g32(pl + 4) == (0x4eu << 16 | 20u) && g32(v) == 0 && g32(v + 4) == 0xa000 && g32(v + 8) == 0 &&
-		    g32(v + 12) == 0, "STOP_SCAN requester/scan id/STOP_ONE/vdev");
-		fw_stop_pdev = g32(v + 16);
+		CHECK(plen == 28 && g32(pl + 4) == (0x4eu << 16 | 20u) && g32(v) == 0 && g32(v + 4) == fw_scan_id && g32(v + 8) == 0 &&
+		    g32(v + 12) == 0, "STOP_SCAN requester/scan id (the scan in flight)/STOP_ONE/vdev");
+		fw_stop_pdev = g32(v + 16); fw_stop_id = g32(v + 4);
 		fw_stop_cmds++;
 		return;
 	} else {
@@ -2389,6 +2411,7 @@ reset(void)
 	wl23_lines = wl23_pdev = wl23_htt_major = wl23_htt_minor = wl23_rssi_conv = 0; wl23_guard_bad = false;
 	fw_c2_step = fw_chan_seen = fw_chan_cmds = fw_scan_cmds = fw_stop_cmds = fw_htt_req = 0; fw_stop_pdev = ~0u;
 	n_beacons = 0; wl23_chmask = 0; wlscan_chmask = 0; m_chmask = 0;  /* CH1 */
+	fw_scan_id = 0xa000; fw_stop_id = ~0u; fw_scan_done_q = ~0u; wl23_scan_id = WLWMI_SCAN_ID;  /* CH1 split */
 	memset(&wl_stats, 0, sizeof(wl_stats)); wl23_ci_lines = wl23_ci_drop = 0; fw_stats_req = 0; fw_stats_at = 0; fw_stats_pdev = 1;
 }
 
@@ -6378,6 +6401,358 @@ s_ch1_scan(void)
 	     "w20 0x10 == mask 0x1ffffff on the wire, one channel left, split in four commands, an empty list fails closed, knob off silent");
 }
 
+/* ---- CH1 split (fuxiwlanch bit 26): the kept 2.4 GHz channels as one passive scan, then the kept 5 GHz channels as a second ----
+ * The model firmware (fw_c2_cmd) expects the first START_SCAN with id 0xa000 and the kept 2.4 GHz channels, the second with id
+ * 0xa001 and the kept 5 GHz channels, only after the first scan's COMPLETED (or DEQUEUED) reached the host; one SCAN_CHAN_LIST of
+ * the whole kept list before the first; a STOP_SCAN with the id of the scan in flight. Written down here from the owner's
+ * description, not from the driver. */
+#define LINE_IS(l, lit) (!strncmp((l), (lit), sizeof(lit) - 1))
+
+/* The W24 BSS lines and the summary line of the log: the part a split scan and one scan over the same list must give alike. */
+static char *
+w24_table(void)
+{
+	char *out = calloc(1, loglen + 1), *p = out;
+	for (const char *l = logbuf; *l; ) {
+		const char *nl = strchr(l, '\n');
+		size_t len = nl ? (size_t)(nl - l) + 1 : strlen(l);
+		if (LINE_IS(l, "FUXI WLAN: W24 bss ") || LINE_IS(l, "FUXI WLAN: W24 scan summary ")) { memcpy(p, l, len); p += len; }
+		l += len;
+	}
+	return out;
+}
+
+/* A log without the lines a split adds (the mask line and the split line): what is left must be a plain scan's log. */
+static char *
+log_without_split_lines(void)
+{
+	char *out = calloc(1, loglen + 1), *p = out;
+	for (const char *l = logbuf; *l; ) {
+		const char *nl = strchr(l, '\n');
+		size_t len = nl ? (size_t)(nl - l) + 1 : strlen(l);
+		if (!LINE_IS(l, "FUXI WLAN: W23 chan mask ") && !LINE_IS(l, "FUXI WLAN: W23 split scan: ")) { memcpy(p, l, len); p += len; }
+		l += len;
+	}
+	return out;
+}
+
+/* One split scan: DROP the drop mask (bits 0..25), BITS the w20 bits, EFF the list the model expects (the drop mask with w20 0x10
+ * applied), N its length. */
+static void
+sp_setup(unsigned drop, unsigned bits, unsigned eff, unsigned n)
+{
+	ch1_setup(drop | 1u << 26, bits, eff, n);
+	C.split = true;
+}
+
+/* What the scan hears: the happy frames, and the HomeNet BSSID again on 5200, stronger: one table entry across the two scans. */
+static void
+split_frames(void)
+{
+	happy_frames();
+	add_frame(14, 60, 8, B_HOME, 0x0411, "HomeNet", 7, 0, 40, true);
+}
+
+static void
+s_split_pure(void)
+{
+	static uint8_t a[2048], b[2048];
+	uint32_t len = 0, len2 = 0, seed = 0x6d2b79f5u;
+	CHECK(WL23_CH_SPLIT == 0x4000000u && WL23_CH_KNOB == 0x7ffffffu && WL23_CH_VALID == 0x3ffffffu && WLSCAN_CH_SPLIT == WL23_CH_SPLIT &&
+	    WLWMI_SCAN_ID == 0xa000u && WLWMI_SCAN_ID2 == 0xa001u, "split bit layout and ids");
+	/* the split bit drops nothing: no list function reads it */
+	for (unsigned m = 0; m < 4096; m++) {
+		seed = seed * 1664525u + 1013904223u;
+		uint32_t drop = (m == 0 ? 0u : (seed >> 3) & WL23_CH_VALID);
+		if (m & 1) { seed = seed * 1664525u + 1013904223u; drop &= (seed >> 5); }
+		wlscan_chmask = drop;
+		unsigned n = wlscan_kept(drop), k24 = wlscan_kept24(drop);
+		CHECK(wlscan_kept(drop | WL23_CH_SPLIT) == n && wlscan_kept24(drop | WL23_CH_SPLIT) == k24 && WL23_CH_KEPT(drop | WL23_CH_SPLIT) == n,
+		    "bit 26 changes the kept count");
+		uint32_t full[40];
+		for (unsigned i = 0; i < n; i++) { full[i] = wlscan_chan(i); }
+		wlscan_chmask = drop | WL23_CH_SPLIT;
+		for (unsigned i = 0; i <= n; i++) { CHECK(wlscan_chan(i) == (i < n ? full[i] : 0u), "bit 26 changes the list"); }
+		/* each band is one range of the kept list: the 2.4 GHz entries first (k24 of them), then the 5 GHz ones */
+		for (unsigned i = 0; i < n; i++) { CHECK((full[i] < 3000u) == (i < k24), "bands are not two ranges of the kept list"); }
+		if (k24 && n > k24) {
+			CHECK(wlscan_max_time(k24) == k24 * 225u && wlscan_max_time(n - k24) == (n - k24) * 225u, "per-scan max time");
+		}
+	}
+	/* the START_SCAN encoder: ids, ranges, bounds; the one-scan form is the id 0xa000 range from 0 */
+	wlscan_chmask = 57344;   /* 35 kept: 13 + 22 */
+	CHECK(wlwmi_encode_start_scan_range(0xa000, 0, 13, 2925, a, sizeof(a), &len) == 0 && len == wlwmi_start_scan_total(13) &&
+	    g32(a + 4 + 4 * WLWMI_SS_SCAN_ID) == 0xa000 && g32(a + 4 + 4 * WLWMI_SS_NUM_CHAN) == 13 && g32(a + 4 + 4 * WLWMI_SS_MAX_SCAN_TIME) == 2925 &&
+	    g32(a + 4 + 160) == (0x10u << 16 | 4 * 13) && g32(a + 4 + 160 + 4) == 2412 && g32(a + 4 + 160 + 4 + 4 * 12) == 2472, "scan 0xa000: 13 2.4 GHz channels");
+	CHECK(wlwmi_encode_start_scan_range(0xa001, 13, 22, 4950, a, sizeof(a), &len) == 0 && len == wlwmi_start_scan_total(22) &&
+	    g32(a + 4 + 4 * WLWMI_SS_SCAN_ID) == 0xa001 && g32(a + 4 + 4 * WLWMI_SS_NUM_CHAN) == 22 && g32(a + 4 + 4 * WLWMI_SS_MAX_SCAN_TIME) == 4950 &&
+	    g32(a + 4 + 160) == (0x10u << 16 | 4 * 22) && g32(a + 4 + 160 + 4) == 5180 && g32(a + 4 + 160 + 4 + 4 * 12) == 5580 &&
+	    g32(a + 4 + 160 + 4 + 4 * 13) == 5660 && g32(a + 4 + 160 + 4 + 4 * 21) == 5825, "scan 0xa001: 22 5 GHz channels, 5600/5620/5640 absent");
+	CHECK(wlwmi_encode_start_scan_range(0xa001, 13, 23, 1, a, sizeof(a), &len) == 1 && wlwmi_encode_start_scan_range(0xa001, 36, 1, 1, a, sizeof(a), &len) == 1 &&
+	    wlwmi_encode_start_scan_range(0xa001, 35, 1, 1, a, sizeof(a), &len) == 1 && wlwmi_encode_start_scan_range(0xa001, 34, 1, 1, a, sizeof(a), &len) == 0 &&
+	    wlwmi_encode_start_scan_range(0xa001, 13, 0, 1, a, sizeof(a), &len) == 1 && wlwmi_encode_start_scan_range(0xa001, 0xffffffffu, 1, 1, a, sizeof(a), &len) == 1 &&
+	    wlwmi_encode_start_scan_range(0xa001, 13, 22, 1, a, wlwmi_start_scan_total(22) - 1, &len) == 1, "range bounds");
+	for (uint32_t m = 0; m < 4; m++) {
+		wlscan_chmask = m == 0 ? 0u : m == 1 ? 57344u : m == 2 ? WL23_CH_24 : 0x1fffffeu;
+		unsigned n = wlscan_kept(wlscan_chmask);
+		CHECK(wlwmi_encode_start_scan(n, wlscan_max_time(n), a, sizeof(a), &len) == 0 &&
+		    wlwmi_encode_start_scan_range(0xa000, 0, n, wlscan_max_time(n), b, sizeof(b), &len2) == 0 && len == len2 && !memcmp(a, b, len),
+		    "the one-scan encoder is the 0xa000 range from 0");
+	}
+	/* re-arming: the per-scan state goes back, the counters and the table stay */
+	{
+		static struct wlscan s;
+		wlscan_init(&s, 38);
+		s.started = s.done = s.dequeued = true; s.start_failed = true; s.reason = 7;
+		s.events = 5; s.foreign = 13; s.ci_start = 13; s.ci_end = 13; s.mgmt = 4; s.frames = 3; s.nbss = 2; s.bss[1].frames = 9; s.wrong_vdev = 1; s.why = "kept";
+		wlscan_rearm(&s);
+		CHECK(!s.started && !s.done && !s.dequeued && !s.start_failed && s.reason == 0, "rearm clears the per-scan state");
+		CHECK(s.nchan == 38 && s.events == 5 && s.foreign == 13 && s.ci_start == 13 && s.ci_end == 13 && s.mgmt == 4 && s.frames == 3 && s.nbss == 2 &&
+		    s.bss[1].frames == 9 && s.wrong_vdev == 1 && s.why && s.noise_floor == WLWMI_NOISE_FLOOR, "rearm keeps the counters and the table");
+	}
+	wlscan_chmask = 0;
+	puts("CH1 split pure: bit 26 changes no count and no list entry (4096 masks), each band is one range of the kept list, START_SCAN carries "
+	     "the id and the range and refuses past the list, the one-scan encoder is the 0xa000 range from 0, rearm keeps counters and table");
+}
+
+static void
+s_split_scan(void)
+{
+	/* the reference: one scan over the whole list with the same frames */
+	ch1_setup(0, 0, 0, 38);
+	C.wrong_vdev = true;
+	split_frames();
+	CHECK(run() == 0, "unsplit reference scan failed");
+	char *ref = w24_table();
+	CHECK(wl_scan.frames == 13 && wl_scan.nbss == 9, "reference table");
+	contained_and_freed();
+
+	/* split, the full list (bit 26 alone): two scans, ids 0xa000 and 0xa001, 13 then 25 channels, one merged table */
+	sp_setup(0, 0, 0, 38);
+	C.wrong_vdev = true;
+	split_frames();
+	CHECK(run() == 0, "split scan failed");
+	static const char *const lines[] = {
+		"FUXI WLAN: W23 chan mask 0x4000000: 38 channels kept (2.4 GHz 13, 5 GHz 25)\n",
+		"FUXI WLAN: W23 chan list 38 passive (2.4 GHz 13, 5 GHz 25, dfs 16) pdev 0 commands 1 bytes 1088\n",
+		"FUXI WLAN: W23 vdev 0 nss 2, sta ps rx-wake 0 tx-wake 1 pspoll 0, ps mode off\n",
+		"FUXI WLAN: W23 split scan: 2 scans (2.4 GHz 13 channels, 5 GHz 25 channels)\n",
+		"FUXI WLAN: W23 scan start id 0xa000 vdev 0 channels 13 passive dwell 150 ms max 2925 ms events 0x5f flags 0x11\n",
+		"FUXI WLAN: W23 scan started after ", " ms, scan id 0xa000\n",
+		"FUXI WLAN: W23 scan foreign freq 2412\n",
+		"FUXI WLAN: W23 scan foreign freq 2472\n",
+		"FUXI WLAN: W23 scan completed reason 0 after ", " ms (foreign 13 chan-info 13), scan id 0xa000\n",
+		"FUXI WLAN: W23 scan start id 0xa001 vdev 0 channels 25 passive dwell 150 ms max 5625 ms events 0x5f flags 0x11\n",
+		"FUXI WLAN: W23 scan started after ", " ms, scan id 0xa001\n",
+		"FUXI WLAN: W23 scan foreign freq 5180\n",
+		"FUXI WLAN: W23 scan foreign freq 5825\n",
+		"FUXI WLAN: W23 scan completed reason 0 after ", " ms (foreign 25 chan-info 25), scan id 0xa001\n",
+		"FUXI WLAN: W24 bss 00:1a:2b:xx:xx:xx ch 1 freq 2412 dBm -65 privacy 0 rsn 0 beacon frames 1 ssid \"Caf\\xc3\\xa9 \\x22Free\\x22\"\n",
+		"FUXI WLAN: W24 bss 3c:84:6a:xx:xx:xx ch 6 freq 5200 dBm -35 privacy 1 rsn 1 beacon+probe-resp frames 5 ssid \"HomeNet\"\n",
+		"FUXI WLAN: W24 bss 74:83:c2:xx:xx:xx ch 100 freq 5500 dBm -62 privacy 1 rsn 1 beacon frames 1 ssid \"Lab DFS\"\n",
+		"FUXI WLAN: W24 scan summary frames 13 bss 9 ssids 5\n",
+		("FUXI WLAN: W24 scan detail mgmt-rx 21 hidden 3 table-full frames 0 dropped status 1 channel 2 malformed 4 other-mgmt 1 "
+		 "ie-truncated 2 noise-floor -95 dBm (L19 default; rssi-conv events 2, not applied)\n"),
+		"FUXI WLAN: W23 stats request pdev-stat pdev 1 bands 0x1 vdev 0 sent\n",
+		"FUXI WLAN: W23 stats request pdev-stat pdev 2 bands 0x2 vdev 0 sent\n",
+		"FUXI WLAN: W23 stats after-scan wmi mgmt-rx +",
+		"FUXI WLAN: W23 complete; stop/contain\n",
+	};
+	expect_order(lines, sizeof(lines) / sizeof(lines[0]));
+	CHECK(count_text("W23 scan start id") == 2 && count_text("W23 split scan:") == 1 && count_text("W23 chan list") == 1 &&
+	    count_text("W23 scan foreign freq") == 38 && count_text("FUXI WLAN: W23 chan-info freq ") == 76 && count_text("FUXI WLAN: W24 bss ") == 9 &&
+	    count_text("W23 stats request pdev-stat") == 2 && count_text("W23 stats after-scan") == 1 && count_text("W24 scan summary") == 1,
+	    "split: scans, lines and one report");
+	expect_not("scan id 0xa002"); expect_not("W24 no beacon"); expect_not("W23 failure");
+	char *tab = w24_table();
+	if (strcmp(ref, tab)) { fputs(ref, stderr); fputs("-----\n", stderr); fputs(tab, stderr); fail("the split table differs from the one-scan table"); }
+	free(tab);
+	CHECK(fw_chan_cmds == 1 && fw_chan_seen == 38 && fw_scan_cmds == 2 && fw_c2_step == 8 && fw_scan_id == 0xa001 && wl_scan.nchan == 38 &&
+	    wl_scan.ci_end == 38 && wl_scan.done && !wl_scan.start_failed && wl_scan.wrong_vdev == 2 && wl_scan.frames == 13 && wl_scan.nbss == 9 &&
+	    fw_stats_req == 2, "split: firmware and scan view");
+	contained_and_freed();
+	expect("FUXI WLAN: W23 contain: scan over, no STOP_SCAN\n");
+	CHECK(fw_stop_cmds == 0, "STOP_SCAN after two completed scans");
+
+	/* a small WMI message: the whole kept list still goes out once, in several commands, before the first scan */
+	sp_setup(0, 0, 0, 38);
+	C.max_msg = 300;
+	CHECK(run() == 0, "split scan with a small WMI message failed");
+	expect("FUXI WLAN: W23 chan list 38 passive (2.4 GHz 13, 5 GHz 25, dfs 16) pdev 0 commands 4 bytes 1160\n");
+	CHECK(fw_chan_cmds == 4 && fw_chan_seen == 38 && fw_scan_cmds == 2 && count_text("W23 chan list") == 1, "chan list once, in four commands, then two scans");
+	contained_and_freed();
+
+	/* split with w20 0x10 (BAND24): one band is empty, one scan, and the log is a plain scan's but for the two split-only lines */
+	sp_setup(0, WL20_BAND24, WL23_CH_ALL5, 13);
+	add_frame(5, 47, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	CHECK(run() == 0, "split with BAND24 failed");
+	expect("FUXI WLAN: W23 chan mask 0x4000000: 13 channels kept (2.4 GHz 13, 5 GHz 0)\n");
+	expect("FUXI WLAN: W23 split scan: 1 scan (2.4 GHz 13 channels, 5 GHz 0 channels; one band has none, nothing to split)\n");
+	expect("FUXI WLAN: W23 scan start id 0xa000 vdev 0 channels 13 passive dwell 150 ms max 2925 ms events 0x5f flags 0x11\n");
+	expect(" ms (foreign 13 chan-info 13)\n");
+	expect_not("scan id 0x"); expect_not("0xa001"); expect_not("W23 split scan: 2");
+	CHECK(fw_scan_cmds == 1 && fw_chan_seen == 13 && fw_scan_id == 0xa000 && count_text("W23 scan start id") == 1, "BAND24: one scan");
+	char *one = log_without_split_lines();
+	contained_and_freed();
+	ch1_setup(0, WL20_BAND24, WL23_CH_ALL5, 13);   /* the same boot without bit 26 */
+	add_frame(5, 47, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	CHECK(run() == 0, "BAND24 without the split failed");
+	char *plain = log_without_split_lines();
+	contained_and_freed();
+	if (strcmp(one, plain)) { fputs(one, stderr); fputs("-----\n", stderr); fputs(plain, stderr); fail("split with one band is not a plain scan"); }
+	free(one); free(plain);
+
+	/* split with bit 25 (5 GHz only): the other empty band, again one scan */
+	sp_setup(WL23_CH_24, 0, WL23_CH_24, 25);
+	add_frame(13, 50, 8, B_OFF, 0x0011, "Office-5G", 9, 0, 36, true);
+	CHECK(run() == 0, "split with bit 25 failed");
+	expect("FUXI WLAN: W23 chan mask 0x6000000: 25 channels kept (2.4 GHz 0, 5 GHz 25)\n");
+	expect("FUXI WLAN: W23 split scan: 1 scan (2.4 GHz 0 channels, 5 GHz 25 channels; one band has none, nothing to split)\n");
+	expect("FUXI WLAN: W23 scan start id 0xa000 vdev 0 channels 25 passive dwell 150 ms max 5625 ms events 0x5f flags 0x11\n");
+	expect_not("scan id 0x"); expect_not("0xa001");
+	CHECK(fw_scan_cmds == 1 && fw_chan_seen == 25 && wl_scan.frames == 1, "bit 25: one scan over 25");
+	contained_and_freed();
+
+	/* split plus a 5 GHz drop mask (57344 = 5600/5620/5640): 13 then 22 channels, 3 dropped ones never listed or visited */
+	sp_setup(57344, 0, 57344, 35);
+	split_frames();
+	add_frame(26, 40, 8, B_X5, 0x0401, "Dropped", 7, 6, 0, false);   /* 5600: not scanned */
+	CHECK(run() == 0, "split with a 5 GHz mask failed");
+	static const char *const l57[] = {
+		"FUXI WLAN: W23 chan mask 0x400e000: 35 channels kept (2.4 GHz 13, 5 GHz 22)\n",
+		"FUXI WLAN: W23 chan list 35 passive (2.4 GHz 13, 5 GHz 22, dfs 13) pdev 0 commands 1 bytes 1004\n",
+		"FUXI WLAN: W23 split scan: 2 scans (2.4 GHz 13 channels, 5 GHz 22 channels)\n",
+		"FUXI WLAN: W23 scan start id 0xa000 vdev 0 channels 13 passive dwell 150 ms max 2925 ms events 0x5f flags 0x11\n",
+		" ms (foreign 13 chan-info 13), scan id 0xa000\n",
+		"FUXI WLAN: W23 scan start id 0xa001 vdev 0 channels 22 passive dwell 150 ms max 4950 ms events 0x5f flags 0x11\n",
+		"FUXI WLAN: W23 scan foreign freq 5580\n",
+		"FUXI WLAN: W23 scan foreign freq 5660\n",
+		" ms (foreign 22 chan-info 22), scan id 0xa001\n",
+	};
+	expect_order(l57, sizeof(l57) / sizeof(l57[0]));
+	expect_not("freq 5600"); expect_not("freq 5620"); expect_not("freq 5640"); expect_not("Dropped");
+	CHECK(fw_scan_cmds == 2 && fw_chan_seen == 35 && count_text("W23 scan foreign freq") == 35 && wl_scan.nchan == 35 && wl_scan.ci_end == 35,
+	    "split with a mask: 35 channels in two scans");
+	contained_and_freed();
+
+	/* w20 0x92 (HTT version, BAND24, EXT pdev) is one scan; w20 0x82 (HTT version, EXT pdev, no BAND24) is two, pdev 1 in the chan list */
+	sp_setup(0, WL20_HTTVER | WL20_PDEVCAP, 0, 38);
+	split_frames();
+	CHECK(run() == 0, "split with the HTT version and the EXT pdev failed");
+	expect("FUXI WLAN: W23 chan list 38 passive (2.4 GHz 13, 5 GHz 25, dfs 16) pdev 1 commands 1 bytes 1088\n");
+	expect("FUXI WLAN: W23 split scan: 2 scans (2.4 GHz 13 channels, 5 GHz 25 channels)\n");
+	CHECK(fw_htt_req == 1 && fw_scan_cmds == 2 && fw_chan_seen == 38 && wl_scan.frames == 13, "split with 0x82");
+	contained_and_freed();
+
+	/* the first scan ends with DEQUEUED: that ends it, the second goes out */
+	sp_setup(0, 0, 0, 38);
+	C.dequeue_first = true;
+	split_frames();
+	CHECK(run() == 0, "split with a DEQUEUED first scan failed");
+	expect(" ms (foreign 13 chan-info 13, dequeued), scan id 0xa000\n");
+	expect(" ms (foreign 25 chan-info 25), scan id 0xa001\n");
+	CHECK(fw_scan_cmds == 2 && wl_scan.frames == 13, "DEQUEUED first scan");
+	contained_and_freed();
+	free(ref);
+	puts("CH1 split scans: the full list (two scans 0xa000 / 0xa001 with 13 then 25 channels, one SCAN_CHAN_LIST, one merged table equal to the "
+	     "one-scan table, one report, stats once), small WMI messages, BAND24 and bit 25 (one scan, a plain scan's log), a 5 GHz mask (13 + 22), "
+	     "the HTT version with the EXT pdev, a DEQUEUED first scan");
+}
+
+static void
+s_split_failures(void)
+{
+	/* the first scan's START_FAILED: the stage ends as today, no second scan, no STOP_SCAN */
+	sp_setup(0, 0, 0, 38);
+	C.scan_mode = 1;
+	CHECK(run() == 1, "START_FAILED of the first scan accepted");
+	expect("FUXI WLAN: W23 scan START_FAILED reason 4 (ladder: w20 0x80, then 0x10, then 0x40), scan id 0xa000\n");
+	expect("FUXI WLAN: W23 failure: W23 scan START_FAILED; contain, no retry\n");
+	expect_not("0xa001"); expect_not("W23 scan completed");
+	CHECK(fw_scan_cmds == 1 && wl_scan.start_failed, "no second START_SCAN after START_FAILED");
+	contained_and_freed();
+	expect("FUXI WLAN: W23 contain: scan start failed, no STOP_SCAN\n");
+	CHECK(fw_stop_cmds == 0, "STOP_SCAN after START_FAILED");
+
+	/* no STARTED for the first scan: contain names 0xa000 */
+	sp_setup(0, 0, 0, 38);
+	C.scan_mode = 2;
+	CHECK(run() == 1, "no STARTED for the first scan accepted");
+	expect("FUXI WLAN: W23 timeout scan STARTED (1000 ms); contain, no retry\n");
+	expect_not("0xa001");
+	CHECK(fw_scan_cmds == 1, "no second START_SCAN without STARTED");
+	contained_and_freed();
+	expect("FUXI WLAN: W23 contain: STOP_SCAN sent (best effort)");
+	CHECK(fw_stop_cmds == 1 && fw_stop_id == 0xa000, "STOP_SCAN id of the first scan");
+
+	/* the first scan never COMPLETES: the table so far, the stage ends, no second scan, STOP_SCAN 0xa000 */
+	sp_setup(0, 0, 0, 38);
+	C.scan_mode = 3;
+	add_frame(5, 47, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	add_frame(14, 60, 8, B_HOME, 0x0411, "HomeNet", 7, 0, 40, true);   /* 5 GHz: never visited */
+	CHECK(run() == 1, "first scan without COMPLETED accepted");
+	static const char *const t1[] = {
+		"FUXI WLAN: W23 scan started after ", " ms, scan id 0xa000\n",
+		"FUXI WLAN: W23 timeout scan COMPLETED (3125 ms); report, contain, no retry, scan id 0xa000\n",
+		"FUXI WLAN: W24 bss 3c:84:6a:xx:xx:xx ch 6 freq 2437 dBm -48 privacy 1 rsn 1 beacon frames 1 ssid \"HomeNet\"\n",
+		"FUXI WLAN: W24 scan summary frames 1 bss 1 ssids 1\n",
+		"FUXI WLAN: W20 snapshot scan COMPLETED: ",
+		"FUXI WLAN: W20 snapshot scan started 1 done 0 start-failed 0 events 14 foreign 13 chan-info 13 mgmt-rx 1 frames 1 bss 1 why -\n",
+		"FUXI WLAN: W23 failure: scan COMPLETED; contain, no retry\n",
+	};
+	expect_order(t1, sizeof(t1) / sizeof(t1[0]));
+	expect_not("0xa001"); expect_not("W23 scan completed");
+	CHECK(fw_scan_cmds == 1 && fw_chan_seen == 38 && wl_scan.frames == 1, "no second START_SCAN after a COMPLETED timeout");
+	contained_and_freed();
+	expect("FUXI WLAN: W23 contain: STOP_SCAN sent (best effort)");
+	CHECK(fw_stop_cmds == 1 && fw_stop_id == 0xa000, "containment STOP_SCAN names the first scan, 0xa000");
+
+	/* the second scan's START_FAILED: the first was fine; no STOP_SCAN */
+	sp_setup(0, 0, 0, 38);
+	C.scan_mode2 = 1;
+	CHECK(run() == 1, "START_FAILED of the second scan accepted");
+	expect("FUXI WLAN: W23 scan completed reason 0 after ");
+	expect("FUXI WLAN: W23 scan START_FAILED reason 4 (ladder: w20 0x80, then 0x10, then 0x40), scan id 0xa001\n");
+	CHECK(fw_scan_cmds == 2 && wl_scan.start_failed && !wl_scan.done, "second scan START_FAILED");
+	contained_and_freed();
+	expect("FUXI WLAN: W23 contain: scan start failed, no STOP_SCAN\n");
+	CHECK(fw_stop_cmds == 0, "STOP_SCAN after the second scan's START_FAILED");
+
+	/* no STARTED for the second scan: STOP_SCAN names 0xa001 */
+	sp_setup(0, 0, 0, 38);
+	C.scan_mode2 = 2;
+	CHECK(run() == 1, "no STARTED for the second scan accepted");
+	expect("FUXI WLAN: W23 timeout scan STARTED (1000 ms); contain, no retry\n");
+	contained_and_freed();
+	CHECK(fw_scan_cmds == 2 && fw_stop_cmds == 1 && fw_stop_id == 0xa001, "STOP_SCAN id of the second scan before its STARTED");
+
+	/* the second scan never COMPLETES: both bands' frames are in the table, then STOP_SCAN 0xa001 */
+	sp_setup(0, 0, 0, 38);
+	C.scan_mode2 = 3;
+	split_frames();
+	CHECK(run() == 1, "second scan without COMPLETED accepted");
+	static const char *const t2[] = {
+		"FUXI WLAN: W23 scan completed reason 0 after ", " ms (foreign 13 chan-info 13), scan id 0xa000\n",
+		"FUXI WLAN: W23 scan start id 0xa001 vdev 0 channels 25 passive dwell 150 ms max 5625 ms events 0x5f flags 0x11\n",
+		"FUXI WLAN: W23 timeout scan COMPLETED (5825 ms); report, contain, no retry, scan id 0xa001\n",
+		"FUXI WLAN: W24 bss 00:1a:2b:xx:xx:xx ch 1 freq 2412 ",
+		"FUXI WLAN: W24 bss 3c:84:6a:xx:xx:xx ch 6 freq 5200 dBm -35 privacy 1 rsn 1 beacon+probe-resp frames 5 ssid \"HomeNet\"\n",
+		"FUXI WLAN: W24 scan summary frames 13 bss 9 ssids 5\n",
+		"FUXI WLAN: W20 snapshot scan COMPLETED: ",
+		"FUXI WLAN: W20 snapshot scan started 1 done 0 start-failed 0 ",
+		"FUXI WLAN: W23 failure: scan COMPLETED; contain, no retry\n",
+	};
+	expect_order(t2, sizeof(t2) / sizeof(t2[0]));
+	expect_not("W23 stats request");
+	CHECK(fw_scan_cmds == 2 && wl_scan.frames == 13 && wl_scan.nbss == 9 && !wl_scan.done, "second scan timeout view");
+	contained_and_freed();
+	expect("FUXI WLAN: W23 contain: STOP_SCAN sent (best effort)");
+	CHECK(fw_stop_cmds == 1 && fw_stop_id == 0xa001, "containment STOP_SCAN names the second scan, 0xa001");
+	reset();
+	puts("CH1 split failures: the first scan's START_FAILED, missing STARTED and missing COMPLETED end the stage with no second scan (STOP_SCAN "
+	     "0xa000 where one is due), the second scan's START_FAILED, missing STARTED and missing COMPLETED (table of both bands, STOP_SCAN 0xa001)");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -6407,8 +6782,15 @@ main(int argc, char **argv)
 	}
 	if (argc == 2 && !strcmp(argv[1], "c2ch")) {  /* the CH1 scenarios alone (the mutant runs of tools/test-fuxi-wlan-ce.py) */
 		s_ch1_pure(); s_ch1_scan();
+		s_split_pure(); s_split_scan(); s_split_failures();
 		reset();
 		puts("CH1 model: all scenarios passed");
+		return 0;
+	}
+	if (argc == 2 && !strcmp(argv[1], "c2split")) {  /* the CH1 split firmware scenarios alone, without the pure ones (diagnostic: which mutants the scans catch on their own) */
+		s_split_scan(); s_split_failures();
+		reset();
+		puts("CH1 split model: all scenarios passed");
 		return 0;
 	}
 	if (argc == 2 && !strcmp(argv[1], "c2f")) {  /* the C2f scenarios alone (the mutant runs of tools/test-fuxi-wlan-ce.py) */
@@ -6488,6 +6870,9 @@ main(int argc, char **argv)
 	s_c2h_all();
 	s_ch1_pure();
 	s_ch1_scan();
+	s_split_pure();
+	s_split_scan();
+	s_split_failures();
 	reset();
 	puts("W20 model: all scenarios passed");
 	return 0;

@@ -947,13 +947,18 @@ static unsigned wl30_mask;
 /* CH1 (fuxiwlanch, only with qrtr 7, the scan paths): a drop mask over the 38-entry
  * passive scan list. Bits 0..24 drop the 5 GHz entries in list order (bit 13 = 5600),
  * bit 25 drops the 13 2.4 GHz channels; w20 0x10 (BAND24) applies on top. Absent or 0
- * = the list as before, no line; a bit above 25, or a mask (with BAND24) that leaves no
+ * = the list as before, no line; a bit above 26, or a mask (with BAND24) that leaves no
  * channel, refuses the run before any access. Only the list changes: no new command,
- * no register access, the scan stays passive. */
+ * no register access, the scan stays passive. Bit 26 (SPLIT) drops nothing: the W23
+ * stage then runs two passive scans back to back on the same vdev, the kept 2.4 GHz
+ * channels (id 0xa000) and then the kept 5 GHz channels (id 0xa001), after one
+ * SCAN_CHAN_LIST of the whole kept list. */
 static unsigned wl23_chmask;
 #define WL23_CH_24 (1u << 25)               /* fuxiwlanch bit 25: the 13 2.4 GHz channels */
 #define WL23_CH_ALL5 (WL23_CH_24 - 1u)      /* bits 0..24: the 25 5 GHz entries */
 #define WL23_CH_VALID (WL23_CH_24 | WL23_CH_ALL5)
+#define WL23_CH_SPLIT (1u << 26)            /* fuxiwlanch bit 26, not a drop bit: scan the kept 2.4 GHz channels, then the kept 5 GHz channels */
+#define WL23_CH_KNOB (WL23_CH_VALID | WL23_CH_SPLIT)   /* every bit the knob accepts: 0..26 */
 /* The effective mask: the knob, plus every 5 GHz entry when w20 0x10 (BAND24) is set. */
 #define WL23_CH_EFF(knob, band24) ((knob) | ((band24) ? WL23_CH_ALL5 : 0u))
 /* Channels of the 38 that an effective mask leaves (the header's wlscan_kept(), here for the parser, which cannot see the header). */
@@ -1362,16 +1367,16 @@ wl_probe_configure(void)
 			printf("FUXI WLAN: W20 fuxiwlanvrx %#x refused: needs a valid w20 0x4000, bits 0xf only, 0x02 only with fuxiwlanw29 0x02, "
 			    "0x08 only with w20 0x800\n", (unsigned)vrx);
 		} else if (vrx_given) { wl30_mask = (unsigned)vrx; }
-		/* CH1: fuxiwlanch only with qrtr 7, bits 0..25 only, and at least one channel must stay (w20 0x10 counts too) */
+		/* CH1: fuxiwlanch only with qrtr 7, bits 0..26 only, and at least one channel must stay (w20 0x10 counts too) */
 		if (chm_given && chm && !wl_w23) {
 			wl_variant_invalid = true;
 			wl20_bits = 0;
 			printf("FUXI WLAN: W20 fuxiwlanch %#x needs fuxiwlanqrtr=7; refused\n", (unsigned)chm);
-		} else if (chm_given && chm && (chm < 0 || ((unsigned)chm & ~WL23_CH_VALID) ||
+		} else if (chm_given && chm && (chm < 0 || ((unsigned)chm & ~WL23_CH_KNOB) ||
 		    !WL23_CH_KEPT(WL23_CH_EFF((unsigned)chm, !!(wl20_bits & WL20_BAND24))))) {
 			wl_variant_invalid = true;
 			wl20_bits = 0;
-			printf("FUXI WLAN: W20 fuxiwlanch %#x refused: bits 0..25 only, and at least one channel must stay (w20 0x10 counts too)\n",
+			printf("FUXI WLAN: W20 fuxiwlanch %#x refused: bits 0..26 only, and at least one channel must stay (w20 0x10 counts too)\n",
 			    (unsigned)chm);
 		} else if (chm_given) { wl23_chmask = (unsigned)chm; }
 		printf("FUXI WLAN: W20 selected qrtr=%d (%s) w20 %#x valid %u\n", qrtr,
@@ -5150,6 +5155,7 @@ static unsigned wl_ce_waited, wl_ce_need_eid, wl_ce_need_len, wl_ce_tx_pipe, wl_
  * wl23_rssi_conv: 0x402b events seen with qrtr 7 (W24 detail line). */
 static struct wlscan wl_scan;
 static bool wl23_scan_sent, wl23_htt_seen, wl23_guard_bad;
+static uint32_t wl23_scan_id = WLWMI_SCAN_ID;   /* the id of the scan START_SCAN last named (CH1 split: 0xa000, then 0xa001) */
 static unsigned wl23_lines, wl23_pdev, wl23_htt_major, wl23_htt_minor, wl23_rssi_conv;
 /* C2b: the pdev stats answer (wl23_stats) and the CHAN_INFO detail lines,
  * WL23_CI_LINES at most, the rest counted (wl23_ci_line, wl23_ci_flush). */
@@ -7065,6 +7071,7 @@ wl30_fse(void)
 /* CH1: the parser's constants (before the header exists for it) are the header's */
 _Static_assert(WL23_CH_24 == WLSCAN_CH_24 && WL23_CH_ALL5 == WLSCAN_CH_ALL5 && WL23_CH_VALID == WLSCAN_CH_VALID,
     "fuxiwlanch mask layout: the driver and the header agree");
+_Static_assert(WL23_CH_SPLIT == WLSCAN_CH_SPLIT && !(WL23_CH_SPLIT & WL23_CH_VALID), "fuxiwlanch bit 26 is the split bit, outside the drop mask");
 static int
 wl_w23_run(void)
 {
@@ -7143,29 +7150,54 @@ wl_w23_run(void)
 		if (wl23_words(WLWMI_CMD_STA_POWERSAVE_MODE, WLWMI_TAG_STA_POWERSAVE_MODE_CMD, mode, 2, "WMI STA_POWERSAVE_MODE")) { return 1; }
 		printf("FUXI WLAN: W23 vdev 0 nss %u, sta ps rx-wake 0 tx-wake 1 pspoll 0, ps mode off\n", nss);
 	}
-	if (wlwmi_encode_start_scan(n, max_ms, cmd, sizeof(cmd), &len)) { return wl_w11_fail("W23 START_SCAN encode bounds"); }
-	wl23_scan_sent = true; /* from here on containment asks for STOP_SCAN unless the scan is over */
-	printf("FUXI WLAN: W23 scan start id %#x vdev 0 channels %u passive dwell %u ms max %u ms events %#x flags %#x\n",
-	    WLWMI_SCAN_ID, n, WLSCAN_DWELL_PASSIVE, max_ms, WLSCAN_EVENTS, WLSCAN_FLAGS);
-	/* L19 waits 1 s for STARTED (mac.c:5046-5053) */
-	if (wl_ce_send(eid, cmd, len, "WMI START_SCAN") || wl_ce_wait(WL23_W_STARTED, 1000, "scan STARTED")) { wl23_ci_flush(); return 1; }
-	if (wl_scan.start_failed) {
-		printf("FUXI WLAN: W23 scan START_FAILED reason %u (ladder: w20 0x80, then 0x10, then 0x40)\n", wl_scan.reason);
-		return wl_w11_fail("W23 scan START_FAILED");
+	/* CH1 split (fuxiwlanch bit 26): the kept 2.4 GHz channels in one scan, then the kept 5 GHz channels in a second, on the same
+	 * vdev, one after the other (a mixed list scanned in DBS stalls the firmware when the 2.4 GHz MAC finishes its part). The kept
+	 * list is in band order, so each band is one range of it. SCAN_CHAN_LIST above already carried the whole kept list, once;
+	 * each START_SCAN names only its band. Without the bit, or with only one band kept, it is the one scan over the whole list. */
+	const uint32_t nb24 = wlscan_kept24(wlscan_chmask);
+	const bool split = (wl23_chmask & WL23_CH_SPLIT) && nb24 && n > nb24;
+	const unsigned nscans = split ? 2u : 1u;
+	int w = 0;
+	if (wl23_chmask & WL23_CH_SPLIT) {
+		if (split) {
+			printf("FUXI WLAN: W23 split scan: 2 scans (2.4 GHz %u channels, 5 GHz %u channels)\n", nb24, n - nb24);
+		} else {
+			printf("FUXI WLAN: W23 split scan: 1 scan (2.4 GHz %u channels, 5 GHz %u channels; one band has none, nothing to split)\n",
+			    nb24, n - nb24);
+		}
 	}
-	printf("FUXI WLAN: W23 scan started after %u ms\n", wl_ce_waited);
-	wl26_watch(WLRX_P_STARTED);  /* C2c */
-	/* L19 arms its scan timeout at max_scan_time + 200 ms (mac.c:5385-5388) */
-	int w = wl23_wait_done(max_ms + 200u, &took);
-	if (w == 1) { wl23_ci_flush(); return 1; }
-	if (w == 0) {
-		printf("FUXI WLAN: W23 scan completed reason %u after %u ms (foreign %u chan-info %u%s)\n", wl_scan.reason, took,
-		    wl_scan.foreign, wl_scan.ci_start, wl_scan.dequeued ? ", dequeued" : "");
-	} else {
-		printf("FUXI WLAN: W23 timeout scan COMPLETED (%u ms); report, contain, no retry\n", took);
-		wl28_crash("scan COMPLETED timeout");  /* C2e: read-only, before anything else touches the device */
+	for (unsigned sc = 0; ; sc++) {
+		const uint32_t first = sc ? nb24 : 0u, cnt = !split ? n : sc ? n - nb24 : nb24, cmax = split ? wlscan_max_time(cnt) : max_ms;
+		const uint32_t sid = sc ? WLWMI_SCAN_ID2 : WLWMI_SCAN_ID, fo0 = sc ? wl_scan.foreign : 0u, ci0 = sc ? wl_scan.ci_start : 0u;
+		char tag[24] = "";   /* the scan id on every per-scan line, only when there are two */
+		if (split) { snprintf(tag, sizeof(tag), ", scan id %#x", sid); }
+		if (wlwmi_encode_start_scan_range(sid, first, cnt, cmax, cmd, sizeof(cmd), &len)) { return wl_w11_fail("W23 START_SCAN encode bounds"); }
+		wl23_scan_id = sid;   /* containment's STOP_SCAN names the scan in flight */
+		if (sc) { wlscan_rearm(&wl_scan); }   /* the first scan is over (COMPLETED or DEQUEUED seen); counters and BSS table stay */
+		wl23_scan_sent = true; /* from here on containment asks for STOP_SCAN unless the scan is over */
+		printf("FUXI WLAN: W23 scan start id %#x vdev 0 channels %u passive dwell %u ms max %u ms events %#x flags %#x\n",
+		    sid, cnt, WLSCAN_DWELL_PASSIVE, cmax, WLSCAN_EVENTS, WLSCAN_FLAGS);
+		/* L19 waits 1 s for STARTED (mac.c:5046-5053) */
+		if (wl_ce_send(eid, cmd, len, "WMI START_SCAN") || wl_ce_wait(WL23_W_STARTED, 1000, "scan STARTED")) { wl23_ci_flush(); return 1; }
+		if (wl_scan.start_failed) {
+			printf("FUXI WLAN: W23 scan START_FAILED reason %u (ladder: w20 0x80, then 0x10, then 0x40)%s\n", wl_scan.reason, tag);
+			return wl_w11_fail("W23 scan START_FAILED");
+		}
+		printf("FUXI WLAN: W23 scan started after %u ms%s\n", wl_ce_waited, tag);
+		wl26_watch(WLRX_P_STARTED);  /* C2c: taken once, at the first STARTED */
+		/* L19 arms its scan timeout at max_scan_time + 200 ms (mac.c:5385-5388) */
+		w = wl23_wait_done(cmax + 200u, &took);
+		if (w == 1) { wl23_ci_flush(); return 1; }
+		if (w == 0) {
+			printf("FUXI WLAN: W23 scan completed reason %u after %u ms (foreign %u chan-info %u%s)%s\n", wl_scan.reason, took,
+			    wl_scan.foreign - fo0, wl_scan.ci_start - ci0, wl_scan.dequeued ? ", dequeued" : "", tag);
+		} else {
+			printf("FUXI WLAN: W23 timeout scan COMPLETED (%u ms); report, contain, no retry%s\n", took, tag);
+			wl28_crash("scan COMPLETED timeout");  /* C2e: read-only, before anything else touches the device */
+		}
+		if (w != 0 || sc + 1u >= nscans) { break; }   /* only a first scan that ended (COMPLETED or DEQUEUED) lets the second start */
 	}
-	wl26_watch(WLRX_P_COMPLETED);  /* C2c: as soon as the wait returned, before the W24 lines */
+	wl26_watch(WLRX_P_COMPLETED);  /* C2c: as soon as the last wait returned, before the W24 lines */
 	wl24_report();
 	if (wl30_mask & WL30_MGMTREO) {   /* C2h: counts only */
 		printf("FUXI WLAN: W30 mgmtreo counts: mgmt-rx %u (reo-params %u, ctr-valid %u), fw-consumed %u (beacon %u, probe-resp %u, "
@@ -7203,7 +7235,7 @@ static void
 wl23_stop_scan(void)
 {
 	static uint8_t cmd[4 + WLWMI_STOP_SCAN_BYTES], frame[WLCE_BUF];
-	const uint32_t w[5] = { 0, WLWMI_SCAN_ID, WLWMI_SCAN_STOP_ONE, WLWMI_VDEV_ID, wl23_pdev };
+	const uint32_t w[5] = { 0, wl23_scan_id, WLWMI_SCAN_STOP_ONE, WLWMI_VDEV_ID, wl23_pdev };   /* the scan in flight: 0xa000, or 0xa001 in the CH1 split */
 	uint32_t len = 0, total = 0;
 	unsigned t = 0;
 	if (!wl23_scan_sent) { return; }

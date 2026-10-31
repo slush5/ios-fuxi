@@ -12,7 +12,8 @@ and the common SRNGs L19 programs before any scan, w20 0x4000, default off) is h
 RXDMA ring pointers live, read-only pointer-word lines, the relaxed cookie-conversion gate and the `fuxiwlanw29` default
 0x9f) is host-tested only; C2h (W30: the vendor's kiwi RX extras behind `fuxiwlanvrx`, default off, after the
 management-RX study `docs-lanes/wlan-mgmt-rx-study.md`) is host-tested only; CH1 (`fuxiwlanch`, a default-off drop mask over
-the passive scan channel list, [below](#ch1-the-scan-channel-mask-fuxiwlanch)) is host-tested only. Every line below that
+the passive scan channel list, and its bit 26, which runs the scan as two scans, one per band,
+[below](#ch1-the-scan-channel-mask-fuxiwlanch)) is host-tested only. Every line below that
 says what the target does is what
 the model does, built from Linux ath12k v6.19. C2, C2b and C2c are described in their own sections below
 ([C2: W23/W24](#c2-w23w24-one-passive-scan-fuxiwlanqrtr7),
@@ -48,7 +49,7 @@ file:line below is into that tree. UniXNU-sheng was not used for any line of cod
 | `fuxiwlanw20=N` | 0 default | With qrtr 6 or 7: 0x01 NOHTT (no HTT connect; WMI then gets the next endpoint), 0x04 MRRS128 (endpoint PCIe Device Control max read request 128 bytes before CE init, low half only), 0x40 NOHWMODE (no PDEV_SET_HW_MODE). With qrtr 7 only: 0x02 HTTVER (HTT version request after HW mode), 0x10 BAND24 (the 13 2.4 GHz channels only), 0x80 PDEVCAP (the EXT MAC/PHY pdev id instead of 0), and C2c's 0x100 RXRING (host RX rings with 4095 buffers and their 4 HTT SRING_SETUP; only with 0x02), 0x200 IDLELINK (the WBM idle link-descriptor list), 0x400 CHAINMASK (PDEV_SET_PARAM TX/RX chain mask), and C2d's 0x800 RXSEL (RX_RING_SELECTION_CFG per MAC ring) and 0x1000 REORX (REO/release rings, buffers back to ring 160), each only with 0x100, and C2e's 0x2000 MONSTAT (the monitor status rings 185/193 and the crash line), only with 0x100. Refused: 0x08 ACTIVE (would transmit probe requests) and 0x20 FULLBSSID (would log whole BSSIDs; the owner masks every BSSID) at every qrtr, the qrtr-7 bits with qrtr 6, 0x01 together with 0x02, 0x100 without 0x02, 0x800, 0x1000 or 0x2000 without 0x100, any other bit. |
 
 | `fuxiwlanvrx=N` | absent or 0 default | C2h, only with qrtr 7 and a valid w20 0x4000: 0x01 MGMTREO (read-only management-RX counts), 0x02 CCSTALE (cookie conversion over a stale PPT; needs `fuxiwlanw29` 0x02, in the 0x9f default), 0x04 IPADIS (WMI INIT flag1 IPA_DISABLE), 0x08 FSE (HTT RX_FSE_SETUP_CFG and RX_FISA_CFG; needs w20 0x800). Refused: negative, any other bit, without a valid 0x4000 or qrtr 7. See [C2h](#c2h-w30-the-vendors-kiwi-rx-extras-fuxiwlanvrx). |
-| `fuxiwlanch=N` | absent or 0 default | CH1, only with qrtr 7: a drop mask over the 38-entry passive scan list. Bits 0..24 drop the 5 GHz entries in list order (5180 ... 5825; bit 13 = 5600), bit 25 drops the 13 2.4 GHz channels; w20 0x10 applies on top. Refused: any bit above 25, a mask (with w20 0x10) that leaves no channel, any other qrtr. See [CH1](#ch1-the-scan-channel-mask-fuxiwlanch). |
+| `fuxiwlanch=N` | absent or 0 default | CH1, only with qrtr 7: a drop mask over the 38-entry passive scan list. Bits 0..24 drop the 5 GHz entries in list order (5180 ... 5825; bit 13 = 5600), bit 25 drops the 13 2.4 GHz channels; w20 0x10 applies on top. Bit 26 (SPLIT, 0x4000000) drops nothing: it runs the passive scan as two scans back to back, the kept 2.4 GHz channels and then the kept 5 GHz channels. Refused: any bit above 26, a mask (with w20 0x10) that leaves no channel, any other qrtr. See [CH1](#ch1-the-scan-channel-mask-fuxiwlanch). |
 
 Refusals set `wl_variant_invalid`; salami refuses at init before any access, the Fuxi build at step 17.
 Every boot without `fuxiwlanqrtr=6` or `7` logs and behaves as before C1, and every boot with qrtr absent
@@ -1856,8 +1857,9 @@ nothing, bit 25 empties the list.
 | 57344 with w20 0x10 | 13 | `W23 chan mask 0xe000: 13 channels kept (2.4 GHz 13, 5 GHz 0)` |
 | 33554432 with w20 0x10 | none | refused at init |
 
-Gate (all before any access, the run invalid, in the existing refusal style): a bit above 25 (`W20 fuxiwlanch 0xN refused:
-bits 0..25 only, and at least one channel must stay (w20 0x10 counts too)`), a mask that leaves no channel on its own or
+Gate (all before any access, the run invalid, in the existing refusal style): a bit above 26 (`W20 fuxiwlanch 0xN refused:
+bits 0..26 only, and at least one channel must stay (w20 0x10 counts too)`; bit 26 is the [split](#bit-26-split-the-passive-scan-by-band)
+and was refused as "bits 0..25 only" before it existed), a mask that leaves no channel on its own or
 with w20 0x10 (the same line), and any qrtr but 7 (`W20 fuxiwlanch 0xN needs fuxiwlanqrtr=7; refused`; qrtr 8 does not
 exist in this build and is refused by its own line). The scan stage still fails closed if it were ever reached with an empty
 list: `W23 failure: W23 chan mask leaves no channel (init refuses this)` before any CE traffic.
@@ -1911,6 +1913,95 @@ cases plus 5 ADT parity sets and a check that the kept count in the log equals a
 `test-fuxi-wlan-salami.py` (whose "no W20 line" guard also learns that a non-zero `fuxiwlanch` prints one), the knob in
 `mkadt-salami.py`'s table, and the one stub line the fake `PE_parse_boot_argn` of `test-fuxi-wlan-m6.py` needs for the
 new, absent knob.
+
+### Bit 26: split the passive scan by band
+
+Code and host tests only. Why: on the phone (WCN7850, upstream firmware) a passive scan of 2.4 GHz alone completes cleanly, a
+scan of 5 GHz alone completes cleanly, but a mixed list (scanned in DBS by two MACs in parallel) always stalls the firmware at the
+moment the 2.4 GHz MAC finishes its sub-list. The workaround is to scan the bands one after the other in the same boot.
+
+`fuxiwlanch` bit 26 (0x4000000 = 67108864, only with qrtr 7, default off) does that. It drops nothing and no list function reads
+it: the kept list is built as before (bits 0..25, w20 0x10), and it is in band order, so each band is one range of it. Bit 26 alone
+splits the full 38-channel list.
+
+| | first scan | second scan |
+|---|---|---|
+| id (`scan_id` in START_SCAN, in its events, in a containment STOP_SCAN) | 0xa000 | 0xa001 |
+| channels | the kept 2.4 GHz ones (13) | the kept 5 GHz ones (25, fewer under a mask) |
+| `max_scan_time` | 225 ms x its own count | 225 ms x its own count |
+| STARTED wait, COMPLETED wait | 1000 ms, max + 200 ms | the same |
+
+- SCAN_CHAN_LIST is the pdev's channel list (L19 sends it from the regulatory update, wmi.c:2880-2997, reg.c:200-221), START_SCAN
+  names the channels of one scan. Nothing in L19 says whether the firmware drops START_SCAN channels that the last SCAN_CHAN_LIST
+  did not cover, so the safe reading is taken: the whole kept list goes out once, in as many commands as before, before the first
+  scan (the firmware's channel list is exactly what it is without the bit), and each START_SCAN then carries only its band.
+  No second SCAN_CHAN_LIST.
+- The second START_SCAN is sent only after the first scan's COMPLETED or DEQUEUED was seen. Any failure of the first scan (START_FAILED,
+  no STARTED in 1 s, no COMPLETED in max + 200 ms, a failed poll) ends the stage exactly as it does without the bit: the
+  table so far is printed where it was before, containment runs, there is no second scan.
+- Between the scans `wlscan_rearm` clears only the per-scan state (started, done, start-failed, dequeued, reason). The counters,
+  the last event and the BSS table stay, so MGMT_RX frames of both scans land in one table (dedup as before) and the W24 lines and
+  `W24 scan summary` are printed once, after the second scan, as are the W26 COMPLETED watch and C2b's pdev stats. Scan events
+  are not matched on the scan id (nor are they in L19): a stray COMPLETED of the first scan after the second STARTED would end the
+  second; the firmware sends one.
+- If one band has no kept channel (bit 25, w20 0x10, or a 5 GHz mask that drops all 25) there is nothing to split: one scan over
+  the kept list, the log is a plain scan's log plus the mask line and the split line (the model checks this equality).
+- Containment: `wl23_scan_id` is the id of the scan whose START_SCAN was last encoded; the best-effort STOP_SCAN names it
+  (0xa000 for a first scan that never completed or never started, 0xa001 for the second). It is set where `wl23_scan_sent` was
+  set before, after the encode and before the send, so a second START_SCAN that fails in its send is stopped as the first would be.
+  If the first scan is over and the second was never encoded, nothing is in flight: `scan over, no STOP_SCAN`.
+
+Lines (the existing ones keep their text; the id is appended to the per-scan ones only when there are two scans):
+
+```
+FUXI WLAN: W23 chan mask 0x4000000: 38 channels kept (2.4 GHz 13, 5 GHz 25)                                  (M includes bit 26)
+FUXI WLAN: W23 chan list 38 passive (2.4 GHz 13, 5 GHz 25, dfs 16) pdev P commands K bytes B                 (once, the whole kept list)
+FUXI WLAN: W23 split scan: 2 scans (2.4 GHz 13 channels, 5 GHz 25 channels)                                  (after the power-save lines)
+FUXI WLAN: W23 split scan: 1 scan (2.4 GHz a channels, 5 GHz b channels; one band has none, nothing to split)  (instead, one band empty)
+FUXI WLAN: W23 scan start id 0xa000 vdev 0 channels 13 passive dwell 150 ms max 2925 ms events 0x5f flags 0x11
+FUXI WLAN: W23 scan started after N ms, scan id 0xa000
+FUXI WLAN: W23 scan completed reason 0 after N ms (foreign 13 chan-info 13), scan id 0xa000                  (counts of this scan)
+FUXI WLAN: W23 scan start id 0xa001 vdev 0 channels 25 passive dwell 150 ms max 5625 ms events 0x5f flags 0x11
+FUXI WLAN: W23 scan started after N ms, scan id 0xa001
+FUXI WLAN: W23 scan completed reason 0 after N ms (foreign 25 chan-info 25), scan id 0xa001
+FUXI WLAN: W24 bss ... / W24 scan summary ... / W24 scan detail ...                                          (once, both bands)
+```
+
+The same suffix ends `W23 scan START_FAILED reason R (ladder: ...)` and `W23 timeout scan COMPLETED (T ms); report, contain, no retry`.
+A COMPLETED reason other than 0 (or a DEQUEUED) still lets the second scan start; the lines show it. The per-channel foreign and
+CHAN_INFO lines are as before, and the 64 and 128 line caps count across both scans.
+
+What does not change: no new WMI command or tag (START_SCAN is the existing encoder with an id and a range), PASSIVE stays forced
+(`WLSCAN_FLAGS` 0x11), no register access, no allocation, the same bounds on every wait. Without bit 26 the stage is the same code
+path with one pass of the scan loop: the same bytes on the wire and the same log (proof below).
+
+### Proof for bit 26
+
+Against d8d7be6 (the commit that added the knob):
+
+- D1: d8d7be6's model with all its scenarios, instrumented to dump every log, linked against d8d7be6's and this change's
+  production code: the new dump begins with all 273 base logs, 2920761 bytes, byte for byte (the split scenarios run last and
+  only add 174536 bytes after them); the six wire dumps equal; the 65 scenario summary lines equal.
+- D2: the salami and Fuxi init/configure gate over the same 8100 boot-arg sets without `fuxiwlanch`, cmdline and ADT /defaults,
+  both configurations: 32400 runs, stdout byte for byte equal.
+- D2b: the same gate with `fuxiwlanch` itself, 4320 knob sets x 2 configurations x 2 forms = 17280 runs. Without bit 26: byte
+  for byte equal, but for the refusal text (`bits 0..26 only` now, `bits 0..25 only` before; 390 runs, compared after spelling
+  it back). With bit 26 added to a mask X: equal to the base tree given X (the mask printed back; 7920 runs). Bit 26 alone: equal
+  to no knob but for the mask mention (and, in the ADT form, the line and the property count that name the knob), 360 runs, and
+  refused without qrtr 7 like any non-zero value (360 runs).
+- D3: the salami test's own distinct boots and RPMh runs recorded in both trees: 381 of the 382 base ones equal byte for byte
+  (7 after spelling the refusal text back); the 382nd is the base test's `fuxiwlanch=67108864`, which was a refusal and is an
+  accepted boot now. The new tree adds 22.
+
+The assertions edited on purpose: the refusal text and the bit-26 gate case (`bits 0..25 only` is `bits 0..26 only`, 67108864 is
+accepted and 134217728 refused), `static_ch1`'s pins on the parser line, the START_SCAN bound and the encoder name, the timeout
+line pin in `static_c2e`, and three `C2CH_MUTANTS` texts (bit 26 accepted becomes bit 27 accepted; the START_SCAN bound and array
+mutants follow the new encoder). Added: `s_split_pure` (4096 masks: bit 26 changes no count and no entry, each band is a range of
+the kept list; the encoder's id and range; rearm), `s_split_scan` (the full list, a small WMI message, w20 0x10, bit 25, a 5 GHz
+mask, 0x82, a DEQUEUED first scan; the merged table equals a one-scan table; one report and one set of stats), `s_split_failures`
+(START_FAILED, no STARTED and no COMPLETED of each scan, STOP_SCAN ids 0xa000 and 0xa001), `static_split`, 28 more
+`C2CH_MUTANTS`, 12 more gate cases (one rewritten) and 5 ADT parity sets. The model firmware checks the scans from the description (ids, ranges, max
+time, order, "not before the previous COMPLETED reached the host"), not from the driver.
 
 ## Host tests
 

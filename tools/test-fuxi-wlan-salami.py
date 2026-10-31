@@ -58,8 +58,9 @@ Host-only, synthetic cmd-db and RSC registers, fake boot-args and a fake ADT
   - CH1: fuxiwlanch (cmdline and ADT /defaults), only with qrtr 7: a drop mask over the passive scan list
     (bits 0..24 the 5 GHz entries in list order, bit 25 the 13 2.4 GHz channels; w20 0x10 applies on top);
     the W23 selected line counts the kept channels ("N channels (fuxiwlanch 0xM)"); absent or 0 = no mention and
-    the line as before; a bit above 25, a mask (with w20 0x10) that leaves no channel, or any other qrtr refused
-    before any access.
+    the line as before; a bit above 26, a mask (with w20 0x10) that leaves no channel, or any other qrtr refused
+    before any access. Bit 26 is not a drop bit: it asks for the passive scan in two scans, 2.4 GHz and then 5 GHz
+    (the model test checks that); here it is accepted like the others and counts no channel.
 """
 from pathlib import Path
 import importlib.util
@@ -731,7 +732,7 @@ def gate_suite(tmp, mk):
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlandiag=4', 0, 0, 'HD1 fuxiwlandiag 0x4 refused: bits 0x3 only'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlandiag=-1', 0, 0, 'HD1 fuxiwlandiag 0xffffffff refused'),
         # CH1: fuxiwlanch, a passive scan channel mask, only with qrtr 7 (bits 0..24 the 5 GHz entries in list order, bit 25 the
-        # 2.4 GHz channels, w20 0x10 on top); absent or 0 = no change and no mention; bits above 25, an empty list and any other
+        # 2.4 GHz channels, w20 0x10 on top); absent or 0 = no change and no mention; bits above 26, an empty list and any other
         # qrtr refused before any access
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanch=57344', 1, 28,
          'W23 selected passive scan of 35 channels (fuxiwlanch 0xe000), dwell 150 ms, nothing transmitted; BSSIDs OUI only, pdev 0, '
@@ -750,10 +751,31 @@ def gate_suite(tmp, mk):
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=16 fuxiwlanch=0', 1, 28,
          'W23 selected passive scan of 13 channels (2.4 GHz only), dwell 150 ms'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=16 fuxiwlanch=33554432', 0, 0,
-         'W20 fuxiwlanch 0x2000000 refused: bits 0..25 only, and at least one channel must stay (w20 0x10 counts too)'),
+         'W20 fuxiwlanch 0x2000000 refused: bits 0..26 only, and at least one channel must stay (w20 0x10 counts too)'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=16 fuxiwlanch=67108863', 0, 0, 'W20 fuxiwlanch 0x3ffffff refused'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanch=67108863', 0, 0, 'W20 fuxiwlanch 0x3ffffff refused'),
-        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanch=67108864', 0, 0, 'W20 fuxiwlanch 0x4000000 refused: bits 0..25 only'),
+        # bit 26 (SPLIT): accepted, drops nothing; bit 27 and above refused
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanch=67108864', 1, 28,
+         'W23 selected passive scan of 38 channels (fuxiwlanch 0x4000000), dwell 150 ms, nothing transmitted; BSSIDs OUI only, pdev 0, '
+         'htt version not asked'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanch=67166208', 1, 28, 'passive scan of 35 channels (fuxiwlanch 0x400e000), dwell 150 ms'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanch=100663296', 1, 28, 'passive scan of 25 channels (fuxiwlanch 0x6000000), dwell 150 ms'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=16 fuxiwlanch=67108864', 1, 28,
+         'passive scan of 13 channels (fuxiwlanch 0x4000000), dwell 150 ms'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=146 fuxiwlanch=67108864', 1, 28,
+         'passive scan of 13 channels (fuxiwlanch 0x4000000), dwell 150 ms, nothing transmitted; BSSIDs OUI only, pdev from EXT caps, '
+         'htt version asked'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=130 fuxiwlanch=67108864', 1, 28,
+         'passive scan of 38 channels (fuxiwlanch 0x4000000), dwell 150 ms, nothing transmitted; BSSIDs OUI only, pdev from EXT caps, '
+         'htt version asked'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32514 fuxiwlanch=67108864', 1, 28, 'passive scan of 38 channels (fuxiwlanch 0x4000000)'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=16 fuxiwlanch=100663296', 0, 0,
+         'W20 fuxiwlanch 0x6000000 refused: bits 0..26 only, and at least one channel must stay (w20 0x10 counts too)'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanch=134217727', 0, 0, 'W20 fuxiwlanch 0x7ffffff refused'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanch=134217728', 0, 0, 'W20 fuxiwlanch 0x8000000 refused: bits 0..26 only'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanch=201326592', 0, 0, 'W20 fuxiwlanch 0xc000000 refused: bits 0..26 only'),
+        ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw20=0x45 fuxiwlanch=67108864', 0, 0, 'W20 fuxiwlanch 0x4000000 needs fuxiwlanqrtr=7; refused'),
+        ('fuxiwlan=11 fuxiwlansalami=1 fuxiwlanch=67108864', 0, 0, 'W20 fuxiwlanch 0x4000000 needs fuxiwlanqrtr=7; refused'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanch=2147483648', 0, 0, 'W20 fuxiwlanch 0x80000000 refused'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanch=-1', 0, 0, 'W20 fuxiwlanch 0xffffffff refused'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=6 fuxiwlanw20=0x45 fuxiwlanch=1', 0, 0, 'W20 fuxiwlanch 0x1 needs fuxiwlanqrtr=7; refused'),
@@ -897,6 +919,12 @@ def gate_suite(tmp, mk):
         'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=32530 fuxiwlanch=57344',
         'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=16 fuxiwlanch=33554432',
         'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=5 fuxiwlanch=1',
+        # CH1 split: bit 26 alone, with a 5 GHz mask, with w20 0x10, and refused (empty list, bit 27)
+        'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanch=67108864',
+        'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanch=67166208',
+        'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=16 fuxiwlanch=67108864',
+        'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanw20=16 fuxiwlanch=100663296',
+        'fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=7 fuxiwlanch=134217728',
     ]
     for args in equal:
         want = run(salami, args)
@@ -1038,7 +1066,7 @@ def gate_suite(tmp, mk):
           f'negative, bits outside 0xf, 0x02 without fuxiwlanw29 0x02, 0x08 without w20 0x800, without 0x4000 or qrtr 7 '
           f'refused; {len(vrx)} kit values from /defaults')
     print('CH1: fuxiwlanch parsed (cmdline and ADT /defaults), the W23 selected line counts the kept channels; absent or 0 = no mention; '
-          'bits above 25, an empty list (also with w20 0x10) and any qrtr but 7 refused')
+          'bit 26 (the scan split) accepted; bits above 26, an empty list (also with w20 0x10) and any qrtr but 7 refused')
     print(f'C2c..C2f kit route: r1c2 cmdline with fuxiwlanw20 from ADT /defaults for {len(kits)} kit values (512 .. 32514, '
           'including C2d/C2e/C2f 6402/15106/32514), each read from /defaults and giving its W26..W29 selection; the bits '
           'refused with qrtr 6, keep/stop22, 0x100 without 0x02, 0x4000 without 0x1000')
@@ -1072,6 +1100,7 @@ def mkadt_suite(mk):
     assert mk.wlan_defaults(['fuxiwlanqrtr=2147483647'])[0][1] == struct.pack('<i', 2 ** 31 - 1)
     assert mk.wlan_defaults(['fuxiwlanch=57344']) == [('fuxiwlanch', b'\x00\xe0\x00\x00')]   # CH1: an int like the others
     assert mk.wlan_defaults(['fuxiwlanch=33554432']) == [('fuxiwlanch', b'\x00\x00\x00\x02')]
+    assert mk.wlan_defaults(['fuxiwlanch=67108864']) == [('fuxiwlanch', b'\x00\x00\x00\x04')]   # CH1 split: bit 26
     for bad in ('', 'fuxiwlanrails', 'fuxiwlanrails=', 'fuxiwlanrail=1', 'fuxitic=2', 'FUXIWLANRAILS=1',
                 'fuxiwlanrails=1 fuxiwlanrails=2', 'fuxiwlanrails=one', 'fuxiwlanrails=010', 'fuxiwlanrails=1_0',
                 'fuxiwlanrails=0x', 'fuxiwlanrails=1.0', 'fuxiwlanqrtr=2147483648', 'fuxiwlanqrtr=-2147483649',

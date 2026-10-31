@@ -1361,6 +1361,7 @@ wlhtt_version_conf(const uint8_t *msg, uint32_t len, uint32_t *major, uint32_t *
 #define WLWMI_STA_PS_PSPOLL_COUNT_NO_MAX 0u      /* wmi.h:4678 */
 #define WLWMI_STA_PS_MODE_DISABLED 0u            /* wmi.h:3647 */
 #define WLWMI_SCAN_ID 0xa000u                    /* ATH12K_SCAN_ID (wmi.h:3597) */
+#define WLWMI_SCAN_ID2 0xa001u                   /* CH1 split (fuxiwlanch bit 26): the id of the second scan, the 5 GHz one */
 #define WLWMI_SCAN_REQ_ID 1u                     /* wmi.c:2545 */
 #define WLWMI_SCAN_EV_STARTED (1u << 0)          /* enum wmi_scan_event_type (wmi.h:3407-3421) */
 #define WLWMI_SCAN_EV_COMPLETED (1u << 1)
@@ -1438,11 +1439,17 @@ _Static_assert(WLWMI_CI_WORDS * 4 == WLWMI_CHAN_INFO_BYTES && WLWMI_CI_CMD_FLAGS
  * bit 25 drops all 13 2.4 GHz channels; 0 keeps the whole list. wlscan_chmask
  * is the one place the mask lives: wlscan_chan(i) is the i-th kept channel, so
  * SCAN_CHAN_LIST, START_SCAN and every count read the same filtered list. The
- * driver sets it once, before the first encoder call of a scan. */
+ * driver sets it once, before the first encoder call of a scan.
+ *
+ * Bit 26 (WLSCAN_CH_SPLIT) is not a drop bit and no list function reads it: it
+ * asks the driver to run the kept 2.4 GHz channels and the kept 5 GHz channels
+ * as two scans, one after the other. The list is in band order, so each band is
+ * one range of the kept list (the 2.4 GHz one first). */
 #define WLSCAN_CH_5G_BITS 25u
 #define WLSCAN_CH_24 (1u << WLSCAN_CH_5G_BITS)
 #define WLSCAN_CH_ALL5 (WLSCAN_CH_24 - 1u)
 #define WLSCAN_CH_VALID (WLSCAN_CH_24 | WLSCAN_CH_ALL5)
+#define WLSCAN_CH_SPLIT (WLSCAN_CH_24 << 1)
 _Static_assert(WLSCAN_NCHAN == WLSCAN_NCHAN_24 + WLSCAN_CH_5G_BITS, "CH1: one mask bit per 5 GHz entry");
 static uint32_t wlscan_chmask;
 
@@ -1631,16 +1638,20 @@ wlwmi_start_scan_total(uint32_t n)
 	return 4u + WLWMI_START_SCAN_BYTES + 4u + 4u * n + 4u + 4u + WLWMI_MAC_ADDR_BYTES + 4u;
 }
 
+/* CH1 split: ID names the scan and its channels are the N kept entries from list
+ * position FIRST on; wlwmi_encode_start_scan below is the one-scan form (id
+ * 0xa000, from the start of the list). */
 static inline int
-wlwmi_encode_start_scan(uint32_t n, uint32_t max_time, uint8_t *out, uint32_t room, uint32_t *len)
+wlwmi_encode_start_scan_range(uint32_t id, uint32_t first, uint32_t n, uint32_t max_time, uint8_t *out, uint32_t room,
+    uint32_t *len)
 {
-	uint32_t total = wlwmi_start_scan_total(n);
-	if (!n || n > wlscan_kept(wlscan_chmask) || total > room) { return 1; }
+	uint32_t total = wlwmi_start_scan_total(n), kept = wlscan_kept(wlscan_chmask);
+	if (!n || first > kept || n > kept - first || total > room) { return 1; }
 	for (uint32_t i = 0; i < total; i++) { out[i] = 0; }
 	uint8_t *f = out + 4, *p = f + WLWMI_START_SCAN_BYTES;
 	wlce_put32(out, WLWMI_CMD_START_SCAN);
 	wlwmi_put_tlv(f, WLWMI_TAG_START_SCAN_CMD, WLWMI_START_SCAN_BYTES - 4u);
-	wlce_put32(f + 4 * WLWMI_SS_SCAN_ID, WLWMI_SCAN_ID);
+	wlce_put32(f + 4 * WLWMI_SS_SCAN_ID, id);
 	wlce_put32(f + 4 * WLWMI_SS_SCAN_REQ_ID, WLWMI_SCAN_REQ_ID);
 	wlce_put32(f + 4 * WLWMI_SS_VDEV_ID, WLWMI_VDEV_ID);
 	wlce_put32(f + 4 * WLWMI_SS_NOTIFY, WLSCAN_EVENTS);
@@ -1657,7 +1668,7 @@ wlwmi_encode_start_scan(uint32_t n, uint32_t max_time, uint8_t *out, uint32_t ro
 	wlce_put32(f + 4 * WLWMI_SS_DWELL_ACTIVE_6G, WLSCAN_DWELL_ACTIVE_6G);
 	wlce_put32(f + 4 * WLWMI_SS_DWELL_PASSIVE_6G, WLSCAN_DWELL_PASSIVE_6G);
 	wlwmi_put_tlv(p, WLWMI_TAG_ARRAY_UINT32, 4u * n);
-	for (uint32_t i = 0; i < n; i++) { wlce_put32(p + 4 + 4 * i, wlscan_chan(i)); }
+	for (uint32_t i = 0; i < n; i++) { wlce_put32(p + 4 + 4 * i, wlscan_chan(first + i)); }
 	p += 4u + 4u * n;
 	wlwmi_put_tlv(p, WLWMI_TAG_ARRAY_FIXED_STRUCT, 0);
 	p += 4;
@@ -1667,6 +1678,12 @@ wlwmi_encode_start_scan(uint32_t n, uint32_t max_time, uint8_t *out, uint32_t ro
 	wlwmi_put_tlv(p, WLWMI_TAG_ARRAY_BYTE, 0);
 	*len = total;
 	return 0;
+}
+
+static inline int
+wlwmi_encode_start_scan(uint32_t n, uint32_t max_time, uint8_t *out, uint32_t room, uint32_t *len)
+{
+	return wlwmi_encode_start_scan_range(WLWMI_SCAN_ID, 0, n, max_time, out, room, len);
 }
 
 /* What the scan heard. One entry per BSSID: the strongest reception's
@@ -1704,6 +1721,16 @@ wlscan_init(struct wlscan *s, uint32_t nchan)
 	for (size_t i = 0; i < sizeof(*s); i++) { ((uint8_t *)s)[i] = 0; }
 	s->nchan = nchan;
 	s->noise_floor = WLWMI_NOISE_FLOOR;
+}
+
+/* CH1 split: ready the scan state machine for the next START_SCAN of the same vdev once the previous scan is over. Only
+ * the per-scan state goes back (started / done / start-failed / dequeued and the reason); the counters, the last event and
+ * the BSS table stay, so the frames of both scans end in one table. */
+static inline void
+wlscan_rearm(struct wlscan *s)
+{
+	s->started = s->done = s->start_failed = s->dequeued = false;
+	s->reason = 0;
 }
 
 static inline int
