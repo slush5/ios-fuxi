@@ -944,6 +944,20 @@ static unsigned wl29_mask = WL29_DEFAULT;
 #define WL30_FSE 0x08u        /* HTT RX_FSE_SETUP_CFG (table in CMEM) and RX_FISA_CFG after the ring selection */
 #define WL30_ALL 0x0fu
 static unsigned wl30_mask;
+/* CH1 (fuxiwlanch, only with qrtr 7, the scan paths): a drop mask over the 38-entry
+ * passive scan list. Bits 0..24 drop the 5 GHz entries in list order (bit 13 = 5600),
+ * bit 25 drops the 13 2.4 GHz channels; w20 0x10 (BAND24) applies on top. Absent or 0
+ * = the list as before, no line; a bit above 25, or a mask (with BAND24) that leaves no
+ * channel, refuses the run before any access. Only the list changes: no new command,
+ * no register access, the scan stays passive. */
+static unsigned wl23_chmask;
+#define WL23_CH_24 (1u << 25)               /* fuxiwlanch bit 25: the 13 2.4 GHz channels */
+#define WL23_CH_ALL5 (WL23_CH_24 - 1u)      /* bits 0..24: the 25 5 GHz entries */
+#define WL23_CH_VALID (WL23_CH_24 | WL23_CH_ALL5)
+/* The effective mask: the knob, plus every 5 GHz entry when w20 0x10 (BAND24) is set. */
+#define WL23_CH_EFF(knob, band24) ((knob) | ((band24) ? WL23_CH_ALL5 : 0u))
+/* Channels of the 38 that an effective mask leaves (the header's wlscan_kept(), here for the parser, which cannot see the header). */
+#define WL23_CH_KEPT(eff) (38u - (unsigned)__builtin_popcount((eff) & WL23_CH_ALL5) - (((eff) & WL23_CH_24) ? 13u : 0u))
 static bool wl_w20, wl_w23;
 static unsigned wl20_bits;
 static unsigned wl20_qrtr; /* 6 or 7 when wl_w20, for the init lines */
@@ -1254,7 +1268,7 @@ wl_probe_configure(void)
 		printf("FUXI WLAN: rails variant %d (1 early before WLAN_EN, 2 late before WLAN_MODE) valid %u\n",
 		    rails, !wl_variant_invalid);
 	}
-	int stop22 = 0, keep = 0, qrtr = 0, w20 = 0, w29 = 0, vrx = 0;
+	int stop22 = 0, keep = 0, qrtr = 0, w20 = 0, w29 = 0, vrx = 0, chm = 0;
 	(void)PE_parse_boot_argn("fuxiwlanstop22", &stop22, sizeof(stop22));
 	(void)PE_parse_boot_argn("fuxiwlankeep", &keep, sizeof(keep));
 	(void)PE_parse_boot_argn("fuxiwlanqrtr", &qrtr, sizeof(qrtr));
@@ -1318,6 +1332,8 @@ wl_probe_configure(void)
 	bool w29_given = PE_parse_boot_argn("fuxiwlanw29", &w29, sizeof(w29));
 	wl30_mask = 0;
 	bool vrx_given = PE_parse_boot_argn("fuxiwlanvrx", &vrx, sizeof(vrx));
+	wl23_chmask = 0;
+	bool chm_given = PE_parse_boot_argn("fuxiwlanch", &chm, sizeof(chm));
 	if (qrtr < 0 || qrtr > WL20_QRTR_MAX) {
 		wl_variant_invalid = true;
 		printf("FUXI WLAN: W20 fuxiwlanqrtr=%d is not 0..%d in this build; refused\n", qrtr, WL20_QRTR_MAX);
@@ -1346,12 +1362,30 @@ wl_probe_configure(void)
 			printf("FUXI WLAN: W20 fuxiwlanvrx %#x refused: needs a valid w20 0x4000, bits 0xf only, 0x02 only with fuxiwlanw29 0x02, "
 			    "0x08 only with w20 0x800\n", (unsigned)vrx);
 		} else if (vrx_given) { wl30_mask = (unsigned)vrx; }
+		/* CH1: fuxiwlanch only with qrtr 7, bits 0..25 only, and at least one channel must stay (w20 0x10 counts too) */
+		if (chm_given && chm && !wl_w23) {
+			wl_variant_invalid = true;
+			wl20_bits = 0;
+			printf("FUXI WLAN: W20 fuxiwlanch %#x needs fuxiwlanqrtr=7; refused\n", (unsigned)chm);
+		} else if (chm_given && chm && (chm < 0 || ((unsigned)chm & ~WL23_CH_VALID) ||
+		    !WL23_CH_KEPT(WL23_CH_EFF((unsigned)chm, !!(wl20_bits & WL20_BAND24))))) {
+			wl_variant_invalid = true;
+			wl20_bits = 0;
+			printf("FUXI WLAN: W20 fuxiwlanch %#x refused: bits 0..25 only, and at least one channel must stay (w20 0x10 counts too)\n",
+			    (unsigned)chm);
+		} else if (chm_given) { wl23_chmask = (unsigned)chm; }
 		printf("FUXI WLAN: W20 selected qrtr=%d (%s) w20 %#x valid %u\n", qrtr,
 		    wl_w23 ? "CE/HTC/WMI init, then W23 passive scan" : "CE/HTC/WMI init to READY", (unsigned)w20, !wl_variant_invalid);
 		if (wl_w23) {
+			char chlist[48];
+			const char *chdesc = (wl20_bits & WL20_BAND24) ? "13 channels (2.4 GHz only)" : "38 channels";
+			if (wl23_chmask) {   /* CH1: the real count of the filtered list */
+				snprintf(chlist, sizeof(chlist), "%u channels (fuxiwlanch %#x)",
+				    WL23_CH_KEPT(WL23_CH_EFF(wl23_chmask, !!(wl20_bits & WL20_BAND24))), wl23_chmask);
+				chdesc = chlist;
+			}
 			printf("FUXI WLAN: W23 selected passive scan of %s, dwell 150 ms, nothing transmitted; BSSIDs OUI only, pdev %s, htt version %s\n",
-			    (wl20_bits & WL20_BAND24) ? "13 channels (2.4 GHz only)" : "38 channels",
-			    (wl20_bits & WL20_PDEVCAP) ? "from EXT caps" : "0", (wl20_bits & WL20_HTTVER) ? "asked" : "not asked");
+			    chdesc, (wl20_bits & WL20_PDEVCAP) ? "from EXT caps" : "0", (wl20_bits & WL20_HTTVER) ? "asked" : "not asked");
 		}
 		if (wl20_bits & WL26_BITS) {
 			printf("FUXI WLAN: W26 selected: rx rings %s; wbm idle list %s; chain mask %s; nothing selected to host rings\n",
@@ -1393,6 +1427,10 @@ wl_probe_configure(void)
 	if (!wl_w20 && vrx_given && vrx) {   /* C2h: fuxiwlanvrx without qrtr 7 and w20 0x4000 */
 		wl_variant_invalid = true;
 		printf("FUXI WLAN: W20 fuxiwlanvrx %#x needs fuxiwlanqrtr=7 with w20 0x4000; refused\n", (unsigned)vrx);
+	}
+	if (!wl_w20 && chm_given && chm) {   /* CH1: fuxiwlanch without qrtr 7 */
+		wl_variant_invalid = true;
+		printf("FUXI WLAN: W20 fuxiwlanch %#x needs fuxiwlanqrtr=7; refused\n", (unsigned)chm);
 	}
 	wl_stop22 = stop22 == 1; wl_keep = keep == 1;
 	wlhd_bits = 0; wlhd_cap_off_seen = wlhd_cap_len_seen = false; wlhd_cap_off = 0; wlhd_cap_len = 0;
@@ -7024,12 +7062,17 @@ wl30_fse(void)
 }
 /* ---- end C2h ---- */
 
+/* CH1: the parser's constants (before the header exists for it) are the header's */
+_Static_assert(WL23_CH_24 == WLSCAN_CH_24 && WL23_CH_ALL5 == WLSCAN_CH_ALL5 && WL23_CH_VALID == WLSCAN_CH_VALID,
+    "fuxiwlanch mask layout: the driver and the header agree");
 static int
 wl_w23_run(void)
 {
 	static uint8_t cmd[WLCE_BUF];
-	uint32_t len = 0, n = (wl20_bits & WL20_BAND24) ? WLSCAN_NCHAN_24 : WLSCAN_NCHAN, max_ms = wlscan_max_time(n);
-	uint32_t eid = wl_htc.wmi_eid, sends = 0, bytes = 0, dfs = 0;
+	/* CH1: one filtered list for SCAN_CHAN_LIST, START_SCAN (array, n, max time) and every count below; w20 0x10 drops the 5 GHz entries */
+	wlscan_chmask = wlscan_mask_eff(wl23_chmask, !!(wl20_bits & WL20_BAND24));
+	uint32_t len = 0, n = wlscan_kept(wlscan_chmask), max_ms = wlscan_max_time(n);
+	uint32_t eid = wl_htc.wmi_eid, sends = 0, bytes = 0, dfs = 0, n24 = 0;
 	unsigned took = 0;
 	wl12_stage = WL23_SCAN;
 	wlscan_init(&wl_scan, n);
@@ -7037,6 +7080,11 @@ wl_w23_run(void)
 	wl23_scan_sent = wl23_htt_seen = false;
 	wl23_lines = 0;
 	wl23_ci_lines = wl23_ci_drop = 0;  /* C2b */
+	if (wl23_chmask) {   /* CH1: silent while the knob is off */
+		printf("FUXI WLAN: W23 chan mask 0x%x: %u channels kept (2.4 GHz %u, 5 GHz %u)\n", wl23_chmask, n,
+		    wlscan_kept24(wlscan_chmask), n - wlscan_kept24(wlscan_chmask));
+		if (!n) { return wl_w11_fail("W23 chan mask leaves no channel (init refuses this)"); }   /* before any CE traffic */
+	}
 	/* L19 sends pdev 0 for a single-pdev chip such as WCN7850 (wmi.c:4688-4691;
 	 * reg.c:178, mac.c:9740, 4894 read it); w20 0x80 takes the EXT MAC/PHY pdev. */
 	wl23_pdev = (wl20_bits & WL20_PDEVCAP) ? wl_wmi.pdev_id : 0u;
@@ -7059,9 +7107,13 @@ wl_w23_run(void)
 		if (wl_ce_send(eid, cmd, len, "WMI SCAN_CHAN_LIST")) { return 1; }
 		bytes += len;
 	}
-	for (uint32_t i = 0; i < n; i++) { dfs += wlscan_is_dfs(wlscan_chan(i)) ? 1u : 0u; }
+	for (uint32_t i = 0; i < n; i++) {
+		uint32_t mhz = wlscan_chan(i);
+		dfs += wlscan_is_dfs(mhz) ? 1u : 0u;
+		n24 += mhz < 3000u ? 1u : 0u;   /* CH1: counted off the filtered list itself */
+	}
 	printf("FUXI WLAN: W23 chan list %u passive (2.4 GHz %u, 5 GHz %u, dfs %u) pdev %u commands %u bytes %u\n", n,
-	    n < WLSCAN_NCHAN_24 ? n : WLSCAN_NCHAN_24, n > WLSCAN_NCHAN_24 ? n - WLSCAN_NCHAN_24 : 0u, dfs, wl23_pdev, sends, bytes);
+	    n24, n - n24, dfs, wl23_pdev, sends, bytes);
 	if (wl29_macstart_post()) { return 1; }   /* C2f: LRO config and idle-PS after the channel list (mac.c:9452-9465) */
 	/* Streams = the pdev's chains on each band it has (mac.c:9753-9760,
 	 * 14557-14560); without MAC/PHY caps, SERVICE_READY's rf chains on both. */

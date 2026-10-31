@@ -104,6 +104,7 @@ static bool PE_parse_boot_argn(const char *name, void *out, int size) {
     if(!strcmp(name,"fuxiwlanw29")) { assert(size==sizeof(int)); return false; }  /* C2f bisect: absent */
     if(!strcmp(name,"fuxiwlanvrx")) { assert(size==sizeof(int)); return false; }  /* C2h: absent */
     if(!strcmp(name,"fuxiwlandiag")) { assert(size==sizeof(int)); return false; }  /* HD1: absent */
+    if(!strcmp(name,"fuxiwlanch")) { assert(size==sizeof(int)); return false; }  /* CH1: absent */
     if(!strcmp(name,"fuxiwlanprobe")) {
         if(probe_arg) { strncpy(out,probe_arg,size); return true; }
         return false;

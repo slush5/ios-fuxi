@@ -84,6 +84,9 @@ C2h (fuxiwlanvrx, W30): the vendor's kiwi RX extras after docs-lanes/wlan-mgmt-r
 stale PPT (our 280 written, the rest read only), 0x04 WMI INIT flag1 IPA_DISABLE, 0x08 HTT RX_FSE_SETUP_CFG /
 RX_FISA_CFG (model s_c2h_*; static_c2h; vendor_c2h re-derives every constant from the ISC vendor tree at
 $KIWI_VENDOR_SRC, else skipped; mutants).
+CH1 (fuxiwlanch): a default-off drop mask over the 38-entry passive scan list (bits 0..24 the 5 GHz entries in list
+order, bit 25 the 2.4 GHz channels, w20 0x10 applied on top); the one filtered list reaches SCAN_CHAN_LIST, START_SCAN
+and every printed count (model s_ch1_*; static_ch1; mutants).
 No device, no network.
 """
 from pathlib import Path
@@ -204,6 +207,52 @@ def static_checks():
     static_c2e()
     static_c2f()
     static_c2h()
+    static_ch1()
+
+
+def static_ch1():
+    """CH1 (fuxiwlanch): the scan channel mask. The knob is read like every fuxiwlan* knob, is 0 unless given valid
+    (bits 0..25, at least one channel left with w20 0x10 counted, qrtr 7 only), lives in one variable that only the
+    parser sets and only the scan stage reads, and the filtered list is set once, before the first encoder call; the
+    header never writes the mask and bounds both encoders by the kept count; nothing in the CH1 lines sends or touches
+    a register."""
+    drv = DRIVER
+    code = strip_comments(drv)
+    cfg = between(drv, 'static void\nwl_probe_configure(void)\n{', '\n}\n')
+    assert cfg.count('PE_parse_boot_argn("fuxiwlanch", &chm, sizeof(chm))') == 1 and 'wl23_chmask = 0;' in cfg
+    assert 'else if (chm_given) { wl23_chmask = (unsigned)chm; }' in cfg and strip_comments(cfg).count('wl23_chmask = ') == 2
+    assert 'if (chm_given && chm && !wl_w23) {' in cfg and 'if (!wl_w20 && chm_given && chm) {' in cfg
+    assert ('} else if (chm_given && chm && (chm < 0 || ((unsigned)chm & ~WL23_CH_VALID) ||\n'
+            '\t\t    !WL23_CH_KEPT(WL23_CH_EFF((unsigned)chm, !!(wl20_bits & WL20_BAND24))))) {') in cfg
+    assert cfg.index('wl30_mask = (unsigned)vrx;') < cfg.index('wl23_chmask = (unsigned)chm;') < cfg.index('W20 selected qrtr=%d')
+    assert cfg.count('W20 fuxiwlanch %#x needs fuxiwlanqrtr=7; refused') == 2 and cfg.count('W20 fuxiwlanch %#x refused: bits 0..25 only') == 1
+    # the scan stage: one filtered list, set before the stage state and every encoder call; n, max time and the counts from it
+    w23 = between(drv, 'static int\nwl_w23_run(void)\n{', '\n}\n')
+    assert code.count('wlscan_chmask = ') == 1 and w23.count('wlscan_chmask = ') == 1
+    assert w23.index('wlscan_chmask = wlscan_mask_eff(wl23_chmask, !!(wl20_bits & WL20_BAND24));') < w23.index('wlscan_init(&wl_scan, n);') < \
+        w23.index('wlwmi_encode_chan_list(') < w23.index('wlwmi_encode_start_scan(n, max_ms,')
+    assert 'n = wlscan_kept(wlscan_chmask), max_ms = wlscan_max_time(n)' in w23
+    assert w23.count('printf("FUXI WLAN: W23 chan mask 0x%x: %u channels kept (2.4 GHz %u, 5 GHz %u)\\n"') == 1
+    assert 'if (wl23_chmask) {   /* CH1: silent while the knob is off */' in w23
+    assert w23.index('W23 chan mask 0x%x') < w23.index('if (!n) { return wl_w11_fail(') < w23.index('W23 htt version %u.%u (w20 0x02)')
+    assert 'n24 += mhz < 3000u ? 1u : 0u;' in w23 and 'n24, n - n24, dfs, wl23_pdev, sends, bytes);' in w23
+    # nothing else reads or sets the knob; the CH1 lines send nothing and touch no register
+    assert code.count('wl23_chmask') == 1 + strip_comments(cfg).count('wl23_chmask') + strip_comments(w23).count('wl23_chmask')
+    for body in (cfg, w23):
+        for line in strip_comments(body).splitlines():
+            if 'chmask' in line or 'W23 chan mask' in line:
+                assert not re.search(r'wl_ce_send|wl_pwr|wl_mwr|wl_prd|wl_win|wl_soc|wlwmi_encode|wl_contain_wr', line), line
+    # the header: the mask is written only by the driver; both encoders are bounded by the kept count; the list is the same function
+    assert 'static uint32_t wlscan_chmask;' in HEADER and HEADER.count('wlscan_chmask =') == 0
+    assert 'uint32_t kept = wlscan_kept(wlscan_chmask);\n\tif (!n || n > kept || first > kept - n || total > room) { return 1; }' in HEADER
+    assert 'if (!n || n > wlscan_kept(wlscan_chmask) || total > room) { return 1; }' in HEADER
+    assert HEADER.count('wlscan_chan_full(') == 2 and HEADER.count('wlscan_chan(') >= 3
+    assert '_Static_assert(WLSCAN_NCHAN == WLSCAN_NCHAN_24 + WLSCAN_CH_5G_BITS' in HEADER and \
+        '_Static_assert(WL23_CH_24 == WLSCAN_CH_24 && WL23_CH_ALL5 == WLSCAN_CH_ALL5 && WL23_CH_VALID == WLSCAN_CH_VALID,' in drv
+    assert '#define WLSCAN_FLAGS (WLWMI_SCAN_FLAG_PASSIVE | WLWMI_SCAN_CHAN_STAT_EVENT)' in HEADER   # still passive, whatever the mask
+    print('CH1 static: fuxiwlanch read like every knob, 0 unless valid (bits 0..25, a channel left with w20 0x10 counted, qrtr 7 only), '
+          'set in one place, the filtered list fixed once before the first encoder call, n / max time / counts from it, the line silent '
+          'while off, the header never writes the mask and bounds both encoders by it, the CH1 lines send nothing')
 
 
 def c_calls(body, name):
@@ -2061,6 +2110,37 @@ C2H_MUTANTS = [
 ]
 
 
+# Each CH1 rule broken in the production code must be caught by the CH1 static checks or the model's CH1 scenarios.
+C2CH_MUTANTS = [
+    ('d', 'wlscan_chmask = wlscan_mask_eff(wl23_chmask, !!(wl20_bits & WL20_BAND24));', 'wlscan_chmask = 0;', 'the mask never applied'),
+    ('d', 'wlscan_chmask = wlscan_mask_eff(wl23_chmask, !!(wl20_bits & WL20_BAND24));', 'wlscan_chmask = wlscan_mask_eff(wl23_chmask, false);',
+     'w20 0x10 ignored'),
+    ('d', 'wlscan_chmask = wlscan_mask_eff(wl23_chmask, !!(wl20_bits & WL20_BAND24));', 'wlscan_chmask = wl23_chmask;', 'w20 0x10 not combined'),
+    ('d', 'n = wlscan_kept(wlscan_chmask), max_ms = wlscan_max_time(n)', 'n = WLSCAN_NCHAN, max_ms = wlscan_max_time(n)', 'n not from the list'),
+    ('d', 'n24 += mhz < 3000u ? 1u : 0u;', 'n24 += 0u;', '2.4 GHz count not off the list'),
+    ('d', 'wlscan_kept24(wlscan_chmask), n - wlscan_kept24(wlscan_chmask));', 'WLSCAN_NCHAN_24, n - WLSCAN_NCHAN_24);',
+     'mask line counts fixed'),
+    ('d', 'if (wl23_chmask) {   /* CH1: silent while the knob is off */', 'if (1) {   /* CH1: silent while the knob is off */',
+     'mask line with the knob off'),
+    ('d', 'if (!n) { return wl_w11_fail("W23 chan mask leaves no channel (init refuses this)"); }', '', 'an empty list runs'),
+    ('d', 'if (chm_given && chm && !wl_w23) {', 'if (chm_given && chm && 0) {', 'the knob accepted without qrtr 7'),
+    ('d', '((unsigned)chm & ~WL23_CH_VALID)', '((unsigned)chm & ~0x7ffffffu)', 'bit 26 accepted'),
+    ('h', 'for (uint32_t i = 0; i < WLSCAN_NCHAN; i++) { n += wlscan_dropped(mask, i) ? 0u : 1u; }',
+     'for (uint32_t i = 0; i < WLSCAN_NCHAN; i++) { n += 1u; }', 'kept count ignores the mask'),
+    ('h', '((mask >> (i - WLSCAN_NCHAN_24)) & 1u) != 0;', '((mask >> (i - WLSCAN_NCHAN_24 + 1u)) & 1u) != 0;', '5 GHz bits shifted by one'),
+    ('h', 'return i < WLSCAN_NCHAN_24 ? (mask & WLSCAN_CH_24) != 0 :', 'return i < WLSCAN_NCHAN_24 ? (mask & 1u) != 0 :',
+     'bit 25 is bit 0'),
+    ('h', 'if (!n || n > kept || first > kept - n || total > room) { return 1; }',
+     'if (!n || n > WLSCAN_NCHAN || first > WLSCAN_NCHAN - n || total > room) { return 1; }', 'chan list bound ignores the mask'),
+    ('h', 'if (!n || n > wlscan_kept(wlscan_chmask) || total > room) { return 1; }',
+     'if (!n || n > WLSCAN_NCHAN || total > room) { return 1; }', 'START_SCAN bound ignores the mask'),
+    ('h', 'wlce_put32(p + 4 + 4 * i, wlscan_chan(i)); }', 'wlce_put32(p + 4 + 4 * i, wlscan_chan_full(i)); }', 'START_SCAN array unfiltered'),
+    ('h', 'uint32_t mhz = wlscan_chan(first + i);', 'uint32_t mhz = wlscan_chan_full(first + i);', 'chan list entries unfiltered'),
+    ('h', 'return knob | (band24 ? WLSCAN_CH_ALL5 : 0u);', 'return knob;', 'w20 0x10 not in the effective mask'),
+    ('h', '#define WLSCAN_CH_ALL5 (WLSCAN_CH_24 - 1u)', '#define WLSCAN_CH_ALL5 (WLSCAN_CH_24 - 2u)', 'mask layout disagrees with the parser'),
+]
+
+
 def mutants(table=None, mode='c2d'):
     """Every C2d (C2e) mutant is caught (static check or the model's C2d (C2e) scenarios); run in parallel."""
     table = C2D_MUTANTS if table is None else table
@@ -3067,9 +3147,10 @@ def main():
     mutants(C2E_MUTANTS, 'c2e')
     mutants(C2F_MUTANTS, 'c2f')
     mutants(C2H_MUTANTS, 'c2h')
+    mutants(C2CH_MUTANTS, 'c2ch')
     dash_check()
-    print('W20 (fuxiwlanqrtr=6) CE/HTC/WMI, W23 (fuxiwlanqrtr=7) passive scan, C2c (W26), C2d (W27), C2e (W28), C2f (W29) and '
-          'C2h (W30) host tests passed')
+    print('W20 (fuxiwlanqrtr=6) CE/HTC/WMI, W23 (fuxiwlanqrtr=7) passive scan, C2c (W26), C2d (W27), C2e (W28), C2f (W29), '
+          'C2h (W30) and CH1 (fuxiwlanch) host tests passed')
 
 
 if __name__ == '__main__':

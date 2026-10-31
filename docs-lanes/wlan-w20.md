@@ -11,7 +11,8 @@ written, the scan wedged after 3 channels); C2e (W28: the RXDMA monitor status r
 and the common SRNGs L19 programs before any scan, w20 0x4000, default off) is host-tested only too; C2g (where the per-MAC
 RXDMA ring pointers live, read-only pointer-word lines, the relaxed cookie-conversion gate and the `fuxiwlanw29` default
 0x9f) is host-tested only; C2h (W30: the vendor's kiwi RX extras behind `fuxiwlanvrx`, default off, after the
-management-RX study `docs-lanes/wlan-mgmt-rx-study.md`) is host-tested only. Every line below that
+management-RX study `docs-lanes/wlan-mgmt-rx-study.md`) is host-tested only; CH1 (`fuxiwlanch`, a default-off drop mask over
+the passive scan channel list, [below](#ch1-the-scan-channel-mask-fuxiwlanch)) is host-tested only. Every line below that
 says what the target does is what
 the model does, built from Linux ath12k v6.19. C2, C2b and C2c are described in their own sections below
 ([C2: W23/W24](#c2-w23w24-one-passive-scan-fuxiwlanqrtr7),
@@ -47,6 +48,7 @@ file:line below is into that tree. UniXNU-sheng was not used for any line of cod
 | `fuxiwlanw20=N` | 0 default | With qrtr 6 or 7: 0x01 NOHTT (no HTT connect; WMI then gets the next endpoint), 0x04 MRRS128 (endpoint PCIe Device Control max read request 128 bytes before CE init, low half only), 0x40 NOHWMODE (no PDEV_SET_HW_MODE). With qrtr 7 only: 0x02 HTTVER (HTT version request after HW mode), 0x10 BAND24 (the 13 2.4 GHz channels only), 0x80 PDEVCAP (the EXT MAC/PHY pdev id instead of 0), and C2c's 0x100 RXRING (host RX rings with 4095 buffers and their 4 HTT SRING_SETUP; only with 0x02), 0x200 IDLELINK (the WBM idle link-descriptor list), 0x400 CHAINMASK (PDEV_SET_PARAM TX/RX chain mask), and C2d's 0x800 RXSEL (RX_RING_SELECTION_CFG per MAC ring) and 0x1000 REORX (REO/release rings, buffers back to ring 160), each only with 0x100, and C2e's 0x2000 MONSTAT (the monitor status rings 185/193 and the crash line), only with 0x100. Refused: 0x08 ACTIVE (would transmit probe requests) and 0x20 FULLBSSID (would log whole BSSIDs; the owner masks every BSSID) at every qrtr, the qrtr-7 bits with qrtr 6, 0x01 together with 0x02, 0x100 without 0x02, 0x800, 0x1000 or 0x2000 without 0x100, any other bit. |
 
 | `fuxiwlanvrx=N` | absent or 0 default | C2h, only with qrtr 7 and a valid w20 0x4000: 0x01 MGMTREO (read-only management-RX counts), 0x02 CCSTALE (cookie conversion over a stale PPT; needs `fuxiwlanw29` 0x02, in the 0x9f default), 0x04 IPADIS (WMI INIT flag1 IPA_DISABLE), 0x08 FSE (HTT RX_FSE_SETUP_CFG and RX_FISA_CFG; needs w20 0x800). Refused: negative, any other bit, without a valid 0x4000 or qrtr 7. See [C2h](#c2h-w30-the-vendors-kiwi-rx-extras-fuxiwlanvrx). |
+| `fuxiwlanch=N` | absent or 0 default | CH1, only with qrtr 7: a drop mask over the 38-entry passive scan list. Bits 0..24 drop the 5 GHz entries in list order (5180 ... 5825; bit 13 = 5600), bit 25 drops the 13 2.4 GHz channels; w20 0x10 applies on top. Refused: any bit above 25, a mask (with w20 0x10) that leaves no channel, any other qrtr. See [CH1](#ch1-the-scan-channel-mask-fuxiwlanch). |
 
 Refusals set `wl_variant_invalid`; salami refuses at init before any access, the Fuxi build at step 17.
 Every boot without `fuxiwlanqrtr=6` or `7` logs and behaves as before C1, and every boot with qrtr absent
@@ -1832,6 +1834,83 @@ recorded in the commit body):
   ADT /defaults: 6144 runs, byte for byte.
 
 Every new line and access is reached only under a `wl30_mask` bit, and `wl30_mask` is 0 unless the knob is given valid.
+
+## CH1: the scan channel mask (`fuxiwlanch`)
+
+Code and host tests only; nothing ran on the phone. Why: the 38-entry passive list (13 channels of 2.4 GHz, 25 of 5 GHz)
+is all or nothing (w20 0x10 keeps the 13 and drops the 25). A readout that wants to ask "does this one channel, or this DFS
+block, make the scan stall or stay quiet" needs a finer cut without a new build per channel. This is only a filter on the list the
+scan already sends; the scan stays passive and nothing else changes.
+
+`fuxiwlanch` is an unsigned int read like every fuxiwlan* knob (boot-arg, else ADT /defaults; `--wlan-defaults
+fuxiwlanch=N`). Bit k (0..24) drops the k-th 5 GHz entry in list order: 5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320, 5500,
+5520, 5540, 5560, 5580, 5600, 5620, 5640, 5660, 5680, 5700, 5720, 5745, 5765, 5785, 5805, 5825 (bit 13 = 5600, 14 = 5620,
+15 = 5640). Bit 25 drops all 13 channels of 2.4 GHz. With w20 0x10 (BAND24) both apply: the 5 GHz bits then change
+nothing, bit 25 empties the list.
+
+| `fuxiwlanch` | Kept | Line |
+|---|---|---|
+| absent or 0 | 38 (13 + 25), or 13 with w20 0x10 | none; the boot exactly as at 5777ed3 (proof below) |
+| 57344 (0xe000) | 35 (13 + 22), 5600/5620/5640 dropped | `W23 chan mask 0xe000: 35 channels kept (2.4 GHz 13, 5 GHz 22)` |
+| 33554432 (0x2000000) | 25, 5 GHz only | `W23 chan mask 0x2000000: 25 channels kept (2.4 GHz 0, 5 GHz 25)` |
+| 57344 with w20 0x10 | 13 | `W23 chan mask 0xe000: 13 channels kept (2.4 GHz 13, 5 GHz 0)` |
+| 33554432 with w20 0x10 | none | refused at init |
+
+Gate (all before any access, the run invalid, in the existing refusal style): a bit above 25 (`W20 fuxiwlanch 0xN refused:
+bits 0..25 only, and at least one channel must stay (w20 0x10 counts too)`), a mask that leaves no channel on its own or
+with w20 0x10 (the same line), and any qrtr but 7 (`W20 fuxiwlanch 0xN needs fuxiwlanqrtr=7; refused`; qrtr 8 does not
+exist in this build and is refused by its own line). The scan stage still fails closed if it were ever reached with an empty
+list: `W23 failure: W23 chan mask leaves no channel (init refuses this)` before any CE traffic.
+
+### One filtered list
+
+`wl_w23_run` sets the effective mask once (`wlscan_chmask = knob | (BAND24 ? every 5 GHz bit : 0)`), before the first
+encoder call. `wlscan_chan(i)` is the i-th kept channel of the full list under that mask, so everything reads the same
+list: the SCAN_CHAN_LIST entries (and its bound and the APPEND split), the START_SCAN channel array, `num_chan`, and
+`max_scan_time` (n x 150 x 3/2 from the real n), `wl_scan.nchan` (the mid-scan watch), and every printed count. The
+2.4 GHz and DFS counts of the `W23 chan list` line are counted off the filtered list itself. `W23 selected passive scan of N
+channels (fuxiwlanch 0xM)` carries the real count at init when the knob is active; without it the line is the old text.
+
+### Lines
+
+```
+FUXI WLAN: W23 selected passive scan of N channels (fuxiwlanch 0xM), dwell 150 ms, nothing transmitted; ...   (init, only with the knob)
+FUXI WLAN: W23 chan mask 0xM: N channels kept (2.4 GHz a, 5 GHz b)                                          (scan stage start, only with the knob)
+FUXI WLAN: W23 chan list N passive (2.4 GHz a, 5 GHz b, dfs c) pdev P commands K bytes B                     (unchanged format, filtered counts)
+FUXI WLAN: W23 scan start id 0xa000 vdev 0 channels N passive dwell 150 ms max T ms events 0x5f flags 0x11   (unchanged format, N and T from the list)
+```
+
+`M` is the knob as given; `N` is what is really kept after w20 0x10.
+
+### Safety and what does not change
+
+No new WMI command or HTT message, no register access, no allocation; PASSIVE stays forced (`WLSCAN_FLAGS` is still
+0x11, no probe request, no SSID or IE words). The only variable is the list the existing SCAN_CHAN_LIST and START_SCAN
+carry. The header never writes the mask; `static_ch1` pins that the driver sets it in one place, before the stage state and
+every encoder call, and that nothing else reads the knob.
+
+### Proof that boots without `fuxiwlanch` are unchanged
+
+Three differentials against 5777ed3, each tree built from its own sources:
+
+- D1: 5777ed3's model with all its scenarios, instrumented to dump every log (appended at each `reset()`), linked against
+  5777ed3's and this change's production code (each tree's `production()` extraction): 262 logs, 2816220 bytes, byte for
+  byte; the six wire dumps (`dump-init`, `dump-c2` ... `dump-c2f`) equal; the 63 scenario summary lines equal. The CH1
+  scenarios run last and only add after them.
+- D2: the salami and Fuxi init/configure gate (`test-fuxi-wlan-salami.py`'s build, each tree's own) over 8100 boot-arg
+  sets without `fuxiwlanch` (fuxiwlan 28/1/11, qrtr absent/5/6/7/8, nine w20 values, three fuxiwlanw29, three fuxiwlanvrx,
+  keep, mlo, diag, rails), cmdline and ADT /defaults (each tree's own `mkadt-salami.py`), both configurations: 32400 runs,
+  stdout (log, RESULT, NAMES) byte for byte.
+- D3: the salami test's own 352 distinct boots and RPMh runs, recorded from `subprocess.run` in both trees: identical
+  byte for byte; the new tree only adds its 30 CH1 boots.
+
+No existing assertion was edited. Added: the CH1 model scenarios (`s_ch1_pure`: 4096 masks and every single bit against
+the model's own reading of the mask; `s_ch1_scan`: 57344, bit 25, w20 0x10 with a mask, 0x92 with bit 0, one channel left,
+the four-command split, the empty list, knob off), `static_ch1` and 19 `C2CH_MUTANTS` in `test-fuxi-wlan-ce.py`, 20 gate
+cases plus 5 ADT parity sets and a check that the kept count in the log equals an independent count in
+`test-fuxi-wlan-salami.py` (whose "no W20 line" guard also learns that a non-zero `fuxiwlanch` prints one), the knob in
+`mkadt-salami.py`'s table, and the one stub line the fake `PE_parse_boot_argn` of `test-fuxi-wlan-m6.py` needs for the
+new, absent knob.
 
 ## Host tests
 

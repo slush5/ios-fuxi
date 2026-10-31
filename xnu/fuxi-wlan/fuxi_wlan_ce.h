@@ -1431,9 +1431,23 @@ _Static_assert(WLWMI_CI_WORDS * 4 == WLWMI_CHAN_INFO_BYTES && WLWMI_CI_CMD_FLAGS
 
 /* The C2 channel list, one for the radio and the iOS side (overnight_plan.md
  * 3.2): 2.4 GHz 1-13, 5 GHz 36-48, 52-64 (DFS), 100-144 (DFS), 149-165; no
- * 6 GHz. The 13 2.4 GHz channels come first: w20 0x10 scans those only. */
+ * 6 GHz. The 13 2.4 GHz channels come first: w20 0x10 scans those only.
+ *
+ * CH1 (fuxiwlanch): a drop mask over that list. Bit k (0..24) drops the k-th
+ * 5 GHz entry in list order (bit 0 = 5180 ... bit 13 = 5600 ... bit 24 = 5825),
+ * bit 25 drops all 13 2.4 GHz channels; 0 keeps the whole list. wlscan_chmask
+ * is the one place the mask lives: wlscan_chan(i) is the i-th kept channel, so
+ * SCAN_CHAN_LIST, START_SCAN and every count read the same filtered list. The
+ * driver sets it once, before the first encoder call of a scan. */
+#define WLSCAN_CH_5G_BITS 25u
+#define WLSCAN_CH_24 (1u << WLSCAN_CH_5G_BITS)
+#define WLSCAN_CH_ALL5 (WLSCAN_CH_24 - 1u)
+#define WLSCAN_CH_VALID (WLSCAN_CH_24 | WLSCAN_CH_ALL5)
+_Static_assert(WLSCAN_NCHAN == WLSCAN_NCHAN_24 + WLSCAN_CH_5G_BITS, "CH1: one mask bit per 5 GHz entry");
+static uint32_t wlscan_chmask;
+
 static inline uint32_t
-wlscan_chan(uint32_t i)
+wlscan_chan_full(uint32_t i)
 {
 	static const uint16_t mhz[WLSCAN_NCHAN] = {
 		2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
@@ -1442,6 +1456,46 @@ wlscan_chan(uint32_t i)
 		5745, 5765, 5785, 5805, 5825,
 	};
 	return i < WLSCAN_NCHAN ? mhz[i] : 0u;
+}
+
+/* Does MASK drop entry I of the full list? */
+static inline bool
+wlscan_dropped(uint32_t mask, uint32_t i)
+{
+	return i < WLSCAN_NCHAN_24 ? (mask & WLSCAN_CH_24) != 0 : ((mask >> (i - WLSCAN_NCHAN_24)) & 1u) != 0;
+}
+
+/* Channels kept under MASK, of the whole list and of its 2.4 GHz part. */
+static inline uint32_t
+wlscan_kept(uint32_t mask)
+{
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < WLSCAN_NCHAN; i++) { n += wlscan_dropped(mask, i) ? 0u : 1u; }
+	return n;
+}
+
+static inline uint32_t
+wlscan_kept24(uint32_t mask)
+{
+	return (mask & WLSCAN_CH_24) ? 0u : WLSCAN_NCHAN_24;
+}
+
+/* The mask a scan really uses: the knob, plus every 5 GHz entry when w20 0x10 (BAND24) is set. */
+static inline uint32_t
+wlscan_mask_eff(uint32_t knob, bool band24)
+{
+	return knob | (band24 ? WLSCAN_CH_ALL5 : 0u);
+}
+
+/* The I-th kept channel under wlscan_chmask, 0 past the end (the whole list, as before, while the mask is 0). */
+static inline uint32_t
+wlscan_chan(uint32_t i)
+{
+	for (uint32_t f = 0, k = 0; f < WLSCAN_NCHAN; f++) {
+		if (wlscan_dropped(wlscan_chmask, f)) { continue; }
+		if (k++ == i) { return wlscan_chan_full(f); }
+	}
+	return 0u;
 }
 
 static inline bool wlscan_is_dfs(uint32_t mhz) { return (mhz >= 5260u && mhz <= 5320u) || (mhz >= 5500u && mhz <= 5720u); }
@@ -1488,7 +1542,8 @@ static inline int
 wlwmi_encode_chan_list(uint32_t first, uint32_t n, bool append, uint32_t pdev, uint8_t *out, uint32_t room, uint32_t *len)
 {
 	uint32_t total = 4u + WLWMI_CHAN_LIST_BYTES + 4u + n * WLWMI_CHANNEL_BYTES;
-	if (!n || n > WLSCAN_NCHAN || first > WLSCAN_NCHAN - n || total > room) { return 1; }
+	uint32_t kept = wlscan_kept(wlscan_chmask);
+	if (!n || n > kept || first > kept - n || total > room) { return 1; }
 	for (uint32_t i = 0; i < total; i++) { out[i] = 0; }
 	wlce_put32(out, WLWMI_CMD_SCAN_CHAN_LIST);
 	wlwmi_put_tlv(out + 4, WLWMI_TAG_SCAN_CHAN_LIST_CMD, WLWMI_CHAN_LIST_BYTES - 4u);
@@ -1580,7 +1635,7 @@ static inline int
 wlwmi_encode_start_scan(uint32_t n, uint32_t max_time, uint8_t *out, uint32_t room, uint32_t *len)
 {
 	uint32_t total = wlwmi_start_scan_total(n);
-	if (!n || n > WLSCAN_NCHAN || total > room) { return 1; }
+	if (!n || n > wlscan_kept(wlscan_chmask) || total > room) { return 1; }
 	for (uint32_t i = 0; i < total; i++) { out[i] = 0; }
 	uint8_t *f = out + 4, *p = f + WLWMI_START_SCAN_BYTES;
 	wlce_put32(out, WLWMI_CMD_START_SCAN);
