@@ -704,6 +704,9 @@ static uint32_t m_chan_no(uint32_t mhz) { return mhz < 3000 ? (mhz - 2407) / 5 :
  * description: bit k (0..24) drops the k-th 5 GHz entry in list order (m_chan(13 + k)), bit 25 drops the 13 2.4 GHz
  * entries. m_kidx(I) = the full-list index of the I-th kept channel (38 past the end); mask 0 = the whole list. */
 static uint32_t m_chmask;
+/* The scan_ctrl_flags_ext word (START_SCAN word 35) the firmware expects in every START_SCAN: 0 unless a scenario asks for a DBS scan
+ * policy. Written down here from the vendor header (wmi_unified.h:6470-6478: policy in bits 0-1, 1 = FORCE_NONDBS, 2 = IGNORE_DUTY). */
+static uint32_t m_ext;
 static unsigned
 m_kidx(unsigned i)
 {
@@ -1760,7 +1763,7 @@ fw_c2_cmd(uint32_t id, const uint8_t *pl, uint32_t plen, unsigned need)
 		CHECK(sc == 0 || (fw_scan_done_q != ~0u && q_head > fw_scan_done_q), "START_SCAN before the previous scan's COMPLETED reached the host");
 		want[0] = 0x4du << 16 | 156u; want[1] = sid; want[2] = 1; want[3] = 0; want[4] = 0; want[5] = 0x5f;
 		want[6] = 50; want[7] = 150; want[8] = 50; want[9] = 500; want[13] = cnt * 150 * 3 / 2; want[14] = 5;
-		want[15] = 0x11; want[17] = cnt; want[18] = 1; want[36] = 0; want[37] = 70; want[38] = 70;
+		want[15] = 0x11; want[17] = cnt; want[18] = 1; want[35] = m_ext; want[36] = 0; want[37] = 70; want[38] = 70;
 		CHECK(fw_c2_step == (sc ? 8u : 7u), "START_SCAN before the vdev was set up");
 		CHECK(plen == 4 + 160 + 4 + 4 * cnt + 4 + 4 + 8 + 4, "START_SCAN length");
 		for (unsigned i = 0; i < 40; i++) {
@@ -2410,7 +2413,7 @@ reset(void)
 	wl_w23 = false; memset(&wl_scan, 0, sizeof(wl_scan)); wl23_scan_sent = wl23_htt_seen = false;
 	wl23_lines = wl23_pdev = wl23_htt_major = wl23_htt_minor = wl23_rssi_conv = 0; wl23_guard_bad = false;
 	fw_c2_step = fw_chan_seen = fw_chan_cmds = fw_scan_cmds = fw_stop_cmds = fw_htt_req = 0; fw_stop_pdev = ~0u;
-	n_beacons = 0; wl23_chmask = 0; wlscan_chmask = 0; m_chmask = 0;  /* CH1 */
+	n_beacons = 0; wl23_chmask = 0; wlscan_chmask = 0; m_chmask = 0; m_ext = 0;  /* CH1 */
 	fw_scan_id = 0xa000; fw_stop_id = ~0u; fw_scan_done_q = ~0u; wl23_scan_id = WLWMI_SCAN_ID;  /* CH1 split */
 	memset(&wl_stats, 0, sizeof(wl_stats)); wl23_ci_lines = wl23_ci_drop = 0; fw_stats_req = 0; fw_stats_at = 0; fw_stats_pdev = 1;
 }
@@ -6458,7 +6461,7 @@ s_split_pure(void)
 {
 	static uint8_t a[2048], b[2048];
 	uint32_t len = 0, len2 = 0, seed = 0x6d2b79f5u;
-	CHECK(WL23_CH_SPLIT == 0x4000000u && WL23_CH_KNOB == 0x7ffffffu && WL23_CH_VALID == 0x3ffffffu && WLSCAN_CH_SPLIT == WL23_CH_SPLIT &&
+	CHECK(WL23_CH_SPLIT == 0x4000000u && WL23_CH_KNOB == 0x1fffffffu && WL23_CH_VALID == 0x3ffffffu && WLSCAN_CH_SPLIT == WL23_CH_SPLIT &&
 	    WLWMI_SCAN_ID == 0xa000u && WLWMI_SCAN_ID2 == 0xa001u, "split bit layout and ids");
 	/* the split bit drops nothing: no list function reads it */
 	for (unsigned m = 0; m < 4096; m++) {
@@ -6753,6 +6756,205 @@ s_split_failures(void)
 	     "0xa000 where one is due), the second scan's START_FAILED, missing STARTED and missing COMPLETED (table of both bands, STOP_SCAN 0xa001)");
 }
 
+
+/* ---- CH1 DBS scan policy (fuxiwlanch bits 27 / 28): START_SCAN scan_ctrl_flags_ext, default off ----
+ * Bit 27 sets the word to 0x1 (FORCE_NONDBS), bit 28 to 0x2 (IGNORE_DUTY); the two are values of one 2-bit field, so the driver refuses
+ * both (the gate test checks the refusal). Neither drops a channel. The model firmware (fw_c2_cmd) checks all 40 words of every
+ * START_SCAN against what the description says, word 35 against m_ext, so a scan that carries the word wrongly, in the wrong place, in
+ * only one of two scans, or without being asked, aborts the scenario. */
+
+/* A log without the lines a bit adds (the mask line, the split lines) and without the " ext 0xN" ending of the scan start line:
+ * what is left must be the log of the same scan without the bit. */
+static char *
+log_without_ext(void)
+{
+	char *plain = log_without_split_lines(), *at;
+	while ((at = strstr(plain, " ext 0x"))) {
+		char *nl = strchr(at, '\n');
+		memmove(at, nl, strlen(nl) + 1);
+	}
+	return plain;
+}
+
+/* One scan with KNOB (drop mask, maybe the split bit) plus fuxiwlanch bit EXTBIT (27 or 28); the firmware expects the word that bit asks for. */
+static void
+ex_setup(unsigned knob, unsigned extbit, unsigned bits, unsigned eff, unsigned n)
+{
+	ch1_setup(knob | 1u << extbit, bits, eff, n);
+	C.split = (knob & (1u << 26)) != 0;
+	m_ext = extbit == 27 ? 0x1u : 0x2u;
+}
+
+static void
+s_ext_pure(void)
+{
+	static uint8_t a[2048], b[2048];
+	uint32_t len = 0, len2 = 0, seed = 0x1b873593u;
+	CHECK(WLSCAN_CH_NONDBS == 0x8000000u && WLSCAN_CH_IGNDUTY == 0x10000000u && WL23_CH_NONDBS == 0x8000000u && WL23_CH_IGNDUTY == 0x10000000u &&
+	    WL23_CH_KNOB == 0x1fffffffu && WL23_CH_VALID == 0x3ffffffu && WL23_CH_SPLIT == 0x4000000u && WLWMI_SS_CTRL_FLAGS_EXT == 35 &&
+	    WLWMI_SS_PRIORITY == 4 && WLWMI_SCAN_FLAG_EXT_DBS_POLICY_MASK == 3u && WLWMI_SCAN_FLAG_EXT_FORCE_NONDBS == 1u &&
+	    WLWMI_SCAN_FLAG_EXT_IGNORE_DUTY == 2u, "ext bit layout and vendor policy values");
+	CHECK(wlscan_ext_flags(0) == 0 && wlscan_ext_flags(0x8000000u) == 1 && wlscan_ext_flags(0x10000000u) == 2 && wlscan_ext_flags(0x18000000u) == 3 &&
+	    wlscan_ext_flags(WL23_CH_VALID | WL23_CH_SPLIT) == 0 && wlscan_ext_flags(0x7ffffffu) == 0 && wlscan_ext_flags(0xe0000000u) == 0, "ext word of a mask");
+	/* 4096 pseudo-random masks: the word is bit 27 / bit 28 and nothing else; the bits change no count and no list entry */
+	for (unsigned t = 0; t < 4096; t++) {
+		seed = seed * 1664525u + 1013904223u;
+		uint32_t x = seed ^ (seed >> 7);
+		uint32_t want = ((x >> 27) & 1u) | (((x >> 28) & 1u) << 1);
+		CHECK(wlscan_ext_flags(x) == want, "ext word of a random mask");
+		uint32_t drop = x & WL23_CH_VALID, ext = x & (WL23_CH_NONDBS | WL23_CH_IGNDUTY);
+		wlscan_chmask = drop;
+		unsigned n = wlscan_kept(drop), k24 = wlscan_kept24(drop);
+		uint32_t full[40];
+		for (unsigned i = 0; i < n; i++) { full[i] = wlscan_chan(i); }
+		wlscan_chmask = drop | ext | (x & WL23_CH_SPLIT);
+		CHECK(wlscan_kept(wlscan_chmask) == n && wlscan_kept24(wlscan_chmask) == k24 && WL23_CH_KEPT(wlscan_chmask) == n, "ext bits change the kept count");
+		for (unsigned i = 0; i <= n; i++) { CHECK(wlscan_chan(i) == (i < n ? full[i] : 0u), "ext bits change the list"); }
+		CHECK(wlscan_mask_eff(drop | ext, true) == (drop | ext | WL23_CH_ALL5), "ext bits survive the BAND24 combination");
+	}
+	/* the START_SCAN encoder: the word and nothing else. For several lists, with and without the split bit, in both the one-scan form and the
+	 * range form: the message with a bit differs from the message without it in word 35 only, and that word is what the vendor value says */
+	static const uint32_t lists[] = {0u, 57344u, WL23_CH_24, 0x1fffffeu, WL23_CH_ALL5};
+	for (unsigned li = 0; li < sizeof(lists) / sizeof(lists[0]); li++) {
+		for (unsigned form = 0; form < 3; form++) {
+			unsigned n24 = wlscan_kept24(lists[li]), n = wlscan_kept(lists[li]);
+			unsigned first = form == 2 ? n24 : 0u, cnt = form == 0 ? n : form == 1 ? n24 : n - n24;
+			if (!cnt) { continue; }
+			wlscan_chmask = lists[li];
+			CHECK(wlwmi_encode_start_scan_range(0xa000u + (form == 2), first, cnt, wlscan_max_time(cnt), a, sizeof(a), &len) == 0, "plain encode");
+			CHECK(g32(a + 4 + 4 * WLWMI_SS_CTRL_FLAGS_EXT) == 0 && g32(a + 4 + 4 * WLWMI_SS_PRIORITY) == 0 && g32(a + 4 + 4 * WLWMI_SS_CTRL_FLAGS) == 0x11u,
+			    "no bit: ext word 0, priority 0, flags 0x11");
+			for (unsigned v = 0; v < 6; v++) {
+				uint32_t bit = (v & 1) ? WL23_CH_IGNDUTY : WL23_CH_NONDBS, split = (v >> 1) >= 1 ? WL23_CH_SPLIT : 0u, ext = (v >> 1) == 2 ? 0u : bit;
+				wlscan_chmask = lists[li] | ext | split;
+				CHECK(wlwmi_encode_start_scan_range(0xa000u + (form == 2), first, cnt, wlscan_max_time(cnt), b, sizeof(b), &len2) == 0 && len2 == len,
+				    "encode with a bit");
+				uint32_t want = ext == WL23_CH_NONDBS ? 1u : ext == WL23_CH_IGNDUTY ? 2u : 0u;
+				CHECK(g32(b + 4 + 4 * WLWMI_SS_CTRL_FLAGS_EXT) == want, "the ext word on the wire");
+				for (uint32_t i = 0; i < len; i++) {
+					if (i >= 4u + 4u * WLWMI_SS_CTRL_FLAGS_EXT && i < 4u + 4u * (WLWMI_SS_CTRL_FLAGS_EXT + 1u)) { continue; }
+					CHECK(a[i] == b[i], "a byte other than the ext word changed");
+				}
+				CHECK((want == 0) == !memcmp(a, b, len), "a message without ext is the plain message, byte for byte");
+				CHECK(g32(b + 4 + 4 * WLWMI_SS_PRIORITY) == 0 && g32(b + 4 + 4 * WLWMI_SS_CTRL_FLAGS) == 0x11u, "scan_priority 0 and flags 0x11 with a bit");
+			}
+		}
+	}
+	wlscan_chmask = 0;
+	puts("CH1 ext pure: bits 27 / 28 are FORCE_NONDBS 0x1 / IGNORE_DUTY 0x2 and nothing else (4096 masks), change no count and no list entry, "
+	     "START_SCAN differs from the plain message in word 35 only (five lists, one-scan and both range forms, with and without the split bit), "
+	     "scan_priority 0 and flags 0x11 either way");
+}
+
+static void
+s_ext_scan(void)
+{
+	/* the reference: the whole list, one scan, no bit */
+	ch1_setup(0, 0, 0, 38);
+	happy_frames();
+	CHECK(run() == 0, "plain reference scan failed");
+	expect("FUXI WLAN: W23 scan start id 0xa000 vdev 0 channels 38 passive dwell 150 ms max 8550 ms events 0x5f flags 0x11\n");
+	expect_not(" ext 0x");
+	char *ref = log_without_ext();
+	contained_and_freed();
+
+	/* bit 27 alone: one scan over the whole list, the line ends in ext 0x1, the log is the reference's but for the mask line and that ending */
+	ex_setup(0, 27, 0, 0, 38);
+	happy_frames();
+	CHECK(run() == 0, "bit 27 scan failed");
+	expect("FUXI WLAN: W23 chan mask 0x8000000: 38 channels kept (2.4 GHz 13, 5 GHz 25)\n");
+	expect("FUXI WLAN: W23 scan start id 0xa000 vdev 0 channels 38 passive dwell 150 ms max 8550 ms events 0x5f flags 0x11 ext 0x1\n");
+	expect_not("W23 split scan"); expect_not("scan id 0x"); expect_not("ext 0x2");
+	CHECK(fw_scan_cmds == 1 && fw_chan_seen == 38 && count_text(" ext 0x") == 1 && wl_scan.frames == 12, "bit 27: one scan, one ext");
+	char *got = log_without_ext();
+	if (strcmp(ref, got)) { fputs(ref, stderr); fputs("-----\n", stderr); fputs(got, stderr); fail("bit 27 changes more than the mask line and the ext ending"); }
+	free(got);
+	contained_and_freed();
+
+	/* bit 28 alone: ext 0x2 */
+	ex_setup(0, 28, 0, 0, 38);
+	happy_frames();
+	CHECK(run() == 0, "bit 28 scan failed");
+	expect("FUXI WLAN: W23 chan mask 0x10000000: 38 channels kept (2.4 GHz 13, 5 GHz 25)\n");
+	expect("FUXI WLAN: W23 scan start id 0xa000 vdev 0 channels 38 passive dwell 150 ms max 8550 ms events 0x5f flags 0x11 ext 0x2\n");
+	expect_not("ext 0x1");
+	CHECK(fw_scan_cmds == 1 && count_text(" ext 0x") == 1, "bit 28: one scan, one ext");
+	got = log_without_ext();
+	if (strcmp(ref, got)) { fputs(ref, stderr); fputs("-----\n", stderr); fputs(got, stderr); fail("bit 28 changes more than the mask line and the ext ending"); }
+	free(got);
+	contained_and_freed();
+	free(ref);
+
+	/* bit 27 with the split: both scans (0xa000 and 0xa001) carry ext 0x1, and only that differs from the split without it */
+	sp_setup(0, 0, 0, 38);
+	split_frames();
+	CHECK(run() == 0, "split reference failed");
+	char *sref = log_without_ext();
+	contained_and_freed();
+	ex_setup(1u << 26, 27, 0, 0, 38);
+	split_frames();
+	CHECK(run() == 0, "bit 27 with the split failed");
+	static const char *const l27[] = {
+		"FUXI WLAN: W23 chan mask 0xc000000: 38 channels kept (2.4 GHz 13, 5 GHz 25)\n",
+		"FUXI WLAN: W23 split scan: 2 scans (2.4 GHz 13 channels, 5 GHz 25 channels)\n",
+		"FUXI WLAN: W23 scan start id 0xa000 vdev 0 channels 13 passive dwell 150 ms max 2925 ms events 0x5f flags 0x11 ext 0x1\n",
+		" ms (foreign 13 chan-info 13), scan id 0xa000\n",
+		"FUXI WLAN: W23 scan start id 0xa001 vdev 0 channels 25 passive dwell 150 ms max 5625 ms events 0x5f flags 0x11 ext 0x1\n",
+		" ms (foreign 25 chan-info 25), scan id 0xa001\n",
+	};
+	expect_order(l27, sizeof(l27) / sizeof(l27[0]));
+	CHECK(fw_scan_cmds == 2 && count_text("W23 scan start id") == 2 && count_text(" flags 0x11 ext 0x1\n") == 2 && count_text(" ext 0x") == 2 &&
+	    wl_scan.frames == 13 && wl_scan.nbss == 9, "bit 27 with the split: both scans carry ext 0x1");
+	got = log_without_ext();
+	if (strcmp(sref, got)) { fputs(sref, stderr); fputs("-----\n", stderr); fputs(got, stderr); fail("bit 27 with the split changes more than the ext endings"); }
+	free(got);
+	contained_and_freed();
+
+	/* bit 28 with the split and a 5 GHz mask: 13 then 22 channels, ext 0x2 on both */
+	ex_setup((1u << 26) | 57344u, 28, 0, 57344, 35);
+	split_frames();
+	CHECK(run() == 0, "bit 28 with the split and a mask failed");
+	expect("FUXI WLAN: W23 scan start id 0xa000 vdev 0 channels 13 passive dwell 150 ms max 2925 ms events 0x5f flags 0x11 ext 0x2\n");
+	expect("FUXI WLAN: W23 scan start id 0xa001 vdev 0 channels 22 passive dwell 150 ms max 4950 ms events 0x5f flags 0x11 ext 0x2\n");
+	CHECK(fw_scan_cmds == 2 && fw_chan_seen == 35 && count_text(" ext 0x2\n") == 2 && count_text(" ext 0x") == 2, "bit 28 with the split and a mask: both scans ext 0x2");
+	contained_and_freed();
+
+	/* a bit with one band empty: the split makes one scan, and that one carries the word */
+	ex_setup(1u << 26, 27, WL20_BAND24, WL23_CH_ALL5, 13);
+	add_frame(5, 47, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	CHECK(run() == 0, "bit 27 with the split and BAND24 failed");
+	expect("FUXI WLAN: W23 split scan: 1 scan (2.4 GHz 13 channels, 5 GHz 0 channels; one band has none, nothing to split)\n");
+	expect("FUXI WLAN: W23 scan start id 0xa000 vdev 0 channels 13 passive dwell 150 ms max 2925 ms events 0x5f flags 0x11 ext 0x1\n");
+	CHECK(fw_scan_cmds == 1 && count_text(" ext 0x") == 1, "bit 27 with one band empty: one scan, ext 0x1");
+	contained_and_freed();
+	ex_setup(WL23_CH_24, 28, 0, WL23_CH_24, 25);   /* 5 GHz only */
+	add_frame(13, 50, 8, B_OFF, 0x0011, "Office-5G", 9, 0, 36, true);
+	CHECK(run() == 0, "bit 28 with bit 25 failed");
+	expect("FUXI WLAN: W23 scan start id 0xa000 vdev 0 channels 25 passive dwell 150 ms max 5625 ms events 0x5f flags 0x11 ext 0x2\n");
+	CHECK(fw_scan_cmds == 1 && fw_chan_seen == 25, "bit 28 with the 2.4 GHz channels dropped");
+	contained_and_freed();
+
+	/* a small WMI message: the chan list still goes out once in four commands, the word is in the scan only */
+	ex_setup(1u << 26, 27, 0, 0, 38);
+	C.max_msg = 300;
+	CHECK(run() == 0, "bit 27 with a small WMI message failed");
+	CHECK(fw_chan_cmds == 4 && fw_scan_cmds == 2 && count_text(" ext 0x1\n") == 2, "small WMI message: four chan list commands, two scans with ext");
+	contained_and_freed();
+
+	/* the first scan's START_FAILED: the word was on the wire (the firmware checked it), the line shows it, no second scan */
+	ex_setup(1u << 26, 28, 0, 0, 38);
+	C.scan_mode = 1;
+	CHECK(run() == 1, "START_FAILED of the first scan accepted");
+	expect("FUXI WLAN: W23 scan start id 0xa000 vdev 0 channels 13 passive dwell 150 ms max 2925 ms events 0x5f flags 0x11 ext 0x2\n");
+	expect("FUXI WLAN: W23 scan START_FAILED reason 4 (ladder: w20 0x80, then 0x10, then 0x40), scan id 0xa000\n");
+	CHECK(fw_scan_cmds == 1 && count_text(" ext 0x") == 1, "START_FAILED with a bit: one START_SCAN");
+	contained_and_freed();
+	free(sref);
+	reset();
+	puts("CH1 ext scans: bit 27 (ext 0x1) and bit 28 (ext 0x2) change the wire word and the scan start line only (the log equals the plain scan's), "
+	     "with the split both scans carry the word, also with a mask, one band empty, a small WMI message and a failed first scan");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -6783,6 +6985,7 @@ main(int argc, char **argv)
 	if (argc == 2 && !strcmp(argv[1], "c2ch")) {  /* the CH1 scenarios alone (the mutant runs of tools/test-fuxi-wlan-ce.py) */
 		s_ch1_pure(); s_ch1_scan();
 		s_split_pure(); s_split_scan(); s_split_failures();
+		s_ext_pure(); s_ext_scan();
 		reset();
 		puts("CH1 model: all scenarios passed");
 		return 0;
@@ -6873,6 +7076,8 @@ main(int argc, char **argv)
 	s_split_pure();
 	s_split_scan();
 	s_split_failures();
+	s_ext_pure();
+	s_ext_scan();
 	reset();
 	puts("W20 model: all scenarios passed");
 	return 0;

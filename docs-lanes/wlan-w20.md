@@ -49,7 +49,7 @@ file:line below is into that tree. UniXNU-sheng was not used for any line of cod
 | `fuxiwlanw20=N` | 0 default | With qrtr 6 or 7: 0x01 NOHTT (no HTT connect; WMI then gets the next endpoint), 0x04 MRRS128 (endpoint PCIe Device Control max read request 128 bytes before CE init, low half only), 0x40 NOHWMODE (no PDEV_SET_HW_MODE). With qrtr 7 only: 0x02 HTTVER (HTT version request after HW mode), 0x10 BAND24 (the 13 2.4 GHz channels only), 0x80 PDEVCAP (the EXT MAC/PHY pdev id instead of 0), and C2c's 0x100 RXRING (host RX rings with 4095 buffers and their 4 HTT SRING_SETUP; only with 0x02), 0x200 IDLELINK (the WBM idle link-descriptor list), 0x400 CHAINMASK (PDEV_SET_PARAM TX/RX chain mask), and C2d's 0x800 RXSEL (RX_RING_SELECTION_CFG per MAC ring) and 0x1000 REORX (REO/release rings, buffers back to ring 160), each only with 0x100, and C2e's 0x2000 MONSTAT (the monitor status rings 185/193 and the crash line), only with 0x100. Refused: 0x08 ACTIVE (would transmit probe requests) and 0x20 FULLBSSID (would log whole BSSIDs; the owner masks every BSSID) at every qrtr, the qrtr-7 bits with qrtr 6, 0x01 together with 0x02, 0x100 without 0x02, 0x800, 0x1000 or 0x2000 without 0x100, any other bit. |
 
 | `fuxiwlanvrx=N` | absent or 0 default | C2h, only with qrtr 7 and a valid w20 0x4000: 0x01 MGMTREO (read-only management-RX counts), 0x02 CCSTALE (cookie conversion over a stale PPT; needs `fuxiwlanw29` 0x02, in the 0x9f default), 0x04 IPADIS (WMI INIT flag1 IPA_DISABLE), 0x08 FSE (HTT RX_FSE_SETUP_CFG and RX_FISA_CFG; needs w20 0x800). Refused: negative, any other bit, without a valid 0x4000 or qrtr 7. See [C2h](#c2h-w30-the-vendors-kiwi-rx-extras-fuxiwlanvrx). |
-| `fuxiwlanch=N` | absent or 0 default | CH1, only with qrtr 7: a drop mask over the 38-entry passive scan list. Bits 0..24 drop the 5 GHz entries in list order (5180 ... 5825; bit 13 = 5600), bit 25 drops the 13 2.4 GHz channels; w20 0x10 applies on top. Bit 26 (SPLIT, 0x4000000) drops nothing: it runs the passive scan as two scans back to back, the kept 2.4 GHz channels and then the kept 5 GHz channels. Refused: any bit above 26, a mask (with w20 0x10) that leaves no channel, any other qrtr. See [CH1](#ch1-the-scan-channel-mask-fuxiwlanch). |
+| `fuxiwlanch=N` | absent or 0 default | CH1, only with qrtr 7: a drop mask over the 38-entry passive scan list. Bits 0..24 drop the 5 GHz entries in list order (5180 ... 5825; bit 13 = 5600), bit 25 drops the 13 2.4 GHz channels; w20 0x10 applies on top. Bit 26 (SPLIT, 0x4000000) drops nothing: it runs the passive scan as two scans back to back, the kept 2.4 GHz channels and then the kept 5 GHz channels. Bits 27 (0x8000000) and 28 (0x10000000) drop nothing either: they set START_SCAN's `scan_ctrl_flags_ext` to the vendor's DBS scan policy FORCE_NONDBS (0x1) or IGNORE_DUTY (0x2) in every scan of the stage. Refused: any bit above 28, bits 27 and 28 together, a mask (with w20 0x10) that leaves no channel, any other qrtr. See [CH1](#ch1-the-scan-channel-mask-fuxiwlanch) and [bits 27 and 28](#bits-27-and-28-start_scan-dbs-scan-policy). |
 
 Refusals set `wl_variant_invalid`; salami refuses at init before any access, the Fuxi build at step 17.
 Every boot without `fuxiwlanqrtr=6` or `7` logs and behaves as before C1, and every boot with qrtr absent
@@ -1857,9 +1857,10 @@ nothing, bit 25 empties the list.
 | 57344 with w20 0x10 | 13 | `W23 chan mask 0xe000: 13 channels kept (2.4 GHz 13, 5 GHz 0)` |
 | 33554432 with w20 0x10 | none | refused at init |
 
-Gate (all before any access, the run invalid, in the existing refusal style): a bit above 26 (`W20 fuxiwlanch 0xN refused:
-bits 0..26 only, and at least one channel must stay (w20 0x10 counts too)`; bit 26 is the [split](#bit-26-split-the-passive-scan-by-band)
-and was refused as "bits 0..25 only" before it existed), a mask that leaves no channel on its own or
+Gate (all before any access, the run invalid, in the existing refusal style): a bit above 28 (`W20 fuxiwlanch 0xN refused:
+bits 0..28 only, and at least one channel must stay (w20 0x10 counts too)`; bit 26 is the [split](#bit-26-split-the-passive-scan-by-band)
+and was refused as "bits 0..25 only" before it existed; bits 27 and 28 are the [DBS scan policy](#bits-27-and-28-start_scan-dbs-scan-policy),
+refused as "bits 0..26 only" before they existed, and refused together by their own line), a mask that leaves no channel on its own or
 with w20 0x10 (the same line), and any qrtr but 7 (`W20 fuxiwlanch 0xN needs fuxiwlanqrtr=7; refused`; qrtr 8 does not
 exist in this build and is refused by its own line). The scan stage still fails closed if it were ever reached with an empty
 list: `W23 failure: W23 chan mask leaves no channel (init refuses this)` before any CE traffic.
@@ -2002,6 +2003,65 @@ mask, 0x82, a DEQUEUED first scan; the merged table equals a one-scan table; one
 (START_FAILED, no STARTED and no COMPLETED of each scan, STOP_SCAN ids 0xa000 and 0xa001), `static_split`, 28 more
 `C2CH_MUTANTS`, 12 more gate cases (one rewritten) and 5 ADT parity sets. The model firmware checks the scans from the description (ids, ranges, max
 time, order, "not before the previous COMPLETED reached the host"), not from the driver.
+
+### Bits 27 and 28: START_SCAN DBS scan policy
+
+Code and host tests only. Why: with the bands split (bit 26) the question left is which MAC layout the firmware picks for a scan. The
+vendor's `struct wmi_start_scan_cmd` carries `scan_ctrl_flags_ext` (Linux ath12k v6.19 wmi.h:3459, the word after `num_vendor_oui`), whose
+bits 0-1 are the DBS scan selection policy. L19 never writes the word (its START_SCAN encoder, wmi.c:2646-2830, leaves it 0), so today
+the firmware always chooses by its own default (policy 0: "select duty cycle if configured, else whatever policy scan manager computes").
+
+`fuxiwlanch` bit 27 (0x8000000 = 134217728) and bit 28 (0x10000000 = 268435456), only with qrtr 7, default off, set that word:
+
+| bit | name | `scan_ctrl_flags_ext` | vendor fw-api `wmi_unified.h` (qcom/opensource/wlan/fw-api/fw, LineageOS sm8550-modules 9c16bd2) |
+|---|---|---|---|
+| 27 | NONDBS | 0x1 | `WMI_SCAN_DBS_POLICY_FORCE_NONDBS 0x1` (line 6474): force a non-DBS scan |
+| 28 | IGNORE_DUTY | 0x2 | `WMI_SCAN_DBS_POLICY_IGNORE_DUTY 0x2` (line 6475): ignore a configured duty cycle |
+
+Both are values of one field, `WMI_SCAN_FLAG_EXT_DBS_SCAN_POLICY_MASK 0x00000003` (line 6470; 0x3 is reserved, line 6477), so bits 27 and 28
+together are refused (`W20 fuxiwlanch 0xN refused: bits 27 and 28 are two values of one scan policy, not both`), and bits above 28 are refused
+as before (the text now says `bits 0..28 only`). Like bit 26, neither bit drops a channel; no list function reads them, and they combine
+freely with the drop bits, with the split and with w20 0x10. The file carries the ISC permission notice.
+
+- The encoder (`wlwmi_encode_start_scan_range`) writes the word (`WLWMI_SS_CTRL_FLAGS_EXT`, START_SCAN word 35) only when
+  `wlscan_ext_flags(wlscan_chmask)` is non-zero; with neither bit the word is never written, so the message is the same bytes as before.
+  It reads the mask the stage already set, so it applies to every START_SCAN of the stage: with bit 26 both scans (0xa000 and 0xa001)
+  carry it.
+- Nothing else of the message changes. `scan_priority` (word 4) is not written by our encoder: 0 on the wire, which is
+  WMI_SCAN_PRIORITY_VERY_LOW (wmi.h:3399). L19 does the same: wmi.c:2708-2712 fills `arg->scan_priority` (LOW, or MEDIUM during 11d) and
+  the START_SCAN encoder never copies it into `cmd->scan_priority`. `scan_ctrl_flags` stays 0x11 (PASSIVE, CHAN_STAT_EVENT).
+- The only visible line that changes is the scan start line, and only with a bit set: it ends in ` ext 0x1` or ` ext 0x2`
+  (`W23 scan start id 0xa000 vdev 0 channels 38 passive dwell 150 ms max 8550 ms events 0x5f flags 0x11 ext 0x1`). The init line
+  `W23 selected passive scan of N channels (fuxiwlanch 0xM)` and `W23 chan mask 0xM` carry the bits in M as they do the others.
+
+### Proof for bits 27 and 28
+
+Against 674c0da (bit 26, the split):
+
+- D1: 674c0da's model with all its scenarios, instrumented to dump every log, linked against 674c0da's and this change's production code: the
+  new dump begins with all 288 base logs, 3095297 bytes, byte for byte (the new scenarios run last and add 139320 bytes after
+  them); the six wire dumps equal; the 68 scenario summary lines equal.
+- D2: the salami and Fuxi init/configure gate over 8100 boot-arg sets without `fuxiwlanch`, cmdline and ADT /defaults, both configurations:
+  32400 runs, stdout byte for byte equal.
+- D2b: the same gate with `fuxiwlanch` itself, 18720 knob sets, 74880 runs. 17760 runs without bits 27 / 28 byte for byte
+  equal, 960 more after spelling the refusal text back (`bits 0..28 only` now, `bits 0..26 only` before). With bit 27 or 28 added
+  to a mask X: equal to the base tree given X (the mask printed back; 36000 runs); either bit alone: equal to no knob but for
+  the mask mention (720 runs; 720 refused without qrtr 7 like any non-zero value). Bits 27 and 28 together:
+  18720 runs, refused, and everything but the one refusal line equal to what the base tree prints for a refused knob.
+- D3: the salami test's own distinct boots and RPMh runs recorded in both trees: 400 of the 404 base ones equal byte for byte
+  (11 after spelling the refusal text back); the other 4 are the base test's bit 27 boots, which were refusals and are
+  accepted boots now. The new tree adds 33.
+
+The assertions edited on purpose: the refusal text (`bits 0..26 only` is `bits 0..28 only`), the two gate cases that expected 134217728 and
+201326592 to be refused (now accepted), `static_split`'s pins on `WL23_CH_KNOB` and the `WL23_CH_SPLIT` count, `static_ch1`'s refusal-text pin,
+the passive-only pin on the START_SCAN encoder (it may now name `WLWMI_SS_CTRL_FLAGS_EXT`, in the one place `static_ext` pins), the model's
+`WL23_CH_KNOB` value in `s_split_pure`, and the mutant "bit 27 accepted" (bit 27 is a knob bit now; it is "bit 29 accepted"). Added:
+`s_ext_pure` (the word of 4096 masks; no count or list entry changes; START_SCAN differs from the plain message in word 35 only, for five
+lists, three encoder forms, with and without the split), `s_ext_scan` (bit 27, bit 28, bit 27 or 28 with the split, a mask, BAND24, bit 25,
+a small WMI message, a failed first scan; the model firmware checks all 40 START_SCAN words of every scan, word 35 against the policy value,
+and the scan log equals the plain scan's but for the mask line and the ext ending), `static_ext`, 29 more `C2CH_MUTANTS` (ext not written, written
+wrong, to the wrong word, only on one scan, set without a bit, swapped values and bits, the parser accepting both bits or bit 29, the line
+ending on every scan or never), 24 gate cases and 5 ADT parity sets.
 
 ## Host tests
 

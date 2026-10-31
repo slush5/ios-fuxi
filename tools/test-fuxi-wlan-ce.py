@@ -92,6 +92,10 @@ CH1 split (fuxiwlanch bit 26, default off): two passive scans back to back on th
 after the first one's COMPLETED (or DEQUEUED); one BSS table, one report, one set of stats; containment's STOP_SCAN names the
 scan in flight (model s_split_*: the firmware expects the scans, ids, ranges and order from the owner's description;
 static_split; mutants in C2CH_MUTANTS).
+CH1 DBS scan policy (fuxiwlanch bits 27 / 28, default off): START_SCAN scan_ctrl_flags_ext |= 0x1 (FORCE_NONDBS) or 0x2 (IGNORE_DUTY),
+in every START_SCAN of the stage (both scans of a split), the vendor's two non-default values of one 2-bit policy field (the driver
+refuses both bits together); the word is written only when a bit is set, the scan start line gains " ext 0x1" / " ext 0x2" only then
+(model s_ext_*: the firmware checks word 35 and the other 39 words of every START_SCAN; static_ext; mutants in C2CH_MUTANTS).
 No device, no network.
 """
 from pathlib import Path
@@ -169,7 +173,7 @@ def static_checks():
     assert 'return wlwmi_encode_start_scan_range(WLWMI_SCAN_ID, 0, n, max_time, out, room, len);' in \
         between(HEADER, 'static inline int\nwlwmi_encode_start_scan(', '\n}\n')   # the one-scan form is id 0xa000 from the start of the list
     for word in ('WLWMI_SS_NUM_SSIDS', 'WLWMI_SS_IE_LEN', 'WLWMI_SS_N_PROBES', 'WLWMI_SS_PRIORITY', 'WLWMI_SS_IE_BITMAP',
-                 'WLWMI_SS_MAC_ADDR', 'WLWMI_SS_CTRL_FLAGS_EXT'):
+                 'WLWMI_SS_MAC_ADDR'):   # WLWMI_SS_CTRL_FLAGS_EXT is written by CH1 bits 27 / 28 only: static_ext pins that write
         assert word not in enc, word
     assert 'WLWMI_CHAN_INFO_PASSIVE' in between(HEADER, 'static inline uint32_t\nwlwmi_chan_info(', '\n}\n')
     # The vdev MAC is the one the wifi-ios side gives en0 (K-W2), in both backends.
@@ -216,11 +220,12 @@ def static_checks():
     static_c2h()
     static_ch1()
     static_split()
+    static_ext()
 
 
 def static_ch1():
     """CH1 (fuxiwlanch): the scan channel mask. The knob is read like every fuxiwlan* knob, is 0 unless given valid
-    (bits 0..25, at least one channel left with w20 0x10 counted, qrtr 7 only), lives in one variable that only the
+    (bits 0..28, 27 and 28 not together, at least one channel left with w20 0x10 counted, qrtr 7 only), lives in one variable that only the
     parser sets and only the scan stage reads, and the filtered list is set once, before the first encoder call; the
     header never writes the mask and bounds both encoders by the kept count; nothing in the CH1 lines sends or touches
     a register."""
@@ -233,7 +238,7 @@ def static_ch1():
     assert ('} else if (chm_given && chm && (chm < 0 || ((unsigned)chm & ~WL23_CH_KNOB) ||\n'
             '\t\t    !WL23_CH_KEPT(WL23_CH_EFF((unsigned)chm, !!(wl20_bits & WL20_BAND24))))) {') in cfg
     assert cfg.index('wl30_mask = (unsigned)vrx;') < cfg.index('wl23_chmask = (unsigned)chm;') < cfg.index('W20 selected qrtr=%d')
-    assert cfg.count('W20 fuxiwlanch %#x needs fuxiwlanqrtr=7; refused') == 2 and cfg.count('W20 fuxiwlanch %#x refused: bits 0..26 only') == 1
+    assert cfg.count('W20 fuxiwlanch %#x needs fuxiwlanqrtr=7; refused') == 2 and cfg.count('W20 fuxiwlanch %#x refused: bits 0..28 only') == 1
     # the scan stage: one filtered list, set before the stage state and every encoder call; n, max time and the counts from it
     w23 = between(drv, 'static int\nwl_w23_run(void)\n{', '\n}\n')
     assert code.count('wlscan_chmask = ') == 1 and w23.count('wlscan_chmask = ') == 1
@@ -259,7 +264,7 @@ def static_ch1():
     assert '_Static_assert(WLSCAN_NCHAN == WLSCAN_NCHAN_24 + WLSCAN_CH_5G_BITS' in HEADER and \
         '_Static_assert(WL23_CH_24 == WLSCAN_CH_24 && WL23_CH_ALL5 == WLSCAN_CH_ALL5 && WL23_CH_VALID == WLSCAN_CH_VALID,' in drv
     assert '#define WLSCAN_FLAGS (WLWMI_SCAN_FLAG_PASSIVE | WLWMI_SCAN_CHAN_STAT_EVENT)' in HEADER   # still passive, whatever the mask
-    print('CH1 static: fuxiwlanch read like every knob, 0 unless valid (bits 0..26, a channel left with w20 0x10 counted, qrtr 7 only), '
+    print('CH1 static: fuxiwlanch read like every knob, 0 unless valid (bits 0..28, 27 and 28 not together, a channel left with w20 0x10 counted, qrtr 7 only), '
           'set in one place, the filtered list fixed once before the first encoder call, n / max time / counts from it, the line silent '
           'while off, the header never writes the mask and bounds both encoders by it, the CH1 lines send nothing')
 
@@ -280,10 +285,10 @@ def static_split():
     loop = w23.split(loop_head, 1)[1].split('\n\t}\n', 1)[0]
     before, after = w23.split(loop_head, 1)[0], w23.split(loop_head, 1)[1].split('\n\t}\n', 1)[1]
     # the bit: parsed with the others (WL23_CH_KNOB), read only by the scan stage, never by a list function or the header
-    assert '#define WL23_CH_SPLIT (1u << 26)' in drv and '#define WL23_CH_KNOB (WL23_CH_VALID | WL23_CH_SPLIT)' in drv
+    assert '#define WL23_CH_SPLIT (1u << 26)' in drv and '#define WL23_CH_KNOB (WL23_CH_VALID | WL23_CH_SPLIT | WL23_CH_NONDBS | WL23_CH_IGNDUTY)' in drv
     assert 'WL23_CH_SPLIT == WLSCAN_CH_SPLIT && !(WL23_CH_SPLIT & WL23_CH_VALID)' in drv
     assert '#define WLSCAN_CH_SPLIT (WLSCAN_CH_24 << 1)' in HEADER and 'WLSCAN_CH_SPLIT' not in re.sub(r'#define WLSCAN_CH_SPLIT[^\n]*', '', strip_comments(HEADER))
-    assert w23c.count('WL23_CH_SPLIT') == 2 and code.count('WL23_CH_SPLIT') == 4 + w23c.count('WL23_CH_SPLIT')
+    assert w23c.count('WL23_CH_SPLIT') == 2 and code.count('WL23_CH_SPLIT') == 5 + w23c.count('WL23_CH_SPLIT')   # + the bits 27 / 28 static assertion
     assert 'const bool split = (wl23_chmask & WL23_CH_SPLIT) && nb24 && n > nb24;' in before and 'const unsigned nscans = split ? 2u : 1u;' in before
     assert 'const uint32_t nb24 = wlscan_kept24(wlscan_chmask);' in before
     # one SCAN_CHAN_LIST of the whole kept list, before the loop, never again; the scans only name their band
@@ -324,6 +329,60 @@ def static_split():
           'per scan with its own id (0xa000, 0xa001), range and max time, the state re-armed (not re-initialised) after the encode, the second scan '
           'only after a first that ended, one report, one W26 COMPLETED watch and one set of stats after the loop, containment names the scan in '
           'flight, no new encoder, command or register access')
+
+
+def static_ext():
+    """CH1 DBS scan policy (fuxiwlanch bits 27 / 28): START_SCAN's scan_ctrl_flags_ext is written in one place, the encoder, only when the
+    mask asks for it and only from wlscan_ext_flags(); the parser accepts the two bits with the others (WL23_CH_KNOB), refuses both
+    together and anything above 28; the stage computes the word once, before the scan loop, and names it on the scan start line only
+    when it is set; nothing else in the driver or the header reads the bits; scan_priority, the passive flags and the list are untouched."""
+    drv = DRIVER
+    code = strip_comments(drv)
+    hdr = strip_comments(HEADER)
+    cfg = between(drv, 'static void\nwl_probe_configure(void)\n{', '\n}\n')
+    w23 = between(drv, 'static int\nwl_w23_run(void)\n{', '\n}\n')
+    w23c = strip_comments(w23)
+    # the vendor values (wmi_unified.h:6470-6478) and the bit layout, header and driver
+    assert '#define WLWMI_SCAN_FLAG_EXT_DBS_POLICY_MASK 0x3u' in HEADER and '#define WLWMI_SCAN_FLAG_EXT_FORCE_NONDBS 0x1u' in HEADER
+    assert '#define WLWMI_SCAN_FLAG_EXT_IGNORE_DUTY 0x2u' in HEADER
+    assert '#define WLSCAN_CH_NONDBS (WLSCAN_CH_24 << 2)' in HEADER and '#define WLSCAN_CH_IGNDUTY (WLSCAN_CH_24 << 3)' in HEADER
+    assert '#define WL23_CH_NONDBS (1u << 27)' in drv and '#define WL23_CH_IGNDUTY (1u << 28)' in drv
+    assert '#define WL23_CH_KNOB (WL23_CH_VALID | WL23_CH_SPLIT | WL23_CH_NONDBS | WL23_CH_IGNDUTY)' in drv
+    assert 'WL23_CH_NONDBS == WLSCAN_CH_NONDBS && WL23_CH_IGNDUTY == WLSCAN_CH_IGNDUTY' in drv
+    # the header: the word from the mask in one function, written in one place, nowhere else; no list function and no other encoder reads the bits
+    fn = between(HEADER, 'static inline uint32_t\nwlscan_ext_flags(', '\n}\n')
+    assert ('return ((mask & WLSCAN_CH_NONDBS) ? WLWMI_SCAN_FLAG_EXT_FORCE_NONDBS : 0u) |\n'
+            '\t    ((mask & WLSCAN_CH_IGNDUTY) ? WLWMI_SCAN_FLAG_EXT_IGNORE_DUTY : 0u);') in fn
+    enc = between(HEADER, 'static inline int\nwlwmi_encode_start_scan_range(', '\n}\n')
+    assert ('\tconst uint32_t ext = wlscan_ext_flags(wlscan_chmask);\n'
+            '\tif (ext) { wlce_put32(f + 4 * WLWMI_SS_CTRL_FLAGS_EXT, ext); }') in enc
+    assert hdr.count('WLWMI_SS_CTRL_FLAGS_EXT') == 2 and hdr.count('wlscan_ext_flags(') == 2   # the enum + the one write; the function + the one call
+    assert hdr.count('WLSCAN_CH_NONDBS') == 2 and hdr.count('WLSCAN_CH_IGNDUTY') == 2             # the define + the function
+    assert 'WLWMI_SS_PRIORITY' not in enc and 'WLWMI_SS_CTRL_FLAGS,' in enc and enc.count('wlce_put32(f + 4 * WLWMI_SS_CTRL_FLAGS, WLSCAN_FLAGS);') == 1
+    assert enc.index('wlce_put32(f + 4 * WLWMI_SS_DWELL_PASSIVE_6G, WLSCAN_DWELL_PASSIVE_6G);') < enc.index('const uint32_t ext =') < \
+        enc.index('wlwmi_put_tlv(p, WLWMI_TAG_ARRAY_UINT32, 4u * n);')
+    # the parser: two refusals, in this order, before the accepting branch; the first one's text names the new range
+    assert cfg.count('bits 27 and 28 are two values of one scan policy, not both') == 1
+    assert '} else if (chm_given && chm && ((unsigned)chm & WL23_CH_NONDBS) && ((unsigned)chm & WL23_CH_IGNDUTY)) {' in cfg
+    assert cfg.index('refused: bits 0..28 only') < cfg.index('bits 27 and 28 are two values') < cfg.index('else if (chm_given) { wl23_chmask = (unsigned)chm; }')
+    assert 'W20 fuxiwlanch %#x refused: bits 0..28 only, and at least one channel must stay (w20 0x10 counts too)\\n' in cfg
+    # the stage: the word once, from the same mask the encoder reads, after it is set and before the scan loop; the line shows it only when set
+    assert code.count('wlscan_ext_flags(') == 1 and w23c.count('wlscan_ext_flags(') == 1
+    assert w23.index('wlscan_chmask = wlscan_mask_eff(wl23_chmask, !!(wl20_bits & WL20_BAND24));') < \
+        w23.index('const uint32_t ext = wlscan_ext_flags(wlscan_chmask);') < w23.index('for (unsigned sc = 0; ; sc++) {')
+    assert 'char ext_s[16] = "";\n\tif (ext) { snprintf(ext_s, sizeof(ext_s), " ext 0x%x", ext); }' in w23
+    assert w23.count('W23 scan start id') == 1 and (
+        'events %#x flags %#x%s\\n",\n\t\t    sid, cnt, WLSCAN_DWELL_PASSIVE, cmax, WLSCAN_EVENTS, WLSCAN_FLAGS, ext_s);') in w23
+    # nothing else reads the bits (the defines, the knob mask, the parse refusal and the two static assertions), and the lines send nothing
+    assert code.count('WL23_CH_NONDBS') == 5 and code.count('WL23_CH_IGNDUTY') == 5
+    assert code.count('ext_s') == 4 and 'wl23_chmask & WL23_CH_NONDBS' not in code and 'wl23_chmask & WL23_CH_IGNDUTY' not in code
+    for line in w23c.splitlines():
+        if 'ext_s' in line or 'wlscan_ext_flags' in line:
+            assert not re.search(r'wl_ce_send|wl_pwr|wl_mwr|wl_prd|wl_win|wl_soc|wlwmi_encode|wl_contain_wr', line), line
+    assert '#define WLSCAN_FLAGS (WLWMI_SCAN_FLAG_PASSIVE | WLWMI_SCAN_CHAN_STAT_EVENT)' in HEADER
+    print('CH1 ext static: fuxiwlanch bits 27 / 28 parsed with the others (0..28, never both), scan_ctrl_flags_ext written in the one place '
+          'the encoder keeps for it, only from wlscan_ext_flags() and only when set, computed once before the scan loop, " ext 0x%x" on the '
+          'scan start line only when set, nothing else reads the bits, scan_priority and the passive flags untouched')
 
 
 def c_calls(body, name):
@@ -2196,7 +2255,7 @@ C2CH_MUTANTS = [
      'mask line with the knob off'),
     ('d', 'if (!n) { return wl_w11_fail("W23 chan mask leaves no channel (init refuses this)"); }', '', 'an empty list runs'),
     ('d', 'if (chm_given && chm && !wl_w23) {', 'if (chm_given && chm && 0) {', 'the knob accepted without qrtr 7'),
-    ('d', '((unsigned)chm & ~WL23_CH_KNOB)', '((unsigned)chm & ~0xfffffffu)', 'bit 27 accepted'),
+    ('d', '((unsigned)chm & ~WL23_CH_KNOB)', '((unsigned)chm & ~0x3fffffffu)', 'bit 29 accepted'),
     ('d', '((unsigned)chm & ~WL23_CH_KNOB)', '((unsigned)chm & ~WL23_CH_VALID)', 'bit 26 refused'),
     ('h', 'for (uint32_t i = 0; i < WLSCAN_NCHAN; i++) { n += wlscan_dropped(mask, i) ? 0u : 1u; }',
      'for (uint32_t i = 0; i < WLSCAN_NCHAN; i++) { n += 1u; }', 'kept count ignores the mask'),
@@ -2244,6 +2303,54 @@ C2CH_MUTANTS = [
      '\ts->started = s->done = s->start_failed = s->dequeued = false;\n\ts->reason = 0;\n\ts->nbss = 0; s->frames = 0;', 'rearm drops the table'),
     ('h', '#define WLWMI_SCAN_ID2 0xa001u', '#define WLWMI_SCAN_ID2 0xa002u', 'the second scan id'),
     ('h', '#define WLSCAN_CH_SPLIT (WLSCAN_CH_24 << 1)', '#define WLSCAN_CH_SPLIT (WLSCAN_CH_24 << 2)', 'split bit disagrees with the parser'),
+    # CH1 DBS scan policy (fuxiwlanch bits 27 / 28)
+    ('h', 'if (ext) { wlce_put32(f + 4 * WLWMI_SS_CTRL_FLAGS_EXT, ext); }', 'if (ext) { }', 'ext word never written'),
+    ('h', 'if (ext) { wlce_put32(f + 4 * WLWMI_SS_CTRL_FLAGS_EXT, ext); }', 'wlce_put32(f + 4 * WLWMI_SS_CTRL_FLAGS_EXT, ext | 1u);',
+     'ext word written (as 1) without a bit'),
+    ('h', 'if (ext) { wlce_put32(f + 4 * WLWMI_SS_CTRL_FLAGS_EXT, ext); }', 'if (ext) { wlce_put32(f + 4 * WLWMI_SS_CTRL_FLAGS_EXT, ext | 4u); }',
+     'ext word with an extra flag'),
+    ('h', 'if (ext) { wlce_put32(f + 4 * WLWMI_SS_CTRL_FLAGS_EXT, ext); }', 'if (ext && !first) { wlce_put32(f + 4 * WLWMI_SS_CTRL_FLAGS_EXT, ext); }',
+     'the second scan of a split without the ext word'),
+    ('h', 'if (ext) { wlce_put32(f + 4 * WLWMI_SS_CTRL_FLAGS_EXT, ext); }', 'if (ext && first) { wlce_put32(f + 4 * WLWMI_SS_CTRL_FLAGS_EXT, ext); }',
+     'the first scan without the ext word'),
+    ('h', 'if (ext) { wlce_put32(f + 4 * WLWMI_SS_CTRL_FLAGS_EXT, ext); }', 'if (ext) { wlce_put32(f + 4 * WLWMI_SS_CTRL_FLAGS, WLSCAN_FLAGS | ext); }',
+     'ext ORed into the scan control flags word'),
+    ('h', 'if (ext) { wlce_put32(f + 4 * WLWMI_SS_CTRL_FLAGS_EXT, ext); }', 'if (ext) { wlce_put32(f + 4 * WLWMI_SS_PRIORITY, ext); }',
+     'ext written to scan_priority'),
+    ('h', 'if (ext) { wlce_put32(f + 4 * WLWMI_SS_CTRL_FLAGS_EXT, ext); }', 'if (ext) { wlce_put32(f + 4 * WLWMI_SS_NUM_VENDOR_OUI, ext); }',
+     'ext written to the vendor OUI count'),
+    ('h', 'if (ext) { wlce_put32(f + 4 * WLWMI_SS_CTRL_FLAGS_EXT, ext); }', 'if (ext) { wlce_put32(f + 4 * WLWMI_SS_DWELL_ACTIVE_2G, ext); }',
+     'ext written to the next word'),
+    ('h', 'const uint32_t ext = wlscan_ext_flags(wlscan_chmask);\n\tif (ext) {', 'const uint32_t ext = wlscan_ext_flags(wlscan_chmask | WLSCAN_CH_NONDBS);\n\tif (ext) {',
+     'ext set without the bit'),
+    ('h', 'const uint32_t ext = wlscan_ext_flags(wlscan_chmask);\n\tif (ext) {', 'const uint32_t ext = wlscan_ext_flags(0u);\n\tif (ext) {',
+     'ext never taken from the mask'),
+    ('h', 'return ((mask & WLSCAN_CH_NONDBS) ? WLWMI_SCAN_FLAG_EXT_FORCE_NONDBS : 0u) |', 'return ((mask & WLSCAN_CH_NONDBS) ? WLWMI_SCAN_FLAG_EXT_IGNORE_DUTY : 0u) |',
+     'bit 27 gives IGNORE_DUTY'),
+    ('h', '((mask & WLSCAN_CH_IGNDUTY) ? WLWMI_SCAN_FLAG_EXT_IGNORE_DUTY : 0u);', '((mask & WLSCAN_CH_IGNDUTY) ? WLWMI_SCAN_FLAG_EXT_FORCE_NONDBS : 0u);',
+     'bit 28 gives FORCE_NONDBS'),
+    ('h', 'return ((mask & WLSCAN_CH_NONDBS) ? WLWMI_SCAN_FLAG_EXT_FORCE_NONDBS : 0u) |', 'return ((mask & WLSCAN_CH_NONDBS) ? 0u : 0u) |', 'bit 27 gives nothing'),
+    ('h', '((mask & WLSCAN_CH_IGNDUTY) ? WLWMI_SCAN_FLAG_EXT_IGNORE_DUTY : 0u);', '((mask & WLSCAN_CH_IGNDUTY) ? 0u : 0u);', 'bit 28 gives nothing'),
+    ('h', '#define WLSCAN_CH_NONDBS (WLSCAN_CH_24 << 2)', '#define WLSCAN_CH_NONDBS (WLSCAN_CH_24 << 3)', 'bit 27 is bit 28 in the header'),
+    ('h', '#define WLWMI_SCAN_FLAG_EXT_FORCE_NONDBS 0x1u', '#define WLWMI_SCAN_FLAG_EXT_FORCE_NONDBS 0x2u', 'FORCE_NONDBS value wrong'),
+    ('h', '#define WLWMI_SCAN_FLAG_EXT_IGNORE_DUTY 0x2u', '#define WLWMI_SCAN_FLAG_EXT_IGNORE_DUTY 0x4u', 'IGNORE_DUTY value wrong'),
+    ('d', '#define WL23_CH_NONDBS (1u << 27)', '#define WL23_CH_NONDBS (1u << 29)', 'bit 27 in the wrong place in the parser'),
+    ('d', '#define WL23_CH_IGNDUTY (1u << 28)', '#define WL23_CH_IGNDUTY (1u << 29)', 'bit 28 in the wrong place in the parser'),
+    ('d', '((unsigned)chm & ~WL23_CH_KNOB)', '((unsigned)chm & ~(WL23_CH_VALID | WL23_CH_SPLIT))', 'bits 27 and 28 refused'),
+    ('d', '((unsigned)chm & ~WL23_CH_KNOB)', '((unsigned)chm & ~(WL23_CH_VALID | WL23_CH_SPLIT | WL23_CH_NONDBS))', 'bit 28 refused'),
+    ('d', '} else if (chm_given && chm && ((unsigned)chm & WL23_CH_NONDBS) && ((unsigned)chm & WL23_CH_IGNDUTY)) {', '} else if (0) {',
+     'bits 27 and 28 together accepted'),
+    ('d', '} else if (chm_given && chm && ((unsigned)chm & WL23_CH_NONDBS) && ((unsigned)chm & WL23_CH_IGNDUTY)) {',
+     '} else if (chm_given && chm && ((unsigned)chm & WL23_CH_NONDBS)) {', 'bit 27 refused for being with 28'),
+    ('d', 'if (ext) { snprintf(ext_s, sizeof(ext_s), " ext 0x%x", ext); }', 'snprintf(ext_s, sizeof(ext_s), " ext 0x%x", ext);',
+     'the ext ending on every scan start line'),
+    ('d', 'if (ext) { snprintf(ext_s, sizeof(ext_s), " ext 0x%x", ext); }', '', 'no ext ending on the scan start line'),
+    ('d', 'snprintf(ext_s, sizeof(ext_s), " ext 0x%x", ext);', 'snprintf(ext_s, sizeof(ext_s), " ext %x", ext);', 'ext ending without 0x'),
+    ('d', 'const uint32_t ext = wlscan_ext_flags(wlscan_chmask);\n\tchar ext_s', 'const uint32_t ext = wlscan_ext_flags(wlscan_chmask & ~WL23_CH_IGNDUTY);\n\tchar ext_s',
+     'the line misses bit 28'),
+    ('d', 'events %#x flags %#x%s\\n",\n\t\t    sid, cnt, WLSCAN_DWELL_PASSIVE, cmax, WLSCAN_EVENTS, WLSCAN_FLAGS, ext_s);',
+     'events %#x flags %#x%s\\n",\n\t\t    sid, cnt, WLSCAN_DWELL_PASSIVE, cmax, WLSCAN_EVENTS, WLSCAN_FLAGS | ext, ext_s);',
+     'the line folds ext into the flags'),
 ]
 
 
@@ -3256,7 +3363,7 @@ def main():
     mutants(C2CH_MUTANTS, 'c2ch')
     dash_check()
     print('W20 (fuxiwlanqrtr=6) CE/HTC/WMI, W23 (fuxiwlanqrtr=7) passive scan, C2c (W26), C2d (W27), C2e (W28), C2f (W29), '
-          'C2h (W30) and CH1 (fuxiwlanch, with its bit 26 split) host tests passed')
+          'C2h (W30) and CH1 (fuxiwlanch, with its bit 26 split and bits 27 / 28 DBS scan policy) host tests passed')
 
 
 if __name__ == '__main__':

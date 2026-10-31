@@ -1372,6 +1372,11 @@ wlhtt_version_conf(const uint8_t *msg, uint32_t len, uint32_t *major, uint32_t *
 #define WLWMI_SCAN_REASON_CANCELLED 1u           /* enum wmi_scan_completion_reason (wmi.h:3423-3430) */
 #define WLWMI_SCAN_FLAG_PASSIVE 0x1u             /* wmi.h:3466 */
 #define WLWMI_SCAN_CHAN_STAT_EVENT 0x10u         /* wmi.h:3470 */
+/* scan_ctrl_flags_ext, DBS scan selection policy: a 2-bit field in bits 0-1 (vendor fw-api wmi_unified.h:6470 WMI_SCAN_FLAG_EXT_DBS_SCAN_POLICY_MASK
+ * 0x3); 0 = default, 1 = FORCE_NONDBS (:6474), 2 = IGNORE_DUTY (:6475), 3 reserved (:6477). L19 never writes the word (wmi.h:3459 has the field). */
+#define WLWMI_SCAN_FLAG_EXT_DBS_POLICY_MASK 0x3u
+#define WLWMI_SCAN_FLAG_EXT_FORCE_NONDBS 0x1u
+#define WLWMI_SCAN_FLAG_EXT_IGNORE_DUTY 0x2u
 #define WLWMI_SCAN_STOP_ONE 0u                   /* wmi.h:3590 */
 #define WLWMI_CHAN_INFO_START_RESP 0u            /* wmi.h:4583-4584 */
 #define WLWMI_CHAN_INFO_END_RESP 1u
@@ -1405,6 +1410,9 @@ _Static_assert(WLWMI_CHANNEL_BYTES == 28 && WLWMI_VDEV_CREATE_BYTES == 48 && WLW
     WLWMI_STOP_SCAN_BYTES == 24 && WLWMI_SCAN_EVENT_BYTES == 28 && WLWMI_CHAN_INFO_BYTES == 56 &&
     WLWMI_MGMT_RX_HDR_BYTES == 68 && WLHTT_VER_REQ_BYTES == 8, "C2 WMI/HTT wire sizes");
 _Static_assert(WLSCAN_FLAGS == 0x11u && !(WLSCAN_FLAGS & 0x2u), "C2 scans are passive: no broadcast probe request");
+_Static_assert(WLWMI_SCAN_FLAG_EXT_FORCE_NONDBS == 0x1u && WLWMI_SCAN_FLAG_EXT_IGNORE_DUTY == 0x2u &&
+    (WLWMI_SCAN_FLAG_EXT_FORCE_NONDBS | WLWMI_SCAN_FLAG_EXT_IGNORE_DUTY) == WLWMI_SCAN_FLAG_EXT_DBS_POLICY_MASK,
+    "the two DBS scan policies fill the 2-bit policy field of scan_ctrl_flags_ext (wmi_unified.h:6470-6478)");
 
 /* struct wmi_start_scan_cmd word index (0 = TLV header). */
 enum {
@@ -1444,12 +1452,18 @@ _Static_assert(WLWMI_CI_WORDS * 4 == WLWMI_CHAN_INFO_BYTES && WLWMI_CI_CMD_FLAGS
  * Bit 26 (WLSCAN_CH_SPLIT) is not a drop bit and no list function reads it: it
  * asks the driver to run the kept 2.4 GHz channels and the kept 5 GHz channels
  * as two scans, one after the other. The list is in band order, so each band is
- * one range of the kept list (the 2.4 GHz one first). */
+ * one range of the kept list (the 2.4 GHz one first).
+ *
+ * Bits 27 (WLSCAN_CH_NONDBS) and 28 (WLSCAN_CH_IGNDUTY) are not drop bits either: they set START_SCAN's scan_ctrl_flags_ext to
+ * FORCE_NONDBS (1) or IGNORE_DUTY (2), the two non-default values of the vendor's DBS scan policy field (never both, the driver
+ * refuses that). No list function reads them; only the START_SCAN encoder does, through wlscan_ext_flags(). */
 #define WLSCAN_CH_5G_BITS 25u
 #define WLSCAN_CH_24 (1u << WLSCAN_CH_5G_BITS)
 #define WLSCAN_CH_ALL5 (WLSCAN_CH_24 - 1u)
 #define WLSCAN_CH_VALID (WLSCAN_CH_24 | WLSCAN_CH_ALL5)
 #define WLSCAN_CH_SPLIT (WLSCAN_CH_24 << 1)
+#define WLSCAN_CH_NONDBS (WLSCAN_CH_24 << 2)
+#define WLSCAN_CH_IGNDUTY (WLSCAN_CH_24 << 3)
 _Static_assert(WLSCAN_NCHAN == WLSCAN_NCHAN_24 + WLSCAN_CH_5G_BITS, "CH1: one mask bit per 5 GHz entry");
 static uint32_t wlscan_chmask;
 
@@ -1492,6 +1506,14 @@ static inline uint32_t
 wlscan_mask_eff(uint32_t knob, bool band24)
 {
 	return knob | (band24 ? WLSCAN_CH_ALL5 : 0u);
+}
+
+/* The scan_ctrl_flags_ext word the mask asks for: bit 27 FORCE_NONDBS, bit 28 IGNORE_DUTY, else 0 (the word stays unwritten). */
+static inline uint32_t
+wlscan_ext_flags(uint32_t mask)
+{
+	return ((mask & WLSCAN_CH_NONDBS) ? WLWMI_SCAN_FLAG_EXT_FORCE_NONDBS : 0u) |
+	    ((mask & WLSCAN_CH_IGNDUTY) ? WLWMI_SCAN_FLAG_EXT_IGNORE_DUTY : 0u);
 }
 
 /* The I-th kept channel under wlscan_chmask, 0 past the end (the whole list, as before, while the mask is 0). */
@@ -1631,7 +1653,9 @@ wlwmi_encode_words(uint32_t cmd, uint32_t tag, const uint32_t *w, uint32_t nw, u
  * notify events and max_scan_time as above; flags PASSIVE | CHAN_STAT_EVENT,
  * adaptive dwell mode 0 (wmi.c:2600-2643). Then ARRAY_UINT32 of the N MHz
  * values, ARRAY_FIXED_STRUCT of 0 SSIDs, ARRAY_FIXED_STRUCT with the
- * broadcast BSSID + 2 pad, ARRAY_BYTE of 0 extra IE bytes; no hint arrays. */
+ * broadcast BSSID + 2 pad, ARRAY_BYTE of 0 extra IE bytes; no hint arrays.
+ * scan_ctrl_flags_ext (word WLWMI_SS_CTRL_FLAGS_EXT) is 0 too (L19 never writes it) unless fuxiwlanch bit 27 or 28 asks for a DBS scan policy
+ * (wlscan_ext_flags below); it is then the same word in every START_SCAN of the stage. */
 static inline uint32_t
 wlwmi_start_scan_total(uint32_t n)
 {
@@ -1667,6 +1691,8 @@ wlwmi_encode_start_scan_range(uint32_t id, uint32_t first, uint32_t n, uint32_t 
 	wlce_put32(f + 4 * WLWMI_SS_DWELL_ACTIVE_2G, WLSCAN_DWELL_ACTIVE_2G);
 	wlce_put32(f + 4 * WLWMI_SS_DWELL_ACTIVE_6G, WLSCAN_DWELL_ACTIVE_6G);
 	wlce_put32(f + 4 * WLWMI_SS_DWELL_PASSIVE_6G, WLSCAN_DWELL_PASSIVE_6G);
+	const uint32_t ext = wlscan_ext_flags(wlscan_chmask);
+	if (ext) { wlce_put32(f + 4 * WLWMI_SS_CTRL_FLAGS_EXT, ext); }   /* only with fuxiwlanch bit 27 / 28; otherwise the word stays 0 */
 	wlwmi_put_tlv(p, WLWMI_TAG_ARRAY_UINT32, 4u * n);
 	for (uint32_t i = 0; i < n; i++) { wlce_put32(p + 4 + 4 * i, wlscan_chan(first + i)); }
 	p += 4u + 4u * n;
