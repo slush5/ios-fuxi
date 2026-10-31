@@ -609,16 +609,17 @@ static void scenario_radio(void) {
  assert(request(false,1,name,32,NULL)==ENXIO && request(false,9,name,6,NULL)==ENXIO);
  memset(name,1,sizeof(name));
  assert(!request(false,43,name,sizeof(name),NULL) && !strcmp(name,"Fuxi Wi-Fi iOS shim (radio backend, scan only)"));
- /* 3 scans in a row that the radio takes and never answers: each times out (9550 ms), then Wi-Fi is off */
+ /* 3 scans in a row that the radio takes and never answers: each times out (9750 ms: 1000 + 38 x 150 x 3/2 + 200, both
+    bands, C3 on the split), then Wi-Fi is off */
  assert(fuxi_wifi_radio_wanted());
  atomic_store(&lane_mode,LANE_SILENT);
  for (unsigned i=0;i<3;i++) {
   takes=atomic_load(&lane_takes); uint64_t start=(uint64_t)(60+20*i)*NSEC_PER_SEC; now_abs=start;
   assert(!scan_ask(3,0,0)); wait_count(&lane_takes,takes+1);
-  now_abs=start+9549*1000000ull; struct timespec pause={.tv_nsec=5000000}; nanosleep(&pause,NULL);
+  now_abs=start+9749*1000000ull; struct timespec pause={.tv_nsec=5000000}; nanosleep(&pause,NULL);
   assert(fuxi_wifi_sta_busy());
-  now_abs=start+9550*1000000ull; settle(); wait_count(&lane_cancels,i+1);
-  assert(said(SAY("FUXI WIFI IOS: radio: scan %u: 38 channels passive, 0 heard (0 at 2.4 GHz, 0 at 5 GHz, 0 RSN, 0 hidden), 9550 ms, status %d\n",6+i,ETIMEDOUT)));
+  now_abs=start+9750*1000000ull; settle(); wait_count(&lane_cancels,i+1);
+  assert(said(SAY("FUXI WIFI IOS: radio: scan %u: 38 channels passive, 0 heard (0 at 2.4 GHz, 0 at 5 GHz, 0 RSN, 0 hidden), 9750 ms, status %d\n",6+i,ETIMEDOUT)));
  }
  wait_said("FUXI WIFI IOS: radio: scans timed out 3 times in a row (code 0x60003); Wi-Fi reported off, no retry this boot\n");
  other_settle();

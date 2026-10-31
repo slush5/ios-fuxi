@@ -356,7 +356,9 @@ never sees MMIO or DMA. The tables (about 140 KB) are allocated only with
   radar, RSN, -74). The radio lane's calls are ignored.
 - Channels: 38, all passive, no 6 GHz: 1-13, 36-48, 52-64 and 100-144 (radar),
   149-165. Every scan is passive whatever wifid asks, 150 ms a channel (50-200
-  if asked); the iOS side waits 1000 + n * dwell * 3/2 ms, at most 15 s.
+  if asked); the iOS side waits 1000 + n * dwell * 3/2 ms, plus 200 ms when
+  the request has channels of both bands (the radio lane scans one band at a
+  time, 2.4 GHz then 5 GHz, C3 on the split), at most 15 s.
 - Results: SSID, BSSID, channel (the DS or HT operation channel), RSSI, noise
   (-95 dBm when the radio has none) and SNR, beacon interval, capability, and
   the elements kept whole within wifid's room (0 or over 1024 counts as 1024),

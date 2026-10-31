@@ -1735,7 +1735,9 @@ wlwmi_encode_start_scan(uint32_t n, uint32_t max_time, uint8_t *out, uint32_t ro
  * three things differ. PASSIVE and CHAN_STAT_EVENT stay forced (there is no
  * flags argument), still no SSID, IE or probe. Refused: N outside 1..38, a
  * channel not on the list, a dwell outside 50..200 ms (the iOS side's own
- * range), an id outside WLSCAN_ID_FIRST..WLSCAN_ID_LAST. Ids: ATH12K_SCAN_ID
+ * range), an id outside WLSCAN_ID_FIRST..WLSCAN_ID_LAST, and (C3 on the split)
+ * a list of both bands: every W25 scan is single-band, the phone's firmware
+ * stalls in a mixed DBS scan (CH1 split). Ids: ATH12K_SCAN_ID
  * (0xa000, the C2 scan) with a 12-bit counter in the low bits, so a late
  * event of an earlier scan never matches the scan in flight. */
 #define WLSCAN_ID_FIRST 0xa001u
@@ -1745,7 +1747,9 @@ wlwmi_encode_start_scan_list(const uint16_t *mhz, uint32_t n, uint32_t id, uint3
     uint8_t *out, uint32_t room, uint32_t *len)
 {
 	if (!mhz || n > WLSCAN_NCHAN || dwell < 50u || dwell > 200u || id < WLSCAN_ID_FIRST || id > WLSCAN_ID_LAST) { return 1; }
-	for (uint32_t i = 0; i < n; i++) { if (!wlscan_listed(mhz[i], WLSCAN_NCHAN)) { return 1; } }
+	for (uint32_t i = 0; i < n; i++) {
+		if (!wlscan_listed(mhz[i], WLSCAN_NCHAN) || (mhz[i] < 3000u) != (mhz[0] < 3000u)) { return 1; }   /* one band */
+	}
 	if (wlwmi_encode_start_scan(n, max_time, out, room, len)) { return 1; }
 	uint8_t *f = out + 4, *p = f + WLWMI_START_SCAN_BYTES + 4u;
 	wlce_put32(f + 4 * WLWMI_SS_SCAN_ID, id);

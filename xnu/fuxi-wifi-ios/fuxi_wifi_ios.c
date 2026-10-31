@@ -353,14 +353,18 @@ rscan_power(bool on)
 }
 
 /* The listed channels wifid asked for (all of them for "any"), passive, 150 ms each unless it asked for
- * 50 to 200; waited for at most 1 s plus one and a half dwells a channel (15 s at most), so that the radio
- * lane, which gives its own scan n * dwell * 3 / 2, always finishes or aborts first. */
+ * 50 to 200; waited for at most 1 s plus one and a half dwells a channel, plus 200 ms when the request has
+ * channels of both bands (15 s at most), so that the radio lane always finishes or aborts first: it scans
+ * one band at a time (2.4 GHz, then 5 GHz), gives each part n_part * dwell * 3 / 2 and stops a part 200 ms
+ * past that, then waits 300 ms for the stop, so n * dwell * 3 / 2 + 500 ms for one band and + 700 ms for
+ * two (docs-lanes/wlan-w20.md, C3 on the split). */
 static int
 rscan_scan(const struct fuxi_wifi_sta_scan *what)
 {
 	struct fuxi_wifi_radio_request request = { .passive = what->passive };
 	struct fuxi_wifi_sta_channel channels[FUXI_WIFI_RADIO_CHANNELS];
 	unsigned count = fuxi_wifi_radio_channels(channels, FUXI_WIFI_RADIO_CHANNELS), dwell, timeout;
+	bool low, high;
 
 	for (unsigned i = 0; i < count; i++) {
 		bool asked = what->frequency_count == 0;
@@ -376,7 +380,12 @@ rscan_scan(const struct fuxi_wifi_sta_scan *what)
 	memcpy(request.ssid, what->ssid, request.ssid_length);
 	dwell = what->dwell_ms >= 50 && what->dwell_ms <= 200 ? what->dwell_ms : FUXI_WIFI_RADIO_DWELL_MS;
 	request.dwell_ms = (uint16_t)dwell;
-	timeout = 1000 + request.freq_count * dwell * 3 / 2;
+	low = high = false;
+	for (unsigned i = 0; i < request.freq_count; i++) {
+		low |= request.freqs[i] < 3000;
+		high |= request.freqs[i] >= 3000;
+	}
+	timeout = 1000 + request.freq_count * dwell * 3 / 2 + (low && high ? 200 : 0);
 	return fuxi_wifi_radio_scan(&request, timeout < FUXI_WIFI_RADIO_WAIT_MOST_MS ? timeout : FUXI_WIFI_RADIO_WAIT_MOST_MS,
 	           fuxi_wifi_sta_power_pending);
 }

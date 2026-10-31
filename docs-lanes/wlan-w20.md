@@ -2134,11 +2134,103 @@ C3 was written on C2 (39c80e5), rebased onto C2c (c18f99d, branch feat/c3-rebase
 - C2b's rule that no line passes 254 bytes is now checked for C3 too: the service end is two lines
   (`W25 service end: ...;` and `W25 service end rings: rx CE1 ... credits N`).
 
+### C3 on the split: every W25 scan single-band
+
+On the phone the upstream firmware with the board-2 BDF/REGDB scans 2.4 GHz alone and 5 GHz alone, but
+asserts in a mixed scan run in DBS (the CH1 split, `fuxiwlanch` bit 26, 674c0da). C3 now runs on salami
+2622e7a (C2f to C2h, HD1, `fuxiwlanch` with its split and DBS-policy bits) and every W25 scan is
+single-band, whatever the bits:
+
+- `wl25_scan` keeps a request's channels as before (listed, each once) but in two parts: the 2.4 GHz ones
+  in request order, then the 5 GHz ones in request order. Each part that has a channel is one START_SCAN
+  with a scan id of its own (the next of 0xa001..0xafff), its own max_scan_time n_part x dwell x 3/2 and
+  its own bounds (no STARTED in 1000 ms, no end by max_scan_time + 200 ms). The 5 GHz START_SCAN goes out
+  only after the 2.4 GHz part's COMPLETED; the scan state is re-armed between the parts (`wlscan_rearm`,
+  the CH1 split's), so the frames of both parts land in one table and on the iOS side under the one seq.
+- One `done()` per request, after its last part, with the status of the part that ended it: 0 when both
+  completed; EIO for START_FAILED or DEQUEUED of either part (the 5 GHz part is then never sent);
+  ETIMEDOUT for a timeout of either part (STOP_SCAN of that part's id, the 300 ms wait, the 3 s rule for a
+  stop not confirmed, all as before); ECANCELED for a cancel while a part runs (STOP_SCAN of that part)
+  or between the parts (nothing in flight, nothing stopped, the 5 GHz part never sent). Counting is per
+  request: a failed request is one failure, whichever part failed.
+- `wlwmi_encode_start_scan_list` refuses a list of both bands, so a mixed START_SCAN cannot be built.
+- `fuxi_wifi_radio_ready` still names every channel W23 gave the firmware; a request of both bands (the
+  iOS type-3 scan of all 38, say) is simply two scans.
+- The watches and first-scan lines follow the first request that sends a START_SCAN, both its parts:
+  STARTED at the first part's, MID at foreign >= (n + 1) / 2 over the request, COMPLETED and the W26 to W28
+  reports after it, and C2h's `W30 mgmtreo counts` line there too (where qrtr 7 prints it after its scan).
+  C2b's stats stay qrtr 7 only.
+- A request of one band is exactly C3's scan: the same START_SCAN words, id, bounds and W25 line.
+
+W26, W27, W28, W29 (C2f/C2g) and W30 (C2h) apply to qrtr 8 exactly as to qrtr 7: their bits are in
+`WL23_BITS` (now with 0x4000), `fuxiwlanw29` and `fuxiwlanvrx` are parsed with the same rules whenever
+`wl_w20`, and their setup is in the path both stages share before the W25 hook. `fuxiwlanch` too: its
+drop bits shape the list W23 sends and `ready()` names (and so every request), bits 27 / 28 set
+scan_ctrl_flags_ext in every W25 START_SCAN of both parts (the range encoder writes it), and bit 26 adds
+nothing (every W25 scan is split already; the `W23 split scan` line is the qrtr 7 stage's). The refusal
+texts still say `needs fuxiwlanqrtr=7` (unchanged, so qrtr 0..7 boots stay byte-identical); qrtr 8 is
+accepted by the same checks.
+
+Timeout coupling (the iOS side's wait must end after the radio lane's last possible answer):
+
+| | one band | two bands |
+|---|---|---|
+| radio lane, worst case before `done()` | n x dwell x 3/2 + 200 + 300 | n24 x dwell x 3/2 + 200 + n5 x dwell x 3/2 + 200 + 300 = n x dwell x 3/2 + 700 |
+| iOS side waits (`rscan_scan`, fuxi_wifi_ios.c) | 1000 + n x dwell x 3/2 | 1000 + n x dwell x 3/2 + 200 |
+| margin | 500 ms | 500 ms (300 without the new 200) |
+| 38 channels at 150 ms | (one band never has 38) | radio 9250 ms (2925 + 200, 5625 + 200, 300), iOS 9750 ms (was 9550) |
+| 38 channels at 200 ms | | radio 12100 ms, iOS 12600 ms (cap 15000) |
+| 13 channels (2.4 GHz) at 150 ms | radio 3425 ms, iOS 3925 ms | |
+
+max_scan_time is per part (L19's n x dwell x 3/2 with the part's n), so its sum over a request is what C3
+gave the one scan. The 200 ms per extra part is the overrun bound of the second part; the model checks every
+`done()` against the iOS side's wait and plays the worst case (s_svc_split (h): the 2.4 GHz part ends 190 ms
+past its max_scan_time, the 5 GHz part never ends and its STOP_SCAN is never answered: done() at about
+12090 ms of 12600).
+
+Log: a request of both bands names both parts on its W25 line,
+`W25 scan K seq S id 0xa001+0xa002: 13+25 channels passive dwell 150 ms, completed after T ms, ...`
+(`id 0xa001+-` when the 5 GHz part was never sent: a failure or a cancel in the first part, or a cancel
+between the parts, `cancelled before the 5 GHz part`); a one-band request's line is C3's. `W25 selected ...`
+adds `one band a scan (2.4 GHz, then 5 GHz)`. The SCAN_EVENTs of the first part that arrive in the second are
+ignored by the id filter as any stale event (`W25 ignored scan event ...`).
+
+Host tests: `s_svc_split` (a cancel 100 ms into the first part, a cancel between the parts, a timeout in the
+second part with STOP_SCAN of its own id, a 5 GHz-only and a 2.4 GHz-only request, DEQUEUED of the first and
+START_FAILED of the second part, the worst case against the iOS wait), `s_svc_rungs` (W29's commands and
+lines and W30's under qrtr 8 equal to qrtr 7's, `fuxiwlanch` drop and DBS-policy bits through `ready()` and
+both parts), every C3 scenario re-run with the split (the 38-channel and {2437, 5180} requests are now two
+scans), the end-to-end test against the real `fuxi_wifi_radio.c` ({2437, 5180}: two START_SCANs, one result
+set), the fake firmware's checks (every START_SCAN single-band, one whole band of the request, 2.4 GHz first,
+the 5 GHz one only after the 2.4 GHz COMPLETED, `done(0)` only after every band), static checks
+(`c3_split_static`, the timeout margins from the constants) and 7 new C3 mutants.
+
+### The fuxiwlansalami=3 profile
+
+`fuxiwlansalami=3` is the salami gate plus everything `=2` sets (`fuxiwlanclk=1`, `fuxiwlanprobe=civac`,
+`fuxiwlanseq=cycle,parf,dbi,eq,hostirq,msi,por,prefix`) and the radio defaults the phone proved:
+
+| knob | value | applies |
+|---|---|---|
+| `fuxiwlanw20` | 0x7f02 (32514: C2c..C2f, L19's whole RX setup, W29 0x9f by default) | qrtr 7 or 8 only (every other stage refuses w20 0x7f02) |
+| `fuxiwlanch` | 0x4000000 (bit 26, the split; W25 splits anyway) | qrtr 7 or 8 only (every other stage refuses the knob) |
+| `fuxiwlanmlo` | 4 (P17 HOSTMEM) | any stage |
+| `fuxiwlanamss` | lx-amss.bin | not with `fuxiwlanfw=stock` (which refuses an AMSS name) |
+| `fuxiwlanm3`, `fuxiwlanbdf`, `fuxiwlanregdb` | lx-m3.bin, lx-bdf.bin, lx-regdb.bin | any stage that reads them (W14 on) |
+
+Each comes from the table (`wl_salami_defaults`, `wl_arg_profile`) only when its knob is in neither the
+boot-args nor ADT /defaults, so an explicit knob always wins (`fuxiwlanw20=0` or `fuxiwlanch=0` turns the
+profile's off); each use says `salami KNOB from the fuxiwlansalami=3 profile`. The firmware names are
+strings the kit could only carry on the full cmdline: the profile supplies them inside the lane, through
+the same parser path (`PE_parse_boot_arg_str` is routed through `wl_arg_str`, so the names keep their
+basename checks and 63-character bound). The profile never makes a refused knob valid (cyclerails, w20 0x08,
+limit 27, qrtr 9 still refuse). Absent, 1 or 2: nothing of the =3 rows is used, every boot as before.
+
 ### Hooks (every boot, every qrtr)
 
 `fuxi_wlan_init` tells the handoff why there is no radio, once, at the exit it takes:
 `fuxi_wifi_radio_stopped(NOT_REQUESTED)` (no `fuxiwlan`, code 0x10000), `REFUSED | 1` (salami without
-`fuxiwlansalami=1/2`, 0x20001), `REFUSED | 2` (salami invalid selector or cyclerails, 0x20002), or
+`fuxiwlansalami=1/2/3`, 0x20001), `REFUSED | 2` (salami invalid selector or cyclerails, 0x20002), or
 `fuxi_wifi_radio_starting()` just before `kernel_thread_start` and `NO_THREAD` (0x30000) if that fails.
 `fw_thread` calls `fuxi_wifi_radio_stopped(EXITED | detail)` once, after `thread exit`, on every exit: after
 fw_run (detail = its step << 8 | reason, 0 when every step passed; fw_run has run wl5_abort on every path
@@ -2163,11 +2255,12 @@ gate harness records the calls).
    With `fuxiwifiios=3` absent, or with the user's Wi-Fi switch off, it stays true (the radio idles to its
    lifetime, as before).
 3. One request: not passive -> `done(seq, EINVAL)`, nothing sent; its channels kept only where the W23 list
-   has them, each once, in its order; none left -> `done(seq, EINVAL)`, nothing sent. Else one START_SCAN
+   has them, each once, in its order; none left -> `done(seq, EINVAL)`, nothing sent. Else (C3 on the split,
+   above) one START_SCAN per band, the 2.4 GHz part first, each as follows: a START_SCAN
    (`wlwmi_encode_start_scan_list`: the C2 command with only the scan id, the passive dwell and the channel
    array changed; PASSIVE | CHAN_STAT_EVENT forced, no SSID, IE or probe), dwell = the request's when
    50..200 ms (the iOS side's own rule, so both sides compute the same number), else 150; max_scan_time
-   n x dwell x 3/2 (the iOS side waits 1000 ms more); scan id 0xa001..0xafff in turn (ATH12K_SCAN_ID's block
+   n_part x dwell x 3/2 (the iOS side waits 1000 ms more, 1200 for two bands); scan id 0xa001..0xafff in turn (ATH12K_SCAN_ID's block
    with a 12-bit counter; SCAN_EVENTs of another id are counted in `wrong_id` and ignored, so a late event of
    a stopped scan never ends the next one; they are said: `W25 ignored scan event` lines, 8 in the service,
    the count and the last such id on each W25 line, the total in the service end, the count in a snapshot).
@@ -2202,7 +2295,7 @@ difference of 64-bit milliseconds; the rest are only printed.
 ### Logs
 
 ```
-FUXI WLAN: W25 selected scan service for iOS (fuxiwifiios=3): passive only, nothing transmitted; 1800 s, or 3 failed scans in a row, then contain; first scan W24 lines, then one W25 line a scan   (at init)
+FUXI WLAN: W25 selected scan service for iOS (fuxiwifiios=3): passive only, nothing transmitted; 1800 s, or 3 failed scans in a row, then contain; one band a scan (2.4 GHz, then 5 GHz); first scan W24 lines, then one W25 line a scan   (at init)
   ... W15, W20..W22 and the W23 chan list / vdev lines as for qrtr 7 ...
 FUXI WLAN: W25 service ready: 38 channels passive to iOS (2.4 GHz 13, 5 GHz 25), lifetime 1800 s
 FUXI WLAN: W23 scan foreign freq F                                         (the first scan sent only)
@@ -2212,7 +2305,7 @@ FUXI WLAN: W26 rx watch completed ... / W26 idle watch completed ...       (the 
 FUXI WLAN: W24 bss aa:bb:cc:xx:xx:xx ch C freq F dBm S privacy P rsn R beacon frames N ssid "NAME"   (the first completed scan only)
 FUXI WLAN: W24 scan summary frames N bss M ssids K
 FUXI WLAN: W24 scan detail mgmt-rx N ...
-FUXI WLAN: W25 scan K seq S id 0xa001: 38 channels passive dwell 150 ms, completed after T ms, reason 0, status 0; frames N bss M, to iOS N kept K; scan events E, of another id 0 (last 0)   (scans 1..24, every 100th, the first 24 failed ones)
+FUXI WLAN: W25 scan K seq S id 0xa001+0xa002: 13+25 channels passive dwell 150 ms, completed after T ms, reason 0, status 0; frames N bss M, to iOS N kept K; scan events E, of another id 0 (last 0)   (scans 1..24, every 100th, the first 24 failed ones)
 FUXI WLAN: W26 rx content ... / rx guard ... / rxdma err ... / link content ... / counters ...   (C2c, after the first scan's W25 line only)
 FUXI WLAN: W25 scan K seq S: not passive, refused, nothing sent, status 22      (or "no listed channel, refused")
 FUXI WLAN: W25 complete: lifetime over (1800 s); stop/contain                  (or "the iOS side stopped")
@@ -2345,13 +2438,61 @@ Results:
   27 w20 values above plus the C2d and C2e kit values and edges (6402, 6914, 0x902, 15106, 8962, 0x2002,
   0x2000, 0x3f92, 0x4f02).
 
+- feat/c3-on-split against 2622e7a (salami, CH1 bits 26 to 28): every model log write of the default run
+  and of the c2d, c2e, c2f, c2h and c2ch runs (4918201 bytes, captured through a vsnprintf tap compiled into
+  each tree's model) equal byte for byte, the new model adding only the C3 scenarios after them (228145
+  bytes); the six wire dumps equal; gate 315000 runs (78750 boot-arg sets: fuxiwlan absent/11/28/1/27 x
+  fuxiwlansalami absent/1/2/0/4 x qrtr absent or 0..7 x 7 w20 values x 5 fuxiwlanch values x 10 other knob
+  sets incl. w29, vrx, diag, mlo, names, seq, probe, fw=stock, keep; salami cmdline, all in ADT, half and
+  half, and the Fuxi build) equal but for the harness's own `RADIO` record (the C3 handoff stub, absent from
+  the base harness) and the 37800 runs that request with `fuxiwlansalami=2`, which 2622e7a refuses and C3
+  takes as its profile. Against the plain C3 rebase (the commit before this one) the same 315000 runs are
+  equal, `RADIO` lines and `fuxiwlansalami=2` included: the =3 rows touch no other boot.
+
 Left out by design, because C3 changes them: `fuxiwlanqrtr` 8, and -1 or 9 and beyond (the refusal line now
 says `not 0..8`), and `fuxiwlansalami=2` (refused before C3, the C3 profile now). The model's device action
 list now starts again once every queued action is done (for many W25 scans); the base logs above show that
 no qrtr 0..7 scenario changed by it. The scripts (c3diff.py, cross.py) were run from the session's scratch
 space and are not part of the tree; the method above is what they do.
 
+### Kit (M2, with fuxiwlansalami=3)
+
+The M2 kernel recipe with this C3. Both budgets were full (cmdline 607 with the loader's 66, ADT 16384),
+and the profile is what makes the radio defaults fit: in ADT /defaults the same knobs would cost 520 bytes
+(`mkadt-salami.py --wlan-defaults`, 36 bytes + the value rounded to 4 each: the =2 set 204, w20 40, ch 40,
+mlo 40, the four names 196), and on the cmdline the four names alone would take 96 characters (15 are free).
+
+- KIT_BASE (as M2): `fuxitouch=1 fuxitclk=1000 fuxitouch_poll_us=2000 fuxitouch_idle_us=4000 fuxicpuload=10`
+- EXTRA_CMD: `fuxicores=0x7c sweetfb_tegate=1 sweetfb_teguard=0 fuxiwlan=28 fuxiwlanqrtr=8 fuxiwifiios=3`
+  (the radio part is `fuxiwlan=28 fuxiwlanqrtr=8 fuxiwifiios=3`; no `fuxiwlansalami` on the cmdline)
+- EXTRA_ADT_ARGS: `--wlan-node --wlan-defaults fuxiwlansalami=3`
+- KIT_RO=0; run as M2 (`SESSION_SECONDS=3000`).
+
+Budgets: cmdline 526 characters, 592 of 607 with the loader's 66 (`BOOT_LINE_CHARS` 607 and
+`LOGO_APPEND_MAX` 66 of tools/run-ios-salami.py), 15 free: M2's line, since the profile's value is one
+digit on the same ADT property. ADT 16348 of 16384 bytes, 36 free: `--wlan-defaults fuxiwlansalami=3` is one
+4-byte int property, 40 bytes (`mkadt-salami.py` `wlan_defaults` / `adt_prop_bytes`, checked by
+tools/test-fuxi-wlan-salami.py), the same 40 as M2's `fuxiwlansalami=2`; M2c's `fuxiwlansalami=2
+fuxiwlanw20=<n>` was 80 bytes (16388, refused). The base numbers (526 and 16308 + 40) are M2's from
+c3-kit/budget.sh, which builds the kit the way logo-boot/build_kit_rel.sh and s31_build.sh do; the
+inputs it needs (the live FDT, the D22AP tree, the kit scripts) are not in this tree, so the deltas above
+are computed with this tree's tools and budget.sh has to confirm the totals before a build.
+
+Touch and display knobs: all of M2's stay (the four touch knobs and `fuxicpuload=10` of KIT_BASE,
+`sweetfb_tegate=1 sweetfb_teguard=0`): unlike M2c, owner decision 4 (drop `fuxicpuload=10`) is no longer
+needed, and the w20 property is gone from the ADT. Of the knobs left out before, none fits back:
+`sweetiolog=Preferences` needs 23 characters (15 free), `--touch-defaults` needs 120 bytes (36 free). Any
+one knob of up to 14 characters fits the cmdline.
+
+Expected, on top of M2's lines: `salami KNOB from the fuxiwlansalami=3 profile` for seq, probe, mlo, w20,
+ch and the four names (clk at step 2), `W20 selected qrtr=8 ... w20 0x7f02 valid 1`, `W23 selected passive
+scan of 38 channels (fuxiwlanch 0x4000000), dwell per request ...`, the W26 to W29 selected lines and setup
+as in the r1c2f kits, then the W25 lines, each request of both bands as two parts. This supersedes Kit (M2c)
+below: its w20 comes from the profile.
+
 ### Kit (M2)
+
+The recipe before the =3 profile (kept for reference; Kit (M2, with fuxiwlansalami=3) above supersedes it).
 
 The r1c1/r1c2 recipe with the C3 kernel: KIT_BASE `fuxitouch=1 fuxitclk=1000 fuxitouch_poll_us=2000
 fuxitouch_idle_us=4000 fuxicpuload=10`, cmdline extra `fuxicores=0x7c sweetfb_tegate=1 sweetfb_teguard=0
@@ -2371,6 +2512,9 @@ the reset (2100 to 2700 s after the handoff) can come before them. With 3000 s t
 is ready within 20 min of the handoff, and the reset comes at 3300 s or later.
 
 ### Kit (M2c: C3 with the RX rungs)
+
+Superseded by Kit (M2, with fuxiwlansalami=3): the profile gives w20 0x7f02, so neither the w20 property
+nor owner decision 4 is needed any more. Kept for reference:
 
 The same kernel, with the w20 combination of the RX rung whose readout makes frames arrive. On the phone
 r1c2c (0x702) and r1c2d-l (0x1b02) both wedged; C2e's r1c2e (15106 = 0x3b02: L19's whole RX setup with the

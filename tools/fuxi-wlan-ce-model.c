@@ -302,7 +302,8 @@ struct cfg {
 	unsigned scan_mode2;                /* with split: scan_mode of the second START_SCAN (0 = normal) */
 	bool dequeue_first;                 /* with split: the first scan ends with DEQUEUED instead of COMPLETED */
 	/* C3: per START_SCAN number (1..16, else 0) 0 normal, 1 START_FAILED, 2 no STARTED, 3 no COMPLETED,
-	 * 4 DEQUEUED after STARTED */
+	 * 4 DEQUEUED after STARTED, 5 (C3 on the split) COMPLETED late, 190 ms past max_scan_time (the worst a scan can
+	 * end and still count as completed) */
 	unsigned c3_mode[17];
 	bool c3_stop_silent;                /* STOP_SCAN never answered */
 	bool c3_stale;                      /* from the 2nd scan on, a COMPLETED of the previous id comes first */
@@ -331,6 +332,7 @@ static unsigned fw_c3_scans, fw_c3_mode_now;
 static uint32_t fw_c3_id, fw_c3_n, fw_c3_dwell, fw_c3_max, fw_c3_flags, fw_c3_chan[64], fw_c3_stop_id;
 static uint64_t fw_c3_start_at, fw_c3_stop_at;
 static uint32_t fw_c3_stop_after[17];   /* ms from a START_SCAN (by number) to its STOP_SCAN */
+static struct { uint32_t id, n, chan0, max; uint64_t at; } fw_c3_log[17];   /* C3 on the split: START_SCAN k (1..16) as taken */
 static bool fw_ready_sent, fw_setup_done;
 static int fw_credits;
 static unsigned fw_seq[9], fw_eid_used, fw_wmi_msgs, fw_init_ok, fw_hw_mode_ok, fw_echoes, fw_tx_msgs, fw_ext_q, fw_ext2_q;
@@ -1745,12 +1747,26 @@ static uint16_t h_expect[64];
 static unsigned h_expect_n;
 static uint32_t h_expect_dwell;
 static bool h_req_passive;
+/* C3 on the split: h_expect is the request's channels the 2.4 GHz ones first (request order within a band), h_exp24
+ * of them at 2.4 GHz; h_part_off = how many of them the START_SCANs of this request named so far (each part one
+ * whole band, the 2.4 GHz part first); fw_c3_ended_at = when the scan in flight sends its COMPLETED (~0: never). */
+static unsigned h_exp24, h_part_off;
+static uint64_t fw_c3_ended_at = ~0ull;
 static bool m_listed(uint32_t mhz, unsigned n)
 {
 	for (unsigned i = 0; i < n; i++) { if (m_chan(i) == mhz) { return true; } }
 	return false;
 }
+/* C3: one of the channels W23 gave the firmware (w20 0x10 and fuxiwlanch as the scenario set them in m_chmask) */
+static bool m_kept(uint32_t mhz)
+{
+	for (unsigned i = 0; i < 38 && m_chan_k(i); i++) {
+		if (m_chan_k(i) == mhz) { return !((wl20_bits & WL20_BAND24) && mhz >= 3000u); }
+	}
+	return false;
+}
 
+static bool fw_c3_first_req(void);
 /* The scan of START_SCAN: STARTED, per channel (DWELL ms each) FOREIGN_CHAN, CHAN_INFO START, the frames
  * heard there, CHAN_INFO END, then COMPLETED; or the scripted failure. Tagged with the scan id. */
 static void
@@ -1758,6 +1774,7 @@ fw_c3_script(unsigned mode, uint32_t id, uint32_t n, uint32_t dwell)
 {
 	uint32_t t = 2;
 	fw_tag = id;
+	fw_c3_ended_at = ~0ull;
 	if (mode == 1) { fw_scan_event_id(1u << 6, 4, 0, 0, id, t); fw_tag = 0; return; }
 	if (mode == 2) { fw_tag = 0; return; }
 	fw_scan_event_id(1u << 0, 0, 0, 0, id, t);
@@ -1772,8 +1789,9 @@ fw_c3_script(unsigned mode, uint32_t id, uint32_t n, uint32_t dwell)
 		uint32_t t0 = 5 + dwell * i, k = 0, heard = 0, ix = 0;
 		while (ix < 38 && m_chan(ix) != fw_c3_chan[i]) { ix++; }
 		for (unsigned j = 0; j < n_beacons; j++) { heard += beacons[j].idx == ix; }
-		/* C2c: C2c's RXDMA frames in the first W25 scan only (its buffers never come back) */
-		if (C.rx_frames && fw_c3_scans == 1) { act(now + t0 + 3, A_FRAMES, ix < 13 ? 0u : 1u, C.rx_frames); }
+		/* C2c: C2c's RXDMA frames in the first W25 scan only (its buffers never come back); C3 on the split: the
+		 * first request, both its parts */
+		if (C.rx_frames && fw_c3_first_req()) { act(now + t0 + 3, A_FRAMES, ix < 13 ? 0u : 1u, C.rx_frames); }
 		if (C.d_frames && m_rx_live()) { act(now + t0 + 3, A_D2, ix < 13 ? 0u : 1u, C.d_frames); }  /* C2d, every scan */
 		if (C.mon_ppdu) { act(now + t0 + 3, A_MON, ix < 13 ? 0u : 1u, C.mon_ppdu); }  /* C2e, every scan */
 		fw_scan_event_id(1u << 3, 0, fw_c3_chan[i], 0, id, t0);
@@ -1784,13 +1802,16 @@ fw_c3_script(unsigned mode, uint32_t id, uint32_t n, uint32_t dwell)
 		fw_chan_info(1, fw_c3_chan[i], 0, ix, 0, t0 + dwell - 2);
 	}
 	if (crash) { act(now + 5 + dwell * stop_at, A_CRASH, 0, 0); }
-	if (mode != 3 && !wedged && !crash) { fw_scan_event_id(1u << 1, 0, 0, 0, id, 5 + dwell * n + 1); }
+	const uint32_t end_at = mode == 5 ? n * dwell * 3u / 2u + 190u : 5 + dwell * n + 1;
+	if (mode != 3 && !wedged && !crash) { fw_scan_event_id(1u << 1, 0, 0, 0, id, end_at); fw_c3_ended_at = now + end_at; }
 	fw_tag = 0;
 }
 
 /* START_SCAN from the service, word by word: a fresh id in 0xa001..0xafff, PASSIVE | CHAN_STAT only (no
  * broadcast probe, no ACTIVE), the dwell and channels the request asked for (listed, each once, in its
- * order), max_scan_time n x dwell x 3/2, no SSID, no IE, no probe. */
+ * order), max_scan_time n x dwell x 3/2, no SSID, no IE, no probe. C3 on the split: one band only (the phone's
+ * firmware stalls in a mixed DBS scan), each one whole band of the request, the 2.4 GHz part first and the 5 GHz
+ * part only after the 2.4 GHz part's COMPLETED; scan_ctrl_flags_ext as fuxiwlanch bits 27 / 28 ask (m_ext). */
 static void
 fw_c3_start(const uint8_t *pl, uint32_t plen, unsigned need)
 {
@@ -1802,7 +1823,7 @@ fw_c3_start(const uint8_t *pl, uint32_t plen, unsigned need)
 	CHECK(dwell >= 50 && dwell <= 200, "W25 passive dwell outside 50..200");
 	want[0] = 0x4du << 16 | 156u; want[1] = id; want[2] = 1; want[5] = 0x5f; want[6] = 50; want[7] = dwell; want[8] = 50;
 	want[9] = 500; want[13] = n * dwell * 3 / 2; want[14] = 5; want[15] = 0x11; want[17] = n; want[18] = 1; want[37] = 70;
-	want[38] = 70;
+	want[38] = 70; want[35] = m_ext;
 	for (unsigned i = 0; i < 40; i++) {
 		if (g32(f + 4 * i) != want[i]) { fprintf(stderr, "W25 START_SCAN word %u = %#x, want %#x\n", i, g32(f + 4 * i), want[i]); fail("W25 START_SCAN"); }
 	}
@@ -1811,6 +1832,8 @@ fw_c3_start(const uint8_t *pl, uint32_t plen, unsigned need)
 	for (unsigned i = 0; i < n; i++) {
 		fw_c3_chan[i] = g32(p + 4 + 4 * i);
 		CHECK(m_listed(fw_c3_chan[i], 38), "W25 START_SCAN channel off the 38-channel list");
+		CHECK(m_kept(fw_c3_chan[i]), "W25 START_SCAN channel not in the list W23 gave the firmware");
+		CHECK((fw_c3_chan[i] < 3000u) == (fw_c3_chan[0] < 3000u), "W25 START_SCAN of both bands (every W25 scan is single-band)");
 		for (unsigned j = 0; j < i; j++) { CHECK(fw_c3_chan[j] != fw_c3_chan[i], "W25 START_SCAN channel twice"); }
 	}
 	p += 4 + 4 * n;
@@ -1818,12 +1841,21 @@ fw_c3_start(const uint8_t *pl, uint32_t plen, unsigned need)
 	    g32(p + 16) == (0x11u << 16), "W25 START_SCAN SSID/BSSID/IE arrays");
 #if !defined(FUXI_WLAN_E2E)
 	CHECK(h_req_passive, "a request that was not passive reached the firmware as a START_SCAN");
-	CHECK(n == h_expect_n && dwell == h_expect_dwell, "W25 START_SCAN is not the request's channel count / dwell");
-	for (unsigned i = 0; i < n; i++) { CHECK(fw_c3_chan[i] == h_expect[i], "W25 START_SCAN is not the request's channels"); }
+	CHECK(dwell == h_expect_dwell, "W25 START_SCAN is not the request's dwell");
+	CHECK(h_part_off == 0 ? n == (h_exp24 ? h_exp24 : h_expect_n) : h_part_off == h_exp24 && n == h_expect_n - h_exp24,
+	    "W25 START_SCAN is not one whole band of the request, the 2.4 GHz part first");
+	CHECK(h_part_off == 0 || (fw_c3_ended_at != ~0ull && now >= fw_c3_ended_at && fw_c3_stop_id != fw_c3_id),
+	    "the 5 GHz START_SCAN before the 2.4 GHz part's COMPLETED");
+	for (unsigned i = 0; i < n; i++) { CHECK(fw_c3_chan[i] == h_expect[h_part_off + i], "W25 START_SCAN is not the request's channels"); }
+	h_part_off += n;
 #endif
 	fw_c3_scans++; fw_scan_cmds++; fw_c2_step = 8;
 	fw_c3_id = id; fw_c3_n = n; fw_c3_dwell = dwell; fw_c3_max = want[13]; fw_c3_flags = g32(f + 4 * 15);
 	fw_c3_start_at = now;
+	if (fw_c3_scans < 17) {
+		fw_c3_log[fw_c3_scans].id = id; fw_c3_log[fw_c3_scans].n = n; fw_c3_log[fw_c3_scans].chan0 = fw_c3_chan[0];
+		fw_c3_log[fw_c3_scans].max = want[13]; fw_c3_log[fw_c3_scans].at = now;
+	}
 	fw_c3_mode_now = fw_c3_scans < 17 ? C.c3_mode[fw_c3_scans] : fw_c3_scans == C.c3_fail_at ? 1u : 0u;
 	if (C.c3_guard_after && fw_c3_scans >= C.c3_guard_after) { guard_bad = true; }
 	bool held = (C.c3_starve_after && fw_c3_scans >= C.c3_starve_after) || fw_c3_scans <= C.c3_hold;
@@ -2269,6 +2301,7 @@ static uint16_t h_ready_f[64];
 static uint32_t h_live, h_first_id, h_last_id;
 static uint64_t h_taken_at, h_ready_at;
 static int h_status[256];
+static uint64_t h_worst, h_worst_limit;   /* C3 on the split: the longest wait for done() so far, and its limit */
 struct h_frame { uint32_t seq; uint8_t bssid[6]; uint16_t mhz; int16_t rssi, noise; uint32_t len; };
 static struct h_frame h_fr[8192];
 static unsigned h_fr_n;
@@ -2279,6 +2312,7 @@ h_reset(void)
 	hq_n = hq_next = h_ready = h_ready_n = h_takes = h_dones = h_live_idx = h_fr_n = h_gone_after = 0;
 	h_auto = h_auto_ok = h_auto_frames = h_ready_s1 = h_ready_s10 = 0;
 	h_live = h_first_id = h_last_id = 0; h_taken_at = h_ready_at = 0; h_expect_n = 0; h_expect_dwell = 0; h_req_passive = false;
+	h_worst = h_worst_limit = 0;
 	for (unsigned i = 0; i < 256; i++) { h_status[i] = H_NONE; }
 }
 
@@ -2327,6 +2361,8 @@ fuxi_wifi_radio_wanted(void)
 	return !h_gone();
 }
 
+static bool fw_c3_first_req(void) { return h_takes == 1; }   /* the START_SCANs of the first request taken */
+
 bool
 fuxi_wifi_radio_take(struct fuxi_wifi_radio_request *out)
 {
@@ -2343,11 +2379,15 @@ fuxi_wifi_radio_take(struct fuxi_wifi_radio_request *out)
 	unsigned nlist = (wl20_bits & WL20_BAND24) ? 13u : 38u;
 	*out = h->r;
 	h_live = h->r.seq; h_live_idx = idx; h_taken_at = now; h_takes++; h_req_passive = h->r.passive;
-	h_expect_n = 0;
-	for (unsigned i = 0; i < h->r.freq_count; i++) {
-		bool again = false;
-		for (unsigned j = 0; j < h_expect_n; j++) { again |= h_expect[j] == h->r.freqs[i]; }
-		if (!again && m_listed(h->r.freqs[i], nlist)) { h_expect[h_expect_n++] = h->r.freqs[i]; }
+	h_expect_n = 0; h_part_off = 0;
+	for (unsigned band = 0; band < 2; band++) {   /* C3 on the split: the 2.4 GHz channels, then the 5 GHz ones */
+		for (unsigned i = 0; i < h->r.freq_count; i++) {
+			bool again = false;
+			if ((h->r.freqs[i] < 3000u) != (band == 0)) { continue; }
+			for (unsigned j = 0; j < h_expect_n; j++) { again |= h_expect[j] == h->r.freqs[i]; }
+			if (!again && m_listed(h->r.freqs[i], nlist) && m_kept(h->r.freqs[i])) { h_expect[h_expect_n++] = h->r.freqs[i]; }
+		}
+		if (!band) { h_exp24 = h_expect_n; }
 	}
 	h_expect_dwell = h->r.dwell_ms >= 50 && h->r.dwell_ms <= 200 ? h->r.dwell_ms : 150;
 	return true;
@@ -2380,11 +2420,23 @@ fuxi_wifi_radio_done(uint32_t seq, int status)
 {
 	CHECK(seq && seq == h_live && (h_live_idx == H_AUTO || h_status[h_live_idx] == H_NONE),
 	    "done() for a request not in flight, or twice");
+	CHECK(status != 0 || (h_expect_n && h_part_off == h_expect_n), "done(0) before every band of the request was scanned");
+	/* C3 on the split: the timeout coupling. The iOS side (fuxi_wifi_ios.c rscan_scan) waits 1000 + n x dwell x 3/2 ms,
+	 * 200 more for a request of both bands; every answer must come before that (the model's iOS side never gives up
+	 * by itself, so a late answer would go unnoticed without this) */
+	{
+		const uint64_t waited = now - h_taken_at, both = h_exp24 && h_expect_n > h_exp24 ? 200u : 0u;
+		const uint64_t limit = 1000u + (uint64_t)h_expect_n * h_expect_dwell * 3u / 2u + both;
+		if (waited > h_worst) { h_worst = waited; h_worst_limit = limit; }
+		CHECK(waited < limit, "done() after the iOS side's wait (1000 + n x dwell x 3/2, + 200 for both bands)");
+	}
+	CHECK(status != EINVAL || h_part_off == 0, "done(EINVAL) after a START_SCAN");
 	if (h_live_idx == H_AUTO) { h_auto_ok += status == 0; } else { h_status[h_live_idx] = status; }
 	if (status != EINVAL) { h_last_id = fw_c3_id; h_first_id = h_first_id ? h_first_id : fw_c3_id; }
 	h_live = 0; h_dones++;
 }
 #else
+static bool fw_c3_first_req(void) { return fw_c3_scans == 1; }   /* (no C2c frames in the end-to-end run) */
 void e2e_ios_start(void);
 void e2e_tick(uint64_t ms);
 int e2e_ios_finish(void);
@@ -2748,7 +2800,8 @@ reset(void)
 	fw_tag = fw_dead_tag = 0; fw_dropped = 0; starved_since = 0;
 	fw_c3_scans = fw_c3_mode_now = 0; fw_c3_id = fw_c3_n = fw_c3_dwell = fw_c3_max = fw_c3_flags = fw_c3_stop_id = 0;
 	fw_c3_start_at = fw_c3_stop_at = 0; h_expect_n = 0; h_expect_dwell = 0; h_req_passive = false;
-	memset(fw_c3_stop_after, 0, sizeof(fw_c3_stop_after));
+	h_exp24 = h_part_off = 0; fw_c3_ended_at = ~0ull;   /* C3 on the split */
+	memset(fw_c3_stop_after, 0, sizeof(fw_c3_stop_after)); memset(fw_c3_log, 0, sizeof(fw_c3_log));
 #if !defined(FUXI_WLAN_E2E)
 	h_reset();
 #endif
@@ -6213,8 +6266,8 @@ s_svc_requests(void)
 	CHECK(h_ready_n == 38 && !memcmp(h_ready_f, all, sizeof(all)), "ready() is not the 38 channels");
 	CHECK(h_status[0] == 0 && h_status[1] == 0 && h_status[2] == 0 && h_status[3] == EINVAL && h_status[4] == EINVAL &&
 	    h_status[5] == 0 && h_takes == 6 && h_dones == 6, "request statuses");
-	CHECK(fw_c3_scans == 4 && fw_c3_n == 1 && fw_c3_chan[0] == 5500 && fw_c3_dwell == 200 && fw_c3_flags == 0x11 &&
-	    fw_c3_max == 300 && fw_c3_id == 0xa004, "the last START_SCAN");
+	CHECK(fw_c3_scans == 7 && fw_c3_n == 1 && fw_c3_chan[0] == 5500 && fw_c3_dwell == 200 && fw_c3_flags == 0x11 &&
+	    fw_c3_max == 300 && fw_c3_id == 0xa007, "the last START_SCAN (three requests of both bands: two each)");
 	CHECK(wl_scan.wrong_id == 1 && wl_scan.done && !wl_scan.dequeued, "the stale COMPLETED of the previous scan id was not ignored");
 	/* what went to iOS: seq 1 heard the four frames, each in place, with its RX MHz, SNR + floor, floor -95 */
 	unsigned s1 = 0;
@@ -6231,40 +6284,44 @@ s_svc_requests(void)
 	static const char *const lines[] = {
 		"FUXI WLAN: W25 service ready: 38 channels passive to iOS (2.4 GHz 13, 5 GHz 25), lifetime 1800 s\n",
 		"FUXI WLAN: W23 scan foreign freq 2412\n",
+		/* C3 on the split: 13 channels (1956 ms) then 25 (3756 ms); the 5 GHz part sees the 2.4 GHz part's stale COMPLETED */
+		"FUXI WLAN: W25 ignored scan event 0x2 of id 0xa001 (in flight 0xa002)\n",
 		"FUXI WLAN: W23 scan foreign freq 5825\n",
 		"FUXI WLAN: W24 bss 3c:84:6a:xx:xx:xx ch 6 freq 2437 dBm -48 privacy 1 rsn 1 beacon+probe-resp frames 2 ssid \"HomeNet\"\n",
 		"FUXI WLAN: W24 bss 74:83:c2:xx:xx:xx ch 36 freq 5180 dBm -45 privacy 1 rsn 1 beacon frames 1 ssid \"Office-5G\"\n",
 		"FUXI WLAN: W24 bss 74:83:c2:xx:xx:xx ch 100 freq 5500 dBm -62 privacy 1 rsn 1 beacon frames 1 ssid \"Lab DFS\"\n",
 		"FUXI WLAN: W24 scan summary frames 4 bss 3 ssids 3\n",
-		"FUXI WLAN: W25 scan 1 seq 1 id 0xa001: 38 channels passive dwell 150 ms, completed after 5706 ms, reason 0, status 0; "
-		"frames 4 bss 3, to iOS 4 kept 4; scan events 40, of another id 0 (last 0)\n",
-		"FUXI WLAN: W25 ignored scan event 0x2 of id 0xa001 (in flight 0xa002)\n",
-		"FUXI WLAN: W25 scan 2 seq 2 id 0xa002: 2 channels passive dwell 150 ms, completed after 306 ms, reason 0, status 0; "
-		"frames 3 bss 2, to iOS 3 kept 3; scan events 5, of another id 1 (last 0xa001)\n",
-		"FUXI WLAN: W25 scan 3 seq 3 id 0xa003: 2 channels passive dwell 110 ms, completed after 226 ms, reason 0, status 0; "
-		"frames 3 bss 2, to iOS 3 kept 3; scan events 5, of another id 1 (last 0xa002)\n",
+		"FUXI WLAN: W25 scan 1 seq 1 id 0xa001+0xa002: 13+25 channels passive dwell 150 ms, completed after 5712 ms, reason 0, "
+		"status 0; frames 4 bss 3, to iOS 4 kept 4; scan events 43, of another id 1 (last 0xa001)\n",
+		"FUXI WLAN: W25 ignored scan event 0x2 of id 0xa002 (in flight 0xa003)\n",
+		"FUXI WLAN: W25 ignored scan event 0x2 of id 0xa003 (in flight 0xa004)\n",
+		"FUXI WLAN: W25 scan 2 seq 2 id 0xa003+0xa004: 1+1 channels passive dwell 150 ms, completed after 312 ms, reason 0, "
+		"status 0; frames 3 bss 2, to iOS 3 kept 3; scan events 8, of another id 2 (last 0xa003)\n",
+		"FUXI WLAN: W25 scan 3 seq 3 id 0xa005+0xa006: 1+1 channels passive dwell 110 ms, completed after 232 ms, reason 0, "
+		"status 0; frames 3 bss 2, to iOS 3 kept 3; scan events 8, of another id 2 (last 0xa005)\n",
 	};
 	expect_order(lines, sizeof(lines) / sizeof(lines[0]));
 	expect(SAY("FUXI WLAN: W25 scan 4 seq 4: not passive, refused, nothing sent, status %d\n", EINVAL));
 	expect(SAY("FUXI WLAN: W25 scan 5 seq 5: no listed channel, refused, nothing sent, status %d\n", EINVAL));
-	expect("FUXI WLAN: W25 scan 6 seq 6 id 0xa004: 1 channels passive dwell 200 ms, completed after 206 ms, reason 0, status 0; "
-	    "frames 1 bss 1, to iOS 1 kept 1; scan events 4, of another id 1 (last 0xa003)\n");
+	expect("FUXI WLAN: W25 scan 6 seq 6 id 0xa007: 1 channels passive dwell 200 ms, completed after 206 ms, reason 0, status 0; "
+	    "frames 1 bss 1, to iOS 1 kept 1; scan events 4, of another id 1 (last 0xa006)\n");
 	CHECK(count_text("W23 scan foreign freq") == 38 && count_text("W24 scan summary") == 1 && count_text("FUXI WLAN: W24 bss ") == 3,
 	    "foreign lines of the first scan only, W24 lines of the first completed scan only");
-	CHECK(count_text("W25 ignored scan event") == 3, "one line per ignored stale COMPLETED");
+	CHECK(count_text("W25 ignored scan event") == 6, "one line per ignored stale COMPLETED (every START_SCAN but the first)");
 	CHECK(sleeps_10 - h_ready_s10 >= 179000 && sleeps_1 - h_ready_s1 < 8000, "polls: 10 ms idle, 1 ms while scanning");
 	c3_lifetime_end();
 	contained_and_freed();
 	expect(SAY("FUXI WLAN: W25 service end: lifetime over after 1800 s; scans 6 (completed 4, failed 0, cancelled 0, "
-	    "refused 2), frames to iOS 11 kept 11; stops confirmed late 0, scan events of another id 3, credit waits 0;\n"
+	    "refused 2), frames to iOS 11 kept 11; stops confirmed late 0, scan events of another id 6, credit waits 0;\n"
 	    "FUXI WLAN: W25 service end rings: rx CE1 62/0 CE2 %u/%u tx CE3 %u/%u credits %d\n", wl_ce.pipe[2].posted,
 	    wl_ce.pipe[2].reaped, wl_ce.pipe[3].posted, wl_ce.pipe[3].reaped, M_CREDITS));
 	expect("FUXI WLAN: W23 contain: scan over, no STOP_SCAN\n");
 	CHECK(wl_ce.pipe[2].posted - wl_ce.pipe[2].reaped == 62 && wl_ce.pipe[3].posted == wl_ce.pipe[3].reaped && fw_stop_cmds == 0,
 	    "RX buffers out / TX reaped / no STOP_SCAN");
 	expect_not("11:22:33"); expect_not("44:55:66");
-	puts("W25 requests: ready(38), the 38-channel type-3 scan, {2437,5180} at dwell 0 -> 150, a mixed list (2484 and 6 GHz "
-	     "dropped, a repeat once, order kept, dwell 110), a non-passive and an unlisted request refused with EINVAL and "
+	puts("W25 requests: ready(38), the 38-channel type-3 scan as 13 then 25 channels, {2437,5180} at dwell 0 -> 150 as two "
+	     "scans, a mixed list (2484 and 6 GHz dropped, a repeat once, 2.4 GHz first, dwell 110), a non-passive and an "
+	     "unlisted request refused with EINVAL and "
 	     "nothing sent, a DFS channel at 200 ms; ids 0xa001.., a stale COMPLETED of the previous id ignored; every "
 	     "beacon/probe response handed over in its RX buffer with MHz, SNR + floor and floor; foreign lines and W24 "
 	     "lines once; 10 ms idle polls; lifetime end at 1800 s, contained, freed");
@@ -6286,13 +6343,15 @@ s_svc_cancel(void)
 	h_push(all, 38, true, 150, 400);     /* iOS gives up after 400 ms (a power-off, a newer scan) */
 	h_push(six, 1, true, 150, -1);
 	CHECK(run() == 0, "W25 cancel");
-	CHECK(h_status[0] == ECANCELED && h_status[1] == 0 && fw_stop_cmds == 1 && fw_c3_stop_id == 0xa001 && fw_c3_scans == 2,
-	    "a cancel: STOP_SCAN of that scan, ECANCELED, the next request served");
+	/* C3 on the split: the cancel lands 400 ms into the 2.4 GHz part (13 channels, 1956 ms): that part is stopped, the
+	 * 5 GHz part is never sent (START_SCAN 2 is the next request's, 0xa002) */
+	CHECK(h_status[0] == ECANCELED && h_status[1] == 0 && fw_stop_cmds == 1 && fw_c3_stop_id == 0xa001 && fw_c3_scans == 2 &&
+	    fw_c3_id == 0xa002 && fw_c3_n == 1 && fw_c3_chan[0] == 2437, "a cancel: STOP_SCAN of that scan, ECANCELED, the 5 GHz part skipped, the next request served");
 	CHECK(fw_c3_stop_after[1] >= 400 && fw_c3_stop_after[1] <= 402 && fw_dropped > 0, "STOP_SCAN 400 ms in; the rest dropped");
 	unsigned s1 = 0, s2 = 0;
 	for (unsigned i = 0; i < h_fr_n; i++) { s1 += h_fr[i].seq == 1; s2 += h_fr[i].seq == 2; }
 	CHECK(s1 == 3 && s2 == 1, "frames handed over before the cancel (channels 1, 2, 3) and after");
-	expect(SAY("FUXI WLAN: W25 scan 1 seq 1 id 0xa001: 38 channels passive dwell 150 ms, cancelled, stop confirmed after 402 ms, "
+	expect(SAY("FUXI WLAN: W25 scan 1 seq 1 id 0xa001+-: 13+25 channels passive dwell 150 ms, cancelled, stop confirmed after 402 ms, "
 	    "reason %u, status %d; frames 3 bss 3, to iOS 3 kept 3; scan events ", WLWMI_SCAN_REASON_CANCELLED, ECANCELED));
 	expect("FUXI WLAN: W24 bss 10:20:30:xx:xx:xx ch 6 freq 2437 dBm -65 privacy 0 rsn 0 beacon frames 1 ssid \"Net-05\"\n");
 	CHECK(count_text("W23 scan foreign freq") == 3 && count_text("W24 scan summary") == 1, "foreign lines of the first scan");
@@ -6324,7 +6383,8 @@ s_svc_cancel(void)
 	c3_lifetime_end();
 	contained_and_freed();
 	expect("scans 2 (completed 1, failed 0, cancelled 1, refused 0), frames to iOS 0 kept 0; stops confirmed late 1,");
-	puts("W25 cancel: iOS cancels 400 ms into a 38-channel scan: STOP_SCAN with that scan's id, its COMPLETED (cancelled) "
+	puts("W25 cancel: iOS cancels 400 ms into a 38-channel request (its 2.4 GHz part): STOP_SCAN with that part's id, its COMPLETED (cancelled) "
+	     "the 5 GHz part never sent, "
 	     "within the 300 ms bound, ECANCELED, what the target still had queued dropped, 3 frames handed over; the next "
 	     "request is served and gives the W24 lines; an unanswered cancel is a failure and holds the next START_SCAN "
 	     "3 s; a STOP_SCAN answered 1 s late is a cancel and the next START_SCAN follows the late end");
@@ -6333,11 +6393,12 @@ s_svc_cancel(void)
 static void
 s_svc_failures(void)
 {
-	static const uint16_t two[2] = {2437, 5180};
+	static const uint16_t two[2] = {2437, 2462};   /* C3 on the split: one band, so START_SCAN k is request k's */
 	uint16_t all[38];
 	for (unsigned i = 0; i < 38; i++) { all[i] = (uint16_t)m_chan(i); }
-	/* START_FAILED, a good scan (resets the count), no COMPLETED, DEQUEUED, no STARTED (38 channels: max 8550 ms,
-	 * so the 1000 ms STARTED bound comes first): the third failure in a row contains */
+	/* START_FAILED, a good scan (resets the count), no COMPLETED, DEQUEUED, no STARTED (38 channels, so the 2.4 GHz part
+	 * of 13 first: max 2925 ms, so the 1000 ms STARTED bound comes first, and the 5 GHz part is never sent): the third
+	 * failure in a row contains */
 	c3_reset();
 	C.c3_mode[1] = 1; C.c3_mode[3] = 3; C.c3_mode[4] = 4; C.c3_mode[5] = 2;
 	add_frame(5, 47, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
@@ -6346,6 +6407,7 @@ s_svc_failures(void)
 	CHECK(run() == 1, "3 failed scans in a row did not contain");
 	CHECK(h_status[0] == EIO && h_status[1] == 0 && h_status[2] == ETIMEDOUT && h_status[3] == EIO && h_status[4] == ETIMEDOUT &&
 	    h_status[5] == H_NONE && h_takes == 5, "statuses: START_FAILED EIO, ok, overrun ETIMEDOUT, DEQUEUED EIO, no STARTED ETIMEDOUT");
+	CHECK(fw_c3_scans == 5 && fw_c3_n == 13, "the 38-channel request's 5 GHz part never sent after its 2.4 GHz part failed");
 	CHECK(fw_stop_cmds == 2 && fw_c3_stop_after[3] >= 650 && fw_c3_stop_after[3] <= 651 && fw_c3_stop_after[5] >= 1000 &&
 	    fw_c3_stop_after[5] <= 1001, "STOP_SCAN at max_scan_time + 200 ms (450 + 200) and at 1000 ms without STARTED");
 	expect(SAY("FUXI WLAN: W25 scan 1 seq 1 id 0xa001: 2 channels passive dwell 150 ms, start failed after 2 ms, reason 4, "
@@ -6354,7 +6416,7 @@ s_svc_failures(void)
 	    "after 652 ms, reason %u, status %d; frames 1 bss 1, to iOS 1 kept 1; ", WLWMI_SCAN_REASON_CANCELLED, ETIMEDOUT));
 	expect(SAY("FUXI WLAN: W25 scan 4 seq 4 id 0xa004: 2 channels passive dwell 150 ms, dequeued after 5 ms, reason 0, status %d; ",
 	    EIO));
-	expect(SAY("FUXI WLAN: W25 scan 5 seq 5 id 0xa005: 38 channels passive dwell 150 ms, no STARTED, stop confirmed after 1002 ms, "
+	expect(SAY("FUXI WLAN: W25 scan 5 seq 5 id 0xa005+-: 13+25 channels passive dwell 150 ms, no STARTED, stop confirmed after 1002 ms, "
 	    "reason 0, status %d; ", ETIMEDOUT));
 	expect("FUXI WLAN: W25 failure: W25 3 failed scans in a row; contain, no retry\n");
 	contained_and_freed();
@@ -6537,15 +6599,17 @@ s_svc_other_id(void)
 	CHECK(h_takes == 3 && h_status[0] == ETIMEDOUT && h_status[1] == ETIMEDOUT && h_status[2] == ETIMEDOUT, "three timeouts");
 	expect("FUXI WLAN: W25 ignored scan event 0x1 of id 0xa000 (in flight 0xa001)\n");
 	CHECK(count_text("W25 ignored scan event") == 8, "ignored-id lines: 8 in the service");
-	/* (2 channels: the 650 ms overrun bound comes before the 1000 ms STARTED one; STARTED, 2 FOREIGN_CHAN, the
-	 * target's COMPLETED and its answer to STOP_SCAN, all of id 0xa000) */
-	expect(SAY("FUXI WLAN: W25 scan 1 seq 1 id 0xa001: 2 channels passive dwell 150 ms, no STARTED, stop not confirmed after "
-	    "950 ms, reason 0, status %d; frames 1 bss 1, to iOS 1 kept 1; scan events 5, of another id 5 (last 0xa000)\n",
+	/* (C3 on the split: the 2.4 GHz part of 1 channel: the 425 ms overrun bound comes before the 1000 ms STARTED one;
+	 * STARTED, 1 FOREIGN_CHAN, the target's COMPLETED and its answer to STOP_SCAN, all of id 0xa000; the 5 GHz part is
+	 * never sent) */
+	expect(SAY("FUXI WLAN: W25 scan 1 seq 1 id 0xa001+-: 1+1 channels passive dwell 150 ms, no STARTED, stop not confirmed after "
+	    "725 ms, reason 0, status %d; frames 1 bss 1, to iOS 1 kept 1; scan events 4, of another id 4 (last 0xa000)\n",
 	    ETIMEDOUT));
+	CHECK(fw_c3_scans == 3, "one START_SCAN a request: each 5 GHz part skipped after its 2.4 GHz part failed");
 	expect("FUXI WLAN: W25 failure: W25 3 failed scans in a row; contain, no retry\n");
 	contained_and_freed();
 	expect("scans 3 (completed 0, failed 3, cancelled 0, refused 0), frames to iOS 3 kept 3; stops confirmed late 0, "
-	    "scan events of another id 15, credit waits 0;");
+	    "scan events of another id 12, credit waits 0;");
 	puts("W25 another scan id: every SCAN_EVENT ignored; 8 lines name the id the target used, each W25 line counts them "
 	     "with the last id, the service end gives the total; 3 timeouts contain");
 }
@@ -6582,17 +6646,26 @@ s_svc_pure(void)
 	static const uint16_t first38[38] = {2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
 		5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320, 5500, 5520, 5540, 5560, 5580, 5600, 5620, 5640, 5660, 5680,
 		5700, 5720, 5745, 5765, 5785, 5805, 5825};
-	/* the list encoder: the C2 START_SCAN but for the id, the dwell and the channels */
-	CHECK(wlwmi_encode_start_scan(38, 38 * 150 * 3 / 2, a, sizeof(a), &la) == 0 &&
-	    wlwmi_encode_start_scan_list(first38, 38, 0xa001, 150, 38 * 150 * 3 / 2, b, sizeof(b), &lb) == 0 && la == lb,
-	    "list encoder");
-	for (uint32_t i = 0; i < la; i += 4) {
-		uint32_t w = i / 4;
-		CHECK(w == 2 ? g32(b + i) == 0xa001 && g32(a + i) == 0xa000 : g32(a + i) == g32(b + i), "list encoder differs beyond the id");
+	/* the list encoder: the C2 START_SCAN but for the id, the dwell and the channels; C3 on the split: one band a
+	 * list, so each band of the 38 against the range encoder of the CH1 split (same words but the id) */
+	for (unsigned band = 0; band < 2; band++) {
+		const uint32_t first = band ? 13u : 0u, cnt = band ? 25u : 13u;
+		CHECK(wlwmi_encode_start_scan_range(0xa000, first, cnt, cnt * 150 * 3 / 2, a, sizeof(a), &la) == 0 &&
+		    wlwmi_encode_start_scan_list(first38 + first, cnt, 0xa001, 150, cnt * 150 * 3 / 2, b, sizeof(b), &lb) == 0 && la == lb,
+		    "list encoder");
+		for (uint32_t i = 0; i < la; i += 4) {
+			uint32_t w = i / 4;
+			CHECK(w == 2 ? g32(b + i) == 0xa001 && g32(a + i) == 0xa000 : g32(a + i) == g32(b + i), "list encoder differs beyond the id");
+		}
 	}
-	static const uint16_t two[2] = {5180, 2437}, bad6[1] = {5955}, ch14[1] = {2484};
+	static const uint16_t two[2] = {5500, 5180}, mixed[2] = {5180, 2437}, mixed24[3] = {2412, 2437, 5825}, bad6[1] = {5955},
+	    ch14[1] = {2484};
 	CHECK(wlwmi_encode_start_scan_list(two, 2, 0xafff, 110, 330, b, sizeof(b), &lb) == 0 && g32(b + 4 + 4 * 7) == 110 &&
-	    g32(b + 4 + 4 * 13) == 330 && g32(b + 4 + 4 * 15) == 0x11 && g32(b + 168) == 5180 && g32(b + 172) == 2437, "two channels");
+	    g32(b + 4 + 4 * 13) == 330 && g32(b + 4 + 4 * 15) == 0x11 && g32(b + 168) == 5500 && g32(b + 172) == 5180, "two channels");
+	CHECK(wlwmi_encode_start_scan_list(mixed, 2, 0xa001, 150, 450, b, sizeof(b), &lb) == 1 &&
+	    wlwmi_encode_start_scan_list(mixed24, 3, 0xa001, 150, 675, b, sizeof(b), &lb) == 1 &&
+	    wlwmi_encode_start_scan_list(mixed24, 2, 0xa001, 150, 450, b, sizeof(b), &lb) == 0 &&
+	    wlwmi_encode_start_scan_list(first38, 38, 0xa001, 150, 8550, b, sizeof(b), &lb) == 1, "a list of both bands refused");
 	CHECK(wlwmi_encode_start_scan_list(bad6, 1, 0xa001, 150, 225, b, sizeof(b), &lb) == 1 &&
 	    wlwmi_encode_start_scan_list(ch14, 1, 0xa001, 150, 225, b, sizeof(b), &lb) == 1 &&
 	    wlwmi_encode_start_scan_list(two, 0, 0xa001, 150, 0, b, sizeof(b), &lb) == 1 &&
@@ -6627,9 +6700,193 @@ s_svc_pure(void)
 	CHECK(wlhtc_trailer(&h, t, 8) == 0 && h.ep[2].credits == WLHTC_CREDITS_MOST, "credits at the bound");
 	h.ep[2].credits = 3;
 	CHECK(wlhtc_trailer(&h, t, 8) == 0 && h.ep[2].credits == 258, "credits below the bound");
-	puts("W25 pure: the list encoder is C2's START_SCAN but for id, dwell and channels; refuses unlisted/6 GHz/ch 14, "
+	puts("W25 pure: the list encoder is C2's START_SCAN but for id, dwell and channels (each band of the 38 against the "
+	     "split's range encoder); refuses a list of both bands, unlisted/6 GHz/ch 14, "
 	     "0 or 39 channels, ids outside 0xa001..0xafff, dwells outside 50..200, a short buffer; the scan id filter; "
 	     "credits stop at 0xffff");
+}
+
+/* C3 on the split: every W25 scan single-band. A request of both bands is two START_SCANs with ids of their own, the
+ * 2.4 GHz part first, the 5 GHz part only after its COMPLETED; one done() a request after the last part, with the
+ * status of the part that ended it. A cancel in the first part stops that part and skips the second; a timeout in the
+ * second part stops that part (its own id); a 5 GHz-only and a 2.4 GHz-only request are one START_SCAN each. The
+ * worst case (a 2.4 GHz part completing 190 ms past its max_scan_time, a 5 GHz part that never ends and whose
+ * STOP_SCAN is never answered) still answers the iOS side before its wait of 1000 + n x dwell x 3/2 + 200 ms. */
+static void
+s_svc_split(void)
+{
+	static const uint16_t four[4] = {5180, 2412, 5200, 2437}, mixed[4] = {2437, 5180, 5200, 5500}, five[2] = {5500, 5180},
+	    low[3] = {2462, 2412, 2437}, one24[1] = {2462}, two[2] = {2437, 5180};
+	uint16_t all[38];
+	for (unsigned i = 0; i < 38; i++) { all[i] = (uint16_t)m_chan(i); }
+	/* (a) a cancel 100 ms into the first part (2 channels, 306 ms): STOP_SCAN of 0xa001, ECANCELED, no 5 GHz START_SCAN */
+	c3_reset();
+	add_frame(0, 40, 8, B_CAFE, 0x0401, "Cafe", 4, 1, 0, false);
+	h_push(four, 4, true, 150, 100);
+	h_push(one24, 1, true, 150, -1);
+	CHECK(run() == 0, "split: cancel in the first part");
+	CHECK(h_status[0] == ECANCELED && h_status[1] == 0 && fw_stop_cmds == 1 && fw_c3_stop_id == 0xa001 &&
+	    fw_c3_stop_after[1] >= 100 && fw_c3_stop_after[1] <= 102 && fw_c3_scans == 2 && fw_c3_id == 0xa002 && fw_c3_n == 1 &&
+	    fw_c3_chan[0] == 2462, "split cancel: the 2.4 GHz part stopped at 100 ms, the 5 GHz part never sent, the next request served");
+	CHECK(h_fr_n == 1 && h_fr[0].seq == 1 && h_fr[0].mhz == 2412, "the frame heard before the cancel handed over");
+	expect(SAY("FUXI WLAN: W25 scan 1 seq 1 id 0xa001+-: 2+2 channels passive dwell 150 ms, cancelled, stop confirmed after 102 ms, "
+	    "reason %u, status %d; frames 1 bss 1, to iOS 1 kept 1; ", WLWMI_SCAN_REASON_CANCELLED, ECANCELED));
+	c3_lifetime_end();
+	contained_and_freed();
+	expect("scans 2 (completed 1, failed 0, cancelled 1, refused 0)");
+	/* (b) a cancel between the parts: the 2.4 GHz part (1 channel) completes at 156 ms, the iOS side gives up then (one
+	 * ms later it would be a cancel in the 5 GHz part, a STOP_SCAN of 0xa002): no
+	 * 5 GHz START_SCAN, nothing to stop, ECANCELED */
+	c3_reset();
+	h_push(two, 2, true, 150, 156);
+	h_push(one24, 1, true, 150, -1);
+	CHECK(run() == 0, "split: cancel between the parts");
+	CHECK(h_status[0] == ECANCELED && h_status[1] == 0 && fw_stop_cmds == 0 && fw_c3_scans == 2 && fw_c3_id == 0xa002 &&
+	    fw_c3_chan[0] == 2462, "split cancel between the parts: no STOP_SCAN, no 5 GHz START_SCAN");
+	expect(SAY("FUXI WLAN: W25 scan 1 seq 1 id 0xa001+-: 1+1 channels passive dwell 150 ms, cancelled before the 5 GHz part after "
+	    "156 ms, reason 0, status %d; ", ECANCELED));
+	c3_lifetime_end();
+	contained_and_freed();
+	expect("scans 2 (completed 1, failed 0, cancelled 1, refused 0)");
+	expect("FUXI WLAN: W23 contain: scan over, no STOP_SCAN\n");
+	/* (c) a timeout in the second part: the 2.4 GHz part completes, the 5 GHz part (3 channels, max 675 ms) never ends:
+	 * STOP_SCAN of 0xa002 at 875 ms into it, ETIMEDOUT; the 2.4 GHz part's frames were handed over all the same */
+	c3_reset();
+	C.c3_mode[2] = 3;
+	add_frame(5, 47, 8, B_HOME, 0x0411, "HomeNet", 7, 6, 0, true);
+	add_frame(13, 50, 8, B_OFF, 0x0011, "Office-5G", 9, 0, 36, true);
+	h_push(mixed, 4, true, 150, -1);
+	h_push(one24, 1, true, 150, -1);
+	CHECK(run() == 0, "split: timeout in the second part");
+	CHECK(h_status[0] == ETIMEDOUT && h_status[1] == 0 && fw_stop_cmds == 1 && fw_c3_stop_id == 0xa002 &&
+	    fw_c3_stop_after[2] >= 875 && fw_c3_stop_after[2] <= 876 && fw_c3_scans == 3 && fw_c3_id == 0xa003,
+	    "split timeout: STOP_SCAN of the 5 GHz part at its own max_scan_time + 200 ms, ETIMEDOUT, the next request served");
+	CHECK(h_fr_n == 2 && h_fr[0].seq == 1 && h_fr[0].mhz == 2437 && h_fr[1].seq == 1 && h_fr[1].mhz == 5180,
+	    "frames of both parts handed over before the timeout");
+	expect("FUXI WLAN: W25 scan 1 seq 1 id 0xa001+0xa002: 1+3 channels passive dwell 150 ms, no end by max + 200 ms, stop "
+	    "confirmed after ");
+	expect(SAY(", status %d; frames 2 bss 2, to iOS 2 kept 2; ", ETIMEDOUT));
+	c3_lifetime_end();
+	contained_and_freed();
+	expect("scans 2 (completed 1, failed 1, cancelled 0, refused 0)");
+	/* (d) a 5 GHz-only and (e) a 2.4 GHz-only request: one START_SCAN each, request order kept; then the type-3 scan */
+	c3_reset();
+	h_push(five, 2, true, 150, -1);
+	h_push(low, 3, true, 120, -1);
+	h_push(all, 38, true, 150, -1);
+	CHECK(run() == 0, "split: one band a request");
+	CHECK(h_status[0] == 0 && h_status[1] == 0 && h_status[2] == 0 && fw_c3_scans == 4 && fw_c3_id == 0xa004 && fw_c3_n == 25 &&
+	    fw_c3_chan[0] == 5180 && fw_c3_chan[24] == 5825 && fw_c3_max == 25u * 150u * 3u / 2u, "one START_SCAN a one-band request");
+	expect("FUXI WLAN: W25 scan 1 seq 1 id 0xa001: 2 channels passive dwell 150 ms, completed after 306 ms, reason 0, status 0; ");
+	expect("FUXI WLAN: W25 scan 2 seq 2 id 0xa002: 3 channels passive dwell 120 ms, completed after 366 ms, reason 0, status 0; ");
+	expect("FUXI WLAN: W25 scan 3 seq 3 id 0xa003+0xa004: 13+25 channels passive dwell 150 ms, completed after ");
+	c3_lifetime_end();
+	contained_and_freed();
+	/* (f) DEQUEUED of the first part: EIO, no second part; (g) START_FAILED of the second part: EIO */
+	c3_reset();
+	C.c3_mode[1] = 4; C.c3_mode[3] = 1;
+	h_push(two, 2, true, 150, -1);
+	h_push(two, 2, true, 150, -1);
+	h_push(one24, 1, true, 150, -1);
+	CHECK(run() == 0, "split: DEQUEUED, START_FAILED");
+	CHECK(h_status[0] == EIO && h_status[1] == EIO && h_status[2] == 0 && fw_c3_scans == 4 && fw_stop_cmds == 0,
+	    "split: DEQUEUED of the 2.4 GHz part skips the 5 GHz part; START_FAILED of the 5 GHz part is EIO");
+	expect(SAY("FUXI WLAN: W25 scan 1 seq 1 id 0xa001+-: 1+1 channels passive dwell 150 ms, dequeued after 5 ms, reason 0, status %d; ",
+	    EIO));
+	expect("FUXI WLAN: W25 scan 2 seq 2 id 0xa002+0xa003: 1+1 channels passive dwell 150 ms, start failed after ");
+	c3_lifetime_end();
+	contained_and_freed();
+	/* (h) the worst case against the iOS side's wait: 38 channels at 200 ms, the 2.4 GHz part completing 190 ms past its
+	 * 3900 ms, the 5 GHz part never ending and its STOP_SCAN never answered: done() at 3900 + 190 + 7500 + 200 + 300 ms
+	 * and a little, before 1000 + 38 x 200 x 3/2 + 200 = 12600 ms */
+	c3_reset();
+	C.c3_mode[1] = 5; C.c3_mode[2] = 3; C.c3_stop_silent = true;
+	h_push(all, 38, true, 200, -1);
+	CHECK(run() == 0, "split: the worst case");
+	CHECK(h_status[0] == ETIMEDOUT && fw_c3_stop_id == 0xa002 && h_worst_limit == 12600u && h_worst >= 12090u && h_worst <= 12100u,
+	    "split worst case: done() at about 12090 ms, 500 ms inside the iOS side's 12600");
+	c3_lifetime_end();
+	contained_and_freed();
+	puts("W25 split: a request of both bands is two START_SCANs (2.4 GHz, then 5 GHz after its COMPLETED), ids of their own, one "
+	     "done() after the last; a cancel in the first part stops it and skips the second; a cancel between the parts sends "
+	     "nothing more; a timeout in the second part stops that part by its own id; 5 GHz-only and 2.4 GHz-only requests are "
+	     "one START_SCAN; DEQUEUED and START_FAILED of either part are EIO; the worst case answers 500 ms inside the iOS wait");
+}
+
+/* C3 on the split, rule 3: the W29 (C2f), W30 (C2h) and CH1 (fuxiwlanch) knobs take effect under qrtr 8 exactly as
+ * under qrtr 7: the same W29 commands in the same order, the W30 FSE/FISA configuration and mgmt-reo counts (the counts
+ * after the first W25 scan, where qrtr 7 prints them after its scan), the drop mask on the channel list ready() names
+ * and on every START_SCAN, and the DBS scan policy word in every START_SCAN of both parts. */
+static void c2h_fse_reset(uint32_t size);
+static void ex_setup(unsigned knob, unsigned extbit, unsigned bits, unsigned eff, unsigned n);
+static void
+s_svc_rungs(void)
+{
+	static const uint16_t one24[1] = {2437}, ask[4] = {2437, 5600, 5180, 5825};
+	uint32_t log7[16];
+	unsigned n7, lines7;
+	/* W29: qrtr 7, then qrtr 8 */
+	c2_reset();
+	wl20_bits = WL20_HTTVER | WL20_L19ORDER; wl29_mask = WL29_DEFAULT;
+	CHECK(run() == 0, "rungs: W29 under qrtr 7");
+	n7 = fw_w29_n; memcpy(log7, fw_w29_log, sizeof(log7)); lines7 = count_text("FUXI WLAN: W29 ");
+	CHECK(n7 > 0, "rungs: W29 commands under qrtr 7");
+	contained_and_freed();
+	c3_reset();
+	wl20_bits = WL20_HTTVER | WL20_L19ORDER; wl29_mask = WL29_DEFAULT;
+	h_push(one24, 1, true, 150, -1);
+	CHECK(run() == 0, "rungs: W29 under qrtr 8");
+	CHECK(fw_w29_n == n7 && !memcmp(fw_w29_log, log7, sizeof(log7)) && count_text("FUXI WLAN: W29 ") == lines7 && h_status[0] == 0,
+	    "rungs: the W29 commands and lines under qrtr 8 are qrtr 7's");
+	c3_lifetime_end();
+	contained_and_freed();
+	/* W30: FSE/FISA after the ring selection, IPA_DISABLE in INIT, the mgmt-reo counts once, after the first W25 scan */
+	c2h_fse_reset(0x5000u);
+	wl30_mask = WL30_MGMTREO | WL30_IPADIS | WL30_FSE;
+	CHECK(run() == 0, "rungs: W30 under qrtr 7");
+	cmd.on = false;
+	lines7 = count_text("FUXI WLAN: W30 ");
+	contained_and_freed();
+	reset();
+	c2h_fse_reset(0x5000u);
+	wl_w25 = true;
+	wl30_mask = WL30_MGMTREO | WL30_IPADIS | WL30_FSE;
+	h_push(one24, 1, true, 150, -1); h_push(one24, 1, true, 150, -1);
+	CHECK(run() == 0 && fw_fse_n == 1 && fw_fisa_n == 1 && fw_init_ok == 1 && h_status[0] == 0 && h_status[1] == 0,
+	    "rungs: W30 under qrtr 8");
+	cmd.on = false;
+	CHECK(count_text("FUXI WLAN: W30 ") == lines7 && lines7 == 4 && count_text("W30 mgmtreo counts") == 1,
+	    "rungs: the W30 lines under qrtr 8 are qrtr 7's, the counts once");
+	{
+		const char *a = strstr(logbuf, "W30 mgmtreo counts"), *b = strstr(logbuf, "FUXI WLAN: W25 scan 1 seq 1 "),
+		    *c = strstr(logbuf, "FUXI WLAN: W25 scan 2 seq 2 ");
+		CHECK(a && b && c && b < a && a < c, "rungs: the W30 counts after the first W25 scan, before the second");
+	}
+	c3_lifetime_end();
+	contained_and_freed();
+	reset();
+	/* CH1 under qrtr 8: bits 13 and 0 drop 5600 and 5180, bit 27 asks FORCE_NONDBS: ready() names 36 channels, a request
+	 * of 2437, 5600, 5180 and 5825 is 2437 then 5825, both START_SCANs carry scan_ctrl_flags_ext 0x1 (the firmware checks
+	 * word 35); bit 26 changes nothing more (every W25 scan is split already) */
+	for (unsigned split = 0; split < 2; split++) {
+		ex_setup((1u << 13) | 1u | (split ? 1u << 26 : 0u), 27, 0, (1u << 13) | 1u, 36);
+		wl_w25 = true; C.split = false;
+		h_push(ask, 4, true, 150, -1);
+		CHECK(run() == 0, "rungs: fuxiwlanch under qrtr 8");
+		CHECK(h_ready_n == 36 && h_status[0] == 0 && fw_c3_scans == 2 && fw_c3_n == 1 && fw_c3_chan[0] == 5825 && fw_chan_seen == 36,
+		    "rungs: the mask on ready() and on the START_SCANs");
+		for (unsigned i = 0; i < h_ready_n; i++) { CHECK(h_ready_f[i] != 5600 && h_ready_f[i] != 5180, "rungs: a dropped channel in ready()"); }
+		expect("FUXI WLAN: W23 chan list 36 passive (2.4 GHz 13, 5 GHz 23, ");
+		expect("FUXI WLAN: W25 service ready: 36 channels passive to iOS (2.4 GHz 13, 5 GHz 23), lifetime 1800 s\n");
+		expect("FUXI WLAN: W25 scan 1 seq 1 id 0xa001+0xa002: 1+1 channels passive dwell 150 ms, completed after ");
+		expect_not("W23 split scan");
+		c3_lifetime_end();
+		contained_and_freed();
+		reset();
+	}
+	puts("W25 rungs: W29's commands and lines under qrtr 8 are qrtr 7's; W30's FSE/FISA, IPA_DISABLE and four lines too, the "
+	     "mgmt-reo counts after the first W25 scan; fuxiwlanch drops channels from ready() and every START_SCAN and its DBS "
+	     "policy bit reaches both parts' START_SCAN, with or without bit 26");
 }
 
 /* C2c under qrtr 8: the W26 setup exactly as under qrtr 7 (W20 arenas, idle list and refill ring; at W23 the four
@@ -6679,13 +6936,13 @@ s_svc_c2c(void)
 		"avail 974 err hp 0 fill 0; exhausted none\n",
 		"FUXI WLAN: W26 idle watch completed hp 65534 tp 152 avail 32691; exhausted none\n",
 		"FUXI WLAN: W24 scan summary frames 12 bss 9 ssids 5\n",
-		"FUXI WLAN: W25 scan 1 seq 1 id 0xa001: 38 channels passive dwell 150 ms, completed after ",
+		"FUXI WLAN: W25 scan 1 seq 1 id 0xa001+0xa002: 13+25 channels passive dwell 150 ms, completed after ",
 		"FUXI WLAN: W26 rx content mac0 entries 1024 valid 1024 foreign 0 rbm-other 0 cookie-other 0\n",
 		"FUXI WLAN: W26 rx content refill taken 2048 kept 0; buffers written 76 of 4095\n",
 		"FUXI WLAN: W26 rx guard nonzero dwords: slot-upper 0 (slots 0), slot 4095 0, tail 0, gaps 0\n",
 		"FUXI WLAN: W26 link content descriptors written 76 of 32767, unlisted slot clean; idle ring entries changed 0\n",
 		"FUXI WLAN: W26 counters htt-t2h 1 htt-rx 1 wmi-events ",
-		"FUXI WLAN: W25 scan 2 seq 2 id 0xa002: 38 channels passive dwell 150 ms, completed after ",
+		"FUXI WLAN: W25 scan 2 seq 2 id 0xa003+0xa004: 13+25 channels passive dwell 150 ms, completed after ",
 		"FUXI WLAN: W25 complete: lifetime over (1800 s); stop/contain\n",
 	};
 	expect_order(lines, sizeof(lines) / sizeof(lines[0]));
@@ -6741,11 +6998,11 @@ s_svc_c2e(void)
 		"FUXI WLAN: W28 mon watch mid (foreign 19) ",
 		"FUXI WLAN: W28 mon watch completed ",
 		"FUXI WLAN: W24 scan summary frames 12 bss 9 ssids 5\n",
-		"FUXI WLAN: W25 scan 1 seq 1 id 0xa001: 38 channels passive dwell 150 ms, completed after ",
+		"FUXI WLAN: W25 scan 1 seq 1 id 0xa001+0xa002: 13+25 channels passive dwell 150 ms, completed after ",
 		"FUXI WLAN: W27 buffers returned 4560 reposted 4560 pending 0",
 		"FUXI WLAN: W28 mon sring sent 2 of 2\n",
-		"FUXI WLAN: W25 scan 2 seq 2 id 0xa002: 38 channels passive dwell 150 ms, completed after ",
-		"FUXI WLAN: W25 scan 3 seq 3 id 0xa003: 38 channels passive dwell 150 ms, completed after ",
+		"FUXI WLAN: W25 scan 2 seq 2 id 0xa003+0xa004: 13+25 channels passive dwell 150 ms, completed after ",
+		"FUXI WLAN: W25 scan 3 seq 3 id 0xa005+0xa006: 13+25 channels passive dwell 150 ms, completed after ",
 		"FUXI WLAN: W25 complete: lifetime over (1800 s); stop/contain\n",
 	};
 	expect_order(lines, sizeof(lines) / sizeof(lines[0]));
@@ -6776,14 +7033,18 @@ s_e2e(void)
 	add_frame(0, 30, 8, B_CAFE, 0x0401, "Cafe", 4, 1, 0, false);       /* on 2412: not asked for, never scanned */
 	e2e_ios_start();
 	CHECK(run() == 0, "e2e service");
-	CHECK(fw_c3_scans == 1 && fw_c3_n == 2 && fw_c3_chan[0] == 2437 && fw_c3_chan[1] == 5180 && fw_c3_flags == 0x11 &&
-	    fw_c3_dwell == 150 && fw_c3_max == 450, "the iOS request is not one passive START_SCAN of 2437 and 5180 at 150 ms");
+	/* C3 on the split: {2437, 5180} is two passive START_SCANs, 2437 (0xa001), then 5180 (0xa002) after its COMPLETED */
+	CHECK(fw_c3_scans == 2 && fw_c3_log[1].id == 0xa001 && fw_c3_log[1].n == 1 && fw_c3_log[1].chan0 == 2437 && fw_c3_log[1].max == 225 &&
+	    fw_c3_log[2].id == 0xa002 && fw_c3_log[2].n == 1 && fw_c3_log[2].chan0 == 5180 && fw_c3_log[2].max == 225 &&
+	    fw_c3_log[2].at >= fw_c3_log[1].at + 156 && fw_c3_flags == 0x11 && fw_c3_dwell == 150,
+	    "the iOS request is not two passive START_SCANs, 2437 then 5180, at 150 ms");
+	expect("FUXI WLAN: W25 scan 1 seq 1 id 0xa001+0xa002: 1+1 channels passive dwell 150 ms, completed after ");
 	c3_lifetime_end();
 	contained_and_freed();
 	fuxi_wifi_radio_stopped(FUXI_WIFI_RADIO_EXITED | 0);   /* as fw_thread, after the containment */
 	CHECK(e2e_ios_finish() == 0, "the iOS side");
-	puts("W25 end to end: a consumer request through the real fuxi_wifi_radio.c came out as one passive START_SCAN of "
-	     "its channels; the two networks beaconed there came back through fuxi_wifi_radio_results with SSID, BSSID, "
+	puts("W25 end to end: a consumer request of both bands through the real fuxi_wifi_radio.c came out as two passive "
+	     "START_SCANs, 2.4 GHz then 5 GHz, one done(); the two networks beaconed there came back through fuxi_wifi_radio_results with SSID, BSSID, "
 	     "channel and RSSI; EXITED turned Wi-Fi off");
 }
 #endif
@@ -7964,7 +8225,7 @@ main(int argc, char **argv)
 #else
 	if (argc == 2 && !strcmp(argv[1], "c3")) {  /* the C3 scenarios alone */
 		s_svc_pure(); s_svc_requests(); s_svc_cancel(); s_svc_failures(); s_svc_guard_and_credits(); s_svc_lifetime_and_band();
-		s_svc_recycle(); s_svc_ios_stopped(); s_svc_other_id(); s_svc_credit_waits(); s_svc_c2c(); s_svc_c2e(); reset();
+		s_svc_recycle(); s_svc_ios_stopped(); s_svc_other_id(); s_svc_credit_waits(); s_svc_c2c(); s_svc_c2e(); s_svc_split(); s_svc_rungs(); reset();
 		puts("W25 model: all scenarios passed");
 		return 0;
 	}
@@ -8052,6 +8313,8 @@ main(int argc, char **argv)
 	s_svc_credit_waits();
 	s_svc_c2c();
 	s_svc_c2e();
+	s_svc_split();
+	s_svc_rungs();
 #endif
 	reset();
 	puts("W20 model: all scenarios passed");

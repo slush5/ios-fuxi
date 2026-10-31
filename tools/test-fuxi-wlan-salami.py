@@ -530,7 +530,7 @@ def gate_suite(tmp, mk):
         ('fuxiwlan=0 fuxiwlansalami=1', 0, 0, None),
         ('fuxiwlan=11', 0, 0, 'refused on salami (fuxiwlan=11 needs fuxiwlansalami=1)'),
         ('fuxiwlan=11 fuxiwlansalami=0', 0, 0, 'needs fuxiwlansalami=1'),
-        ('fuxiwlan=11 fuxiwlansalami=3', 0, 0, 'needs fuxiwlansalami=1'),
+        ('fuxiwlan=11 fuxiwlansalami=4', 0, 0, 'needs fuxiwlansalami=1'),
         ('fuxiwlan=11 fuxiwlansalami=-2', 0, 0, 'needs fuxiwlansalami=1'),
         ('fuxiwlan=11 fuxiwlansalami=yes', 0, 0, 'needs fuxiwlansalami=1'),
         # C3: fuxiwlansalami=2 = the same gate plus the profile defaults (clk, probe, seq).
@@ -540,8 +540,8 @@ def gate_suite(tmp, mk):
         ('fuxiwlan=28 fuxiwlansalami=2 fuxiwlanqrtr=8', 1, 28,
          'W20 selected qrtr=8 (CE/HTC/WMI init, then the W25 scan service for iOS) w20 0 valid 1'),
         ('fuxiwlan=28 fuxiwlansalami=2 fuxiwlanqrtr=8', 1, 28, 'W25 selected scan service for iOS (fuxiwifiios=3): passive '
-         'only, nothing transmitted; 1800 s, or 3 failed scans in a row, then contain; first scan W24 lines, then one W25 '
-         'line a scan'),
+         'only, nothing transmitted; 1800 s, or 3 failed scans in a row, then contain; one band a scan (2.4 GHz, then 5 GHz); '
+         'first scan W24 lines, then one W25 line a scan'),
         ('fuxiwlan=28 fuxiwlansalami=2 fuxiwlanqrtr=8', 1, 28, 'W23 selected passive scan of 38 channels'),
         ('fuxiwlan=28 fuxiwlansalami=1 fuxiwlanqrtr=8', 1, 28, 'W12 selected qrtr=8 target memory cap'),
         ('fuxiwlan=1 fuxiwlansalami=2 fuxiwlanqrtr=8 fuxiwlanw20=0x92', 1, 28, 'w20 0x92 valid 1'),
@@ -1189,6 +1189,7 @@ def gate_suite(tmp, mk):
             assert f'W20 selected qrtr=8 (CE/HTC/WMI init, then the W25 scan service for iOS) w20 {hexv:#x} valid 1' in out, out
             assert 'FUXI WLAN: W26 selected: ' in out and sel in out and 'FUXI WLAN: W25 selected scan service' in out, out
             assert 'salami fuxiwlanseq from the fuxiwlansalami=2 profile' in out, out
+    profile3_suite(run, enc, salami, fuxi)
     # (c) A boot-arg wins over /defaults, number or string, also when the boot-arg says less.
     s, lim, names, out, _ = run(salami, 'fuxiwlan=12 fuxiwlansalami=1 fuxiwlanrails=2 fuxiwlanqrtr=4 fuxiwlanbdf=a.bin',
                                 enc('fuxiwlan=11 fuxiwlansalami=0 fuxiwlanrails=1 fuxiwlanbdf=b.bin fuxiwlanm3=c.elf'))
@@ -1271,6 +1272,76 @@ def gate_suite(tmp, mk):
           'values, W26 and W25 selected')
 
 
+def profile3_suite(run, enc, salami, fuxi):
+    """C3 on the split: fuxiwlansalami=3 = everything =2 sets plus the proven radio defaults (w20 0x7f02 and the
+    fuxiwlanch split bit with qrtr 7 or 8 only, fuxiwlanmlo=4, the four lx-* firmware names, the AMSS one only without
+    fuxiwlanfw=stock); an explicit knob, boot-arg or ADT /defaults, always wins. The M2 kit: ADT --wlan-node
+    --wlan-defaults fuxiwlansalami=3, cmdline fuxiwlan=28 fuxiwlanqrtr=8 fuxiwifiios=3."""
+    lx = {'bdf': 'lx-bdf.bin', 'regdb': 'lx-regdb.bin', 'm3': 'lx-m3.bin', 'amss': '/usr/local/share/fuxi/wlan/lx-amss.bin'}
+    m2 = run(salami, 'fuxiwlan=28 fuxiwlanqrtr=8 fuxiwifiios=3', enc('fuxiwlansalami=3'))
+    s, lim, names, out, reads = m2
+    assert (s, lim) == (1, 28) and names == lx and reads == 1, (names, reads, out)
+    for want in ('salami K-W1 gate open (fuxiwlansalami=3, fuxiwlanrails 0)', 'M6o seq mask 0xff valid=1', 'M6k probe=civac',
+                 'W20 selected qrtr=8 (CE/HTC/WMI init, then the W25 scan service for iOS) w20 0x7f02 valid 1',
+                 'W23 selected passive scan of 38 channels (fuxiwlanch 0x4000000), dwell per request',
+                 'W29 selected: L19 dp_alloc order, fuxiwlanw29 0x9f default: ', 'W25 selected scan service for iOS',
+                 'W12 mlo variant 4 (1 PHY_CAP, 2 omit MLO) P17 bits 0x4 (hostmem 1 ',
+                 'salami fuxiwlanamss /usr/local/share/fuxi/wlan/lx-amss.bin (replaces the SoC-major choice)',
+                 'salami fuxiwlanregdb lx-regdb.bin (boot-arg or ADT)', 'salami fuxiwlanm3 lx-m3.bin (boot-arg or ADT)',
+                 'W14 selected BDF lx-bdf.bin'):
+        assert want in out, (want, out)
+    for key in ('fuxiwlanprobe', 'fuxiwlanseq', 'fuxiwlanw20',   # (fuxiwlanclk is read later, at step 2: M6h, not in this harness) 'fuxiwlanch', 'fuxiwlanmlo', 'fuxiwlanamss',
+                'fuxiwlanm3', 'fuxiwlanbdf', 'fuxiwlanregdb'):
+        assert out.count(f'salami {key} from the fuxiwlansalami=3 profile') == 1, (key, out)
+    assert 'from the fuxiwlansalami=2 profile' not in out and 'salami fuxiwlansalami from ADT /defaults' in out, out
+    assert 'W30 selected' not in out and 'HD1' not in out and 'CLKON' not in out and 'clkon 1' not in out, out
+    # all on the cmdline gives the same boot (the ADT route only adds its "from ADT" line)
+    same = run(salami, 'fuxiwlan=28 fuxiwlanqrtr=8 fuxiwifiios=3 fuxiwlansalami=3')
+    lines = lambda t: [x for x in t.splitlines() if x.startswith('FUXI WLAN') and 'from ADT /defaults' not in x]  # noqa: E731
+    assert same[:3] == m2[:3] and lines(same[3]) == lines(m2[3]) and same[4] == 0, same[3]
+    # qrtr 7 takes w20 and the split too; qrtr 6 and below take neither (they would refuse both), the rest applies
+    s, lim, names, out, _ = run(salami, 'fuxiwlan=28 fuxiwlanqrtr=7', enc('fuxiwlansalami=3'))
+    assert (s, lim) == (1, 28) and 'w20 0x7f02 valid 1' in out and '38 channels (fuxiwlanch 0x4000000), dwell 150 ms' in out, out
+    for q in ('6', '5', '4', '0'):
+        s, lim, names, out, _ = run(salami, f'fuxiwlan=28 fuxiwlanqrtr={q}', enc('fuxiwlansalami=3'))
+        assert (s, lim) == (1, 28) and 'fuxiwlanw20 from the' not in out and 'fuxiwlanch from the' not in out, (q, out)
+        assert 'refused' not in out and 'valid 0' not in out and 'valid=0' not in out, (q, out)
+        assert 'salami fuxiwlanmlo from the fuxiwlansalami=3 profile' in out and names['amss'] == lx['amss'], (q, out)
+        assert names == (lx if q in ('6', '5', '4') else dict(lx, bdf='', regdb='', m3='')), (q, names)
+    s, lim, names, out, _ = run(salami, 'fuxiwlan=11', enc('fuxiwlansalami=3'))
+    assert (s, lim) == (1, 11) and 'fuxiwlanw20' not in out and names['amss'] == lx['amss'], out
+    # explicit knobs win, on the cmdline or in /defaults
+    s, lim, names, out, _ = run(salami, 'fuxiwlan=28 fuxiwlanqrtr=8 fuxiwlanw20=15106 fuxiwlanbdf=a.bin fuxiwlanmlo=0',
+                                enc('fuxiwlansalami=3 fuxiwlanch=33554432 fuxiwlanm3=c.elf'))
+    assert (s, lim) == (1, 28) and 'w20 0x3b02 valid 1' in out and '25 channels (fuxiwlanch 0x2000000)' in out, out
+    assert names == dict(lx, bdf='a.bin', m3='c.elf') and 'W12 mlo variant' not in out, (names, out)
+    for key in ('fuxiwlanw20', 'fuxiwlanch', 'fuxiwlanbdf', 'fuxiwlanm3', 'fuxiwlanmlo'):
+        assert f'salami {key} from the fuxiwlansalami=3 profile' not in out, (key, out)
+    s, lim, names, out, _ = run(salami, 'fuxiwlan=28 fuxiwlanqrtr=8 fuxiwlanch=0 fuxiwlanw20=0', enc('fuxiwlansalami=3'))
+    assert (s, lim) == (1, 28) and 'w20 0 valid 1' in out and 'fuxiwlanch 0x' not in out and 'W26' not in out, out
+    # fuxiwlanfw=stock refuses an AMSS name: the profile leaves that one out, the rest stays
+    s, lim, names, out, _ = run(salami, 'fuxiwlan=28 fuxiwlanqrtr=8 fuxiwlanfw=stock', enc('fuxiwlansalami=3'))
+    assert names['amss'] == '' and 'fuxiwlanamss from the' not in out and 'invalid fuxiwlanamss' not in out, (names, out)
+    assert names['bdf'] == 'lx-bdf.bin' and 'w20 0x7f02' in out, (names, out)
+    # an explicit amss with stock is still refused (the profile never hides a refusal)
+    s, _, _, out, _ = run(salami, 'fuxiwlan=28 fuxiwlanqrtr=8 fuxiwlanfw=stock fuxiwlanamss=x.bin', enc('fuxiwlansalami=3'))
+    assert s == 0 and 'salami invalid fuxiwlanamss basename (or with fuxiwlanfw=stock); refused' in out, out
+    # the profile never makes an invalid knob valid, nor rescues a refused stage
+    for args in ('fuxiwlan=28 fuxiwlanqrtr=8 fuxiwlanseq=cyclerails', 'fuxiwlan=28 fuxiwlanqrtr=8 fuxiwlanw20=8',
+                 'fuxiwlan=27 fuxiwlanqrtr=8', 'fuxiwlan=28 fuxiwlanqrtr=9'):
+        assert run(salami, args, enc('fuxiwlansalami=3'))[0] == 0, args
+    # =2 is unchanged by =3's rows: no w20, no names, no mlo from a profile
+    s, _, names, out, _ = run(salami, 'fuxiwlan=28 fuxiwlanqrtr=8', enc('fuxiwlansalami=2'))
+    assert s == 1 and 'w20 0 valid 1' in out and names['bdf'] == 'bdwlan.b0e' and names['amss'] == '' and 'mlo' not in out, out
+    # the Fuxi build has no profile: fuxiwlansalami means nothing there
+    s, lim, names, out, _ = run(fuxi, 'fuxiwlan=28 fuxiwlanqrtr=8 fuxiwlansalami=3')
+    assert (s, lim) == (1, 28) and 'profile' not in out and 'w20 0 valid 1' in out and names['bdf'] == 'bd_m3gl.elf', out
+    print('C3 profile 3: the M2 kit (ADT fuxiwlansalami=3, cmdline fuxiwlan=28 fuxiwlanqrtr=8 fuxiwifiios=3) boots with the =2 set, '
+          'w20 0x7f02, the split bit, mlo 4 and the four lx-* names, each said once; cmdline and ADT give the same boot; qrtr 7 takes '
+          'w20 and the split, qrtr 0..6 neither; explicit knobs win; fuxiwlanfw=stock drops only the AMSS row; refusals stand; =2 '
+          'and the Fuxi build unchanged')
+
+
 def mkadt_suite(mk):
     # The table is every fuxiwlan* knob of the driver, typed as the driver reads it.
     knobs = set(re.findall(r'"(fuxiwlan[a-z0-9]*)"', DRIVER))
@@ -1331,6 +1402,25 @@ def mkadt_suite(mk):
         except ValueError:
             continue
         raise AssertionError('add_wlan_defaults accepted a repeat or a tree without /defaults')
+    # C3 on the split, the M2 kit budget (docs-lanes/wlan-w20.md, Kit (M2, with fuxiwlansalami=3)): the profile is one
+    # 40-byte property, as M2's fuxiwlansalami=2 was; M2c's profile + w20 was 80 (16388 of 16384: refused); the same
+    # knobs written out would be 520. The cmdline rule: 607 characters with the loader's 66 (tools/run-ios-salami.py).
+    cost = lambda t: sum(mk.adt_prop_bytes(v) for _, v in mk.wlan_defaults([t]))  # noqa: E731
+    m2_base = 16348 - cost('fuxiwlansalami=2')
+    explicit = ('fuxiwlansalami=1 fuxiwlanclk=1 fuxiwlanprobe=civac fuxiwlanseq=cycle,parf,dbi,eq,hostirq,msi,por,prefix '
+                'fuxiwlanw20=32514 fuxiwlanch=67108864 fuxiwlanmlo=4 fuxiwlanamss=lx-amss.bin fuxiwlanm3=lx-m3.bin '
+                'fuxiwlanbdf=lx-bdf.bin fuxiwlanregdb=lx-regdb.bin')
+    assert m2_base == 16308 and m2_base + cost('fuxiwlansalami=3') == 16348 <= mk.ADT_MAX == 16384
+    assert m2_base + cost('fuxiwlansalami=2 fuxiwlanw20=15106') == 16388 > mk.ADT_MAX and cost(explicit) == 520
+    rsp = importlib.util.spec_from_file_location('run_salami', ROOT / 'tools/run-ios-salami.py')
+    rs = importlib.util.module_from_spec(rsp)
+    rsp.loader.exec_module(rs)
+    extra = 'fuxicores=0x7c sweetfb_tegate=1 sweetfb_teguard=0 fuxiwlan=28 fuxiwlanqrtr=8 fuxiwifiios=3'
+    assert (rs.BOOT_LINE_CHARS, rs.LOGO_APPEND_MAX) == (607, 66) and 526 + rs.LOGO_APPEND_MAX == 592 <= rs.BOOT_LINE_CHARS
+    assert 'fuxiwlansalami' not in extra and 592 + len(' sweetiolog=Preferences') > rs.BOOT_LINE_CHARS
+    assert 16348 + sum(mk.adt_prop_bytes(struct.pack('<I', v)) for _, v in mk.TOUCH_DEFAULTS) > mk.ADT_MAX
+    print('C3 M2 kit budget: ADT 16348 of 16384 with --wlan-defaults fuxiwlansalami=3 (40 bytes; M2c\'s 80 would be 16388, the '
+          'knobs written out 520); cmdline 526 + the loader\'s 66 = 592 of 607; sweetiolog=Preferences and --touch-defaults do not fit')
     print(f'mkadt --wlan-defaults: {len(mk.WLAN_KNOBS)} knobs = the driver\'s, typed as read; encodings, refusals '
           'and per-property bytes (number 40, string 36 + len+1 rounded to 4) checked')
 
