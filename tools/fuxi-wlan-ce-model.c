@@ -169,6 +169,9 @@ static void wl_wlfw_diagnostics(const char *label);
 static void wl5_status(unsigned step);
 static void wl_hd_diag(const char *where);  /* HD1: fuxiwlandiag is off here; tools/test-fuxi-wlan-hd.py runs it */
 static void wl_c6_rddm(uint32_t ee, uint32_t errdbg2);  /* C6: fuxiwlanvec=rddm is off here; the crash dump path is outside the W20 block */
+static unsigned wl_fwlog;  /* C7: off here */
+static void wl_c7_note(uint32_t id, const uint8_t *payload, uint32_t len);
+static void wl_c7_dump(const char *where);
 static int wl_smmu_fault(unsigned step);
 static int wl_m6o_msi_undo(void);
 static int wl_m6o_undo(bool contained);
@@ -2987,6 +2990,8 @@ static void wl_wlfw_diagnostics(const char *label) { printf("FUXI WLAN: %s diagn
 static void wl5_status(unsigned step) { (void)step; }
 static void wl_hd_diag(const char *where) { (void)where; }
 static void wl_c6_rddm(uint32_t ee, uint32_t errdbg2) { (void)ee; (void)errdbg2; }
+static void wl_c7_note(uint32_t id, const uint8_t *payload, uint32_t len) { (void)id; (void)payload; (void)len; }
+static void wl_c7_dump(const char *where) { (void)where; }
 static int wl_smmu_fault(unsigned step) { (void)step; return 0; }
 static int wl_m6o_msi_undo(void) { return 0; }
 static int wl_m6o_undo(bool contained) { (void)contained; return 0; }

@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,9557 @@
+@@ -0,0 +1,9604 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -65,6 +65,9 @@
 + *   fuxiwlanqrtr=1  W11 capability-only diagnostic; =2 W12 setup; =3 W13 small-chunk negotiation; =4 W14 downloads; =5 W15 config/mode
 + *   fuxiwlanmem=1  C4: serve the firmware's first REQUEST_MEM as asked (contiguous segments up to the
 + *                 64 MiB cap, power-of-two IOVA alignment); no W13 decline/fragment round (default off)
++ *   fuxiwlanfwlog=1  C7: QMI INI enablefwlog 1 (the firmware streams its log as WMI events, as for
++ *                 ath12k); the last 64 WMI events the lane does not decode (id, length, first 96 bytes)
++ *                 are kept and printed at a W25/W28 crash, oldest first (default off)
 + *   fuxiwlanqrtr=6  W20-W22: W15, then copy engines, HTC and WMI init to WMI READY (needs
 + *                 fuxiwlan=28 or 1; not with keep/stop22); any other value outside 0..8 is refused
 + *   fuxiwlanqrtr=7  W23/W24: all of 6, then the 38-channel passive list, a station vdev and one
@@ -1259,6 +1262,7 @@
 + * containment is proven. Limit includes XNU page rounding, not just wire sizes. */
 +#define WL13_CHUNK_LIMIT (2u * 1024u * 1024u)
 +static bool wl13_contig; /* fuxiwlanmem=1 (C4): no W13 decline, the first REQUEST_MEM is served as asked */
++static unsigned wl_fwlog; /* fuxiwlanfwlog=1 (C7): INI enablefwlog 1 and the undecoded-event ring */
 +#define WL_TARGET_MAX 52u
 +#define WL_TARGET_CAP (64u * 1024u * 1024u)
 +static struct wl_dma wl_target[WL_TARGET_MAX];
@@ -1435,6 +1439,10 @@
 +	(void)PE_parse_boot_argn("fuxiwlanmem", &mem, sizeof(mem));
 +	if (mem < 0 || mem > 1) { wl_variant_invalid = true; }
 +	wl13_contig = mem == 1;
++	int fwlog = 0;
++	(void)PE_parse_boot_argn("fuxiwlanfwlog", &fwlog, sizeof(fwlog));
++	if (fwlog < 0 || fwlog > 1) { wl_variant_invalid = true; }
++	wl_fwlog = (unsigned)fwlog;
 +	wl_w25 = qrtr == 8; /* C3: the W25 scan service replaces the one W23 scan */
 +	wl_w23 = qrtr == 7 || wl_w25; /* C2: the W23 passive scan runs on top of W20..W22 */
 +	wl_w20 = qrtr == 6 || wl_w23; /* W20 runs on top of the whole W11..W15 chain */
@@ -5139,6 +5147,43 @@
 +	wl_c6_save(seg);
 +}
 +
++/* C7 (fuxiwlanfwlog=1): the firmware's own log. With INI enablefwlog 1 the firmware streams
++ * dbglog records as WMI events (ath12k traces them as wmi_diag). The lane keeps the last 64
++ * WMI events it does not otherwise decode (id, length, the first 96 payload bytes), and the
++ * W28 crash line prints them oldest first: the module and message ids of the last records
++ * before the assert are readable even without the string table. No hardware access. */
++#define WL_C7_N 64u
++#define WL_C7_HEAD 96u
++static struct { uint32_t id, len, seq; uint8_t head[WL_C7_HEAD]; } wl_c7_ring[WL_C7_N];
++static unsigned wl_c7_next, wl_c7_total;
++static void
++wl_c7_note(uint32_t id, const uint8_t *payload, uint32_t len)
++{
++	if (!wl_fwlog) { return; }
++	unsigned i = wl_c7_next;
++	wl_c7_ring[i].id = id; wl_c7_ring[i].len = len; wl_c7_ring[i].seq = ++wl_c7_total;
++	memset(wl_c7_ring[i].head, 0, WL_C7_HEAD);
++	memcpy(wl_c7_ring[i].head, payload, len < WL_C7_HEAD ? len : WL_C7_HEAD);
++	wl_c7_next = (i + 1u) % WL_C7_N;
++}
++
++static void
++wl_c7_dump(const char *where)
++{
++	if (!wl_fwlog) { return; }
++	unsigned n = wl_c7_total < WL_C7_N ? wl_c7_total : WL_C7_N;
++	printf("FUXI WLAN: C7 fwlog ring at %s: %u undecoded WMI events seen, last %u follow (oldest first)\n", where, wl_c7_total, n);
++	for (unsigned k = 0; k < n; k++) {
++		unsigned i = (wl_c7_next + WL_C7_N - n + k) % WL_C7_N;
++		const uint8_t *h = wl_c7_ring[i].head;
++		for (unsigned o = 0; o < WL_C7_HEAD; o += 32) {
++			uint32_t w[8]; memcpy(w, h + o, 32);
++			printf("FUXI WLAN: C7 ev seq %u id %#x len %u +%02x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
++			    wl_c7_ring[i].seq, wl_c7_ring[i].id, wl_c7_ring[i].len, o, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
++		}
++	}
++}
++
 +static void
 +wl17_errdec(const char *label, uint32_t ee, uint32_t code, uint32_t d1, uint32_t d2, uint32_t d3)
 +{
@@ -5774,6 +5819,7 @@
 +		else if (id == WLWMI_EV_MGMT_RX) { wl25_w.ev_mgmt++; } else { wl25_w.ev_other++; }
 +	}
 +	if (wl30_mask & WL30_MGMTREO) { wlvrx_note(&wl30_reo, id, msg + 4, len - 4); }  /* C2h: counts only */
++	if (wl_fwlog && id != WLWMI_EV_SCAN && id != WLWMI_EV_CHAN_INFO && id != WLWMI_EV_MGMT_RX) { wl_c7_note(id, msg + 4, len - 4); }   /* C7 */
 +	if (wl_wmi.scan && wlscan_known(id)) {
 +		if (wl_scan.foreign != foreign && wl23_lines++ < 64) { printf("FUXI WLAN: W23 scan foreign freq %u\n", wl_scan.ev_freq); }
 +		/* C2c: D4/D5 notes, no line; C2b: a line (W25: in the first scan only) */
@@ -7020,6 +7066,7 @@
 +	 * when it enters the RDDM EE (3) after SYSERR. Scan it for assert text (P17) and print
 +	 * the first 1 KiB. Nothing is requested from or written to the device. */
 +	if (fw_faults == before) { wl_c6_rddm(v[1], v[4]); }   /* C5/C6: only with fuxiwlanvec=rddm */
++	wl_c7_dump(where);   /* C7: only with fuxiwlanfwlog=1 */
 +}
 +
 +/* One monitor status SRING_SETUP through wl_ce_send on the HTT endpoint (CE4,
@@ -8696,8 +8743,8 @@
 +	bzero(&e, sizeof(e)); e.len = 7;
 +	/* qmi_wlanfw_wlan_ini_req_msg_v01 / *_ei: optional 0x10 u8.
 +	 * Explicit lane policy: disable fw log (0). Upstream v6.12 sends 1. */
-+	printf("FUXI WLAN: W15 wlan ini enable_fwlog 0\n");
-+	if (wl12_tlv(&e, 0x10, 0, 1) || wl12_send(&e, 0x2f, WL15_INI) ||
++	printf("FUXI WLAN: W15 wlan ini enable_fwlog %u\n", wl_fwlog);
++	if (wl12_tlv(&e, 0x10, wl_fwlog, 1) || wl12_send(&e, 0x2f, WL15_INI) ||
 +	    wl12_wait(0, "WLAN_INI reply") || wl_w11_wait(3, "W15 INI TX drain")) { return 1; }
 +	printf("FUXI WLAN: W15 wlan ini ok\n");
 +	bzero(&e, sizeof(e)); e.len = 7;
