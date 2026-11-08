@@ -14,8 +14,10 @@
  *   fuxiwlanpre=qfprom|warm|reset|wake|l1ss  pre-BHI experiment
  *   fuxiwlanfw=stock  separate caller-supplied stock image, no fallback
  *   fuxiwlanbhi=full  M6l whole-file BHI size experiment
- *   fuxiwlanvec=early|rddm  M6l TX staging or RDDM RX experiment; C5: with rddm, a W25/W28 crash in
- *                 RDDM EE scans the uploaded dump for assert text and prints its first 1 KiB (read only)
+ *   fuxiwlanvec=early|rddm  M6l TX staging or RDDM RX experiment; C5/C6: with rddm, a W25/W28 crash
+ *                 forces SYS_ERR through MHICTRL (mhi_force_rddm_mode) when the device stays in AMSS,
+ *                 waits for the RDDM upload, scans it for assert text, prints the header, the bytes
+ *                 around the assert pointer and each text hit, and saves the whole dump to a file
  *   fuxiwlancnss=pdc  M6n AOP WLAN PDC setup before rails (default off)
  *   fuxiwlanseq=cycle,parf,dbi,eq,hostirq,msi,por,prefix  M6o opt-ins
  *   fuxiwlanseq=cyclerails  also cycle shared rails (froze the SoC once)
@@ -4988,10 +4990,13 @@ wl_qmi_w12(const uint8_t *p, unsigned len)
 /* P17 ERRDEC: classify the BHI error words (raw values stay in the line
  * above) and, when the device is in RDDM and the RX sink exists, scan the
  * uploaded dump for firmware assert text. Reads only; no dump is requested. */
+static uint64_t wl_c6_hits[8];   /* C6: the first text hits of the last scan, for the context dump */
+static unsigned wl_c6_nhits;
 static void
 wl17_emit_hit(uint64_t off, const char *text)
 {
 	printf("FUXI WLAN: P17 rddm text +%#llx: %s\n", off, text);
+	if (wl_c6_nhits < 8) { wl_c6_hits[wl_c6_nhits++] = off; }
 }
 
 static void
@@ -5016,6 +5021,90 @@ wl17_rddm_scan(void)
 		uint32_t w[8]; memcpy(w, seg+o, 32);
 		printf("FUXI WLAN: P17 rddm-rec %03x: %08x %08x %08x %08x %08x %08x %08x %08x\n", o, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
 	}
+}
+
+/* C6 (fuxiwlanvec=rddm, called from the W28 crash line): the firmware asserted (BHI error words
+ * set) but stays in the AMSS EE with no SYSERR, so no dump is uploaded by itself. As the Linux MHI
+ * host (mhi_force_rddm_mode) and cnss2 (TRIGGER_RDDM) do, request SYS_ERR through MHICTRL.MHISTATE
+ * (bits 15:8 = 0xff), wait for the RDDM EE and for the RXVECSTATUS completion of the upload into the
+ * vectors armed before BHI, then read the sink: P17 text scan and header, the words around the
+ * ERRDBG2 pointer value (the assert record), the bytes around each text hit, and the whole dump to
+ * a file on the data volume. Containment follows as before; no recovery is attempted here. */
+static void
+wl_c6_hex(const char *tag, const uint8_t *seg, uint64_t off, uint64_t len)
+{
+	if (off >= WL_RDDM_SIZE) { return; }
+	if (len > WL_RDDM_SIZE - off) { len = WL_RDDM_SIZE - off; }
+	for (uint64_t o = off & ~31ull; o < off + len && o + 32 <= WL_RDDM_SIZE; o += 32) {
+		uint32_t w[8]; memcpy(w, seg + o, 32);
+		printf("FUXI WLAN: C6 %s %06llx: %08x %08x %08x %08x %08x %08x %08x %08x\n", tag, o, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+	}
+}
+
+static void
+wl_c6_save(const uint8_t *seg)
+{
+	static const char *const paths[] = { "/private/var/mobile/Media/fuxi-rddm.bin", "/private/var/tmp/fuxi-rddm.bin" };
+	vfs_context_t ctx = vfs_context_kernel();
+	for (unsigned i = 0; i < 2; i++) {
+		vnode_t vp = NULL; int resid = 0;
+		int e = vnode_open(paths[i], FWRITE | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644, 0, &vp, ctx);
+		if (e) { printf("FUXI WLAN: C6 rddm save %s: open errno %d\n", paths[i], e); continue; }
+		e = vn_rdwr(UIO_WRITE, vp, (caddr_t)seg, (int)WL_RDDM_SIZE, 0, UIO_SYSSPACE, IO_NOCACHE,
+		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
+		int ce = vnode_close(vp, FWRITE, ctx);
+		printf("FUXI WLAN: C6 rddm save %s: write errno %d resid %d close %d (%u bytes)\n", paths[i], e, resid, ce, WL_RDDM_SIZE);
+		if (!e && !resid && !ce) { return; }
+	}
+}
+
+static void
+wl_c6_rddm(uint32_t ee, uint32_t errdbg2)
+{
+	const unsigned before = fw_faults;
+	if (wl_vec != 2 || !wl_rddm.va || fw_faults) { return; }
+	if (ee != 3) {
+		uint32_t ctrl = wl_mrd(0x38);
+		wl_mwr(0x38, (ctrl & ~0xff00u) | 0xff00u);
+		unsigned ms = 0;
+		for (; ms < 5000 && fw_faults == before; ms += 10) {
+			ee = wl_mrd(wl_bhi + 0x28);
+			if (ee == 3) { break; }
+			wl_sleep(10);
+		}
+		printf("FUXI WLAN: C6 rddm forced: MHICTRL %#x -> %#x, EE %#x (%s) after %u ms, MHISTATUS %#x, faults %u\n",
+		    ctrl, wl_mrd(0x38), ee, wl_mhi_ee(ee), ms, wl_mrd(0x48), fw_faults - before);
+	}
+	if (ee != 3 || fw_faults != before) {
+		printf("FUXI WLAN: C6 rddm: EE %#x is not RDDM (3) after the request; sink not read\n", ee);
+		return;
+	}
+	uint32_t st = 0; unsigned waited = 0;
+	for (; waited < 500 && fw_faults == before; waited++) {
+		st = wl_mrd(wl_bhie + 0x78);
+		if ((st >> 30) >= 2) { break; }
+		wl_sleep(10);
+	}
+	printf("FUXI WLAN: C6 rddm upload RXVECSTATUS %#x after %u ms\n", st, waited * 10);
+	wl_c6_nhits = 0;
+	wl17_rddm_scan();   /* civac, P17 text scan (hits recorded), first 0x80 bytes */
+	if ((st >> 30) != 2 || fw_faults != before) { return; }
+	const uint8_t *seg = (const uint8_t *)wl_rddm.va;
+	wl_c6_hex("hdr", seg, 0x80, 0x380);
+	unsigned ptr_hits = 0;
+	for (uint64_t o = 0; o + 4 <= WL_RDDM_SIZE && ptr_hits < 4; o += 4) {
+		uint32_t w; memcpy(&w, seg + o, 4);
+		if (w != errdbg2) { continue; }
+		ptr_hits++;
+		printf("FUXI WLAN: C6 rddm errdbg2 value %#x found at +%#llx; 1 KiB around it:\n", errdbg2, o);
+		wl_c6_hex("ptr", seg, o >= 0x200 ? o - 0x200 : 0, 0x400);
+	}
+	printf("FUXI WLAN: C6 rddm errdbg2 value %#x: %u occurrence(s) shown\n", errdbg2, ptr_hits);
+	for (unsigned i = 0; i < wl_c6_nhits; i++) {
+		printf("FUXI WLAN: C6 rddm text hit %u at +%#llx; 512 B around it:\n", i, wl_c6_hits[i]);
+		wl_c6_hex("txt", seg, wl_c6_hits[i] >= 0x100 ? wl_c6_hits[i] - 0x100 : 0, 0x200);
+	}
+	wl_c6_save(seg);
 }
 
 static void
@@ -6898,18 +6987,7 @@ wl28_crash(const char *where)
 	 * vectors were armed before BHI (M6l) and the device uploads its RDDM into the sink
 	 * when it enters the RDDM EE (3) after SYSERR. Scan it for assert text (P17) and print
 	 * the first 1 KiB. Nothing is requested from or written to the device. */
-	if (wl_vec == 2 && wl_rddm.va && fw_faults == before) {
-		if (v[1] == 3) {
-			wl17_rddm_scan();
-			const uint8_t *seg = (const uint8_t *)wl_rddm.va;
-			for (unsigned o = 0x80; o < 0x400; o += 32) {
-				uint32_t w[8]; memcpy(w, seg + o, 32);
-				printf("FUXI WLAN: C5 rddm-rec %03x: %08x %08x %08x %08x %08x %08x %08x %08x\n", o, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
-			}
-		} else {
-			printf("FUXI WLAN: C5 rddm: EE %#x is not RDDM (3); no upload expected, sink not read\n", v[1]);
-		}
-	}
+	if (fw_faults == before) { wl_c6_rddm(v[1], v[4]); }   /* C5/C6: only with fuxiwlanvec=rddm */
 }
 
 /* One monitor status SRING_SETUP through wl_ce_send on the HTT endpoint (CE4,

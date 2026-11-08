@@ -63,6 +63,11 @@ typedef void *event_t;
 #define VREG 1
 #define UIO_READ 0
 #define UIO_SYSSPACE 0
+#define UIO_WRITE 1
+#define FWRITE 2
+#define O_CREAT 0x200
+#define O_TRUNC 0x400
+#define IO_NOCACHE 0x10 /* C6 dump file: symbols only, the write path is never reached in these suites */
 #define WL_BAR0 0x60400000ull
 #define WL_EPCFG 0x60100000ull
 #define WL_DBI 0x60000000ull
