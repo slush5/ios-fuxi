@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,9462 @@
+@@ -0,0 +1,9479 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -46,7 +46,8 @@
 + *   fuxiwlanpre=qfprom|warm|reset|wake|l1ss  pre-BHI experiment
 + *   fuxiwlanfw=stock  separate caller-supplied stock image, no fallback
 + *   fuxiwlanbhi=full  M6l whole-file BHI size experiment
-+ *   fuxiwlanvec=early|rddm  M6l TX staging or RDDM RX experiment
++ *   fuxiwlanvec=early|rddm  M6l TX staging or RDDM RX experiment; C5: with rddm, a W25/W28 crash in
++ *                 RDDM EE scans the uploaded dump for assert text and prints its first 1 KiB (read only)
 + *   fuxiwlancnss=pdc  M6n AOP WLAN PDC setup before rails (default off)
 + *   fuxiwlanseq=cycle,parf,dbi,eq,hostirq,msi,por,prefix  M6o opt-ins
 + *   fuxiwlanseq=cyclerails  also cycle shared rails (froze the SoC once)
@@ -6925,6 +6926,22 @@
 +	    "access-faults %u; read-only\n", where, v[0], (v[0] >> 8) & 0xffu, (v[0] >> 2) & 1u, v[1], v[2], v[3], v[4], v[5],
 +	    fw_faults - before);
 +	wl_hd_diag(where);   /* HD1: silent without fuxiwlandiag */
++	/* C5: the firmware's own crash record, read only. With fuxiwlanvec=rddm the BHIe RX
++	 * vectors were armed before BHI (M6l) and the device uploads its RDDM into the sink
++	 * when it enters the RDDM EE (3) after SYSERR. Scan it for assert text (P17) and print
++	 * the first 1 KiB. Nothing is requested from or written to the device. */
++	if (wl_vec == 2 && wl_rddm.va && fw_faults == before) {
++		if (v[1] == 3) {
++			wl17_rddm_scan();
++			const uint8_t *seg = (const uint8_t *)wl_rddm.va;
++			for (unsigned o = 0x80; o < 0x400; o += 32) {
++				uint32_t w[8]; memcpy(w, seg + o, 32);
++				printf("FUXI WLAN: C5 rddm-rec %03x: %08x %08x %08x %08x %08x %08x %08x %08x\n", o, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
++			}
++		} else {
++			printf("FUXI WLAN: C5 rddm: EE %#x is not RDDM (3); no upload expected, sink not read\n", v[1]);
++		}
++	}
 +}
 +
 +/* One monitor status SRING_SETUP through wl_ce_send on the HTT endpoint (CE4,
