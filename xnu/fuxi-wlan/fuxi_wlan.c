@@ -28,6 +28,8 @@
  *                 align to 2^n of size, 0x40 read-only PMK8550 gpio3 sleep clock log, 0x80 also
  *                 enable it, 0x100 decode BHI error words and scan RDDM text
  *   fuxiwlanqrtr=1  W11 capability-only diagnostic; =2 W12 setup; =3 W13 small-chunk negotiation; =4 W14 downloads; =5 W15 config/mode
+ *   fuxiwlanmem=1  C4: serve the firmware's first REQUEST_MEM as asked (contiguous segments up to the
+ *                 64 MiB cap, power-of-two IOVA alignment); no W13 decline/fragment round (default off)
  *   fuxiwlanqrtr=6  W20-W22: W15, then copy engines, HTC and WMI init to WMI READY (needs
  *                 fuxiwlan=28 or 1; not with keep/stop22); any other value outside 0..8 is refused
  *   fuxiwlanqrtr=7  W23/W24: all of 6, then the 38-channel passive list, a station vdev and one
@@ -1221,6 +1223,7 @@ wl17_scan(const uint8_t *seg, uint64_t size, unsigned max, wl17_emit emit)
 /* W12/W13 allocate after an accepted REQUEST_MEM; retain partial allocations until
  * containment is proven. Limit includes XNU page rounding, not just wire sizes. */
 #define WL13_CHUNK_LIMIT (2u * 1024u * 1024u)
+static bool wl13_contig; /* fuxiwlanmem=1 (C4): no W13 decline, the first REQUEST_MEM is served as asked */
 #define WL_TARGET_MAX 52u
 #define WL_TARGET_CAP (64u * 1024u * 1024u)
 static struct wl_dma wl_target[WL_TARGET_MAX];
@@ -1393,6 +1396,10 @@ wl_probe_configure(void)
 	(void)PE_parse_boot_argn("fuxiwlanstop22", &stop22, sizeof(stop22));
 	(void)PE_parse_boot_argn("fuxiwlankeep", &keep, sizeof(keep));
 	(void)PE_parse_boot_argn("fuxiwlanqrtr", &qrtr, sizeof(qrtr));
+	int mem = 0;
+	(void)PE_parse_boot_argn("fuxiwlanmem", &mem, sizeof(mem));
+	if (mem < 0 || mem > 1) { wl_variant_invalid = true; }
+	wl13_contig = mem == 1;
 	wl_w25 = qrtr == 8; /* C3: the W25 scan service replaces the one W23 scan */
 	wl_w23 = qrtr == 7 || wl_w25; /* C2: the W23 passive scan runs on top of W20..W22 */
 	wl_w20 = qrtr == 6 || wl_w23; /* W20 runs on top of the whole W11..W15 chain */
@@ -1651,7 +1658,8 @@ wl_probe_configure(void)
 	printf("FUXI WLAN: W10 continue=%u keep=%u (stop22=1 retains BHI diagnostics; no data channels)\n", !wl_stop22, wl_keep);
 	printf("FUXI WLAN: W11 qrtr=%u keep=%u (one conversation after AMSS/M0)\n", wl_qrtr, wl_keep);
 	if (wl_w12) { printf("FUXI WLAN: W12 selected qrtr=%u target memory cap %u bytes\n", wl_w20 ? wl20_qrtr : wl_w15 ? 5 : wl_w14 ? 4 : wl_w13 ? 3 : 2, WL_TARGET_CAP); }
-	if (wl_w13) { printf("FUXI WLAN: W13 small-chunk policy limit %u bytes; one zero-segment negotiation, aligned IOVAs\n", WL13_CHUNK_LIMIT); }
+	if (wl_w13 && wl13_contig) { printf("FUXI WLAN: W13 C4 contiguous policy (fuxiwlanmem=1): the first REQUEST_MEM is served as asked, no decline; aligned IOVAs\n"); }
+	else if (wl_w13) { printf("FUXI WLAN: W13 small-chunk policy limit %u bytes; one zero-segment negotiation, aligned IOVAs\n", WL13_CHUNK_LIMIT); }
 	printf("FUXI WLAN: M6o seq mask %#x valid=%u (selectors default off)\n",
 	    wl_seq_flags, !wl_variant_invalid);
 	printf("FUXI WLAN: M6l pre=%s bhi=%s vec=%s valid=%u\n",
@@ -4845,7 +4853,7 @@ wl12_request_mem(const uint8_t *v, unsigned n)
 	}
 	if (off != n || wl_iova_next < wl_iova_base || wl_iova_next >= wl_iova_end ||
 	    rounded > wl_iova_end-wl_iova_next) { return wl_w11_fail("REQUEST_MEM trailing bytes/IOVA exhaustion"); }
-	if (wl_w13 && ((wl13_negotiated && large) || (!large && cursor > wl_iova_end))) {
+	if (wl_w13 && ((wl13_negotiated && large) || ((!large || wl13_contig) && cursor > wl_iova_end))) {
 		return wl_w11_fail("REQUEST_MEM small-chunk limit/aligned IOVA exhaustion; negotiation exhausted");
 	}
 	wl_target_n = count; wl_target_total = total; wl12_requested = true;
@@ -8665,12 +8673,15 @@ wl_w12_run(void)
 	if (wl12_wait(1, "REQUEST_MEM indication")) { return 1; }
 	for (unsigned round = 0; round < 2; round++) {
 		wl13_delayed = false;
-		if (wl_w13 && !wl13_negotiated) {
+		if (wl_w13 && !wl13_negotiated && !wl13_contig) {
 			for (unsigned i = 0; i < wl_target_n; i++) {
 				if (wl13_supported(wl_target_type[i]) && wl_target_size[i] > WL13_CHUNK_LIMIT) {
 					wl13_delayed = true;
 				}
 			}
+		}
+		if (wl_w13 && wl13_contig && !round) {
+			printf("FUXI WLAN: W13 C4 contig: serving n=%u segments as asked (fuxiwlanmem=1), no decline\n", wl_target_n);
 		}
 		if (wl13_delayed) {
 			wl13_negotiated = true;

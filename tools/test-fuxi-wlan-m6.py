@@ -127,6 +127,7 @@ static bool PE_parse_boot_argn(const char *name, void *out, int size) {
     if(!strcmp(name,"fuxiwlanstop22")) { memcpy(out,&stop22_arg,size); return true; }
     if(!strcmp(name,"fuxiwlankeep")) { memcpy(out,&keep_arg,size); return true; }
     if(!strcmp(name,"fuxiwlanqrtr")) { memcpy(out,&qrtr_arg,size); return true; }
+    if(!strcmp(name,"fuxiwlanmem")) return false; /* C4 contiguous policy knob, absent here */
     assert(!strcmp(name,"fuxiwlanoldiova"));
     if(old_iova_present) memcpy(out,&old_iova_arg,size);
     return old_iova_present;
