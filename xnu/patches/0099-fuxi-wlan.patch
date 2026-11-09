@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,9604 @@
+@@ -0,0 +1,9726 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -68,6 +68,9 @@
 + *   fuxiwlanfwlog=1  C7: QMI INI enablefwlog 1 (the firmware streams its log as WMI events, as for
 + *                 ath12k); the last 64 WMI events the lane does not decode (id, length, first 96 bytes)
 + *                 are kept and printed at a W25/W28 crash, oldest first (default off)
++ *   fuxiwlanfwlog=2  C8: as =1, and the full payload of the last 48 diag events is kept; at the crash the
++ *                 cmnos records (935/1174) and the newest event are printed, and all are written to
++ *                 /private/var/mobile/Media/fuxi-fwlog.bin on the data volume for offline .msc decode
 + *   fuxiwlanqrtr=6  W20-W22: W15, then copy engines, HTC and WMI init to WMI READY (needs
 + *                 fuxiwlan=28 or 1; not with keep/stop22); any other value outside 0..8 is refused
 + *   fuxiwlanqrtr=7  W23/W24: all of 6, then the 38-channel passive list, a station vdev and one
@@ -1441,7 +1444,7 @@
 +	wl13_contig = mem == 1;
 +	int fwlog = 0;
 +	(void)PE_parse_boot_argn("fuxiwlanfwlog", &fwlog, sizeof(fwlog));
-+	if (fwlog < 0 || fwlog > 1) { wl_variant_invalid = true; }
++	if (fwlog < 0 || fwlog > 2) { wl_variant_invalid = true; }
 +	wl_fwlog = (unsigned)fwlog;
 +	wl_w25 = qrtr == 8; /* C3: the W25 scan service replaces the one W23 scan */
 +	wl_w23 = qrtr == 7 || wl_w25; /* C2: the W23 passive scan runs on top of W20..W22 */
@@ -5184,6 +5187,123 @@
 +	}
 +}
 +
++/* C8 (fuxiwlanfwlog=2): the firmware log in full. C7 keeps only the first 96 bytes of each WMI
++ * diag event, but each flushed log buffer is ~1.5 KiB, so the record that trips the assert
++ * (cmnos_thread_patch.c:1174) is past that cut. C8 keeps the whole payload of the last WL_C8_SLOTS
++ * diag events in memory; at a W25/W28 crash it (a) walks the records for the two cmnos ids and
++ * prints them, with the newest event in full, to the console so they are in boot.log, and (b)
++ * writes all kept events to a file on the data volume (inside ios-root.img, same vnode path style
++ * as C6) as a backup for offline .msc decode. No hardware access; file I/O only at the crash. */
++#define WL_C8_SLOTS 48u
++#define WL_C8_SLOT 1536u
++static struct { uint32_t id, seq, len; uint8_t data[WL_C8_SLOT]; } wl_c8_ring[WL_C8_SLOTS];
++static unsigned wl_c8_next, wl_c8_total;
++static void
++wl_c8_note(uint32_t id, const uint8_t *payload, uint32_t len)
++{
++	if (wl_fwlog < 2) { return; }
++	unsigned i = wl_c8_next;
++	uint32_t cap = len < WL_C8_SLOT ? len : WL_C8_SLOT;
++	wl_c8_ring[i].id = id; wl_c8_ring[i].len = len; wl_c8_ring[i].seq = ++wl_c8_total;
++	memset(wl_c8_ring[i].data, 0, WL_C8_SLOT);
++	memcpy(wl_c8_ring[i].data, payload, cap);
++	wl_c8_next = (i + 1u) % WL_C8_SLOTS;
++}
++
++static void
++wl_c8_save(void)
++{
++	if (wl_fwlog < 2) { return; }
++	unsigned n = wl_c8_total < WL_C8_SLOTS ? wl_c8_total : WL_C8_SLOTS;
++	static const char *const paths[] = { "/private/var/mobile/Media/fuxi-fwlog.bin", "/private/var/tmp/fuxi-fwlog.bin" };
++	vfs_context_t ctx = vfs_context_kernel();
++	for (unsigned p = 0; p < 2; p++) {
++		vnode_t vp = NULL; int resid = 0; int e = 0; off_t off = 0;
++		e = vnode_open(paths[p], FWRITE | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644, 0, &vp, ctx);
++		if (e) { printf("FUXI WLAN: C8 fwlog save %s: open errno %d\n", paths[p], e); continue; }
++		uint32_t hdr[4] = { 0x57465846u, 1u, n, wl_c8_total };   /* "FXFW", version 1, count kept, total seen */
++		e = vn_rdwr(UIO_WRITE, vp, (caddr_t)hdr, (int)sizeof(hdr), off, UIO_SYSSPACE, IO_NOCACHE,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		off += (off_t)sizeof(hdr);
++		for (unsigned k = 0; k < n && !e && !resid; k++) {
++			unsigned i = (wl_c8_next + WL_C8_SLOTS - n + k) % WL_C8_SLOTS;
++			uint32_t cap = wl_c8_ring[i].len < WL_C8_SLOT ? wl_c8_ring[i].len : WL_C8_SLOT;
++			uint32_t rh[3] = { wl_c8_ring[i].id, wl_c8_ring[i].seq, cap };
++			e = vn_rdwr(UIO_WRITE, vp, (caddr_t)rh, (int)sizeof(rh), off, UIO_SYSSPACE, IO_NOCACHE,
++			    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++			off += (off_t)sizeof(rh);
++			if (e || resid) { break; }
++			e = vn_rdwr(UIO_WRITE, vp, (caddr_t)wl_c8_ring[i].data, (int)cap, off, UIO_SYSSPACE, IO_NOCACHE,
++			    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++			off += (off_t)cap;
++		}
++		int cl = vnode_close(vp, FWRITE, ctx);
++		printf("FUXI WLAN: C8 fwlog save %s: %u events, %lld bytes, write errno %d resid %d close %d\n", paths[p], n, (long long)off, e, resid, cl);
++		if (!e && !resid && !cl) { return; }
++	}
++}
++
++/* Walk the kept events' dbglog records (marker value 0x07000000, per-record word, header word
++ * hdr = id<<16 | b8<<8 | len_bytes, then len_bytes/4 arg words). Print (1) any record whose id
++ * is a known cmnos id, and (2) in the last 3 events, any record whose args carry the fatal
++ * signature (0xcafecace, 0x14feeb3, 0x496), since cmnos_thread_patch.c is a patch file and its
++ * ids can shift between fw builds. Then the newest two events in full as a backstop. */
++static void
++wl_c8_scan(const char *where)
++{
++	if (wl_fwlog < 2) { return; }
++	static const uint32_t watch[] = { 0x72b2u, 0x72b3u };   /* 935 LACK ROOM / 1174 assert in the 1.0 .msc (may shift in c7) */
++	static const uint32_t sig[] = { 0xcafecaceu, 0x014feeb3u, 0x00000496u };   /* fatal cookie, ERRDBG1, line 1174 */
++	unsigned n = wl_c8_total < WL_C8_SLOTS ? wl_c8_total : WL_C8_SLOTS;
++	unsigned idhits = 0, arghits = 0;
++	printf("FUXI WLAN: C8 fwlog scan at %s: %u events; id watch 0x72b2/0x72b3, arg watch cafecace/14feeb3/496 (last 3)\n", where, n);
++	for (unsigned k = 0; k < n; k++) {
++		unsigned si = (wl_c8_next + WL_C8_SLOTS - n + k) % WL_C8_SLOTS;
++		const uint8_t *d = wl_c8_ring[si].data;
++		uint32_t cap = wl_c8_ring[si].len < WL_C8_SLOT ? wl_c8_ring[si].len : WL_C8_SLOT;
++		bool argwin = (k + 3u >= n);
++		uint32_t o = 0, w = 0;
++		while (o + 4u <= cap) { memcpy(&w, d + o, 4); if (w == 0x07000000u) { break; } o += 4u; }
++		while (o + 12u <= cap) {
++			uint32_t mark = 0, ts = 0, hdr = 0;
++			memcpy(&mark, d + o, 4); if (mark != 0x07000000u) { break; }
++			memcpy(&ts, d + o + 4u, 4);
++			memcpy(&hdr, d + o + 8u, 4);
++			uint32_t id = hdr >> 16, lenb = hdr & 0xffu, nargs = lenb / 4u, body = o + 12u;
++			if (body + nargs * 4u > cap) { break; }
++			uint32_t a[6] = { 0, 0, 0, 0, 0, 0 };
++			for (unsigned ai = 0; ai < nargs && ai < 6u; ai++) { memcpy(&a[ai], d + body + ai * 4u, 4); }
++			bool id_hit = false, arg_hit = false;
++			for (unsigned wi = 0; wi < sizeof(watch) / sizeof(watch[0]); wi++) { if (id == watch[wi]) { id_hit = true; } }
++			if (argwin) {
++				for (unsigned ai = 0; ai < nargs; ai++) {
++					uint32_t v = 0; memcpy(&v, d + body + ai * 4u, 4);
++					for (unsigned s2 = 0; s2 < sizeof(sig) / sizeof(sig[0]); s2++) { if (v == sig[s2]) { arg_hit = true; } }
++				}
++			}
++			if (id_hit || arg_hit) {
++				printf("FUXI WLAN: C8 %s ev seq %u id %#x ts %#x nargs %u args: %#x %#x %#x %#x %#x %#x\n",
++				    id_hit ? "id hit" : "arg hit", wl_c8_ring[si].seq, id, ts, nargs, a[0], a[1], a[2], a[3], a[4], a[5]);
++				if (id_hit) { idhits++; } else { arghits++; }
++			}
++			o = body + nargs * 4u;
++		}
++	}
++	if (!idhits) { printf("FUXI WLAN: C8 id scan 0, see arg scan (cmnos ids 29362/29363 may have shifted in c7)\n"); }
++	printf("FUXI WLAN: C8 fwlog scan: %u id hit(s), %u arg hit(s)\n", idhits, arghits);
++	unsigned show = n < 2u ? n : 2u;
++	for (unsigned s = 0; s < show; s++) {
++		unsigned si = (wl_c8_next + WL_C8_SLOTS - 1u - s) % WL_C8_SLOTS;
++		const uint8_t *d = wl_c8_ring[si].data;
++		uint32_t cap = wl_c8_ring[si].len < WL_C8_SLOT ? wl_c8_ring[si].len : WL_C8_SLOT;
++		printf("FUXI WLAN: C8 event seq %u id %#x len %u, full payload follows\n", wl_c8_ring[si].seq, wl_c8_ring[si].id, wl_c8_ring[si].len);
++		for (uint32_t p = 0; p + 32u <= cap; p += 32u) {
++			uint32_t v[8]; memcpy(v, d + p, 32);
++			printf("FUXI WLAN: C8 seq %u +%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n", wl_c8_ring[si].seq, p, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
++		}
++	}
++}
++
 +static void
 +wl17_errdec(const char *label, uint32_t ee, uint32_t code, uint32_t d1, uint32_t d2, uint32_t d3)
 +{
@@ -5819,7 +5939,7 @@
 +		else if (id == WLWMI_EV_MGMT_RX) { wl25_w.ev_mgmt++; } else { wl25_w.ev_other++; }
 +	}
 +	if (wl30_mask & WL30_MGMTREO) { wlvrx_note(&wl30_reo, id, msg + 4, len - 4); }  /* C2h: counts only */
-+	if (wl_fwlog && id != WLWMI_EV_SCAN && id != WLWMI_EV_CHAN_INFO && id != WLWMI_EV_MGMT_RX) { wl_c7_note(id, msg + 4, len - 4); }   /* C7 */
++	if (wl_fwlog && id != WLWMI_EV_SCAN && id != WLWMI_EV_CHAN_INFO && id != WLWMI_EV_MGMT_RX) { wl_c7_note(id, msg + 4, len - 4); wl_c8_note(id, msg + 4, len - 4); }   /* C7/C8 */
 +	if (wl_wmi.scan && wlscan_known(id)) {
 +		if (wl_scan.foreign != foreign && wl23_lines++ < 64) { printf("FUXI WLAN: W23 scan foreign freq %u\n", wl_scan.ev_freq); }
 +		/* C2c: D4/D5 notes, no line; C2b: a line (W25: in the first scan only) */
@@ -7067,6 +7187,8 @@
 +	 * the first 1 KiB. Nothing is requested from or written to the device. */
 +	if (fw_faults == before) { wl_c6_rddm(v[1], v[4]); }   /* C5/C6: only with fuxiwlanvec=rddm */
 +	wl_c7_dump(where);   /* C7: only with fuxiwlanfwlog=1 */
++	wl_c8_scan(where);   /* C8: cmnos records + newest event to the console */
++	wl_c8_save();   /* C8: full log to the data volume */
 +}
 +
 +/* One monitor status SRING_SETUP through wl_ce_send on the HTT endpoint (CE4,
@@ -8744,7 +8866,7 @@
 +	/* qmi_wlanfw_wlan_ini_req_msg_v01 / *_ei: optional 0x10 u8.
 +	 * Explicit lane policy: disable fw log (0). Upstream v6.12 sends 1. */
 +	printf("FUXI WLAN: W15 wlan ini enable_fwlog %u\n", wl_fwlog);
-+	if (wl12_tlv(&e, 0x10, wl_fwlog, 1) || wl12_send(&e, 0x2f, WL15_INI) ||
++	if (wl12_tlv(&e, 0x10, (wl_fwlog != 0u), 1) || wl12_send(&e, 0x2f, WL15_INI) ||
 +	    wl12_wait(0, "WLAN_INI reply") || wl_w11_wait(3, "W15 INI TX drain")) { return 1; }
 +	printf("FUXI WLAN: W15 wlan ini ok\n");
 +	bzero(&e, sizeof(e)); e.len = 7;

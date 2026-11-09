@@ -172,6 +172,9 @@ static void wl_c6_rddm(uint32_t ee, uint32_t errdbg2);  /* C6: fuxiwlanvec=rddm 
 static unsigned wl_fwlog;  /* C7: off here */
 static void wl_c7_note(uint32_t id, const uint8_t *payload, uint32_t len);
 static void wl_c7_dump(const char *where);
+static void wl_c8_note(uint32_t id, const uint8_t *payload, uint32_t len);
+static void wl_c8_save(void);
+static void wl_c8_scan(const char *where);
 static int wl_smmu_fault(unsigned step);
 static int wl_m6o_msi_undo(void);
 static int wl_m6o_undo(bool contained);
@@ -2992,6 +2995,9 @@ static void wl_hd_diag(const char *where) { (void)where; }
 static void wl_c6_rddm(uint32_t ee, uint32_t errdbg2) { (void)ee; (void)errdbg2; }
 static void wl_c7_note(uint32_t id, const uint8_t *payload, uint32_t len) { (void)id; (void)payload; (void)len; }
 static void wl_c7_dump(const char *where) { (void)where; }
+static void wl_c8_note(uint32_t id, const uint8_t *payload, uint32_t len) { (void)id; (void)payload; (void)len; }
+static void wl_c8_save(void) { }
+static void wl_c8_scan(const char *where) { (void)where; }
 static int wl_smmu_fault(unsigned step) { (void)step; return 0; }
 static int wl_m6o_msi_undo(void) { return 0; }
 static int wl_m6o_undo(bool contained) { (void)contained; return 0; }
