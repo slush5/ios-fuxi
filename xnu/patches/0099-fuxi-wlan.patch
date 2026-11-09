@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,9978 @@
+@@ -0,0 +1,10007 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -5378,26 +5378,26 @@
 + * chunks (9/10/5/11/12). A record is [0x07000000][ts][hdr = id:16 | vdev:5 | level:3 | len:8]
 + * [len/4 args]; len 0 is kept, only len>36, misaligned or id 0 dropped.
 + *
-+ * Selection: the per-record ts is RELATIVE to its buffer (restarts ~0x150; the absolute base is a
-+ * "00010008 <base>" header TLV before the first record). We do NOT rank by ts. Two passes, no run
-+ * table: read in address order, group records into runs by chaining (record N+1 starts where N
-+ * ended) AND non-decreasing ts (a ts drop is a buffer-reuse boundary, so the write head becomes a
-+ * run tail). Pass 1 counts total + per-chunk + runs; pass 2 re-walks and prints. Per run we print a
-+ * header with the 12 words before the first record (the base TLV). If total <= WL_C10_CAP print all,
-+ * else print the first 2 and last 8 of each run. Outside the cap we ALWAYS print any record whose id
-+ * is a cmnos thread message (ROM cmnos_thread_patched.c 0xa1..0xa7, RAM 0x72b2 LACK ROOM / 0x72b3
-+ * assert), any arg = 0x496 or 0x492 (assert lines 1174/1170), or any arg pointing into the lx image
-+ * (seg19 0x19e3000..0x1a19000 thread-name strings; seg14/15 .rodata; seg15 bss). The DIAG_VERSION in
-+ * every c7 payload is 0x10018568 = the msc ROM section, so ROM ids decode on the plain lx kit with no
-+ * amss20 twin. Known thread messages are decoded inline.
++ * Selection: ts is RELATIVE to its buffer (restarts ~0x150; the absolute 64-bit base is the
++ * "00010008 <base_lo> <base_hi>" TLV before the first record). No ts ranking. Two passes: read in
++ * address order, group into runs by chaining AND non-decreasing ts (a ts drop = buffer reuse, so the
++ * write head is a run tail). Pass 1 counts total + per-chunk + runs and tracks the newest buffer by
++ * base time; pass 2 re-walks and prints, with a per-run header of the 12 words before the first
++ * record. If total <= WL_C10_CAP print all, else first 2 + last 8 per run. Outside the cap we ALWAYS
++ * print any record whose id is a cmnos thread message (ROM cmnos_thread_patched.c 0xa1..0xa7, RAM
++ * 0x72b2 LACK ROOM / 0x72b3 assert), any arg = 0x496/0x492 (assert lines 1174/1170), or any arg into
++ * the lx image (seg19 thread-name strings; seg14/15 .rodata; seg15 bss). DIAG_VERSION in every c7
++ * payload is 0x10018568 = the msc ROM section, so ROM ids decode on the plain lx kit, no amss20 twin.
 + *
-+ * Flood guard: with no run table the output is unbounded, and a stray 0x07000000 word with a plausible
-+ * header is a non-special one-record run (2 lines). If a buffer is full of look-alikes that could drown
-+ * the console. So when the total run count exceeds WL_C10_RUN_GUARD, pass 2 skips non-special
-+ * one-record runs and prints one per-chunk "N not printed" line; specials and multi-record runs are
-+ * always printed, and the pass-1 per-chunk counts print first regardless. Read only, console only. */
++ * Flood guard: with no run table the output is unbounded (a stray 0x07000000 + plausible header is a
++ * non-special one-record run). When nrun > WL_C10_RUN_GUARD, pass 2 skips non-special one-record runs
++ * and prints a per-chunk "N not printed" line. Exceptions kept even then: a record at a real buffer
++ * start (preceded by the 00010008 base TLV) - a lone assert on lx can have plain r0/r1 and no special
++ * arg, and 31 of 65 real payloads hold exactly one record - up to WL_C10_EXEMPT_MAX of them. Specials
++ * and every multi-record run always print; pass-1 per-chunk counts print first. Read only, console only. */
 +#define WL_C10_CAP 800u
 +#define WL_C10_RUN_GUARD 256u
++#define WL_C10_EXEMPT_MAX 1024u
 +#define WL_C10_RODATA_LO 0x014d2000u
 +#define WL_C10_STR_HI 0x0153a76cu
 +#define WL_C10_BSS_HI 0x0166c620u
@@ -5430,6 +5430,15 @@
 +	}
 +	*end = o;
 +	return count;
++}
++
++/* record at o sits right after a 00010008 base-time TLV, i.e. it is a buffer's first record. */
++static int
++wl_c10_buf_start(const uint8_t *b, uint64_t o)
++{
++	if (o < 12u) { return 0; }
++	uint32_t w; memcpy(&w, b + o - 12u, 4);
++	return w == 0x00010008u;
 +}
 +
 +static const char *
@@ -5495,7 +5504,8 @@
 +{
 +	if (wl_fwmem < 2u) { return; }
 +	printf("FUXI WLAN: C10 diag-record parse at %s: MSG_V2 07000000, two-pass, runs by chaining + ts-drop break (no ts rank)\n", where);
-+	unsigned total = 0, nrun = 0;
++	unsigned total = 0, nrun = 0, maxc = 0;
++	uint64_t maxbase = 0, maxoff = 0; int haveb = 0;
 +	for (unsigned i = 0; i < WL_TARGET_MAX; i++) {
 +		struct wl_dma *d = &wl_target[i];
 +		if (!d->va || !d->size) { continue; }
@@ -5508,7 +5518,13 @@
 +			if (!wl_c10_rec_at(b, o, sz, &id, &len, &ts)) { o += 4u; continue; }
 +			uint64_t end;
 +			unsigned rc = wl_c10_scan_run(b, o, sz, &end);
-+			cc += rc; total += rc; nrun++; o = end;
++			cc += rc; total += rc; nrun++;
++			if (wl_c10_buf_start(b, o)) {
++				uint32_t lo, hi; memcpy(&lo, b + o - 8u, 4); memcpy(&hi, b + o - 4u, 4);
++				uint64_t base = ((uint64_t)hi << 32) | lo;
++				if (!haveb || base > maxbase) { maxbase = base; maxc = i; maxoff = o; haveb = 1; }
++			}
++			o = end;
 +		}
 +		printf("FUXI WLAN: C10 chunk %u iova %#llx valid-records %u\n", i, (unsigned long long)d->iova, cc);
 +	}
@@ -5516,7 +5532,11 @@
 +	int guard = nrun > WL_C10_RUN_GUARD;
 +	printf("FUXI WLAN: C10 total %u record(s) in %u run(s); cap %u (<=cap: all; else first 2 + last 8 per run + specials)%s\n",
 +	    total, nrun, WL_C10_CAP, guard ? "; flood guard on (skip non-special 1-record runs)" : "");
-+	unsigned runidx = 0;
++	if (haveb) {
++		printf("FUXI WLAN: C10 newest buffer start: chunk %u +%#llx base %#llx (abs clock; newest buffer most likely holds the crash)\n",
++		    maxc, (unsigned long long)maxoff, (unsigned long long)maxbase);
++	}
++	unsigned runidx = 0, exempt = 0;
 +	for (unsigned i = 0; i < WL_TARGET_MAX; i++) {
 +		struct wl_dma *d = &wl_target[i];
 +		if (!d->va || !d->size) { continue; }
@@ -5528,7 +5548,13 @@
 +			if (!wl_c10_rec_at(b, o, sz, &id, &len, &ts)) { o += 4u; continue; }
 +			uint64_t start = o, end;
 +			unsigned rc = wl_c10_scan_run(b, o, sz, &end);
-+			if (guard && rc == 1u && !wl_c10_special(b, start)) { skipped++; runidx++; o = end; continue; }
++			if (guard && rc == 1u && !wl_c10_special(b, start)) {
++				if (wl_c10_buf_start(b, start) && exempt < WL_C10_EXEMPT_MAX) {
++					exempt++;   /* lone record at a real buffer start: a lone assert could live here */
++				} else {
++					skipped++; runidx++; o = end; continue;
++				}
++			}
 +			if (start >= 48u) {
 +				uint32_t w[12];
 +				for (unsigned k = 0; k < 12u; k++) { memcpy(&w[k], b + start - 48u + 4u * k, 4); }
@@ -5551,6 +5577,9 @@
 +		if (skipped) {
 +			printf("FUXI WLAN: C10 chunk %u: %u non-special one-record run(s) not printed (flood guard)\n", i, skipped);
 +		}
++	}
++	if (exempt) {
++		printf("FUXI WLAN: C10 flood guard: %u buffer-start one-record run(s) exempted and printed\n", exempt);
 +	}
 +}
 +
