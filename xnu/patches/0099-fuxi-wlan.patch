@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,9968 @@
+@@ -0,0 +1,9978 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -5378,9 +5378,9 @@
 + * chunks (9/10/5/11/12). A record is [0x07000000][ts][hdr = id:16 | vdev:5 | level:3 | len:8]
 + * [len/4 args]; len 0 is kept, only len>36, misaligned or id 0 dropped.
 + *
-+ * Selection (C10c): the per-record ts is RELATIVE to its buffer (restarts ~0x150; the absolute base
-+ * is a "00010008 <base>" header TLV before the first record). We do NOT rank by ts. Two passes, no
-+ * run table: read in address order, group records into runs by chaining (record N+1 starts where N
++ * Selection: the per-record ts is RELATIVE to its buffer (restarts ~0x150; the absolute base is a
++ * "00010008 <base>" header TLV before the first record). We do NOT rank by ts. Two passes, no run
++ * table: read in address order, group records into runs by chaining (record N+1 starts where N
 + * ended) AND non-decreasing ts (a ts drop is a buffer-reuse boundary, so the write head becomes a
 + * run tail). Pass 1 counts total + per-chunk + runs; pass 2 re-walks and prints. Per run we print a
 + * header with the 12 words before the first record (the base TLV). If total <= WL_C10_CAP print all,
@@ -5389,8 +5389,15 @@
 + * assert), any arg = 0x496 or 0x492 (assert lines 1174/1170), or any arg pointing into the lx image
 + * (seg19 0x19e3000..0x1a19000 thread-name strings; seg14/15 .rodata; seg15 bss). The DIAG_VERSION in
 + * every c7 payload is 0x10018568 = the msc ROM section, so ROM ids decode on the plain lx kit with no
-+ * amss20 twin. Known thread messages are decoded inline. Read only, console only. */
++ * amss20 twin. Known thread messages are decoded inline.
++ *
++ * Flood guard: with no run table the output is unbounded, and a stray 0x07000000 word with a plausible
++ * header is a non-special one-record run (2 lines). If a buffer is full of look-alikes that could drown
++ * the console. So when the total run count exceeds WL_C10_RUN_GUARD, pass 2 skips non-special
++ * one-record runs and prints one per-chunk "N not printed" line; specials and multi-record runs are
++ * always printed, and the pass-1 per-chunk counts print first regardless. Read only, console only. */
 +#define WL_C10_CAP 800u
++#define WL_C10_RUN_GUARD 256u
 +#define WL_C10_RODATA_LO 0x014d2000u
 +#define WL_C10_STR_HI 0x0153a76cu
 +#define WL_C10_BSS_HI 0x0166c620u
@@ -5410,7 +5417,6 @@
 +	*id = i; *len = l; *ts = t; return 1;
 +}
 +
-+/* records in the run starting at `start`: chained (by construction) and ts non-decreasing; sets *end. */
 +static unsigned
 +wl_c10_scan_run(const uint8_t *b, uint64_t start, uint64_t sz, uint64_t *end)
 +{
@@ -5489,7 +5495,6 @@
 +{
 +	if (wl_fwmem < 2u) { return; }
 +	printf("FUXI WLAN: C10 diag-record parse at %s: MSG_V2 07000000, two-pass, runs by chaining + ts-drop break (no ts rank)\n", where);
-+	/* pass 1: count */
 +	unsigned total = 0, nrun = 0;
 +	for (unsigned i = 0; i < WL_TARGET_MAX; i++) {
 +		struct wl_dma *d = &wl_target[i];
@@ -5508,20 +5513,22 @@
 +		printf("FUXI WLAN: C10 chunk %u iova %#llx valid-records %u\n", i, (unsigned long long)d->iova, cc);
 +	}
 +	int all = total <= WL_C10_CAP;
-+	printf("FUXI WLAN: C10 total %u record(s) in %u run(s); cap %u (<=cap: all; else first 2 + last 8 per run + specials)\n",
-+	    total, nrun, WL_C10_CAP);
-+	/* pass 2: print */
++	int guard = nrun > WL_C10_RUN_GUARD;
++	printf("FUXI WLAN: C10 total %u record(s) in %u run(s); cap %u (<=cap: all; else first 2 + last 8 per run + specials)%s\n",
++	    total, nrun, WL_C10_CAP, guard ? "; flood guard on (skip non-special 1-record runs)" : "");
 +	unsigned runidx = 0;
 +	for (unsigned i = 0; i < WL_TARGET_MAX; i++) {
 +		struct wl_dma *d = &wl_target[i];
 +		if (!d->va || !d->size) { continue; }
 +		const uint8_t *b = (const uint8_t *)d->va;
 +		uint64_t sz = d->size, o = 0;
++		unsigned skipped = 0;
 +		while (o + 12u <= sz) {
 +			uint32_t id, len, ts;
 +			if (!wl_c10_rec_at(b, o, sz, &id, &len, &ts)) { o += 4u; continue; }
 +			uint64_t start = o, end;
 +			unsigned rc = wl_c10_scan_run(b, o, sz, &end);
++			if (guard && rc == 1u && !wl_c10_special(b, start)) { skipped++; runidx++; o = end; continue; }
 +			if (start >= 48u) {
 +				uint32_t w[12];
 +				for (unsigned k = 0; k < 12u; k++) { memcpy(&w[k], b + start - 48u + 4u * k, 4); }
@@ -5540,6 +5547,9 @@
 +			}
 +			runidx++;
 +			o = end;
++		}
++		if (skipped) {
++			printf("FUXI WLAN: C10 chunk %u: %u non-special one-record run(s) not printed (flood guard)\n", i, skipped);
 +		}
 +	}
 +}
