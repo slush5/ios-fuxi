@@ -134,6 +134,7 @@ static bool PE_parse_boot_argn(const char *name, void *out, int size) {
     if(!strcmp(name,"fuxiwlanqrtr")) { memcpy(out,&qrtr_arg,size); return true; }
     if(!strcmp(name,"fuxiwlanmem")) return false; /* C4 contiguous policy knob, absent here */
     if(!strcmp(name,"fuxiwlanfwlog")) return false; /* C7 firmware log knob, absent here */
+    if(!strcmp(name,"fuxiwlanfwmem")) return false; /* C9 host-mem scan knob, absent here */
     assert(!strcmp(name,"fuxiwlanoldiova"));
     if(old_iova_present) memcpy(out,&old_iova_arg,size);
     return old_iova_present;

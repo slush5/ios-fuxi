@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,9726 @@
+@@ -0,0 +1,9792 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -71,6 +71,8 @@
 + *   fuxiwlanfwlog=2  C8: as =1, and the full payload of the last 48 diag events is kept; at the crash the
 + *                 cmnos records (935/1174) and the newest event are printed, and all are written to
 + *                 /private/var/mobile/Media/fuxi-fwlog.bin on the data volume for offline .msc decode
++ *   fuxiwlanfwmem=1  C9: at a W25/W28 crash, scan the REQUEST_MEM host chunks for the assert signature
++ *                 (cafecace/014feeb3/496) and print the records around it to the console (default off)
 + *   fuxiwlanqrtr=6  W20-W22: W15, then copy engines, HTC and WMI init to WMI READY (needs
 + *                 fuxiwlan=28 or 1; not with keep/stop22); any other value outside 0..8 is refused
 + *   fuxiwlanqrtr=7  W23/W24: all of 6, then the 38-channel passive list, a station vdev and one
@@ -1266,6 +1268,7 @@
 +#define WL13_CHUNK_LIMIT (2u * 1024u * 1024u)
 +static bool wl13_contig; /* fuxiwlanmem=1 (C4): no W13 decline, the first REQUEST_MEM is served as asked */
 +static unsigned wl_fwlog; /* fuxiwlanfwlog=1 (C7): INI enablefwlog 1 and the undecoded-event ring */
++static unsigned wl_fwmem; /* fuxiwlanfwmem=1 (C9): scan the REQUEST_MEM host chunks for the assert at the crash */
 +#define WL_TARGET_MAX 52u
 +#define WL_TARGET_CAP (64u * 1024u * 1024u)
 +static struct wl_dma wl_target[WL_TARGET_MAX];
@@ -1446,6 +1449,10 @@
 +	(void)PE_parse_boot_argn("fuxiwlanfwlog", &fwlog, sizeof(fwlog));
 +	if (fwlog < 0 || fwlog > 2) { wl_variant_invalid = true; }
 +	wl_fwlog = (unsigned)fwlog;
++	int fwmem = 0;
++	(void)PE_parse_boot_argn("fuxiwlanfwmem", &fwmem, sizeof(fwmem));
++	if (fwmem < 0 || fwmem > 1) { wl_variant_invalid = true; }
++	wl_fwmem = (unsigned)fwmem;
 +	wl_w25 = qrtr == 8; /* C3: the W25 scan service replaces the one W23 scan */
 +	wl_w23 = qrtr == 7 || wl_w25; /* C2: the W23 passive scan runs on top of W20..W22 */
 +	wl_w20 = qrtr == 6 || wl_w23; /* W20 runs on top of the whole W11..W15 chain */
@@ -5304,6 +5311,64 @@
 +	}
 +}
 +
++/* C9 (fuxiwlanfwmem=1): the firmware's diag heap lives in the REQUEST_MEM host memory we
++ * allocated (wl_target[], ~15 MiB, type 1 HOST_DDR), not in firmware RAM, so at the W25/W28 halt
++ * we can scan it in place - no BAR window, no file, no pull. For each chunk: civac (to see the
++ * firmware's DMA writes), count non-zero words (a coarse write map), and search for the assert
++ * record signature 0xcafecace / 0x014feeb3 / 0x00000496 (cookie, cmnos_thread_patch.c string ptr,
++ * line 1174). On a hit, dump ~512 B around it so the records before the assert (incl. the LACK ROOM
++ * warning) can be decoded from boot.log. If no hit, dump the tail of the most-written chunk. Read only. */
++static void
++wl_c9_scan(const char *where)
++{
++	if (!wl_fwmem) { return; }
++	printf("FUXI WLAN: C9 fwmem scan at %s: %u host chunks, assert sig cafecace/014feeb3/00000496\n", where, WL_TARGET_MAX);
++	unsigned hits = 0, best = 0;
++	uint64_t best_nz = 0;
++	for (unsigned i = 0; i < WL_TARGET_MAX; i++) {
++		struct wl_dma *d = &wl_target[i];
++		if (!d->va || !d->size) { continue; }
++		wl_dma_civac(d);
++		const uint8_t *b = (const uint8_t *)d->va;
++		uint64_t sz = d->size, nz = 0;
++		for (uint64_t o = 0; o + 4u <= sz; o += 4u) {
++			uint32_t w0; memcpy(&w0, b + o, 4);
++			if (w0) { nz++; }
++			if (w0 == 0xcafecaceu && o + 12u <= sz && hits < 8u) {
++				uint32_t w1, w2; memcpy(&w1, b + o + 4u, 4); memcpy(&w2, b + o + 8u, 4);
++				if (w1 == 0x014feeb3u) {
++					hits++;
++					printf("FUXI WLAN: C9 hit %u chunk %u iova %#llx +%#llx: %08x %08x %08x (line 1174 match %u)\n",
++					    hits, i, (unsigned long long)d->iova, (unsigned long long)o, w0, w1, w2, w2 == 0x00000496u);
++					uint64_t s = o >= 256u ? o - 256u : 0;
++					for (uint64_t p = s; p + 32u <= sz && p < o + 288u; p += 32u) {
++						uint32_t v[8]; memcpy(v, b + p, 32);
++						printf("FUXI WLAN: C9 ctx chunk %u +%#llx: %08x %08x %08x %08x %08x %08x %08x %08x\n",
++						    i, (unsigned long long)p, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
++					}
++				}
++			}
++		}
++		printf("FUXI WLAN: C9 chunk %u iova %#llx size %llu nonzero-words %llu\n",
++		    i, (unsigned long long)d->iova, (unsigned long long)sz, (unsigned long long)nz);
++		if (nz > best_nz) { best_nz = nz; best = i; }
++	}
++	printf("FUXI WLAN: C9 fwmem scan: %u signature hit(s); most-written chunk %u (%llu nonzero-words)\n",
++	    hits, best, (unsigned long long)best_nz);
++	if (!hits && best_nz) {
++		struct wl_dma *d = &wl_target[best];
++		const uint8_t *b = (const uint8_t *)d->va;
++		uint64_t sz = d->size, s = sz > 2048u ? sz - 2048u : 0;
++		printf("FUXI WLAN: C9 no signature; tail of chunk %u iova %#llx from +%#llx:\n",
++		    best, (unsigned long long)d->iova, (unsigned long long)s);
++		for (uint64_t p = s; p + 32u <= sz; p += 32u) {
++			uint32_t v[8]; memcpy(v, b + p, 32);
++			printf("FUXI WLAN: C9 tail +%#llx: %08x %08x %08x %08x %08x %08x %08x %08x\n",
++			    (unsigned long long)p, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
++		}
++	}
++}
++
 +static void
 +wl17_errdec(const char *label, uint32_t ee, uint32_t code, uint32_t d1, uint32_t d2, uint32_t d3)
 +{
@@ -7189,6 +7254,7 @@
 +	wl_c7_dump(where);   /* C7: only with fuxiwlanfwlog=1 */
 +	wl_c8_scan(where);   /* C8: cmnos records + newest event to the console */
 +	wl_c8_save();   /* C8: full log to the data volume */
++	wl_c9_scan(where);   /* C9: scan the REQUEST_MEM host chunks for the assert */
 +}
 +
 +/* One monitor status SRING_SETUP through wl_ce_send on the HTT endpoint (CE4,
