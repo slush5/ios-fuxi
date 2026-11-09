@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,9887 @@
+@@ -0,0 +1,9946 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -5373,92 +5373,151 @@
 +}
 +
 +/* C10 (fuxiwlanfwmem=2): parse the firmware's MSG_V2 diag ring in the REQUEST_MEM host chunks.
-+ * C9 proved the cafecace/014feeb3/496 triple is only the MHI BHI register shadow (ERRCODE +
-+ * ERRDBG1..3), not the cmnos assert frame: no r0/r1, no thread name. The real assert print
-+ * (cmnos_thread_patch.c:1174, 2 args r0/r1) and the LACK ROOM warning (c:935, 5 args: thread-name
-+ * ptr, need, have, readIdx, writeIdx) are MSG_V2 diag records the firmware DMAs into our chunks
-+ * (9/10/5/11/12). A record is [0x07000000][ts][hdr = id<<16 | vdev<<8 | len][len/4 arg words];
-+ * len==0 (a no-arg one-liner) is kept too. The format strings are NOT in the firmware (resolved by
-+ * msc id off-device); a pointer arg is a runtime %s operand - for LACK ROOM, the thread name. We
-+ * walk every chunk, keep the newest WL_C10_TOP records by ts, print them with args, and flag
-+ * len==8 (candidate assert r0/r1) and any arg that points into the lx image, tagged by segment:
-+ * 0x19e3000..0x1a19000 = seg19 file-backed .rodata, the thread-name strings (WLAN_SCHED0, WLAN_HIF,
-+ * ...); 0x14d2000..0x153a76c = seg14/15 .rodata (a few names: WLAN_PMU_TOP/WLAN_PM_ARB); and
-+ * 0x153a76c..0x166c620 = seg15 bss, a RAM var (thread/queue struct). The pointer is resolved
-+ * against lx-amss off-device. Read only, console only. */
-+#define WL_C10_TOP 48u
++ * C9 proved the cafecace/014feeb3/496 triple is only the MHI BHI register shadow, not the cmnos
++ * assert frame. The assert print (cmnos_thread_patch.c:1174, 2 args r0/r1) and the LACK ROOM warning
++ * (c:935, 5 args: thread-name ptr, need, have, readIdx, writeIdx) are MSG_V2 diag records the
++ * firmware DMAs into our chunks (9/10/5/11/12). A record is [0x07000000][ts][hdr = id<<16 | vdev<<8
++ * | len][len/4 args]; len 0 (a no-arg one-liner) is kept, only len>36, misaligned or id 0 dropped.
++ *
++ * NB the per-record ts is RELATIVE to its buffer (every WMI payload restarts near 0x150); the
++ * absolute base is the "00010008 <base> 00000000" header TLV just before a run's first record. So
++ * we do NOT rank by ts. We read in address order and group records into runs by chaining (record
++ * N+1 starts exactly where record N ended). Per run we print a header line with the 12 words before
++ * the first record (the base TLV). Volume control: if the total record count is <= WL_C10_CAP we
++ * print every record; above that we print the first 2 and last 8 of each run (the write head is the
++ * end of a run). Outside the cap we ALWAYS print any record with an arg pointing into the lx image
++ * (seg19 0x19e3000..0x1a19000 thread-name strings; seg14/15 0x14d2000..0x153a76c .rodata; seg15 bss
++ * 0x153a76c..0x166c620 a RAM var) and any record with a Data20 id 0x72b2 (LACK ROOM) or 0x72b3
++ * (assert) so the amss20 twin finds them by id. The "candidate assert r0/r1" flag fires on id 0x72b3
++ * or on a len-8 record at a run's tail (the write head), not on every 2-arg record. Per-chunk
++ * valid-record counts print too (zero is a result). Read only, console only. */
++#define WL_C10_RUNS 512u
++#define WL_C10_CAP 800u
 +#define WL_C10_RODATA_LO 0x014d2000u
 +#define WL_C10_STR_HI 0x0153a76cu
 +#define WL_C10_BSS_HI 0x0166c620u
 +#define WL_C10_SEG19_LO 0x019e3000u
 +#define WL_C10_SEG19_HI 0x01a19000u
-+struct wl_c10_rec { uint32_t ts, id, vdev, len, chunk; uint64_t off; uint32_t a[9]; };
-+static struct wl_c10_rec wl_c10_top[WL_C10_TOP];
++struct wl_c10_run { uint32_t off, count; uint8_t chunk; };
++static struct wl_c10_run wl_c10_run[WL_C10_RUNS];
++
++/* valid MSG_V2 record at b+o within sz? set *id,*len (bytes) on success. */
++static int
++wl_c10_rec_at(const uint8_t *b, uint64_t o, uint64_t sz, uint32_t *id, uint32_t *len)
++{
++	if (o + 12u > sz) { return 0; }
++	uint32_t w0; memcpy(&w0, b + o, 4);
++	if (w0 != 0x07000000u) { return 0; }
++	uint32_t hdr; memcpy(&hdr, b + o + 8u, 4);
++	uint32_t l = hdr & 0xffu, i = hdr >> 16;
++	if (l > 36u || (l & 3u) != 0u || i == 0u) { return 0; }
++	if (o + 12u + (uint64_t)l > sz) { return 0; }
++	*id = i; *len = l; return 1;
++}
++
++static const char *
++wl_c10_ptr_kind(uint32_t p)
++{
++	if (p >= WL_C10_SEG19_LO && p < WL_C10_SEG19_HI) { return "seg19 str (thread name)"; }
++	if (p >= WL_C10_RODATA_LO && p < WL_C10_STR_HI) { return "seg14/15 str"; }
++	if (p >= WL_C10_STR_HI && p < WL_C10_BSS_HI) { return "seg15 bss (RAM var: thread/queue)"; }
++	return (const char *)0;
++}
++
++static int
++wl_c10_special(const uint8_t *b, uint64_t o)
++{
++	uint32_t hdr; memcpy(&hdr, b + o + 8u, 4);
++	uint32_t len = hdr & 0xffu, id = hdr >> 16;
++	if (id == 0x72b2u || id == 0x72b3u) { return 1; }
++	for (unsigned k = 0; k < len / 4u && k < 9u; k++) {
++		uint32_t p; memcpy(&p, b + o + 12u + 4u * k, 4);
++		if (wl_c10_ptr_kind(p)) { return 1; }
++	}
++	return 0;
++}
++
++static void
++wl_c10_print_rec(const uint8_t *b, unsigned chunk, uint64_t o, int tail)
++{
++	uint32_t ts, hdr; memcpy(&ts, b + o + 4u, 4); memcpy(&hdr, b + o + 8u, 4);
++	uint32_t len = hdr & 0xffu, id = hdr >> 16, vdev = (hdr >> 8) & 0xffu, a[9];
++	for (unsigned k = 0; k < 9u; k++) { a[k] = 0u; }
++	for (unsigned k = 0; k < len / 4u; k++) { memcpy(&a[k], b + o + 12u + 4u * k, 4); }
++	printf("FUXI WLAN: C10 rec chunk %u +%#llx ts %#x id %#x vdev %u len %u a: %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
++	    chunk, (unsigned long long)o, ts, id, vdev, len, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);
++	if (id == 0x72b3u || (len == 8u && tail)) {
++		printf("FUXI WLAN: C10   ^ id %#x len %u%s - candidate assert r0=%#x r1=%#x\n",
++		    id, len, tail ? " run-tail" : "", a[0], a[1]);
++	}
++	if (id == 0x72b2u) {
++		printf("FUXI WLAN: C10   ^ id 72b2 Data20 LACK ROOM: name=%#x need=%u have=%u rIdx=%u wIdx=%u\n",
++		    a[0], a[1], a[2], a[3], a[4]);
++	}
++	for (unsigned k = 0; k < len / 4u && k < 9u; k++) {
++		const char *kind = wl_c10_ptr_kind(a[k]);
++		if (kind) {
++			printf("FUXI WLAN: C10   ^ arg%u %#x -> lx %s%s\n", k, a[k], kind,
++			    (k == 0u && len >= 20u) ? " (len>=20 => candidate LACK ROOM: ptr,need,have,rIdx,wIdx)" : "");
++		}
++	}
++}
 +
 +static void
 +wl_c10_records(const char *where)
 +{
 +	if (wl_fwmem < 2u) { return; }
-+	printf("FUXI WLAN: C10 diag-record parse at %s: MSG_V2 marker 07000000, keep newest %u by ts\n",
-+	    where, WL_C10_TOP);
-+	unsigned n = 0, total = 0, minidx = 0;
-+	uint32_t mints = 0;
++	printf("FUXI WLAN: C10 diag-record parse at %s: MSG_V2 07000000, address order, runs by chaining (no ts rank)\n", where);
++	unsigned nrun = 0, total = 0;
 +	for (unsigned i = 0; i < WL_TARGET_MAX; i++) {
 +		struct wl_dma *d = &wl_target[i];
 +		if (!d->va || !d->size) { continue; }
 +		wl_dma_civac(d);
 +		const uint8_t *b = (const uint8_t *)d->va;
-+		uint64_t sz = d->size;
-+		for (uint64_t o = 0; o + 12u <= sz; o += 4u) {
-+			uint32_t w0; memcpy(&w0, b + o, 4);
-+			if (w0 != 0x07000000u) { continue; }
-+			uint32_t ts, hdr; memcpy(&ts, b + o + 4u, 4); memcpy(&hdr, b + o + 8u, 4);
-+			uint32_t len = hdr & 0xffu, id = hdr >> 16, vdev = (hdr >> 8) & 0xffu;
-+			if (len > 36u || (len & 3u) != 0u || id == 0u) { continue; }
-+			if (o + 12u + (uint64_t)len > sz) { continue; }
-+			total++;
-+			struct wl_c10_rec *r;
-+			if (n < WL_C10_TOP) { r = &wl_c10_top[n++]; }
-+			else if (ts > mints) { r = &wl_c10_top[minidx]; }
-+			else { continue; }
-+			r->ts = ts; r->id = id; r->vdev = vdev; r->len = len; r->chunk = i; r->off = o;
-+			for (unsigned k = 0; k < 9u; k++) { r->a[k] = 0u; }
-+			for (unsigned k = 0; k < len / 4u; k++) { memcpy(&r->a[k], b + o + 12u + 4u * k, 4); }
-+			if (n == WL_C10_TOP) {
-+				mints = wl_c10_top[0].ts; minidx = 0;
-+				for (unsigned k = 1; k < WL_C10_TOP; k++) {
-+					if (wl_c10_top[k].ts < mints) { mints = wl_c10_top[k].ts; minidx = k; }
-+				}
++		uint64_t sz = d->size, o = 0;
++		unsigned cc = 0;
++		while (o + 12u <= sz) {
++			uint32_t id, len;
++			if (!wl_c10_rec_at(b, o, sz, &id, &len)) { o += 4u; continue; }
++			uint64_t start = o;
++			unsigned rc = 0;
++			while (o + 12u <= sz && wl_c10_rec_at(b, o, sz, &id, &len)) {
++				rc++; cc++; total++; o += 12u + (uint64_t)len;
++			}
++			if (nrun < WL_C10_RUNS) {
++				wl_c10_run[nrun].chunk = (uint8_t)i;
++				wl_c10_run[nrun].off = (uint32_t)start;
++				wl_c10_run[nrun].count = rc;
++				nrun++;
 +			}
 +		}
++		printf("FUXI WLAN: C10 chunk %u iova %#llx valid-records %u\n", i, (unsigned long long)d->iova, cc);
 +	}
-+	printf("FUXI WLAN: C10 found %u MSG_V2 record(s); printing newest %u by ts (desc)\n", total, n);
-+	for (unsigned s = 0; s < n; s++) {
-+		unsigned mx = s;
-+		for (unsigned k = s + 1u; k < n; k++) {
-+			if (wl_c10_top[k].ts > wl_c10_top[mx].ts) { mx = k; }
++	printf("FUXI WLAN: C10 total %u record(s) in %u run(s)%s; cap %u (<=cap: all; else first 2 + last 8 per run + specials)\n",
++	    total, nrun, nrun >= WL_C10_RUNS ? " (runs capped)" : "", WL_C10_CAP);
++	int all = total <= WL_C10_CAP;
++	for (unsigned r = 0; r < nrun && r < WL_C10_RUNS; r++) {
++		unsigned i = wl_c10_run[r].chunk, cnt = wl_c10_run[r].count;
++		struct wl_dma *d = &wl_target[i];
++		const uint8_t *b = (const uint8_t *)d->va;
++		uint64_t sz = d->size, start = wl_c10_run[r].off;
++		if (start >= 48u) {
++			uint32_t w[12];
++			for (unsigned k = 0; k < 12u; k++) { memcpy(&w[k], b + start - 48u + 4u * k, 4); }
++			printf("FUXI WLAN: C10 run %u chunk %u +%#llx records %u; 12 words before: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
++			    r, i, (unsigned long long)start, cnt, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11]);
++		} else {
++			printf("FUXI WLAN: C10 run %u chunk %u +%#llx records %u; <48 B into chunk, no pre-dump\n",
++			    r, i, (unsigned long long)start, cnt);
 +		}
-+		if (mx != s) {
-+			struct wl_c10_rec t = wl_c10_top[s]; wl_c10_top[s] = wl_c10_top[mx]; wl_c10_top[mx] = t;
-+		}
-+		struct wl_c10_rec *r = &wl_c10_top[s];
-+		printf("FUXI WLAN: C10 rec %u chunk %u +%#llx ts %u id %#x vdev %u len %u a: %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
-+		    s, r->chunk, (unsigned long long)r->off, r->ts, r->id, r->vdev, r->len,
-+		    r->a[0], r->a[1], r->a[2], r->a[3], r->a[4], r->a[5], r->a[6], r->a[7], r->a[8]);
-+		if (r->len == 8u) {
-+			printf("FUXI WLAN: C10   ^ len 8 (2 args) - candidate assert r0=%#x r1=%#x\n", r->a[0], r->a[1]);
-+		}
-+		for (unsigned k = 0; k < r->len / 4u && k < 9u; k++) {
-+			uint32_t p = r->a[k];
-+			const char *kind =
-+			    (p >= WL_C10_SEG19_LO && p < WL_C10_SEG19_HI) ? "seg19 str (thread name)" :
-+			    (p >= WL_C10_RODATA_LO && p < WL_C10_STR_HI) ? "seg14/15 str" :
-+			    (p >= WL_C10_STR_HI && p < WL_C10_BSS_HI) ? "seg15 bss (RAM var: thread/queue)" :
-+			    (const char *)0;
-+			if (kind) {
-+				printf("FUXI WLAN: C10   ^ arg%u %#x -> lx %s%s\n", k, p, kind,
-+				    (k == 0u && r->len >= 20u) ? " (len>=20 => candidate LACK ROOM: ptr,need,have,rIdx,wIdx)" : "");
++		uint64_t o = start;
++		for (unsigned k = 0; k < cnt && o + 12u <= sz; k++) {
++			uint32_t id, len;
++			if (!wl_c10_rec_at(b, o, sz, &id, &len)) { break; }
++			if (all || k < 2u || k + 8u >= cnt || wl_c10_special(b, o)) {
++				wl_c10_print_rec(b, i, o, k + 1u == cnt);
 +			}
++			o += 12u + (uint64_t)len;
 +		}
 +	}
 +}
