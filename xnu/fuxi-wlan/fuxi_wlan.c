@@ -41,6 +41,8 @@
  *                 /private/var/mobile/Media/fuxi-fwlog.bin on the data volume for offline .msc decode
  *   fuxiwlanfwmem=1  C9: at a W25/W28 crash, scan the REQUEST_MEM host chunks for the assert signature
  *                 (cafecace/014feeb3/496) and print the records around it to the console (default off)
+ *   fuxiwlanfwmem=2  C10: also parse the MSG_V2 diag ring in those chunks and print the newest records
+ *                 (the assert r0/r1 and the LACK ROOM thread/need/have) for offline lx-amss decode
  *   fuxiwlanqrtr=6  W20-W22: W15, then copy engines, HTC and WMI init to WMI READY (needs
  *                 fuxiwlan=28 or 1; not with keep/stop22); any other value outside 0..8 is refused
  *   fuxiwlanqrtr=7  W23/W24: all of 6, then the 38-channel passive list, a station vdev and one
@@ -1419,7 +1421,7 @@ wl_probe_configure(void)
 	wl_fwlog = (unsigned)fwlog;
 	int fwmem = 0;
 	(void)PE_parse_boot_argn("fuxiwlanfwmem", &fwmem, sizeof(fwmem));
-	if (fwmem < 0 || fwmem > 1) { wl_variant_invalid = true; }
+	if (fwmem < 0 || fwmem > 2) { wl_variant_invalid = true; }
 	wl_fwmem = (unsigned)fwmem;
 	wl_w25 = qrtr == 8; /* C3: the W25 scan service replaces the one W23 scan */
 	wl_w23 = qrtr == 7 || wl_w25; /* C2: the W23 passive scan runs on top of W20..W22 */
@@ -5308,7 +5310,8 @@ wl_c9_scan(const char *where)
 					hits++;
 					printf("FUXI WLAN: C9 hit %u chunk %u iova %#llx +%#llx: %08x %08x %08x (line 1174 match %u)\n",
 					    hits, i, (unsigned long long)d->iova, (unsigned long long)o, w0, w1, w2, w2 == 0x00000496u);
-					uint64_t s = o >= 256u ? o - 256u : 0;
+					uint64_t pre = wl_fwmem >= 2u ? 1024u : 256u;   /* C10 (c): wider pre-window before the BHI shadow */
+					uint64_t s = o >= pre ? o - pre : 0;
 					for (uint64_t p = s; p + 32u <= sz && p < o + 288u; p += 32u) {
 						uint32_t v[8]; memcpy(v, b + p, 32);
 						printf("FUXI WLAN: C9 ctx chunk %u +%#llx: %08x %08x %08x %08x %08x %08x %08x %08x\n",
@@ -5333,6 +5336,97 @@ wl_c9_scan(const char *where)
 			uint32_t v[8]; memcpy(v, b + p, 32);
 			printf("FUXI WLAN: C9 tail +%#llx: %08x %08x %08x %08x %08x %08x %08x %08x\n",
 			    (unsigned long long)p, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+		}
+	}
+}
+
+/* C10 (fuxiwlanfwmem=2): parse the firmware's MSG_V2 diag ring in the REQUEST_MEM host chunks.
+ * C9 proved the cafecace/014feeb3/496 triple is only the MHI BHI register shadow (ERRCODE +
+ * ERRDBG1..3), not the cmnos assert frame: no r0/r1, no thread name. The real assert print
+ * (cmnos_thread_patch.c:1174, 2 args r0/r1) and the LACK ROOM warning (c:935, 5 args: thread-name
+ * ptr, need, have, readIdx, writeIdx) are MSG_V2 diag records the firmware DMAs into our chunks
+ * (9/10/5/11/12). A record is [0x07000000][ts][hdr = id<<16 | vdev<<8 | len][len/4 arg words];
+ * len==0 (a no-arg one-liner) is kept too. The format strings are NOT in the firmware (resolved by
+ * msc id off-device); a pointer arg is a runtime %s operand - for LACK ROOM, the thread name. We
+ * walk every chunk, keep the newest WL_C10_TOP records by ts, print them with args, and flag
+ * len==8 (candidate assert r0/r1) and any arg that points into the lx image, tagged by segment:
+ * 0x19e3000..0x1a19000 = seg19 file-backed .rodata, the thread-name strings (WLAN_SCHED0, WLAN_HIF,
+ * ...); 0x14d2000..0x153a76c = seg14/15 .rodata (a few names: WLAN_PMU_TOP/WLAN_PM_ARB); and
+ * 0x153a76c..0x166c620 = seg15 bss, a RAM var (thread/queue struct). The pointer is resolved
+ * against lx-amss off-device. Read only, console only. */
+#define WL_C10_TOP 48u
+#define WL_C10_RODATA_LO 0x014d2000u
+#define WL_C10_STR_HI 0x0153a76cu
+#define WL_C10_BSS_HI 0x0166c620u
+#define WL_C10_SEG19_LO 0x019e3000u
+#define WL_C10_SEG19_HI 0x01a19000u
+struct wl_c10_rec { uint32_t ts, id, vdev, len, chunk; uint64_t off; uint32_t a[9]; };
+static struct wl_c10_rec wl_c10_top[WL_C10_TOP];
+
+static void
+wl_c10_records(const char *where)
+{
+	if (wl_fwmem < 2u) { return; }
+	printf("FUXI WLAN: C10 diag-record parse at %s: MSG_V2 marker 07000000, keep newest %u by ts\n",
+	    where, WL_C10_TOP);
+	unsigned n = 0, total = 0, minidx = 0;
+	uint32_t mints = 0;
+	for (unsigned i = 0; i < WL_TARGET_MAX; i++) {
+		struct wl_dma *d = &wl_target[i];
+		if (!d->va || !d->size) { continue; }
+		wl_dma_civac(d);
+		const uint8_t *b = (const uint8_t *)d->va;
+		uint64_t sz = d->size;
+		for (uint64_t o = 0; o + 12u <= sz; o += 4u) {
+			uint32_t w0; memcpy(&w0, b + o, 4);
+			if (w0 != 0x07000000u) { continue; }
+			uint32_t ts, hdr; memcpy(&ts, b + o + 4u, 4); memcpy(&hdr, b + o + 8u, 4);
+			uint32_t len = hdr & 0xffu, id = hdr >> 16, vdev = (hdr >> 8) & 0xffu;
+			if (len > 36u || (len & 3u) != 0u || id == 0u) { continue; }
+			if (o + 12u + (uint64_t)len > sz) { continue; }
+			total++;
+			struct wl_c10_rec *r;
+			if (n < WL_C10_TOP) { r = &wl_c10_top[n++]; }
+			else if (ts > mints) { r = &wl_c10_top[minidx]; }
+			else { continue; }
+			r->ts = ts; r->id = id; r->vdev = vdev; r->len = len; r->chunk = i; r->off = o;
+			for (unsigned k = 0; k < 9u; k++) { r->a[k] = 0u; }
+			for (unsigned k = 0; k < len / 4u; k++) { memcpy(&r->a[k], b + o + 12u + 4u * k, 4); }
+			if (n == WL_C10_TOP) {
+				mints = wl_c10_top[0].ts; minidx = 0;
+				for (unsigned k = 1; k < WL_C10_TOP; k++) {
+					if (wl_c10_top[k].ts < mints) { mints = wl_c10_top[k].ts; minidx = k; }
+				}
+			}
+		}
+	}
+	printf("FUXI WLAN: C10 found %u MSG_V2 record(s); printing newest %u by ts (desc)\n", total, n);
+	for (unsigned s = 0; s < n; s++) {
+		unsigned mx = s;
+		for (unsigned k = s + 1u; k < n; k++) {
+			if (wl_c10_top[k].ts > wl_c10_top[mx].ts) { mx = k; }
+		}
+		if (mx != s) {
+			struct wl_c10_rec t = wl_c10_top[s]; wl_c10_top[s] = wl_c10_top[mx]; wl_c10_top[mx] = t;
+		}
+		struct wl_c10_rec *r = &wl_c10_top[s];
+		printf("FUXI WLAN: C10 rec %u chunk %u +%#llx ts %u id %#x vdev %u len %u a: %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+		    s, r->chunk, (unsigned long long)r->off, r->ts, r->id, r->vdev, r->len,
+		    r->a[0], r->a[1], r->a[2], r->a[3], r->a[4], r->a[5], r->a[6], r->a[7], r->a[8]);
+		if (r->len == 8u) {
+			printf("FUXI WLAN: C10   ^ len 8 (2 args) - candidate assert r0=%#x r1=%#x\n", r->a[0], r->a[1]);
+		}
+		for (unsigned k = 0; k < r->len / 4u && k < 9u; k++) {
+			uint32_t p = r->a[k];
+			const char *kind =
+			    (p >= WL_C10_SEG19_LO && p < WL_C10_SEG19_HI) ? "seg19 str (thread name)" :
+			    (p >= WL_C10_RODATA_LO && p < WL_C10_STR_HI) ? "seg14/15 str" :
+			    (p >= WL_C10_STR_HI && p < WL_C10_BSS_HI) ? "seg15 bss (RAM var: thread/queue)" :
+			    (const char *)0;
+			if (kind) {
+				printf("FUXI WLAN: C10   ^ arg%u %#x -> lx %s%s\n", k, p, kind,
+				    (k == 0u && r->len >= 20u) ? " (len>=20 => candidate LACK ROOM: ptr,need,have,rIdx,wIdx)" : "");
+			}
 		}
 	}
 }
@@ -7223,6 +7317,7 @@ wl28_crash(const char *where)
 	wl_c8_scan(where);   /* C8: cmnos records + newest event to the console */
 	wl_c8_save();   /* C8: full log to the data volume */
 	wl_c9_scan(where);   /* C9: scan the REQUEST_MEM host chunks for the assert */
+	wl_c10_records(where);   /* C10: parse the MSG_V2 diag ring in those chunks */
 }
 
 /* One monitor status SRING_SETUP through wl_ce_send on the HTT endpoint (CE4,

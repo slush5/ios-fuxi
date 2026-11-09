@@ -176,6 +176,7 @@ static void wl_c8_note(uint32_t id, const uint8_t *payload, uint32_t len);
 static void wl_c8_save(void);
 static void wl_c8_scan(const char *where);
 static void wl_c9_scan(const char *where);
+static void wl_c10_records(const char *where);
 static int wl_smmu_fault(unsigned step);
 static int wl_m6o_msi_undo(void);
 static int wl_m6o_undo(bool contained);
@@ -3000,6 +3001,7 @@ static void wl_c8_note(uint32_t id, const uint8_t *payload, uint32_t len) { (voi
 static void wl_c8_save(void) { }
 static void wl_c8_scan(const char *where) { (void)where; }
 static void wl_c9_scan(const char *where) { (void)where; }
+static void wl_c10_records(const char *where) { (void)where; }
 static int wl_smmu_fault(unsigned step) { (void)step; return 0; }
 static int wl_m6o_msi_undo(void) { return 0; }
 static int wl_m6o_undo(bool contained) { (void)contained; return 0; }
