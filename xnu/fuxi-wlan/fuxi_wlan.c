@@ -6136,7 +6136,8 @@ wl_ce_alloc(void)
 static int
 wl_ce_init_rings(void)
 {
-	wl_ce.msi_on = wl_ce_msi != 0u; wl_ce.thresh_on = wl_ce_thresh != 0u; wl_ce.msi_iova = wl_msi_sink.iova;   /* C-W1 (owner greenlit): from the knobs + the existing MSI sink; 0 when both off */
+	wl_ce.msi_on = wl_ce_msi != 0u && wl_msi_sink.iova != 0u; wl_ce.thresh_on = wl_ce_thresh != 0u; wl_ce.msi_iova = wl_msi_sink.iova;   /* C-W1 (owner greenlit): from the knobs + the existing MSI sink; MSI needs the sink; 0 when both off */
+	if (wl_ce_msi != 0u && wl_msi_sink.iova == 0u) { printf("FUXI WLAN: C-W1 ring MSI1 words skipped: wl_msi_sink.iova 0\n"); }   /* D2: refuse knob-on MSI without the sink */
 	for (unsigned i = 0; i < WLCE_NRING; i++) {
 		struct wlce_ring *r = wl_ce.ring[i];
 		uint32_t base = 0, misc = 0, dctl = 0;
@@ -6153,7 +6154,7 @@ wl_ce_init_rings(void)
 		if (wl_ce.msi_on || wl_ce.thresh_on) {
 			uint32_t m0 = 0, m1 = 0, md = 0, t0 = 0, t1 = 0;
 			bool sts = r->kind == WLCE_STS;
-			if (wl_ce.msi_on) { (void)(wlce_rd(&wl_ce, &wl_ce_io, r->r0 + WLCE_R0_MSI1_BASE_LSB, &m0) ||
+			if (wl_ce.msi_on && (r->r0 - WLCE_REG_BASE) / 0x2000u <= 3u) { (void)(wlce_rd(&wl_ce, &wl_ce_io, r->r0 + WLCE_R0_MSI1_BASE_LSB, &m0) ||
 			    wlce_rd(&wl_ce, &wl_ce_io, r->r0 + WLCE_R0_MSI1_BASE_MSB, &m1) ||
 			    wlce_rd(&wl_ce, &wl_ce_io, r->r0 + WLCE_R0_MSI1_DATA, &md)); }
 			(void)(wlce_rd(&wl_ce, &wl_ce_io, r->r0 + (sts ? WLCE_R0_PROD_INT : WLCE_R0_CONS_IX0), &t0) ||
