@@ -8170,7 +8170,7 @@ wl25_heard(void *ctx, const uint8_t *frame, uint32_t len, uint32_t mhz, int32_t 
 	struct wl25_cached *c;
 	(void)ctx;
 	wl25_tr_heard_n++; wl25_tr_mhz = mhz; wl25_tr_dbm = dbm;   /* W25e: freq and dBm of this frame, for its ring entry */
-	if (wl25_tr_on && wl_fwlog) { printf("FUXI WLAN: C11b mgmt-rx #%u arr %u ms f%u s%d rx_tsf %u hi %u tsf_delta %u\n", wl25_tr_heard_n, wl25_rel_ms(wl25_ns()), mhz, (int)dbm, wl_scan.last_rx_tsf_l32, wl_scan.last_rx_tsf_u32, wl_scan.last_tsf_delta); }   /* C11b observability */
+	if (wl25_tr_on && wl_fwlog) { printf("FUXI WLAN: C11c mgmt-rx #%u arr %u ms f%u s%d local_rx_us %u ts %u tsf_delta %u\n", wl25_tr_heard_n, wl25_rel_ms(wl25_ns()), mhz, (int)dbm, wl_scan.last_rx_local, (unsigned)wl_scan.last_rx_local_ok, wl_scan.last_tsf_delta); }   /* C11c: local rx TSF in us (ts 1 = valid beacon/probe-resp), our clock, next to tsf_delta */
 	if (!wl25_fill) { return; }
 	const int16_t s = (int16_t)(dbm < -128 ? -128 : dbm > 127 ? 127 : dbm), f = (int16_t)(nf < -128 ? -128 : nf > 127 ? 127 : nf);
 	if (len < 22u || len > sizeof(c->frame)) { wl25_cache_lost++; return; }

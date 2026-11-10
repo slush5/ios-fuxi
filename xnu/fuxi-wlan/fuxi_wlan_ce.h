@@ -1793,7 +1793,8 @@ struct wlscan {
 	 * wrong_id and ignored), and who gets every beacon or probe response the table took, during the
 	 * call that has its RX buffer: the frame, its length, the RX MHz, dBm (SNR + noise floor), the floor. */
 	uint32_t want_id, wrong_id;
-	uint32_t last_rx_tsf_l32, last_rx_tsf_u32, last_tsf_delta;   /* C11b observability: firmware RX TSF of the last mgmt frame (mgmt-rx hdr +52/+56/+48), anchor-verified offsets */
+	uint32_t last_rx_tsf_l32, last_rx_tsf_u32, last_tsf_delta, last_rx_local;   /* C11b/c observability: firmware RX TSF (+52/+56/+48; +52/+56 read 0 on c7-00108) and C11c reconstructed local rx TSF */
+	uint8_t last_rx_local_ok;   /* C11c: 1 when local_rx is a real beacon/probe-resp rx time (type 0 subtype 8/5, no HT-control order bit, delta != 0) */
 	void (*heard)(void *ctx, const uint8_t *frame, uint32_t len, uint32_t mhz, int32_t dbm, int32_t nf);
 	void *heard_ctx;
 };
@@ -2027,6 +2028,11 @@ wlscan_parse_mgmt_rx(struct wlscan *s, const uint8_t *p, uint32_t len)
 	uint32_t status = wlce_get32(hdr + 20), chan_freq = wlce_get32(hdr + 64);
 	s->last_rx_tsf_l32 = wlce_get32(hdr + 52); s->last_rx_tsf_u32 = wlce_get32(hdr + 56); s->last_tsf_delta = wlce_get32(hdr + 48);   /* C11b: RX TSF for the arrival-timing log */
 	if (buf_len > flen) { s->drop_bad++; return 0; }
+	bool ts_ok = buf_len >= 32u && (frame[0] & 0x0cu) == 0u &&
+	    (((frame[0] >> 4) & 0xfu) == 8u || ((frame[0] >> 4) & 0xfu) == 5u) &&
+	    !(frame[1] & 0x80u) && s->last_tsf_delta != 0u;   /* C11c: only a beacon (8) or probe response (5), no HT-control order bit, length >= 32, real delta */
+	s->last_rx_local = ts_ok ? wlce_get32(frame + 24) + s->last_tsf_delta : 0u;   /* local rx TSF (us, our clock) = frame timestamp (+24, low 32) + tsf_delta mod 2^32; the AP TSF is never logged */
+	s->last_rx_local_ok = ts_ok;
 	if (status & (WLWMI_RX_ERR_CRC | WLWMI_RX_ERR_DECRYPT | WLWMI_RX_ERR_KEY_CACHE_MISS)) { s->drop_status++; return 0; }
 	if (chan_freq >= WLWMI_MIN_6GHZ_FREQ && chan_freq <= WLWMI_MAX_6GHZ_FREQ) { s->drop_channel++; return 0; }
 	if (channel >= 1u && channel <= 14u) { freq = channel == 14u ? 2484u : 2407u + 5u * channel; }
