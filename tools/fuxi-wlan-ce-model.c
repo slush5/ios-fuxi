@@ -172,6 +172,8 @@ static void wl_c6_rddm(uint32_t ee, uint32_t errdbg2);  /* C6: fuxiwlanvec=rddm 
 static unsigned wl_fwlog;  /* C7: off here */
 static unsigned wl_scan_notify1f, wl_scan_prio1, wl_scan_maxscan;  /* parity knobs: off here */
 static unsigned wl_ce_msi, wl_ce_thresh;  /* C-W1 knobs: off here */
+static unsigned wl_ces;  /* C-S knob: off here */
+static void wl_ces_arm(void) { }  /* C-S 0x4 arms the driver guard, a stub here */
 static void wl_c7_note(uint32_t id, const uint8_t *payload, uint32_t len);
 static void wl_c7_dump(const char *where);
 static void wl_c8_note(uint32_t id, const uint8_t *payload, uint32_t len);

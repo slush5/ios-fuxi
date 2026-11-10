@@ -1244,6 +1244,7 @@ static unsigned wl_fwlog; /* fuxiwlanfwlog=1 (C7): INI enablefwlog 1 and the und
 static unsigned wl_fwmem; /* fuxiwlanfwmem=1 (C9): scan the REQUEST_MEM host chunks for the assert at the crash */
 static unsigned wl_scan_notify1f, wl_scan_prio1, wl_scan_maxscan; /* parity knobs (default 0): START_SCAN notify 0x1f / priority 1 / max_scan_time 20000 */
 static unsigned wl_ce_msi, wl_ce_thresh; /* C-W1 knobs (default 0, owner greenlit): ring MSI words / INT_SETUP thresholds on CE0-CE3 */
+static unsigned wl_ces; /* C-S knob fuxiwlances (default 0): 0x1 STATUS TP write on an empty RX pass, 0x2 RX pass in three phases, 0x4 light guard on poll passes */
 #define WL_TARGET_MAX 52u
 #define WL_TARGET_CAP (64u * 1024u * 1024u)
 static struct wl_dma wl_target[WL_TARGET_MAX];
@@ -1439,6 +1440,10 @@ wl_probe_configure(void)
 	(void)PE_parse_boot_argn("fuxiwlanthresh", &cthr, sizeof(cthr));
 	if (cmsi < 0 || cmsi > 1 || cthr < 0 || cthr > 1) { wl_variant_invalid = true; }
 	wl_ce_msi = (unsigned)cmsi; wl_ce_thresh = (unsigned)cthr;
+	int ces = 0;
+	(void)PE_parse_boot_argn("fuxiwlances", &ces, sizeof(ces));
+	if (ces < 0 || ces > 7) { wl_variant_invalid = true; }
+	wl_ces = (ces < 0 || ces > 7) ? 0u : (unsigned)ces;
 	wl_w25 = qrtr == 8; /* C3: the W25 scan service replaces the one W23 scan */
 	wl_w23 = qrtr == 7 || wl_w25; /* C2: the W23 passive scan runs on top of W20..W22 */
 	wl_w20 = qrtr == 6 || wl_w23; /* W20 runs on top of the whole W11..W15 chain */
@@ -4086,11 +4091,30 @@ wl_w11_mapping(void)
 	return fw_faults ? 1 : 0;
 }
 
+/* C-S bit 0x4 (fuxiwlances, default off): wl_ce_poll calls wl_ces_arm right
+ * before each of its two guard calls. An armed guard call keeps the host-side
+ * checks only (ownership, the fault flag, the host SMMU fault registers) and
+ * returns, except every 200th armed call (one in 100 poll passes), which runs
+ * the full register guard. Every other caller always gets the full guard.
+ * With the bit set, a device state visible only through those register reads
+ * is noticed up to about 100 poll passes later; MHI state events still come
+ * through the event ring on every pass. Knob off: the flag is never set. */
+static bool wl_ces_light;
+static unsigned wl_ces_armed;
+static void wl_ces_arm(void) { wl_ces_light = (wl_ces & 4u) != 0u; }
+
 /* Doorbells are write-only notifications. Read back the shared context/base
  * registers, never require a doorbell to echo the write. High word first. */
 static int
 wl_w11_guard(void)
 {
+	if (wl_ces_light) {   /* C-S 0x4: armed by wl_ce_poll for this one call */
+		wl_ces_light = false;
+		if (++wl_ces_armed % 200u) {
+			if (!wl_enabled || !wl_owned || fw_faults || wl_smmu_fault(0) || fw_faults) { return wl_w11_fail("light guard: ownership, fault flag or SMMU fault"); }
+			return 0;
+		}
+	}
 	uint32_t st = wl_mrd(0x48), ctrl = wl_mrd(0x38);
 	if (!wl_enabled || !wl_owned || fw_faults || st == ~0u ||
 	    ((st >> 8) & 255) != 2 || (st & 4) || (ctrl & 2) ||
@@ -6138,6 +6162,8 @@ wl_ce_init_rings(void)
 {
 	wl_ce.msi_on = wl_ce_msi != 0u && wl_msi_sink.iova != 0u; wl_ce.thresh_on = wl_ce_thresh != 0u; wl_ce.msi_iova = wl_msi_sink.iova;   /* C-W1 (owner greenlit): from the knobs + the existing MSI sink; MSI needs the sink; 0 when both off */
 	if (wl_ce_msi != 0u && wl_msi_sink.iova == 0u) { printf("FUXI WLAN: C-W1 ring MSI1 words skipped: wl_msi_sink.iova 0\n"); }   /* D2: refuse knob-on MSI without the sink */
+	wl_ce.s1_on = (wl_ces & 1u) != 0u; wl_ce.s2_on = (wl_ces & 2u) != 0u; wl_ce.s2_busy = false;   /* C-S knob bits 0x1 / 0x2 (default off) */
+	if (wl_ces != 0u) { printf("FUXI WLAN: C-S ces 0x%x: sts tp on an empty rx pass %u, three-phase rx pass %u, light guard %u\n", wl_ces, wl_ces & 1u, (wl_ces >> 1) & 1u, (wl_ces >> 2) & 1u); }
 	for (unsigned i = 0; i < WLCE_NRING; i++) {
 		struct wlce_ring *r = wl_ce.ring[i];
 		uint32_t base = 0, misc = 0, dctl = 0;
@@ -6379,6 +6405,7 @@ static int
 wl_ce_poll(void)
 {
 	if (wl25_w.on) { wl25_poll_note(); }   /* W25d: inside a window only (qrtr 8) */
+	wl_ces_arm();   /* C-S 0x4 (default off): the guard inside the events pass may run light */
 	if (wl_w11_events()) { wl23_guard_bad = true; return 1; }
 	if (wlce_reap_rx(&wl_ce, &wl_ce_io, &wl_ce.pipe[2], wl_ce_rx, NULL) ||
 	    wlce_reap_rx(&wl_ce, &wl_ce_io, &wl_ce.pipe[1], wl_ce_rx, NULL) ||
@@ -6386,6 +6413,7 @@ wl_ce_poll(void)
 	    wlce_reap_tx(&wl_ce, &wl_ce_io, &wl_ce.pipe[3]) ||
 	    (wl_ce.pipe[4].posted && wlce_reap_tx(&wl_ce, &wl_ce_io, &wl_ce.pipe[4]))) { return wl_ce_fail("CE poll"); }
 	if (wl_rd.reo_on && wl27_poll()) { return 1; }  /* C2d: REO/release rings, buffers back to ring 160 */
+	wl_ces_arm();   /* C-S 0x4 (default off): the guard that ends the pass may run light */
 	if (wl_w11_guard()) { wl23_guard_bad = true; return 1; }
 	return 0;
 }

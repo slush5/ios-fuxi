@@ -227,6 +227,7 @@ struct wlce {
 	const char *why;                /* first failure, a string literal */
 	uint64_t msi_iova;              /* C-W1 knob: the existing MSI sink IOVA the ring MSI words point at */
 	bool msi_on, thresh_on;         /* C-W1 knobs (default off): write ring MSI words / INT_SETUP thresholds on CE0-CE3 */
+	bool s1_on, s2_on, s2_busy;     /* C-S knob (default off): STATUS TP write on an empty RX pass / RX pass in three phases / that pass is running */
 };
 
 static inline uint32_t wlce_get16(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8); }
@@ -489,6 +490,54 @@ wlce_post_rx(struct wlce *ce, const struct wlce_io *io, struct wlce_pipe *p, uin
 
 typedef int (*wlce_rx_fn)(void *ctx, const uint8_t *buf, uint32_t len);
 
+/* C-S bit 0x2 (fuxiwlances, default off): the RX pass in three phases, in
+ * chunks of at most WLCE_S2_CHUNK entries (an RX pipe has at most WLCE_RX_POST
+ * buffers out, so one chunk covers a pass). Phase 1 takes every new STATUS
+ * entry under the checks of the one-phase pass and publishes the STATUS TP
+ * once per message. Phase 2 gives every payload of the chunk to FN, in order
+ * and in place. Phase 3 posts every buffer of the chunk again, one DST HP
+ * publish per buffer. No buffer is posted before its payload was handled.
+ * With bit 0x1 also set one more STATUS TP publish ends the pass. Fail
+ * closed: the first failure ends the pass, and entries already taken in
+ * phase 1 are then not handled. HP is the device pointer the caller read. */
+#define WLCE_S2_CHUNK 64u
+static inline int
+wlce_reap_rx_s2(struct wlce *ce, const struct wlce_io *io, struct wlce_pipe *q, wlce_rx_fn fn, void *ctx, uint32_t hp)
+{
+	struct wlce_ring *sr = &q->sts, *dr = &q->dst;
+	uint32_t s_dw = wlce_size(sr), d_dw = wlce_size(dr), total = 0;
+	int rc = 0;
+	if (ce->s2_busy) { return wlce_fail(ce, "CE RX three-phase pass entered twice"); }
+	ce->s2_busy = true;
+	while (!rc && sr->tp != hp && total < sr->entries) {
+		uint16_t bytes[WLCE_S2_CHUNK];
+		uint32_t first = q->reap_slot, k = 0;
+		while (!rc && k < WLCE_S2_CHUNK && sr->tp != hp && total < sr->entries) {   /* phase 1 */
+			uint32_t word = wlce_word(sr, sr->tp), got = word >> 16;
+			uint64_t addr = ce->base_iova + q->slot0 + (uint64_t)q->reap_slot * q->buf_bytes;
+			if (got == 0u || got > q->buf_bytes) { rc = wlce_fail(ce, "CE STATUS length 0 or above the RX buffer (three-phase)"); break; }
+			if (wlce_word(dr, dr->tp) != (uint32_t)addr || (wlce_word(dr, dr->tp + 1) & 0xffu) != ((uint32_t)(addr >> 32) & 0xffu)) {
+				rc = wlce_fail(ce, "CE DST descriptor changed under the device (three-phase)"); break;
+			}
+			wlce_set_word(sr, sr->tp, word & 0xffffu);
+			sr->tp = (sr->tp + sr->entry_dw) % s_dw;
+			dr->tp = (dr->tp + dr->entry_dw) % d_dw;
+			q->reap_slot = (q->reap_slot + 1) % q->nslots;
+			q->reaped++; total++;
+			bytes[k++] = (uint16_t)got;
+			rc = wlce_publish(ce, io, sr);
+		}
+		for (uint32_t i = 0; !rc && i < k; i++) {   /* phase 2 */
+			const uint8_t *payload = ce->base + q->slot0 + ((first + i) % q->nslots) * q->buf_bytes;
+			if (fn(ctx, payload, bytes[i])) { rc = wlce_fail(ce, "CE RX message rejected by HTC/WMI (three-phase)"); }
+		}
+		for (uint32_t i = 0; !rc && i < k; i++) { rc = wlce_post_rx(ce, io, q, 1u); }   /* phase 3 */
+	}
+	if (!rc && ce->s1_on) { rc = wlce_publish(ce, io, sr); }
+	ce->s2_busy = false;
+	return rc;
+}
+
 /* RX reap (ce.c:410-494): device STATUS HP from rdp; for every new STATUS
  * entry the length is w0 31:16 (0 or above the buffer is an error here; L19
  * warns and drops), the buffer is the next DST entry in posting order, the
@@ -510,6 +559,7 @@ wlce_reap_rx(struct wlce *ce, const struct wlce_io *io, struct wlce_pipe *p, wlc
 	uint32_t avail = wlce_dist(s->tp, hp, ssize);
 	if (avail / s->entry_dw > p->posted - p->reaped) { return wlce_fail(ce, "CE STATUS entries beyond the posted buffers"); }
 	s->seen = hp;
+	if (ce->s2_on) { return wlce_reap_rx_s2(ce, io, p, fn, ctx, hp); }   /* C-S 0x2 (default off) */
 	while (s->tp != hp && n < s->entries) {
 		uint32_t w0 = wlce_word(s, s->tp), len = w0 >> 16;
 		uint64_t want = ce->base_iova + p->slot0 + (uint64_t)p->reap_slot * p->buf_bytes;
@@ -526,6 +576,7 @@ wlce_reap_rx(struct wlce *ce, const struct wlce_io *io, struct wlce_pipe *p, wlc
 		if (fn(ctx, buf, len)) { return wlce_fail(ce, "CE RX message rejected by HTC/WMI"); }
 		if (wlce_post_rx(ce, io, p, 1)) { return 1; }
 	}
+	if (!n && ce->s1_on) { return wlce_publish(ce, io, s); }   /* C-S 0x1 (default off): a STATUS TP write also ends a pass that took nothing */
 	return n ? wlce_publish(ce, io, s) : 0;
 }
 

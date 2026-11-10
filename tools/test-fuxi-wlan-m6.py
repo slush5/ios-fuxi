@@ -140,6 +140,7 @@ static bool PE_parse_boot_argn(const char *name, void *out, int size) {
     if(!strcmp(name,"fuxiwlanmaxscan")) return false; /* parity knob, absent here */
     if(!strcmp(name,"fuxiwlanmsi")) return false; /* C-W1 knob, absent here */
     if(!strcmp(name,"fuxiwlanthresh")) return false; /* C-W1 knob, absent here */
+    if(!strcmp(name,"fuxiwlances")) return false; /* C-S knob, absent here */
     assert(!strcmp(name,"fuxiwlanoldiova"));
     if(old_iova_present) memcpy(out,&old_iova_arg,size);
     return old_iova_present;
