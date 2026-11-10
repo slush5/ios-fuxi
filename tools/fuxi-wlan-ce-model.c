@@ -171,6 +171,7 @@ static void wl_hd_diag(const char *where);  /* HD1: fuxiwlandiag is off here; to
 static void wl_c6_rddm(uint32_t ee, uint32_t errdbg2);  /* C6: fuxiwlanvec=rddm is off here; the crash dump path is outside the W20 block */
 static unsigned wl_fwlog;  /* C7: off here */
 static unsigned wl_scan_notify1f, wl_scan_prio1, wl_scan_maxscan;  /* parity knobs: off here */
+static unsigned wl_ce_msi, wl_ce_thresh;  /* C-W1 knobs: off here */
 static void wl_c7_note(uint32_t id, const uint8_t *payload, uint32_t len);
 static void wl_c7_dump(const char *where);
 static void wl_c8_note(uint32_t id, const uint8_t *payload, uint32_t len);
@@ -3460,9 +3461,9 @@ s_pure(void)
 	/* the header's register set equals the model's, address by address */
 	reset();
 	for (uint32_t off = CE_BASE - 0x1000; off < CE_END + 0x1000; off += 4) {
-		CHECK(wlce_reg_ok(off) == model_reg_ok(off), "wlce_reg_ok differs from the model's register set");
+		CHECK(wlce_reg_ok(off, false) == model_reg_ok(off), "wlce_reg_ok differs from the model's register set");
 	}
-	CHECK(!wlce_reg_ok(CE_BASE + 2) && !wlce_reg_ok(0x01b8a400), "misaligned / CE5 register allowed");
+	CHECK(!wlce_reg_ok(CE_BASE + 2, false) && !wlce_reg_ok(0x01b8a400, false), "misaligned / CE5 register allowed");
 	/* strict TLV iterator */
 	uint8_t b[16] = {0};
 	struct wlwmi_it it;
@@ -4390,7 +4391,7 @@ s_c2c_pure(void)
 		bool r = false, wr = false;
 		for (unsigned i = 0; i < 9; i++) { r |= off == m_pre_addr[i]; }
 		for (unsigned i = 0; i < 8; i++) { wr |= off == m_wbm_waddr[i]; }
-		CHECK(wlrx_wbm_ok(off, false) == r && wlrx_wbm_ok(off, true) == wr && !wlce_reg_ok(off), "WBM allowlist differs from the model's");
+		CHECK(wlrx_wbm_ok(off, false) == r && wlrx_wbm_ok(off, true) == wr && !wlce_reg_ok(off, false), "WBM allowlist differs from the model's");
 	}
 	for (uint32_t off = CE_BASE; off < CE_END; off += 4) { CHECK(!wlrx_wbm_ok(off, false) && !wlrx_wbm_ok(off, true), "WBM allowlist has a CE register"); }
 	CHECK(!wlrx_wbm_ok(M_IDLE_R0 + 2, false) && !wlrx_wbm_ok(0x00a34000u + 0x900u, true) && !wlrx_wbm_ok(0x00a3b020u, true),

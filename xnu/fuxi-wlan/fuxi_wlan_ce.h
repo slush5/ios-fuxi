@@ -130,6 +130,10 @@
 #define WLCE_DEST_CTRL 0xb0u        /* max buffer length 15:0 (hal.h:339) */
 #define WLCE_R2_HP 0x400u
 #define WLCE_STS_R2_HP 0x408u
+#define WLCE_R0_MSI1_BASE_LSB 0x48u      /* C-W1 knob only: ring MSI words (STATUS block = DST + 0x58 + 0x48 = 0xa0) */
+#define WLCE_R0_MSI1_BASE_MSB 0x4cu
+#define WLCE_R0_MSI1_DATA 0x50u
+#define WLCE_MSI1_ENABLE (1u << 8)       /* MSI1_BASE_MSB bit 8 = ring MSI enable (address 39:32 in 7:0) */
 #define WLCE_MISC_LOOPCNT_DIS (1u << 1)  /* host-produced only (hal.h:291, hal.c:1798-1799) */
 #define WLCE_MISC_SRNG_ENABLE (1u << 6)  /* hal.h:295, 320 */
 #define WLCE_RING_SIZE_MAX 0xffffu       /* HAL_CE_*_RING_BASE_MSB_RING_SIZE (hal.h:368-370) */
@@ -221,6 +225,8 @@ struct wlce {
 	bool shadow, stopping;
 	unsigned writes, errors;
 	const char *why;                /* first failure, a string literal */
+	uint64_t msi_iova;              /* C-W1 knob: the existing MSI sink IOVA the ring MSI words point at */
+	bool msi_on, thresh_on;         /* C-W1 knobs (default off): write ring MSI words / INT_SETUP thresholds on CE0-CE3 */
 };
 
 static inline uint32_t wlce_get16(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8); }
@@ -248,7 +254,7 @@ static inline void wlce_set_word(struct wlce_ring *r, uint32_t dw, uint32_t v) {
 /* The only CE registers C1 writes: R0 setup and R2 HP/TP of the 7 rings and
  * DEST_CTRL of CE1/CE2. Anything else is refused before the window moves. */
 static inline bool
-wlce_reg_ok(uint32_t off)
+wlce_reg_ok(uint32_t off, bool msi)
 {
 	static const uint8_t host_r0[] = { WLCE_R0_BASE_LSB, WLCE_R0_BASE_MSB, WLCE_R0_ID, WLCE_R0_MISC,
 		WLCE_R0_TP_ADDR_LSB, WLCE_R0_TP_ADDR_MSB, WLCE_R0_CONS_IX0, WLCE_R0_CONS_IX1 };
@@ -261,9 +267,11 @@ wlce_reg_ok(uint32_t off)
 	if (dst ? ce != 1 && ce != 2 : ce != 0 && ce != 3 && ce != 4) { return false; }
 	if (rel == WLCE_R2_HP || rel == WLCE_R2_HP + 4u) { return true; }
 	for (unsigned i = 0; i < sizeof(host_r0); i++) { if (rel == host_r0[i]) { return true; } }
+	if (msi && ce <= 3u && (rel == WLCE_R0_MSI1_BASE_LSB || rel == WLCE_R0_MSI1_BASE_MSB || rel == WLCE_R0_MSI1_DATA)) { return true; }   /* C-W1: ring MSI words, CE0-CE3 */
 	if (!dst) { return false; }
 	if (rel == WLCE_DEST_CTRL || rel == WLCE_STS_R2_HP || rel == WLCE_STS_R2_HP + 4u) { return true; }
 	for (unsigned i = 0; i < sizeof(sts_r0); i++) { if (rel == WLCE_STS_R0 + sts_r0[i]) { return true; } }
+	if (msi && (rel == WLCE_STS_R0 + WLCE_R0_MSI1_BASE_LSB || rel == WLCE_STS_R0 + WLCE_R0_MSI1_BASE_MSB || rel == WLCE_STS_R0 + WLCE_R0_MSI1_DATA)) { return true; }   /* C-W1: STATUS ring MSI words, CE1/CE2 */
 	return false;
 }
 
@@ -328,7 +336,7 @@ static inline int
 wlce_wr(struct wlce *ce, const struct wlce_io *io, uint32_t off, uint32_t v)
 {
 	if (ce->stopping) { return wlce_fail(ce, "CE stopping: register write refused"); }
-	if (!wlce_reg_ok(off) || io->soc_wr(io->ctx, off, v)) { return wlce_fail(ce, "CE register write refused or failed"); }
+	if (!wlce_reg_ok(off, ce->msi_on) || io->soc_wr(io->ctx, off, v)) { return wlce_fail(ce, "CE register write refused or failed"); }
 	ce->writes++;
 	return 0;
 }
@@ -337,8 +345,17 @@ static inline int
 wlce_rd(struct wlce *ce, const struct wlce_io *io, uint32_t off, uint32_t *v)
 {
 	*v = ~0u;
-	if (!wlce_reg_ok(off) || io->soc_rd(io->ctx, off, v)) { return wlce_fail(ce, "CE register read refused or failed"); }
+	if (!wlce_reg_ok(off, ce->msi_on) || io->soc_rd(io->ctx, off, v)) { return wlce_fail(ce, "CE register read refused or failed"); }
 	return 0;
+}
+
+/* C-W1 knob: the three ring MSI words (target = our sink page, enable bit in MSI1_BASE_MSB, data = 3 + ce). CE0-CE3 only; nothing transmitted. */
+static inline int
+wlce_msi_write(struct wlce *ce, const struct wlce_io *io, const struct wlce_ring *r, uint32_t mdata)
+{
+	return wlce_wr(ce, io, r->r0 + WLCE_R0_MSI1_BASE_LSB, (uint32_t)ce->msi_iova) ||
+	    wlce_wr(ce, io, r->r0 + WLCE_R0_MSI1_BASE_MSB, ((uint32_t)(ce->msi_iova >> 32) & 0xffu) | WLCE_MSI1_ENABLE) ||
+	    wlce_wr(ce, io, r->r0 + WLCE_R0_MSI1_DATA, mdata);
 }
 
 /* Polled ring setup in the L19 order: memory and rdp word zeroed
@@ -360,21 +377,35 @@ wlce_ring_init(struct wlce *ce, const struct wlce_io *io, struct wlce_ring *r)
 	for (uint32_t i = 0; i < size; i++) { wlce_set_word(r, i, 0); }
 	ce->rdp[r->id] = 0;
 	r->hp = r->tp = r->seen = 0;
+	const uint32_t ce_no = (r->r0 - WLCE_REG_BASE) / 0x2000u;
+	const bool ce_int = ce_no <= 3u;   /* C-W1: CE0-CE3 interrupt-enabled; CE4 untouched */
+	const uint32_t mdata = 3u + ce_no;   /* mainline WCN7850 vector base 3 + ce */
+	uint32_t ix0 = 0u, ix1 = 0u, pint = 0u;   /* INT_SETUP words; 0 = today when the thresh knob is off */
+	if (ce->thresh_on && ce_int) {
+		if (r->kind == WLCE_SRC) { ix0 = (0u << 16) | (1u * r->entry_dw); }   /* batch 1, timer 0 */
+		else if (r->kind == WLCE_DST) {
+			uint32_t th = r->entries - 3u < WLCE_RX_POST - 1u ? r->entries - 3u : WLCE_RX_POST - 1u;   /* min(nentries-3, posted-1): 0x7a on CE1 (posted-1) and CE2 (nentries-3) */
+			ix0 = (1024u << 16) | (0u * r->entry_dw);   /* DST buffer: batch 0, timer 1024, source-type unshifted */
+			ix1 = th * r->entry_dw;   /* low-threshold entries x entry words */
+		} else { pint = ((0x1000u >> 3) << 16) | (1u * r->entry_dw); }   /* STATUS: dest-type timer>>3, batch 1 */
+	}
 	if (r->kind != WLCE_STS) {
-		return wlce_wr(ce, io, r->r0 + WLCE_R0_BASE_LSB, lo) ||
+		return (ce->msi_on && ce_int ? wlce_msi_write(ce, io, r, mdata) : 0) ||
+		    wlce_wr(ce, io, r->r0 + WLCE_R0_BASE_LSB, lo) ||
 		    wlce_wr(ce, io, r->r0 + WLCE_R0_BASE_MSB, msb | (size << 8)) ||
 		    wlce_wr(ce, io, r->r0 + WLCE_R0_ID, r->entry_dw) ||
-		    wlce_wr(ce, io, r->r0 + WLCE_R0_CONS_IX0, 0) ||
-		    wlce_wr(ce, io, r->r0 + WLCE_R0_CONS_IX1, 0) ||
+		    wlce_wr(ce, io, r->r0 + WLCE_R0_CONS_IX0, ix0) ||
+		    wlce_wr(ce, io, r->r0 + WLCE_R0_CONS_IX1, ix1) ||
 		    wlce_wr(ce, io, r->r0 + WLCE_R0_TP_ADDR_LSB, (uint32_t)ptr) ||
 		    wlce_wr(ce, io, r->r0 + WLCE_R0_TP_ADDR_MSB, (uint32_t)(ptr >> 32)) ||
 		    wlce_wr(ce, io, r->r2, 0) || wlce_wr(ce, io, r->r2 + 4u, 0) ||
 		    wlce_wr(ce, io, r->r0 + WLCE_R0_MISC, WLCE_MISC_LOOPCNT_DIS | WLCE_MISC_SRNG_ENABLE);
 	}
-	return wlce_wr(ce, io, r->r0 + WLCE_R0_BASE_LSB, lo) ||
+	return (ce->msi_on && ce_int ? wlce_msi_write(ce, io, r, mdata) : 0) ||
+	    wlce_wr(ce, io, r->r0 + WLCE_R0_BASE_LSB, lo) ||
 	    wlce_wr(ce, io, r->r0 + WLCE_R0_BASE_MSB, msb | (size << 8)) ||
 	    wlce_wr(ce, io, r->r0 + WLCE_R0_ID, ((uint32_t)r->id << 8) | r->entry_dw) ||
-	    wlce_wr(ce, io, r->r0 + WLCE_R0_PROD_INT, 0) ||
+	    wlce_wr(ce, io, r->r0 + WLCE_R0_PROD_INT, pint) ||
 	    wlce_wr(ce, io, r->r0 + WLCE_R0_HP_ADDR_LSB, (uint32_t)ptr) ||
 	    wlce_wr(ce, io, r->r0 + WLCE_R0_HP_ADDR_MSB, (uint32_t)(ptr >> 32)) ||
 	    wlce_wr(ce, io, r->r2, 0) || wlce_wr(ce, io, r->r2 + 4u, 0) ||

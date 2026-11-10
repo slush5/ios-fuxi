@@ -207,9 +207,14 @@ def static_checks():
     assert re.findall(r'\bwl_mwr\(([^,]+),', block) == ['0x310c', 'off'], re.findall(r'\bwl_mwr\(([^,]+),', block)
     assert re.findall(r'\bwl_contain_wr\(([^,]+),', block) == ['WL_BAR0 + 0x310c']
     code = re.sub(r'/\*.*?\*/', '', block, flags=re.S)
-    for forbidden in ('wl_soc_write', 'rh_send', 'wl_m6o_write', 'wl_rails_on', 'wl17_', 'wl_mwr64', 'msi', 'MSI', 'wl_pwr64'):
+    for forbidden in ('wl_soc_write', 'rh_send', 'wl_m6o_write', 'wl_rails_on', 'wl17_', 'wl_mwr64', 'wl_pwr64'):
         assert forbidden not in code, forbidden
-    assert 'if (fw_faults || !wlce_reg_ok(off)) { return 1; }' in block
+    # W20 is MSI-free except the default-off C-W1 ring-MSI knob (wl_ce.msi_on gated): every msi line must be a knob line
+    # (msi_on / msi_iova / MSI1 / msi1), so no cap/m6o MSI, no stray MSI, slips into the bring-up.
+    for _l in code.splitlines():
+        if 'msi' in _l.lower():
+            assert 'msi_on' in _l or 'msi_iova' in _l or 'MSI1' in _l or 'msi1' in _l, _l
+    assert 'if (fw_faults || !wlce_reg_ok(off, wl_ce.msi_on)) { return 1; }' in block
     assert 'off < WLCE_SHADOW_BASE || off >= WLCE_SHADOW_BASE + 4u * WLCE_SHADOW_REGS' in block
     # The pure header stays pure: no includes, no allocation, no XNU calls, the Clear BSD text.
     assert '#include' not in HEADER and 'kalloc' not in HEADER and 'printf' not in HEADER and 'malloc' not in HEADER

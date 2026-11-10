@@ -1243,6 +1243,7 @@ static bool wl13_contig; /* fuxiwlanmem=1 (C4): no W13 decline, the first REQUES
 static unsigned wl_fwlog; /* fuxiwlanfwlog=1 (C7): INI enablefwlog 1 and the undecoded-event ring */
 static unsigned wl_fwmem; /* fuxiwlanfwmem=1 (C9): scan the REQUEST_MEM host chunks for the assert at the crash */
 static unsigned wl_scan_notify1f, wl_scan_prio1, wl_scan_maxscan; /* parity knobs (default 0): START_SCAN notify 0x1f / priority 1 / max_scan_time 20000 */
+static unsigned wl_ce_msi, wl_ce_thresh; /* C-W1 knobs (default 0, owner greenlit): ring MSI words / INT_SETUP thresholds on CE0-CE3 */
 #define WL_TARGET_MAX 52u
 #define WL_TARGET_CAP (64u * 1024u * 1024u)
 static struct wl_dma wl_target[WL_TARGET_MAX];
@@ -1433,6 +1434,11 @@ wl_probe_configure(void)
 	(void)PE_parse_boot_argn("fuxiwlanmaxscan", &smaxsc, sizeof(smaxsc));
 	if (snotify < 0 || snotify > 1 || sprio < 0 || sprio > 1 || smaxsc < 0 || smaxsc > 1) { wl_variant_invalid = true; }
 	wl_scan_notify1f = (unsigned)snotify; wl_scan_prio1 = (unsigned)sprio; wl_scan_maxscan = (unsigned)smaxsc;
+	int cmsi = 0, cthr = 0;
+	(void)PE_parse_boot_argn("fuxiwlanmsi", &cmsi, sizeof(cmsi));
+	(void)PE_parse_boot_argn("fuxiwlanthresh", &cthr, sizeof(cthr));
+	if (cmsi < 0 || cmsi > 1 || cthr < 0 || cthr > 1) { wl_variant_invalid = true; }
+	wl_ce_msi = (unsigned)cmsi; wl_ce_thresh = (unsigned)cthr;
 	wl_w25 = qrtr == 8; /* C3: the W25 scan service replaces the one W23 scan */
 	wl_w23 = qrtr == 7 || wl_w25; /* C2: the W23 passive scan runs on top of W20..W22 */
 	wl_w20 = qrtr == 6 || wl_w23; /* W20 runs on top of the whole W11..W15 chain */
@@ -6010,7 +6016,7 @@ wl_win(uint32_t off, bool wr, uint32_t *value)
 static int
 wl_ce_window(uint32_t off, bool wr, uint32_t *value)
 {
-	if (fw_faults || !wlce_reg_ok(off)) { return 1; }
+	if (fw_faults || !wlce_reg_ok(off, wl_ce.msi_on)) { return 1; }
 	return wl_win(off, wr, value);
 }
 
@@ -6130,6 +6136,7 @@ wl_ce_alloc(void)
 static int
 wl_ce_init_rings(void)
 {
+	wl_ce.msi_on = wl_ce_msi != 0u; wl_ce.thresh_on = wl_ce_thresh != 0u; wl_ce.msi_iova = wl_msi_sink.iova;   /* C-W1 (owner greenlit): from the knobs + the existing MSI sink; 0 when both off */
 	for (unsigned i = 0; i < WLCE_NRING; i++) {
 		struct wlce_ring *r = wl_ce.ring[i];
 		uint32_t base = 0, misc = 0, dctl = 0;
@@ -6143,6 +6150,17 @@ wl_ce_init_rings(void)
 		printf("FUXI WLAN: W20 ce ring %u entries %u base %#x misc %#x", r->id, r->entries, base, misc);
 		if (r->kind == WLCE_DST) { printf(" dest-ctrl %#x", dctl); }
 		printf(" readback ok\n");
+		if (wl_ce.msi_on || wl_ce.thresh_on) {
+			uint32_t m0 = 0, m1 = 0, md = 0, t0 = 0, t1 = 0;
+			bool sts = r->kind == WLCE_STS;
+			if (wl_ce.msi_on) { (void)(wlce_rd(&wl_ce, &wl_ce_io, r->r0 + WLCE_R0_MSI1_BASE_LSB, &m0) ||
+			    wlce_rd(&wl_ce, &wl_ce_io, r->r0 + WLCE_R0_MSI1_BASE_MSB, &m1) ||
+			    wlce_rd(&wl_ce, &wl_ce_io, r->r0 + WLCE_R0_MSI1_DATA, &md)); }
+			(void)(wlce_rd(&wl_ce, &wl_ce_io, r->r0 + (sts ? WLCE_R0_PROD_INT : WLCE_R0_CONS_IX0), &t0) ||
+			    (sts ? 0 : wlce_rd(&wl_ce, &wl_ce_io, r->r0 + WLCE_R0_CONS_IX1, &t1)));
+			printf("FUXI WLAN: C-W1 ring %u ce %u msi1 %08x:%08x data %#x %s %#x ix1 %#x\n", r->id,
+			    (r->r0 - WLCE_REG_BASE) / 0x2000u, m1, m0, md, sts ? "prod_int" : "ix0", t0, t1);
+		}
 	}
 	printf("FUXI WLAN: W20 ce init ok rings %u writes %u window restore checked\n", WLCE_NRING, wl_ce.writes);
 	return wl_w11_guard();
