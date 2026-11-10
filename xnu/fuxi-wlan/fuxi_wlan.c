@@ -43,6 +43,9 @@
  *                 (cafecace/014feeb3/496) and print the records around it to the console (default off)
  *   fuxiwlanfwmem=2  C10: also parse the MSG_V2 diag ring in those chunks and print the newest records
  *                 (the assert r0/r1 and the LACK ROOM thread/need/have) for offline lx-amss decode
+ *   fuxiwlannotify=1 parity: START_SCAN notify mask 0x1f (from 0x5f), test if extra scan events matter
+ *   fuxiwlanprio=1   parity: START_SCAN priority 1 (v6.12; our 0 already = current mainline)
+ *   fuxiwlanmaxscan=1 parity: wire max_scan_time 20000 (host wait unchanged); all three default off
  *   fuxiwlanqrtr=6  W20-W22: W15, then copy engines, HTC and WMI init to WMI READY (needs
  *                 fuxiwlan=28 or 1; not with keep/stop22); any other value outside 0..8 is refused
  *   fuxiwlanqrtr=7  W23/W24: all of 6, then the 38-channel passive list, a station vdev and one
@@ -1239,6 +1242,7 @@ wl17_scan(const uint8_t *seg, uint64_t size, unsigned max, wl17_emit emit)
 static bool wl13_contig; /* fuxiwlanmem=1 (C4): no W13 decline, the first REQUEST_MEM is served as asked */
 static unsigned wl_fwlog; /* fuxiwlanfwlog=1 (C7): INI enablefwlog 1 and the undecoded-event ring */
 static unsigned wl_fwmem; /* fuxiwlanfwmem=1 (C9): scan the REQUEST_MEM host chunks for the assert at the crash */
+static unsigned wl_scan_notify1f, wl_scan_prio1, wl_scan_maxscan; /* parity knobs (default 0): START_SCAN notify 0x1f / priority 1 / max_scan_time 20000 */
 #define WL_TARGET_MAX 52u
 #define WL_TARGET_CAP (64u * 1024u * 1024u)
 static struct wl_dma wl_target[WL_TARGET_MAX];
@@ -1423,6 +1427,12 @@ wl_probe_configure(void)
 	(void)PE_parse_boot_argn("fuxiwlanfwmem", &fwmem, sizeof(fwmem));
 	if (fwmem < 0 || fwmem > 2) { wl_variant_invalid = true; }
 	wl_fwmem = (unsigned)fwmem;
+	int snotify = 0, sprio = 0, smaxsc = 0;
+	(void)PE_parse_boot_argn("fuxiwlannotify", &snotify, sizeof(snotify));
+	(void)PE_parse_boot_argn("fuxiwlanprio", &sprio, sizeof(sprio));
+	(void)PE_parse_boot_argn("fuxiwlanmaxscan", &smaxsc, sizeof(smaxsc));
+	if (snotify < 0 || snotify > 1 || sprio < 0 || sprio > 1 || smaxsc < 0 || smaxsc > 1) { wl_variant_invalid = true; }
+	wl_scan_notify1f = (unsigned)snotify; wl_scan_prio1 = (unsigned)sprio; wl_scan_maxscan = (unsigned)smaxsc;
 	wl_w25 = qrtr == 8; /* C3: the W25 scan service replaces the one W23 scan */
 	wl_w23 = qrtr == 7 || wl_w25; /* C2: the W23 passive scan runs on top of W20..W22 */
 	wl_w20 = qrtr == 6 || wl_w23; /* W20 runs on top of the whole W11..W15 chain */
@@ -5552,7 +5562,7 @@ wl_c10_records(const char *where)
 			}
 			/* (b) tail: words between the last record and the 0x600 slot end, to catch a half-written record */
 			if (bstart) {
-				uint64_t slot_end = start + WL_C10_SLOT;
+				uint64_t slot_end = start + WL_C10_SLOT - 0x30u;   /* C11 fix: the first record sits 0x30 into the slot */
 				if (slot_end > sz) { slot_end = sz; }
 				unsigned tw = 0;
 				for (uint64_t q = p; q + 4u <= slot_end && tw < WL_C10_TAIL_MAX; q += 4u, tw++) {
@@ -8631,13 +8641,16 @@ wl25_scan(const struct fuxi_wifi_radio_request *rq, uint32_t nlist)
 	wl25_other_id = 0;
 	for (unsigned part = 0; part < parts; part++) {
 		const uint32_t off = part || !n24 ? n24 : 0u, cnt = part || !n24 ? n - n24 : n24, max_ms = cnt * dwell * 3u / 2u;
+		const uint32_t wire_max = wl_scan_maxscan ? 20000u : max_ms;   /* parity: fuxiwlanmaxscan=1 -> wire max_scan_time 20000, host wait stays on max_ms */
 		const uint32_t id = WLSCAN_ID_FIRST + wl25_sent % (WLSCAN_ID_LAST - WLSCAN_ID_FIRST + 1u);
 		uint64_t t0, t;
 		/* the 2.4 GHz part ended with COMPLETED: a cancel since then ends the request here, nothing in flight */
 		if (part && wl25_rq_cancelled(rq)) { status = ECANCELED; how = "cancelled before the 5 GHz part"; break; }
-		if (wlwmi_encode_start_scan_list(mhz + off, cnt, id, dwell, max_ms, cmd, sizeof(cmd), &len)) {
+		if (wlwmi_encode_start_scan_list(mhz + off, cnt, id, dwell, wire_max, cmd, sizeof(cmd), &len)) {
 			return wl_w11_fail("W25 START_SCAN encode bounds");
 		}
+		if (wl_scan_notify1f) { wlce_put32(cmd + 4u + 4u * WLWMI_SS_NOTIFY, 0x1fu); }   /* parity: notify 0x1f */
+		if (wl_scan_prio1) { wlce_put32(cmd + 4u + 4u * WLWMI_SS_PRIORITY, 1u); }   /* parity: scan priority 1 */
 		wl25_sent++;
 		ids[part] = id;
 		if (part) { wlscan_rearm(&wl_scan); }  /* the 2.4 GHz part is over; counters and the BSS table stay */
