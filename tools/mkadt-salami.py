@@ -92,6 +92,7 @@ WLAN_KNOBS = {
     'fuxiwlandw': 'i', 'fuxiwlanpar': 'i',
     'fuxiwlanad': 'i',
     'fuxiwlancyc': 'i', 'fuxiwlancr': 'i', 'fuxiwlanpft': 'i', 'fuxiwlanpcie': 'i',
+    'fuxiwlanjoin': 'i', 'fuxiwlantx': 'i', 'fuxiwlancc': 'i',
     'fuxiwlanmlo': 'i', 'fuxiwlanw15': 'i', 'fuxiwlanw16': 'i', 'fuxiwlanw20': 'i', 'fuxiwlanw29': 'i', 'fuxiwlanvrx': 'i', 'fuxiwlandiag': 'i', 'fuxiwlanch': 'i',
     'fuxiwlanstop22': 'i', 'fuxiwlankeep': 'i', 'fuxiwlanicc': 'i', 'fuxiwlaniccbw': 'i', 'fuxiwlanaspm': 'i',
     'fuxiwlanoldiova': 'i', 'fuxiwlanclk': 'i', 'fuxiwlaniboff': 'i',

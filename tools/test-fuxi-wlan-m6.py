@@ -148,6 +148,9 @@ static bool PE_parse_boot_argn(const char *name, void *out, int size) {
     if(!strcmp(name,"fuxiwlancr")) return false; /* C-H knob, absent here */
     if(!strcmp(name,"fuxiwlanpft")) return false; /* C-H knob, absent here */
     if(!strcmp(name,"fuxiwlanpcie")) return false; /* C-H knob, absent here */
+    if(!strcmp(name,"fuxiwlanjoin")) return false; /* J knob, absent here */
+    if(!strcmp(name,"fuxiwlantx")) return false; /* J knob, absent here */
+    if(!strcmp(name,"fuxiwlancc")) return false; /* J knob, absent here */
     assert(!strcmp(name,"fuxiwlanoldiova"));
     if(old_iova_present) memcpy(out,&old_iova_arg,size);
     return old_iova_present;

@@ -1248,6 +1248,41 @@ static unsigned wl_ces; /* C-S knob fuxiwlances (default 0): 0x1 STATUS TP write
 static unsigned wl_dw, wl_par; /* C-P knobs (default 0): fuxiwlandw one passive dwell 50..200 ms for every scan request; fuxiwlanpar bits 0x1 BEI on the IPCR data TREs, 0x2 event ring contexts msivec 1 / 2 and ring 1 moderation 1 ms, 0x4 MHI ctrl/data limit registers at 36 bits, 0x8 INIT flags2 as the BSD reference host builds it */
 static unsigned wl_adw; /* C-D knob fuxiwlanad (default 0): 0x1 one WMI SCAN_ADAPTIVE_DWELL_CONFIG (0x3007) with enable 0 and no parameter element, after the vdev setup and before the first START_SCAN; 0x2 dwell mode STATIC (scan_ctrl_flags bits 23:21 = 4) in every W25 scan request; PASSIVE stays forced */
 static unsigned wl_cyc, wl_cr, wl_pft, wl_pcie; /* C-H knobs (default 0), reference host differences: fuxiwlancyc 0x1 WLAN_EN low 150 ms and high 60 ms in the power cycle, 0x2 100 ms before PERST high; fuxiwlancr N asks RECV_ALLOC N for the WMI service in place of all READY credits; fuxiwlanpft 1 sets the CE1 / CE2 destination ring consumer prefetch timer (R0 + 0x40, bits 2:0) to 1 after ring setup; fuxiwlanpcie 1 prints the endpoint PCIe capability words, read only */
+static unsigned wl_join; /* J knob fuxiwlanjoin (default 0): the join rung. 0 none; 1 the regulatory rung (set the current country, read the channel list event; nothing goes on the air). Rung 1 has no code yet: an accepted fuxiwlanjoin=1 changes nothing but the J knobs line. Higher rungs are refused in this build. */
+static uint32_t wl_cc; /* J knob fuxiwlancc (default 0): the country of the join rung as the WMI alpha2 word, first letter in bits 7:0 ("IL" = 0x4c49 = 19529). Every nonzero fuxiwlanjoin needs it. */
+/* J knobs (begin): pure, no I/O; tools/test-fuxi-wlan-join.py compiles exactly this region. */
+#define WL_JOIN_MAX 1 /* the highest join rung this build accepts */
+static bool
+wl_join_cc_ok(uint32_t cc)
+{
+	uint32_t a = cc & 0xffu, b = (cc >> 8) & 0xffu;
+	return (cc >> 16) == 0 && a >= 'A' && a <= 'Z' && b >= 'A' && b <= 'Z';
+}
+/*
+ * The gate of the three J knobs together. fuxiwlantx is the knob the first
+ * transmitting rung will get; this build refuses it at every value but 0 and
+ * has no variable that could hold an accepted one. A join rung needs the
+ * passive scan path under it (fuxiwlanqrtr 7 or 8), no fuxiwlankeep, and a
+ * country of two capital letters; a country with no join rung is refused as
+ * well. On refusal both outputs are 0, so nothing downstream can act on a
+ * half accepted set.
+ */
+static bool
+wl_join_knobs(int join, int tx, int cc, int qrtr, int keep, unsigned *join_out, uint32_t *cc_out)
+{
+	*join_out = 0;
+	*cc_out = 0;
+	if (tx != 0) { return false; }
+	if (join < 0 || join > WL_JOIN_MAX) { return false; }
+	if (join == 0) { return cc == 0; }
+	if (qrtr != 7 && qrtr != 8) { return false; }
+	if (keep != 0) { return false; }
+	if (cc <= 0 || !wl_join_cc_ok((uint32_t)cc)) { return false; }
+	*join_out = (unsigned)join;
+	*cc_out = (uint32_t)cc;
+	return true;
+}
+/* J knobs (end) */
 #define WL_TARGET_MAX 52u
 #define WL_TARGET_CAP (64u * 1024u * 1024u)
 static struct wl_dma wl_target[WL_TARGET_MAX];
@@ -1468,6 +1503,12 @@ wl_probe_configure(void)
 	wl_pft = (cpf < 0 || cpf > 1) ? 0u : (unsigned)cpf;
 	wl_pcie = (cpc < 0 || cpc > 1) ? 0u : (unsigned)cpc;
 	if (wl_cyc || wl_cr || wl_pft || wl_pcie) { printf("FUXI WLAN: C-H knobs: cyc 0x%x cr %u pft %u pcie %u\n", wl_cyc, wl_cr, wl_pft, wl_pcie); }
+	int jjn = 0, jtx = 0, jcc = 0;
+	(void)PE_parse_boot_argn("fuxiwlanjoin", &jjn, sizeof(jjn));
+	(void)PE_parse_boot_argn("fuxiwlantx", &jtx, sizeof(jtx));
+	(void)PE_parse_boot_argn("fuxiwlancc", &jcc, sizeof(jcc));
+	if (!wl_join_knobs(jjn, jtx, jcc, qrtr, keep, &wl_join, &wl_cc)) { wl_variant_invalid = true; }
+	if (jjn || jtx || jcc) { printf("FUXI WLAN: J knobs: join %d tx %d cc 0x%x, accepted join %u cc 0x%x (any nonzero tx is refused in this build) valid %u\n", jjn, jtx, (unsigned)jcc, wl_join, (unsigned)wl_cc, !wl_variant_invalid); }
 	wl_w25 = qrtr == 8; /* C3: the W25 scan service replaces the one W23 scan */
 	wl_w23 = qrtr == 7 || wl_w25; /* C2: the W23 passive scan runs on top of W20..W22 */
 	wl_w20 = qrtr == 6 || wl_w23; /* W20 runs on top of the whole W11..W15 chain */
