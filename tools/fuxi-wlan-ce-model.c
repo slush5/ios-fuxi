@@ -175,6 +175,7 @@ static unsigned wl_ce_msi, wl_ce_thresh;  /* C-W1 knobs: off here */
 static unsigned wl_ces;  /* C-S knob: off here */
 static unsigned wl_dw, wl_par;  /* C-P knobs: off here */
 static unsigned wl_adw;  /* C-D knob: off here */
+static unsigned wl_cr, wl_pft, wl_pcie;  /* C-H knobs: off here */
 static void wl_ces_arm(void) { }  /* C-S 0x4 arms the driver guard, a stub here */
 static void wl_c7_note(uint32_t id, const uint8_t *payload, uint32_t len);
 static void wl_c7_dump(const char *where);

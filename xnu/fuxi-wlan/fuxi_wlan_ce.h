@@ -128,6 +128,7 @@
 #define WLCE_R0_PROD_INT 0x24u
 #define WLCE_STS_R0 0x58u
 #define WLCE_DEST_CTRL 0xb0u        /* max buffer length 15:0 (hal.h:339) */
+#define WLCE_R0_PFT 0x40u           /* DST ring consumer prefetch timer, bits 2:0 (C-H knob fuxiwlanpft) */
 #define WLCE_R2_HP 0x400u
 #define WLCE_STS_R2_HP 0x408u
 #define WLCE_R0_MSI1_BASE_LSB 0x48u      /* C-W1 knob only: ring MSI words (STATUS block = DST + 0x58 + 0x48 = 0xa0) */
@@ -254,6 +255,10 @@ static inline void wlce_set_word(struct wlce_ring *r, uint32_t dw, uint32_t v) {
 
 /* The only CE registers C1 writes: R0 setup and R2 HP/TP of the 7 rings and
  * DEST_CTRL of CE1/CE2. Anything else is refused before the window moves. */
+/* C-H: false unless the driver runs the fuxiwlanpft=1 step; then R0 + 0x40 of
+ * the CE1 / CE2 destination blocks is one more allowed register. */
+static bool wlce_pft_allow;
+
 static inline bool
 wlce_reg_ok(uint32_t off, bool msi)
 {
@@ -270,6 +275,7 @@ wlce_reg_ok(uint32_t off, bool msi)
 	for (unsigned i = 0; i < sizeof(host_r0); i++) { if (rel == host_r0[i]) { return true; } }
 	if (msi && ce <= 3u && (rel == WLCE_R0_MSI1_BASE_LSB || rel == WLCE_R0_MSI1_BASE_MSB || rel == WLCE_R0_MSI1_DATA)) { return true; }   /* C-W1: ring MSI words, CE0-CE3 */
 	if (!dst) { return false; }
+	if (wlce_pft_allow && rel == WLCE_R0_PFT) { return true; }
 	if (rel == WLCE_DEST_CTRL || rel == WLCE_STS_R2_HP || rel == WLCE_STS_R2_HP + 4u) { return true; }
 	for (unsigned i = 0; i < sizeof(sts_r0); i++) { if (rel == WLCE_STS_R0 + sts_r0[i]) { return true; } }
 	if (msi && (rel == WLCE_STS_R0 + WLCE_R0_MSI1_BASE_LSB || rel == WLCE_STS_R0 + WLCE_R0_MSI1_BASE_MSB || rel == WLCE_STS_R0 + WLCE_R0_MSI1_DATA)) { return true; }   /* C-W1: STATUS ring MSI words, CE1/CE2 */

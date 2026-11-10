@@ -1247,6 +1247,7 @@ static unsigned wl_ce_msi, wl_ce_thresh; /* C-W1 knobs (default 0, owner greenli
 static unsigned wl_ces; /* C-S knob fuxiwlances (default 0): 0x1 STATUS TP write on an empty RX pass, 0x2 RX pass in three phases, 0x4 light guard on poll passes */
 static unsigned wl_dw, wl_par; /* C-P knobs (default 0): fuxiwlandw one passive dwell 50..200 ms for every scan request; fuxiwlanpar bits 0x1 BEI on the IPCR data TREs, 0x2 event ring contexts msivec 1 / 2 and ring 1 moderation 1 ms, 0x4 MHI ctrl/data limit registers at 36 bits, 0x8 INIT flags2 as the BSD reference host builds it */
 static unsigned wl_adw; /* C-D knob fuxiwlanad (default 0): 0x1 one WMI SCAN_ADAPTIVE_DWELL_CONFIG (0x3007) with enable 0 and no parameter element, after the vdev setup and before the first START_SCAN; 0x2 dwell mode STATIC (scan_ctrl_flags bits 23:21 = 4) in every W25 scan request; PASSIVE stays forced */
+static unsigned wl_cyc, wl_cr, wl_pft, wl_pcie; /* C-H knobs (default 0), reference host differences: fuxiwlancyc 0x1 WLAN_EN low 150 ms and high 60 ms in the power cycle, 0x2 100 ms before PERST high; fuxiwlancr N asks RECV_ALLOC N for the WMI service in place of all READY credits; fuxiwlanpft 1 sets the CE1 / CE2 destination ring consumer prefetch timer (R0 + 0x40, bits 2:0) to 1 after ring setup; fuxiwlanpcie 1 prints the endpoint PCIe capability words, read only */
 #define WL_TARGET_MAX 52u
 #define WL_TARGET_CAP (64u * 1024u * 1024u)
 static struct wl_dma wl_target[WL_TARGET_MAX];
@@ -1456,6 +1457,17 @@ wl_probe_configure(void)
 	(void)PE_parse_boot_argn("fuxiwlanad", &cad, sizeof(cad));
 	if (cad < 0 || cad > 3) { wl_variant_invalid = true; }
 	wl_adw = (cad < 0 || cad > 3) ? 0u : (unsigned)cad;
+	int ccy = 0, ccr = 0, cpf = 0, cpc = 0;
+	(void)PE_parse_boot_argn("fuxiwlancyc", &ccy, sizeof(ccy));
+	(void)PE_parse_boot_argn("fuxiwlancr", &ccr, sizeof(ccr));
+	(void)PE_parse_boot_argn("fuxiwlanpft", &cpf, sizeof(cpf));
+	(void)PE_parse_boot_argn("fuxiwlanpcie", &cpc, sizeof(cpc));
+	if (ccy < 0 || ccy > 3 || ccr < 0 || ccr > 255 || cpf < 0 || cpf > 1 || cpc < 0 || cpc > 1) { wl_variant_invalid = true; }
+	wl_cyc = (ccy < 0 || ccy > 3) ? 0u : (unsigned)ccy;
+	wl_cr = (ccr < 0 || ccr > 255) ? 0u : (unsigned)ccr;
+	wl_pft = (cpf < 0 || cpf > 1) ? 0u : (unsigned)cpf;
+	wl_pcie = (cpc < 0 || cpc > 1) ? 0u : (unsigned)cpc;
+	if (wl_cyc || wl_cr || wl_pft || wl_pcie) { printf("FUXI WLAN: C-H knobs: cyc 0x%x cr %u pft %u pcie %u\n", wl_cyc, wl_cr, wl_pft, wl_pcie); }
 	wl_w25 = qrtr == 8; /* C3: the W25 scan service replaces the one W23 scan */
 	wl_w23 = qrtr == 7 || wl_w25; /* C2: the W23 passive scan runs on top of W20..W22 */
 	wl_w20 = qrtr == 6 || wl_w23; /* W20 runs on top of the whole W11..W15 chain */
@@ -3508,6 +3520,7 @@ wl_m6q_resume(void)
 	wl_dbi_ready = true;
 	printf("FUXI WLAN: M6q cycle begin PHY-ready EP latency 10 ms, PERST held low\n");
 	wl_sleep(10); /* X ep-latency, K enable after PHY ready */
+	if (wl_cyc & 2u) { printf("FUXI WLAN: C-H cyc 0x2: 90 ms more before PERST high (100 ms in all)\n"); wl_sleep(90); }
 	if (wl_m6o_host(10) ||
 	    wl_m6o_write("cycle PERST high", TS_TLMM+0x1000ull*94+4, 2, 2)) { goto out; }
 	printf("FUXI WLAN: M6o cycle begin PERST high dwell 1 ms\n");
@@ -3556,11 +3569,13 @@ wl_m6o_cycle(void)
 		printf("FUXI WLAN: M6o cycle retains all six rails; WLAN_EN only\n");
 	}
 	if ((wl_seq_flags & WL_O_CYCLERAILS) && wl_m6o_rails(false)) { return 1; }
+	if (wl_cyc & 1u) { printf("FUXI WLAN: C-H cyc 0x1: WLAN_EN low 140 ms more (150 ms in all)\n"); wl_sleep(140); }
 	printf("FUXI WLAN: M6o cycle begin WLAN_EN low dwell 10 ms\n");
 	wl_sleep(10);
 	if (((wl_seq_flags & WL_O_CYCLERAILS) && wl_m6o_rails(true)) ||
 	    wl_rails_on(1, "cycle before WLAN_EN high") ||
 	    wl_m6o_write("cycle WLAN_EN high", TS_TLMM+0x1000ull*80+4, 2, 2)) { return 1; }
+	if (wl_cyc & 1u) { printf("FUXI WLAN: C-H cyc 0x1: WLAN_EN high 50 ms more (60 ms in all)\n"); wl_sleep(50); }
 	printf("FUXI WLAN: M6o cycle begin WLAN_EN high dwell 10 ms\n");
 	wl_sleep(10); /* retained M6o WLAN_EN dwell; EP latency follows PHY ready */
 	if (wl_m6q_resume()) { return 1; }
@@ -6130,6 +6145,20 @@ wl_ce_fail(const char *what)
 	return wl_w11_fail(why);
 }
 
+/* C-H fuxiwlanpcie=1: read-only print of the endpoint PCIe capability words
+ * (Device Capabilities, Device Control / Status, Link Capabilities, Link
+ * Control / Status). No write. */
+static void
+wl_ce_pcie(void)
+{
+	unsigned cap = wl_m6o_cap(0x10);
+	if (!cap) { printf("FUXI WLAN: C-H pcie: no PCIe capability\n"); return; }
+	uint32_t dcap = wl_prd(WL_EPCFG + cap + 4), dc = wl_prd(WL_EPCFG + cap + 8);
+	uint32_t lcap = wl_prd(WL_EPCFG + cap + 0xc), lc = wl_prd(WL_EPCFG + cap + 0x10);
+	printf("FUXI WLAN: C-H pcie cap %#x devcap %#x devctl %#x devsta %#x lnkcap %#x lnkctl %#x lnksta %#x\n",
+	    cap, dcap, dc & 0xffffu, dc >> 16, lcap, lc & 0xffffu, lc >> 16);
+}
+
 /* w20 0x04: endpoint PCIe Device Control MRRS (14:12) = 0, 128 bytes, before
  * CE init (an observation from UniXNU-sheng 186abef, not Linux). Device
  * Status (31:16) is W1C, so only the low half is written. */
@@ -6169,6 +6198,21 @@ wl_ce_alloc(void)
 	return 0;
 }
 
+/* C-H fuxiwlanpft=1: the destination ring consumer prefetch timer, bits 2:0 of
+ * R0 + 0x40, read, set to 1, read back; after the ring enable and DEST_CTRL.
+ * The register allowlist opens for this one offset only here. */
+static int
+wl_ce_pft(const struct wlce_ring *r)
+{
+	uint32_t old = ~0u, rb = ~0u;
+	wlce_pft_allow = true;
+	if (wlce_rd(&wl_ce, &wl_ce_io, r->r0 + WLCE_R0_PFT, &old) ||
+	    wlce_wr(&wl_ce, &wl_ce_io, r->r0 + WLCE_R0_PFT, (old & ~7u) | 1u) ||
+	    wlce_rd(&wl_ce, &wl_ce_io, r->r0 + WLCE_R0_PFT, &rb)) { return wl_ce_fail("C-H pft access"); }
+	printf("FUXI WLAN: C-H pft ring %u prefetch timer old %#x read %#x\n", r->id, old, rb);
+	return 0;
+}
+
 /* Seven rings in L19 order (ce.c:912-971): CE0 SRC, CE1 DST + DEST_CTRL, CE1
  * STATUS, CE2 DST + DEST_CTRL, CE2 STATUS, CE3 SRC, CE4 SRC; BASE_LSB and MISC
  * read back after each, DEST_CTRL after its write. */
@@ -6192,6 +6236,7 @@ wl_ce_init_rings(void)
 		printf("FUXI WLAN: W20 ce ring %u entries %u base %#x misc %#x", r->id, r->entries, base, misc);
 		if (r->kind == WLCE_DST) { printf(" dest-ctrl %#x", dctl); }
 		printf(" readback ok\n");
+		if (wl_pft && r->kind == WLCE_DST && wl_ce_pft(r)) { return 1; }
 		if (wl_ce.msi_on || wl_ce.thresh_on) {
 			uint32_t m0 = 0, m1 = 0, md = 0, t0 = 0, t1 = 0;
 			bool sts = r->kind == WLCE_STS;
@@ -6501,6 +6546,7 @@ wl_ce_connect(uint32_t svc)
 	uint8_t req[WLHTC_CONNECT_BYTES];
 	bool flow = svc == WLHTC_SVC_WMI;
 	uint32_t alloc = flow ? (uint32_t)(uint8_t)wl_htc.credit_count : 0u, eid = 0, status = 0;
+	if (flow && wl_cr != 0u && wl_cr < alloc) { printf("FUXI WLAN: C-H cr: WMI RECV_ALLOC %u of %u READY credits\n", wl_cr, alloc); alloc = wl_cr; }
 	wlhtc_connect_req(req, svc, flow ? alloc << WLHTC_CONN_RECV_ALLOC_SHIFT : WLHTC_CONN_DISABLE_FLOW);
 	if (wl_ce_send(0, req, sizeof(req), flow ? "HTC connect WMI" : "HTC connect HTT") ||
 	    wl_ce_wait(WL20_W_CTL, 3000, "HTC connect reply")) { return 1; }
@@ -9211,6 +9257,7 @@ wl_w20_run(void)
 	bzero(&wl_htc, sizeof(wl_htc)); bzero(&wl_wmi, sizeof(wl_wmi)); bzero(&wl30_reo, sizeof(wl30_reo));
 	wl23_scan_sent = wl23_guard_bad = false; /* C2: no STOP_SCAN in containment unless W23 sent START_SCAN */
 	wl23_rssi_conv = 0; wl23_scan_id = WLWMI_SCAN_ID; wl25_on = false;
+	if (wl_pcie) { wl_ce_pcie(); }
 	if ((wl20_bits & WL20_MRRS128) && wl_ce_mrrs128()) { return 1; }
 	if (wl_ce_alloc() || wl_ce_init_rings()) { return 1; }
 	if (wl26_setup()) { return 1; }  /* C2c: W26 arenas, idle list, refill ring; silent without 0x100/0x200 */
