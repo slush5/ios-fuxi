@@ -89,6 +89,7 @@ TOUCH_DEFAULTS = (('fuxitic', 2), ('sweethid_mmw', 70), ('sweethid_mmh', 156))
 WLAN_KNOBS = {
     'fuxiwlan': 'i', 'fuxiwlansalami': 'i', 'fuxiwlanrails': 'i', 'fuxiwlanqrtr': 'i', 'fuxiwlanmem': 'i', 'fuxiwlanfwlog': 'i', 'fuxiwlanfwmem': 'i', 'fuxiwlannotify': 'i', 'fuxiwlanprio': 'i', 'fuxiwlanmaxscan': 'i', 'fuxiwlanmsi': 'i', 'fuxiwlanthresh': 'i',
     'fuxiwlances': 'i',
+    'fuxiwlandw': 'i', 'fuxiwlanpar': 'i',
     'fuxiwlanmlo': 'i', 'fuxiwlanw15': 'i', 'fuxiwlanw16': 'i', 'fuxiwlanw20': 'i', 'fuxiwlanw29': 'i', 'fuxiwlanvrx': 'i', 'fuxiwlandiag': 'i', 'fuxiwlanch': 'i',
     'fuxiwlanstop22': 'i', 'fuxiwlankeep': 'i', 'fuxiwlanicc': 'i', 'fuxiwlaniccbw': 'i', 'fuxiwlanaspm': 'i',
     'fuxiwlanoldiova': 'i', 'fuxiwlanclk': 'i', 'fuxiwlaniboff': 'i',

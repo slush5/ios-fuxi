@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,10099 @@
+@@ -0,0 +1,10134 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -1277,6 +1277,7 @@
 +static unsigned wl_scan_notify1f, wl_scan_prio1, wl_scan_maxscan; /* parity knobs (default 0): START_SCAN notify 0x1f / priority 1 / max_scan_time 20000 */
 +static unsigned wl_ce_msi, wl_ce_thresh; /* C-W1 knobs (default 0, owner greenlit): ring MSI words / INT_SETUP thresholds on CE0-CE3 */
 +static unsigned wl_ces; /* C-S knob fuxiwlances (default 0): 0x1 STATUS TP write on an empty RX pass, 0x2 RX pass in three phases, 0x4 light guard on poll passes */
++static unsigned wl_dw, wl_par; /* C-P knobs (default 0): fuxiwlandw one passive dwell 50..200 ms for every scan request; fuxiwlanpar bits 0x1 BEI on the IPCR data TREs, 0x2 event ring contexts msivec 1 / 2 and ring 1 moderation 1 ms, 0x4 MHI ctrl/data limit registers at 36 bits, 0x8 INIT flags2 as the BSD reference host builds it */
 +#define WL_TARGET_MAX 52u
 +#define WL_TARGET_CAP (64u * 1024u * 1024u)
 +static struct wl_dma wl_target[WL_TARGET_MAX];
@@ -1476,6 +1477,12 @@
 +	(void)PE_parse_boot_argn("fuxiwlances", &ces, sizeof(ces));
 +	if (ces < 0 || ces > 7) { wl_variant_invalid = true; }
 +	wl_ces = (ces < 0 || ces > 7) ? 0u : (unsigned)ces;
++	int cdw = 0, cpar = 0;
++	(void)PE_parse_boot_argn("fuxiwlandw", &cdw, sizeof(cdw));
++	(void)PE_parse_boot_argn("fuxiwlanpar", &cpar, sizeof(cpar));
++	if ((cdw != 0 && (cdw < 50 || cdw > 200)) || cpar < 0 || cpar > 15) { wl_variant_invalid = true; }
++	wl_dw = (cdw < 50 || cdw > 200) ? 0u : (unsigned)cdw;
++	wl_par = (cpar < 0 || cpar > 15) ? 0u : (unsigned)cpar;
 +	wl_w25 = qrtr == 8; /* C3: the W25 scan service replaces the one W23 scan */
 +	wl_w23 = qrtr == 7 || wl_w25; /* C2: the W23 passive scan runs on top of W20..W22 */
 +	wl_w20 = qrtr == 6 || wl_w23; /* W20 runs on top of the whole W11..W15 chain */
@@ -4181,6 +4188,7 @@
 +	uint64_t addr = wl_ipcr.iova + WL_IPCR_TXBUF + i * WL_IPCR_TXMTU;
 +	memcpy((void *)(wl_ipcr.va + WL_IPCR_TXBUF + i * WL_IPCR_TXMTU), packet, bytes);
 +	wl_ipcr_ring(WL_IPCR_TXR)[i] = (struct wl_tre){addr, bytes, (2u << 16) | (1u << 9)};
++	if (wl_par & 1u) { wl_ipcr_ring(WL_IPCR_TXR)[i].d1 |= 1u << 10; }   /* C-P 0x1 (default off): BEI, set before the write pointer is published; the reference host sets it on a channel whose event ring has a moderation time */
 +	wl_tx_write = next;
 +	wl_w11_barrier();
 +	wl_channel(20)->wp = wl_ipcr.iova + WL_IPCR_TXR + next * 16;
@@ -4453,6 +4461,7 @@
 +						wl_rx_read = wl_ring_next(ri, WL_IPCR_N);
 +						if (!wl_w11_stopping) {
 +							wl_ipcr_ring(WL_IPCR_RXR)[wl_rx_write] = (struct wl_tre){tre.ptr, WL_IPCR_MTU, (2u<<16)|(1u<<9)};
++							if (wl_par & 1u) { wl_ipcr_ring(WL_IPCR_RXR)[wl_rx_write].d1 |= 1u << 10; }   /* C-P 0x1 (default off): BEI on the re-posted RX TRE */
 +							wl_rx_write = wl_ring_next(wl_rx_write, WL_IPCR_N);
 +							wl_w11_barrier(); wl_channel(21)->wp = wl_ipcr.iova + WL_IPCR_RXR + wl_rx_write*16;
 +							wl_w11_barrier(); wl_mwr64(wl_chdb+21*8, wl_channel(21)->wp);
@@ -4589,6 +4598,7 @@
 +	printf("FUXI WLAN: W11 chan 20/21 started\n");
 +	for (unsigned i = 0; i < WL_IPCR_N-1; i++) {
 +		wl_ipcr_ring(WL_IPCR_RXR)[i] = (struct wl_tre){wl_ipcr.iova+WL_IPCR_RXBUF+i*WL_IPCR_MTU, WL_IPCR_MTU, (2u<<16)|(1u<<9)};
++		if (wl_par & 1u) { wl_ipcr_ring(WL_IPCR_RXR)[i].d1 |= 1u << 10; }   /* C-P 0x1 (default off): BEI on the first RX TREs */
 +	}
 +	wl_w11_barrier(); wl_channel(21)->wp = wl_ipcr.iova+WL_IPCR_RXR+wl_rx_write*16;
 +	wl_w11_barrier(); wl_mwr64(wl_chdb+21*8, wl_channel(21)->wp);
@@ -8250,6 +8260,7 @@
 +	(void)ctx;
 +	wl25_tr_heard_n++; wl25_tr_mhz = mhz; wl25_tr_dbm = dbm;   /* W25e: freq and dBm of this frame, for its ring entry */
 +	if (wl25_tr_on && wl_fwlog) { printf("FUXI WLAN: C11c mgmt-rx #%u arr %u ms f%u s%d local_rx_us %u ts %u tsf_delta %u\n", wl25_tr_heard_n, wl25_rel_ms(wl25_ns()), mhz, (int)dbm, wl_scan.last_rx_local, (unsigned)wl_scan.last_rx_local_ok, wl_scan.last_tsf_delta); }   /* C11c: local rx TSF in us (ts 1 = valid beacon/probe-resp), our clock, next to tsf_delta */
++	if (wl25_tr_on && wl_fwlog) { static uint32_t cp_bytes; cp_bytes += len; printf("FUXI WLAN: C-P mgmt-rx #%u len %u total %u fc %#x\n", wl25_tr_heard_n, (unsigned)len, (unsigned)cp_bytes, (frame != NULL && len >= 2u) ? ((unsigned)frame[0] | ((unsigned)frame[1] << 8)) : 0u); }   /* C-P observability (the C11c gate, no knob): this frame's length, the running byte total of the boot and the frame control word */
 +	if (!wl25_fill) { return; }
 +	const int16_t s = (int16_t)(dbm < -128 ? -128 : dbm > 127 ? 127 : dbm), f = (int16_t)(nf < -128 ? -128 : nf > 127 ? 127 : nf);
 +	if (len < 22u || len > sizeof(c->frame)) { wl25_cache_lost++; return; }
@@ -8711,6 +8722,7 @@
 +		n24 += mhz[n++] < 3000u;
 +	}
 +	dwell = rq->dwell_ms >= 50u && rq->dwell_ms <= 200u ? rq->dwell_ms : WLSCAN_DWELL_PASSIVE;
++	if (wl_dw != 0u) { dwell = wl_dw; }   /* C-P knob fuxiwlandw (default 0): one passive dwell for every request, the first scan included; PASSIVE stays forced */
 +	parts = (n24 ? 1u : 0u) + (n > n24 ? 1u : 0u);
 +	first = wl25_sent == 0u;  /* the first request that sends a START_SCAN: its parts take the watches and the first-scan lines */
 +	wlscan_init(&wl_scan, n);
@@ -9100,6 +9112,14 @@
 +		printf("FUXI WLAN: W30 ipadis: wmi init flag1 %#x -> %#x (IPA_DISABLE bit 30 = !ipa-enabled; no IPA on this host) "
 +		    "(fuxiwlanvrx 0x04)\n", was, wlce_get32(f1));
 +	}
++	if (wl_dw != 0u || wl_par != 0u) { printf("FUXI WLAN: C-P knobs: dw %u ms (0 = per request), par 0x%x (bei %u, evctx %u, limit36 %u, flags2 %u)\n", wl_dw, wl_par, wl_par & 1u, (wl_par >> 1) & 1u, (wl_par >> 2) & 1u, (wl_par >> 3) & 1u); }
++	if (wl_par & 8u) {   /* C-P 0x8 (default off): flags2 as the BSD reference host builds it: RX peer metadata version in bits 5:4 (V1A when service 365 is set, else the low two bits of the EXT2 target_cap_flags word), FW_AST_INDICATION_DISABLE bit 18, WDS_NULL_FRAME_SUPPORT bit 22 when service 421 is set */
++		uint8_t *f2 = cmd + 4 + WLWMI_INIT_BYTES + 4u * WLWMI_RC_FLAGS2;
++		const uint32_t was2 = wlce_get32(f2);
++		const uint32_t pver = wlwmi_svc(&wl_wmi, 365u) ? 2u : ((wl_wmi.got_ext2 && wl_wmi.ext2_fixed_n > 7u) ? (wl_wmi.ext2_fixed[7] & 3u) : 0u);
++		wlce_put32(f2, was2 | (pver << 4) | (1u << 18) | (wlwmi_svc(&wl_wmi, 421u) ? 1u << 22 : 0u));
++		printf("FUXI WLAN: C-P par 0x8: wmi init flags2 %#x -> %#x (peer metadata version %u, svc365 %u, svc421 %u, ext2 words %u)\n", was2, wlce_get32(f2), pver, (unsigned)wlwmi_svc(&wl_wmi, 365u), (unsigned)wlwmi_svc(&wl_wmi, 421u), wl_wmi.ext2_fixed_n);
++	}
 +	if (wl_ce_send(wl_htc.wmi_eid, cmd, len, "WMI INIT")) { return 1; }
 +	printf("FUXI WLAN: W22 wmi init sent bytes %u (vdevs %u peers %u chains %#x flag1 %#x flags2 %#x host-svc %#x mem-chunks 0)\n",
 +	    len, wlce_get32(rc + 4 * WLWMI_RC_NUM_VDEVS), wlce_get32(rc + 4 * WLWMI_RC_NUM_PEERS),
@@ -9480,6 +9500,10 @@
 +			e[i].type = 1; e[i].base = e[i].rp = wl_contexts.iova + (i ? WL_ER1 : WL_ER0);
 +			e[i].len = i ? 4096 : 512; e[i].wp = e[i].base + e[i].len - 16;
 +		}
++		if (wl_par & 2u) {   /* C-P 0x2 (default off): the two event ring contexts as the reference host fills them; this lane polls and reads no MSI */
++			e[0].index = 1; e[1].cfg = 1u << 16; e[1].index = 2;   /* ring 0: msivec 1; ring 1: moderation 1 ms (bits 31:16), msivec 2 */
++			printf("FUXI WLAN: C-P par 0x2: event ring contexts msivec %u / %u, ring 1 moderation word %#x\n", e[0].index, e[1].index, e[1].cfg);
++		}
 +		struct wl_context *c = (struct wl_context *)(wl_contexts.va + WL_CCTX);
 +		c->base = c->rp = c->wp = wl_contexts.iova + WL_CR; c->len = 2048;
 +		wl_dma_clean(&wl_contexts); wl_dma_clean(&wl_vectors);
@@ -9650,6 +9674,17 @@
 +			    wl_mrd(off[i]+4) != (uint32_t)(val[i]>>32) || fw_faults) { return 2; }
 +		}
 +		if (((wl_mrd(0x10)>>16)&255) != 2 || fw_faults) { return 2; }
++		if (wl_par & 4u) {   /* C-P 0x4 (default off): both limit registers at the 36-bit mask, written once more before the event ring doorbells and M0; a readback that differs puts the verified 32-bit values back, an access fault fails closed */
++			wl_mwr64(0x88, 0xfffffffffull); wl_mwr64(0xa0, 0xfffffffffull);
++			const uint32_t cl = wl_mrd(0x88), ch = wl_mrd(0x8c), dl = wl_mrd(0xa0), dh = wl_mrd(0xa4);
++			const bool ok36 = cl == 0xffffffffu && ch == 0xfu && dl == 0xffffffffu && dh == 0xfu;
++			printf("FUXI WLAN: C-P par 0x4: MHI limit readback ctrl %#x:%#x data %#x:%#x, %s\n", ch, cl, dh, dl, ok36 ? "36 bits ok" : "differs, back to 32 bits");
++			if (fw_faults) { return 2; }
++			if (!ok36) {
++				wl_mwr64(0x88, 0xffffffffull); wl_mwr64(0xa0, 0xffffffffull);
++				if (wl_mrd(0x88) != 0xffffffffu || wl_mrd(0x8c) != 0u || wl_mrd(0xa0) != 0xffffffffu || wl_mrd(0xa4) != 0u || fw_faults) { return 2; }
++			}
++		}
 +		/* Event ring doorbells only: channel contexts remain disabled and the
 +		 * command ring empty. No channel (including wake) doorbell is rung. */
 +		wl_mwr64(erdb, wl_contexts.iova + WL_ER0 + 512 - 16);
