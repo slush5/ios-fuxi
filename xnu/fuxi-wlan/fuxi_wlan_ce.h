@@ -905,6 +905,7 @@ struct wlwmi {
 	uint32_t ready_status, num_extra_mac, num_total_peers;
 	uint8_t mac[6];
 	uint32_t ext2_bytes, events, unknown_events, last_event, last_len;
+	uint32_t ext2_fixed[16], ext2_fixed_n;   /* C11b observability: first words of the SERVICE_READY_EXT2 fixed TLV (target_cap_flags = word 7 per mainline), raw for offset-independent read */
 	const char *why;
 	/* C2: bands of the preferred hw mode's PHYs, chain masks of the last of
 	 * them (wmi.c:525-553, 4663-4686), and the scan the SCAN/CHAN_INFO/MGMT_RX
@@ -1119,7 +1120,10 @@ wlwmi_parse_ext2(struct wlwmi *wmi, const uint8_t *p, uint32_t len)
 	struct wlwmi_it it; int r; bool fixed = false;
 	wlwmi_it_init(&it, p, len);
 	while ((r = wlwmi_next(&it)) > 0) {
-		if (it.tag == WLWMI_TAG_SERVICE_READY_EXT2_EVENT) { fixed = true; }
+		if (it.tag == WLWMI_TAG_SERVICE_READY_EXT2_EVENT) {
+			fixed = true;
+			for (unsigned i = 0; i < 16u && 4u * i + 4u <= it.tlen; i++) { wmi->ext2_fixed[i] = wlce_get32(it.v + 4 * i); wmi->ext2_fixed_n = i + 1u; }   /* C11b: raw fixed-param words */
+		}
 	}
 	if (r < 0) { return wlwmi_fail(wmi, "WMI SERVICE_READY_EXT2 TLV past the buffer"); }
 	if (!fixed) { return wlwmi_fail(wmi, "WMI SERVICE_READY_EXT2 without its fixed TLV"); }
@@ -1789,6 +1793,7 @@ struct wlscan {
 	 * wrong_id and ignored), and who gets every beacon or probe response the table took, during the
 	 * call that has its RX buffer: the frame, its length, the RX MHz, dBm (SNR + noise floor), the floor. */
 	uint32_t want_id, wrong_id;
+	uint32_t last_rx_tsf_l32, last_rx_tsf_u32, last_tsf_delta;   /* C11b observability: firmware RX TSF of the last mgmt frame (mgmt-rx hdr +52/+56/+48), anchor-verified offsets */
 	void (*heard)(void *ctx, const uint8_t *frame, uint32_t len, uint32_t mhz, int32_t dbm, int32_t nf);
 	void *heard_ctx;
 };
@@ -2020,6 +2025,7 @@ wlscan_parse_mgmt_rx(struct wlscan *s, const uint8_t *p, uint32_t len)
 	if (short_hdr || !hdr || !frame) { s->drop_bad++; return 0; }
 	uint32_t channel = wlce_get32(hdr), snr = wlce_get32(hdr + 4), buf_len = wlce_get32(hdr + 16);
 	uint32_t status = wlce_get32(hdr + 20), chan_freq = wlce_get32(hdr + 64);
+	s->last_rx_tsf_l32 = wlce_get32(hdr + 52); s->last_rx_tsf_u32 = wlce_get32(hdr + 56); s->last_tsf_delta = wlce_get32(hdr + 48);   /* C11b: RX TSF for the arrival-timing log */
 	if (buf_len > flen) { s->drop_bad++; return 0; }
 	if (status & (WLWMI_RX_ERR_CRC | WLWMI_RX_ERR_DECRYPT | WLWMI_RX_ERR_KEY_CACHE_MISS)) { s->drop_status++; return 0; }
 	if (chan_freq >= WLWMI_MIN_6GHZ_FREQ && chan_freq <= WLWMI_MAX_6GHZ_FREQ) { s->drop_channel++; return 0; }

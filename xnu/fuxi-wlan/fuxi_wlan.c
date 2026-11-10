@@ -8170,6 +8170,7 @@ wl25_heard(void *ctx, const uint8_t *frame, uint32_t len, uint32_t mhz, int32_t 
 	struct wl25_cached *c;
 	(void)ctx;
 	wl25_tr_heard_n++; wl25_tr_mhz = mhz; wl25_tr_dbm = dbm;   /* W25e: freq and dBm of this frame, for its ring entry */
+	if (wl25_tr_on && wl_fwlog) { printf("FUXI WLAN: C11b mgmt-rx #%u arr %u ms f%u s%d rx_tsf %u hi %u tsf_delta %u\n", wl25_tr_heard_n, wl25_rel_ms(wl25_ns()), mhz, (int)dbm, wl_scan.last_rx_tsf_l32, wl_scan.last_rx_tsf_u32, wl_scan.last_tsf_delta); }   /* C11b observability */
 	if (!wl25_fill) { return; }
 	const int16_t s = (int16_t)(dbm < -128 ? -128 : dbm > 127 ? 127 : dbm), f = (int16_t)(nf < -128 ? -128 : nf > 127 ? 127 : nf);
 	if (len < 22u || len > sizeof(c->frame)) { wl25_cache_lost++; return; }
@@ -9073,12 +9074,22 @@ wl_w21_run(void)
 	printf("FUXI WLAN: W21 wmi services ext %u ext2 %u reg-cc-ext %u (available event %u)\n",
 	    wlwmi_svc(&wl_wmi, WLWMI_SVC_EXT_MSG), wlwmi_svc(&wl_wmi, WLWMI_SVC_EXT2_MSG),
 	    wlwmi_svc(&wl_wmi, WLWMI_SVC_REG_CC_EXT), wl_wmi.got_avail);
+	if (wl_fwlog) printf("FUXI WLAN: C11b svc_ext2 %08x %08x %08x %08x %08x %08x %08x %08x; svc365 %u svc421 %u\n",
+	    wl_wmi.svc_ext2[0], wl_wmi.svc_ext2[1], wl_wmi.svc_ext2[2], wl_wmi.svc_ext2[3],
+	    wl_wmi.svc_ext2[4], wl_wmi.svc_ext2[5], wl_wmi.svc_ext2[6], wl_wmi.svc_ext2[7],
+	    (unsigned)wlwmi_svc(&wl_wmi, 365u), (unsigned)wlwmi_svc(&wl_wmi, 421u));
 	if (wl_ce_wait(WL20_W_EXT, 5000, "WMI SERVICE_READY_EXT")) { return 1; }
 	printf("FUXI WLAN: W21 wmi service ready ext hw-modes %u caps %u pdev %u%s\n", wl_wmi.num_hw_modes,
 	    wl_wmi.hw_mode_caps, wl_wmi.pdev_id, wl_wmi.pdev_valid ? "" : " (no MAC/PHY caps)");
 	if (wlwmi_svc(&wl_wmi, WLWMI_SVC_EXT2_MSG)) {
 		if (wl_ce_wait(WL20_W_EXT2, 5000, "WMI SERVICE_READY_EXT2")) { return 1; }
 		printf("FUXI WLAN: W21 wmi service ready ext2 bytes %u\n", wl_wmi.ext2_bytes);
+		if (wl_fwlog) {
+			char hx[16 * 9 + 1]; unsigned o = 0;
+			for (unsigned i = 0; i < wl_wmi.ext2_fixed_n && i < 16u; i++) { o += (unsigned)snprintf(hx + o, sizeof(hx) - o, "%08x ", wl_wmi.ext2_fixed[i]); }
+			printf("FUXI WLAN: C11b ext2 fixed %u words: %s\n", wl_wmi.ext2_fixed_n, hx);
+			if (wl_wmi.ext2_fixed_n > 7u) { printf("FUXI WLAN: C11b target_cap_flags (word7 @0x1c mainline) %#x\n", wl_wmi.ext2_fixed[7]); }
+		}
 	}
 	printf("FUXI WLAN: W21 wmi service ready complete\n");
 	if (wl30_mask & WL30_MGMTREO) {   /* C2h: nothing to send (study); the service bit and what is counted */

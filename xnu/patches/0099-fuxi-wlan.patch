@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,10041 @@
+@@ -0,0 +1,10052 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -8202,6 +8202,7 @@
 +	struct wl25_cached *c;
 +	(void)ctx;
 +	wl25_tr_heard_n++; wl25_tr_mhz = mhz; wl25_tr_dbm = dbm;   /* W25e: freq and dBm of this frame, for its ring entry */
++	if (wl25_tr_on && wl_fwlog) { printf("FUXI WLAN: C11b mgmt-rx #%u arr %u ms f%u s%d rx_tsf %u hi %u tsf_delta %u\n", wl25_tr_heard_n, wl25_rel_ms(wl25_ns()), mhz, (int)dbm, wl_scan.last_rx_tsf_l32, wl_scan.last_rx_tsf_u32, wl_scan.last_tsf_delta); }   /* C11b observability */
 +	if (!wl25_fill) { return; }
 +	const int16_t s = (int16_t)(dbm < -128 ? -128 : dbm > 127 ? 127 : dbm), f = (int16_t)(nf < -128 ? -128 : nf > 127 ? 127 : nf);
 +	if (len < 22u || len > sizeof(c->frame)) { wl25_cache_lost++; return; }
@@ -9105,12 +9106,22 @@
 +	printf("FUXI WLAN: W21 wmi services ext %u ext2 %u reg-cc-ext %u (available event %u)\n",
 +	    wlwmi_svc(&wl_wmi, WLWMI_SVC_EXT_MSG), wlwmi_svc(&wl_wmi, WLWMI_SVC_EXT2_MSG),
 +	    wlwmi_svc(&wl_wmi, WLWMI_SVC_REG_CC_EXT), wl_wmi.got_avail);
++	if (wl_fwlog) printf("FUXI WLAN: C11b svc_ext2 %08x %08x %08x %08x %08x %08x %08x %08x; svc365 %u svc421 %u\n",
++	    wl_wmi.svc_ext2[0], wl_wmi.svc_ext2[1], wl_wmi.svc_ext2[2], wl_wmi.svc_ext2[3],
++	    wl_wmi.svc_ext2[4], wl_wmi.svc_ext2[5], wl_wmi.svc_ext2[6], wl_wmi.svc_ext2[7],
++	    (unsigned)wlwmi_svc(&wl_wmi, 365u), (unsigned)wlwmi_svc(&wl_wmi, 421u));
 +	if (wl_ce_wait(WL20_W_EXT, 5000, "WMI SERVICE_READY_EXT")) { return 1; }
 +	printf("FUXI WLAN: W21 wmi service ready ext hw-modes %u caps %u pdev %u%s\n", wl_wmi.num_hw_modes,
 +	    wl_wmi.hw_mode_caps, wl_wmi.pdev_id, wl_wmi.pdev_valid ? "" : " (no MAC/PHY caps)");
 +	if (wlwmi_svc(&wl_wmi, WLWMI_SVC_EXT2_MSG)) {
 +		if (wl_ce_wait(WL20_W_EXT2, 5000, "WMI SERVICE_READY_EXT2")) { return 1; }
 +		printf("FUXI WLAN: W21 wmi service ready ext2 bytes %u\n", wl_wmi.ext2_bytes);
++		if (wl_fwlog) {
++			char hx[16 * 9 + 1]; unsigned o = 0;
++			for (unsigned i = 0; i < wl_wmi.ext2_fixed_n && i < 16u; i++) { o += (unsigned)snprintf(hx + o, sizeof(hx) - o, "%08x ", wl_wmi.ext2_fixed[i]); }
++			printf("FUXI WLAN: C11b ext2 fixed %u words: %s\n", wl_wmi.ext2_fixed_n, hx);
++			if (wl_wmi.ext2_fixed_n > 7u) { printf("FUXI WLAN: C11b target_cap_flags (word7 @0x1c mainline) %#x\n", wl_wmi.ext2_fixed[7]); }
++		}
 +	}
 +	printf("FUXI WLAN: W21 wmi service ready complete\n");
 +	if (wl30_mask & WL30_MGMTREO) {   /* C2h: nothing to send (study); the service bit and what is counted */
@@ -10073,7 +10084,7 @@
 +#endif /* FUXI */
 --- a/bsd/dev/fuxi_wlan_ce.h
 +++ b/bsd/dev/fuxi_wlan_ce.h
-@@ -0,0 +1,4531 @@
+@@ -0,0 +1,4537 @@
 +/*
 + * FUXI WLAN W20/W21/W22 (fuxiwlanqrtr=6, C1): WCN7850 copy engines on SRNG
 + * rings, HTC and WMI init to WMI READY, polled. W23/W24 (fuxiwlanqrtr=7, C2):
@@ -10981,6 +10992,7 @@
 +	uint32_t ready_status, num_extra_mac, num_total_peers;
 +	uint8_t mac[6];
 +	uint32_t ext2_bytes, events, unknown_events, last_event, last_len;
++	uint32_t ext2_fixed[16], ext2_fixed_n;   /* C11b observability: first words of the SERVICE_READY_EXT2 fixed TLV (target_cap_flags = word 7 per mainline), raw for offset-independent read */
 +	const char *why;
 +	/* C2: bands of the preferred hw mode's PHYs, chain masks of the last of
 +	 * them (wmi.c:525-553, 4663-4686), and the scan the SCAN/CHAN_INFO/MGMT_RX
@@ -11195,7 +11207,10 @@
 +	struct wlwmi_it it; int r; bool fixed = false;
 +	wlwmi_it_init(&it, p, len);
 +	while ((r = wlwmi_next(&it)) > 0) {
-+		if (it.tag == WLWMI_TAG_SERVICE_READY_EXT2_EVENT) { fixed = true; }
++		if (it.tag == WLWMI_TAG_SERVICE_READY_EXT2_EVENT) {
++			fixed = true;
++			for (unsigned i = 0; i < 16u && 4u * i + 4u <= it.tlen; i++) { wmi->ext2_fixed[i] = wlce_get32(it.v + 4 * i); wmi->ext2_fixed_n = i + 1u; }   /* C11b: raw fixed-param words */
++		}
 +	}
 +	if (r < 0) { return wlwmi_fail(wmi, "WMI SERVICE_READY_EXT2 TLV past the buffer"); }
 +	if (!fixed) { return wlwmi_fail(wmi, "WMI SERVICE_READY_EXT2 without its fixed TLV"); }
@@ -11865,6 +11880,7 @@
 +	 * wrong_id and ignored), and who gets every beacon or probe response the table took, during the
 +	 * call that has its RX buffer: the frame, its length, the RX MHz, dBm (SNR + noise floor), the floor. */
 +	uint32_t want_id, wrong_id;
++	uint32_t last_rx_tsf_l32, last_rx_tsf_u32, last_tsf_delta;   /* C11b observability: firmware RX TSF of the last mgmt frame (mgmt-rx hdr +52/+56/+48), anchor-verified offsets */
 +	void (*heard)(void *ctx, const uint8_t *frame, uint32_t len, uint32_t mhz, int32_t dbm, int32_t nf);
 +	void *heard_ctx;
 +};
@@ -12096,6 +12112,7 @@
 +	if (short_hdr || !hdr || !frame) { s->drop_bad++; return 0; }
 +	uint32_t channel = wlce_get32(hdr), snr = wlce_get32(hdr + 4), buf_len = wlce_get32(hdr + 16);
 +	uint32_t status = wlce_get32(hdr + 20), chan_freq = wlce_get32(hdr + 64);
++	s->last_rx_tsf_l32 = wlce_get32(hdr + 52); s->last_rx_tsf_u32 = wlce_get32(hdr + 56); s->last_tsf_delta = wlce_get32(hdr + 48);   /* C11b: RX TSF for the arrival-timing log */
 +	if (buf_len > flen) { s->drop_bad++; return 0; }
 +	if (status & (WLWMI_RX_ERR_CRC | WLWMI_RX_ERR_DECRYPT | WLWMI_RX_ERR_KEY_CACHE_MISS)) { s->drop_status++; return 0; }
 +	if (chan_freq >= WLWMI_MIN_6GHZ_FREQ && chan_freq <= WLWMI_MAX_6GHZ_FREQ) { s->drop_channel++; return 0; }
