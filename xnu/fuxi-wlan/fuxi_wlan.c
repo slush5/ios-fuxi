@@ -1246,6 +1246,7 @@ static unsigned wl_scan_notify1f, wl_scan_prio1, wl_scan_maxscan; /* parity knob
 static unsigned wl_ce_msi, wl_ce_thresh; /* C-W1 knobs (default 0, owner greenlit): ring MSI words / INT_SETUP thresholds on CE0-CE3 */
 static unsigned wl_ces; /* C-S knob fuxiwlances (default 0): 0x1 STATUS TP write on an empty RX pass, 0x2 RX pass in three phases, 0x4 light guard on poll passes */
 static unsigned wl_dw, wl_par; /* C-P knobs (default 0): fuxiwlandw one passive dwell 50..200 ms for every scan request; fuxiwlanpar bits 0x1 BEI on the IPCR data TREs, 0x2 event ring contexts msivec 1 / 2 and ring 1 moderation 1 ms, 0x4 MHI ctrl/data limit registers at 36 bits, 0x8 INIT flags2 as the BSD reference host builds it */
+static unsigned wl_adw; /* C-D knob fuxiwlanad (default 0): 0x1 one WMI SCAN_ADAPTIVE_DWELL_CONFIG (0x3007) with enable 0 and no parameter element, after the vdev setup and before the first START_SCAN; 0x2 dwell mode STATIC (scan_ctrl_flags bits 23:21 = 4) in every W25 scan request; PASSIVE stays forced */
 #define WL_TARGET_MAX 52u
 #define WL_TARGET_CAP (64u * 1024u * 1024u)
 static struct wl_dma wl_target[WL_TARGET_MAX];
@@ -1451,6 +1452,10 @@ wl_probe_configure(void)
 	if ((cdw != 0 && (cdw < 50 || cdw > 200)) || cpar < 0 || cpar > 15) { wl_variant_invalid = true; }
 	wl_dw = (cdw < 50 || cdw > 200) ? 0u : (unsigned)cdw;
 	wl_par = (cpar < 0 || cpar > 15) ? 0u : (unsigned)cpar;
+	int cad = 0;
+	(void)PE_parse_boot_argn("fuxiwlanad", &cad, sizeof(cad));
+	if (cad < 0 || cad > 3) { wl_variant_invalid = true; }
+	wl_adw = (cad < 0 || cad > 3) ? 0u : (unsigned)cad;
 	wl_w25 = qrtr == 8; /* C3: the W25 scan service replaces the one W23 scan */
 	wl_w23 = qrtr == 7 || wl_w25; /* C2: the W23 passive scan runs on top of W20..W22 */
 	wl_w20 = qrtr == 6 || wl_w23; /* W20 runs on top of the whole W11..W15 chain */
@@ -6548,6 +6553,30 @@ wl23_words(uint32_t cmd, uint32_t tag, const uint32_t *w, uint32_t nw, const cha
 	return wl_ce_send(wl_htc.wmi_eid, buf, len, what);
 }
 
+/* C-D knob fuxiwlanad (default 0). Values from the public ISC WMI interface (scan group 3: command 0x3007; fixed param tag 0x218
+ * with the words enable and pdev_id; then an array of structs with 0 or 1 parameter elements); our own code.
+ * 0x1: one SCAN_ADAPTIVE_DWELL_CONFIG with enable 0, pdev_id 0 and an empty array (no parameter element, so no threshold is sent).
+ * 0x2: dwell mode STATIC (4) in bits 23:21 of scan_ctrl_flags of every W25 request; PASSIVE (0x1) stays set, 0x2 stays clear. */
+#define WL_ADW_CMD 0x3007u
+#define WL_ADW_TAG 0x218u
+#define WL_ADW_MODE_MASK 0x00e00000u
+#define WL_ADW_MODE_STATIC (4u << 21)
+_Static_assert((WL_ADW_MODE_STATIC & ~WL_ADW_MODE_MASK) == 0u && !(WL_ADW_MODE_MASK & (WLSCAN_FLAGS | 0x3u)) &&
+    ((WLSCAN_FLAGS | WL_ADW_MODE_STATIC) & 0x3u) == 0x1u, "C-D: the dwell mode bits leave PASSIVE set and the probe request bit clear");
+
+static int
+wl_adw_off(void)
+{
+	const uint32_t w[2] = { 0, 0 };   /* enable 0 (adaptive dwell off), pdev_id 0 */
+	uint8_t buf[8 + 4 * 2 + 4];
+	uint32_t len = 0;
+	if (wlwmi_encode_words(WL_ADW_CMD, WL_ADW_TAG, w, 2, buf, sizeof(buf) - 4u, &len) || len != 16u) { return wl_w11_fail("C-D command encode bounds"); }
+	wlwmi_put_tlv(buf + len, WLWMI_TAG_ARRAY_STRUCT, 0);   /* zero elements */
+	len += 4u;
+	printf("FUXI WLAN: C-D ad 0x1: WMI SCAN_ADAPTIVE_DWELL_CONFIG enable 0, pdev_id 0, 0 parameter elements, %u bytes\n", len);
+	return wl_ce_send(wl_htc.wmi_eid, buf, len, "WMI SCAN_ADAPTIVE_DWELL_CONFIG");
+}
+
 /* The scan runs: poll every 1 ms until COMPLETED or DEQUEUED, at most MS ms.
  * 0 = over, 1 = the poll failed (already contained), 2 = timed out. C2c: the
  * W26 mid watch at the first pass with foreign >= (n + 1) / 2 (19 of 38, 7 of
@@ -8711,6 +8740,7 @@ wl25_scan(const struct fuxi_wifi_radio_request *rq, uint32_t nlist)
 		}
 		if (wl_scan_notify1f) { wlce_put32(cmd + 4u + 4u * WLWMI_SS_NOTIFY, 0x1fu); }   /* parity: notify 0x1f */
 		if (wl_scan_prio1) { wlce_put32(cmd + 4u + 4u * WLWMI_SS_PRIORITY, 1u); }   /* parity: scan priority 1 */
+		if (wl_adw & 2u) { wlce_put32(cmd + 4u + 4u * WLWMI_SS_CTRL_FLAGS, wlce_get32(cmd + 4u + 4u * WLWMI_SS_CTRL_FLAGS) | WL_ADW_MODE_STATIC); }   /* C-D 0x2: dwell mode static; PASSIVE stays set */
 		wl25_sent++;
 		ids[part] = id;
 		if (part) { wlscan_rearm(&wl_scan); }  /* the 2.4 GHz part is over; counters and the BSS table stay */
@@ -8946,6 +8976,8 @@ wl_w23_run(void)
 		if (wl23_words(WLWMI_CMD_STA_POWERSAVE_MODE, WLWMI_TAG_STA_POWERSAVE_MODE_CMD, mode, 2, "WMI STA_POWERSAVE_MODE")) { return 1; }
 		printf("FUXI WLAN: W23 vdev 0 nss %u, sta ps rx-wake 0 tx-wake 1 pspoll 0, ps mode off\n", nss);
 	}
+	if (wl_adw != 0u) { printf("FUXI WLAN: C-D knobs: ad 0x%x (adwell-off cmd %u, dwell mode static %u; W25 requests only)\n", wl_adw, wl_adw & 1u, (wl_adw >> 1) & 1u); }
+	if ((wl_adw & 1u) && wl_adw_off()) { return 1; }   /* C-D 0x1: after the vdev setup, before the first START_SCAN */
 	if (wl_w25) { return wl_w25_run(n); } /* C3: the scan service instead of the W23 scans below */
 	/* CH1 split (fuxiwlanch bit 26): the kept 2.4 GHz channels in one scan, then the kept 5 GHz channels in a second, on the same
 	 * vdev, one after the other (a mixed list scanned in DBS stalls the firmware when the 2.4 GHz MAC finishes its part). The kept
