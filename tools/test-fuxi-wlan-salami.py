@@ -1300,7 +1300,8 @@ def gate_suite(tmp, mk):
 
 def profile3_suite(run, enc, salami, fuxi):
     """C3 on the split: fuxiwlansalami=3 = everything =2 sets plus the proven radio defaults (w20 0x7f02 and the
-    fuxiwlanch split bit with qrtr 7 or 8 only, fuxiwlanmlo=4, the four lx-* firmware names, the AMSS one only without
+    fuxiwlanch split bit with qrtr 7 or 8 only, fuxiwlanmlo=0xc4 (hostmem + the P17 sleep clock check and pad enable), the
+    four lx-* firmware names, the AMSS one only without
     fuxiwlanfw=stock); an explicit knob, boot-arg or ADT /defaults, always wins. The M2 kit: ADT --wlan-node
     --wlan-defaults fuxiwlansalami=3, cmdline fuxiwlan=28 fuxiwlanqrtr=8 fuxiwifiios=3."""
     lx = {'bdf': 'lx-bdf.bin', 'regdb': 'lx-regdb.bin', 'm3': 'lx-m3.bin', 'amss': '/usr/local/share/fuxi/wlan/lx-amss.bin'}
@@ -1311,7 +1312,7 @@ def profile3_suite(run, enc, salami, fuxi):
                  'W20 selected qrtr=8 (CE/HTC/WMI init, then the W25 scan service for iOS) w20 0x7f02 valid 1',
                  'W23 selected passive scan of 38 channels (fuxiwlanch 0x4000000), dwell per request',
                  'W29 selected: L19 dp_alloc order, fuxiwlanw29 0x9f default: ', 'W25 selected scan service for iOS',
-                 'W12 mlo variant 4 (1 PHY_CAP, 2 omit MLO) P17 bits 0x4 (hostmem 1 ',
+                 'W12 mlo variant 196 (1 PHY_CAP, 2 omit MLO) P17 bits 0xc4 (hostmem 1 mloall 0 phy17 0 dmaalign 0 clkcheck 1 clkon 1 ',
                  'salami fuxiwlanamss /usr/local/share/fuxi/wlan/lx-amss.bin (replaces the SoC-major choice)',
                  'salami fuxiwlanregdb lx-regdb.bin (boot-arg or ADT)', 'salami fuxiwlanm3 lx-m3.bin (boot-arg or ADT)',
                  'W14 selected BDF lx-bdf.bin'):
@@ -1320,7 +1321,9 @@ def profile3_suite(run, enc, salami, fuxi):
                 'fuxiwlanm3', 'fuxiwlanbdf', 'fuxiwlanregdb'):
         assert out.count(f'salami {key} from the fuxiwlansalami=3 profile') == 1, (key, out)
     assert 'from the fuxiwlansalami=2 profile' not in out and 'salami fuxiwlansalami from ADT /defaults' in out, out
-    assert 'W30 selected' not in out and 'HD1' not in out and 'CLKON' not in out and 'clkon 1' not in out, out
+    # the profile enables the sleep clock pad (CLKON, 0x80) and nothing else of the P17 writers or probes
+    assert 'W30 selected' not in out and 'HD1' not in out and out.count('clkon 1') == 1 and \
+        'mloall 0 phy17 0 dmaalign 0 clkcheck 1 clkon 1 errdec 0' in out, out
     # all on the cmdline gives the same boot (the ADT route only adds its "from ADT" line)
     same = run(salami, 'fuxiwlan=28 fuxiwlanqrtr=8 fuxiwifiios=3 fuxiwlansalami=3')
     lines = lambda t: [x for x in t.splitlines() if x.startswith('FUXI WLAN') and 'from ADT /defaults' not in x]  # noqa: E731
@@ -1434,7 +1437,7 @@ def mkadt_suite(mk):
     cost = lambda t: sum(mk.adt_prop_bytes(v) for _, v in mk.wlan_defaults([t]))  # noqa: E731
     m2_base = 16348 - cost('fuxiwlansalami=2')
     explicit = ('fuxiwlansalami=1 fuxiwlanclk=1 fuxiwlanprobe=civac fuxiwlanseq=cycle,parf,dbi,eq,hostirq,msi,por,prefix '
-                'fuxiwlanw20=32514 fuxiwlanch=67108864 fuxiwlanmlo=4 fuxiwlanamss=lx-amss.bin fuxiwlanm3=lx-m3.bin '
+                'fuxiwlanw20=32514 fuxiwlanch=67108864 fuxiwlanmlo=196 fuxiwlanamss=lx-amss.bin fuxiwlanm3=lx-m3.bin '
                 'fuxiwlanbdf=lx-bdf.bin fuxiwlanregdb=lx-regdb.bin')
     assert m2_base == 16308 and m2_base + cost('fuxiwlansalami=3') == 16348 <= mk.ADT_MAX == 16384
     assert m2_base + cost('fuxiwlansalami=2 fuxiwlanw20=15106') == 16388 > mk.ADT_MAX and cost(explicit) == 520

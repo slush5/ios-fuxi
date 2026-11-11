@@ -193,11 +193,17 @@ wl_arg_adt(const char *name, void *buf, int size)
  * with. Each is used only when its knob is in neither the boot-args nor ADT
  * /defaults, so an explicit knob always wins; a number fills an int, a
  * string must fit the caller's buffer with its NUL (else absent, as
- * PE_get_default). Never CLKON, cyclerails or fuxiwlancnss=pdc: a change of
- * the profile is a change of this table.
+ * PE_get_default). Never cyclerails or fuxiwlancnss=pdc: a change of the
+ * profile is a change of this table. The level 3 fuxiwlanmlo row carries the
+ * P17 sleep clock pad enable (CLKON, 0x80, with CLKCHECK 0x40 and HOSTMEM
+ * 0x04 = 0xc4): with the PMK8550 gpio3 pad written to its reference state
+ * the scan service ran 900 s with no scan stop in boots 27 to 31, against a
+ * stop within 13 to 21 frames in every boot without it (16 to 26); the pad
+ * is back at state 0 at each boot, so the write is needed every boot. An
+ * explicit fuxiwlanmlo (4 for the old behaviour) still wins.
  * C3 on the split: fuxiwlansalami=3 is everything =2 sets plus the radio
  * defaults the phone proved (level 3 rows): w20 0x7f02, the bit 26 scan split,
- * fuxiwlanmlo=4 and the four lx-* firmware names, which only the boot-args or
+ * fuxiwlanmlo=0xc4 and the four lx-* firmware names, which only the boot-args or
  * this table can carry (the kit's ADT has no room). The w20 and fuxiwlanch
  * rows apply only with qrtr 7 or 8 (the only stages that take them; any
  * other stage refuses both), the fuxiwlanamss row only without fuxiwlanfw=stock
@@ -214,7 +220,7 @@ static const struct { const char *name, *text; int number; unsigned char level, 
 	{ "fuxiwlanseq", "cycle,parf,dbi,eq,hostirq,msi,por,prefix", 0, 2, WL_PROF_ANY },
 	{ "fuxiwlanw20", NULL, 0x7f02, 3, WL_PROF_SCAN },
 	{ "fuxiwlanch", NULL, 0x4000000, 3, WL_PROF_SCAN },
-	{ "fuxiwlanmlo", NULL, 4, 3, WL_PROF_ANY },
+	{ "fuxiwlanmlo", NULL, 0xc4, 3, WL_PROF_ANY },
 	{ "fuxiwlanamss", "lx-amss.bin", 0, 3, WL_PROF_NOSTOCK },
 	{ "fuxiwlanm3", "lx-m3.bin", 0, 3, WL_PROF_ANY },
 	{ "fuxiwlanbdf", "lx-bdf.bin", 0, 3, WL_PROF_ANY },
