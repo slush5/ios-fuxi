@@ -239,6 +239,7 @@ def static_checks():
     static_c2f()
     static_c2h()
     static_ch1()
+    static_j1()
     static_split()
     static_ext()
 
@@ -285,13 +286,50 @@ def static_ch1():
     assert 'uint32_t kept = wlscan_kept(wlscan_chmask);\n\tif (!n || n > kept || first > kept - n || total > room) { return 1; }' in HEADER
     assert ('uint32_t total = wlwmi_start_scan_total(n), kept = wlscan_kept(wlscan_chmask);\n'
             '\tif (!n || first > kept || n > kept - first || total > room) { return 1; }') in HEADER
-    assert HEADER.count('wlscan_chan_full(') == 2 and HEADER.count('wlscan_chan(') >= 3
+    # (J1: wlreg_dropset reads the full list too, to build the regulatory drop set)
+    assert HEADER.count('wlscan_chan_full(') == 3 and HEADER.count('wlscan_chan(') >= 3
     assert '_Static_assert(WLSCAN_NCHAN == WLSCAN_NCHAN_24 + WLSCAN_CH_5G_BITS' in HEADER and \
         '_Static_assert(WL23_CH_24 == WLSCAN_CH_24 && WL23_CH_ALL5 == WLSCAN_CH_ALL5 && WL23_CH_VALID == WLSCAN_CH_VALID,' in drv
     assert '#define WLSCAN_FLAGS (WLWMI_SCAN_FLAG_PASSIVE | WLWMI_SCAN_CHAN_STAT_EVENT)' in HEADER   # still passive, whatever the mask
     print('CH1 static: fuxiwlanch read like every knob, 0 unless valid (bits 0..29, 27 and 28 not together, 29 with qrtr 8 only, a channel left with w20 0x10 counted, qrtr 7 only), '
           'set in one place, the filtered list fixed once before the first encoder call, n / max time / counts from it, the line silent '
           'while off, the header never writes the mask and bounds both encoders by it, the CH1 lines send nothing')
+
+
+def static_j1():
+    """J1 (fuxiwlanjoin=1): the regulatory rung. One SET_CURRENT_COUNTRY, sent only from wl_j1_run, which only a set join
+    knob reaches, before the scan stage fixes its list; the CC_EXT parser is hooked only while the knob is set; the drop set
+    is written only by the W20 reset and wl_j1_run; the header never writes it; nothing in J1 starts a scan or sends
+    anything but the one country command; the knob variables are only read."""
+    drv = DRIVER
+    code = strip_comments(drv)
+    j1 = between(drv, 'static int\nwl_j1_run(void)\n{', '\n}\n')
+    w23 = between(drv, 'static int\nwl_w23_run(void)\n{', '\n}\n')
+    w20 = between(drv, '/* ---- W20: CE/HTC/WMI to WMI READY (fuxiwlanqrtr=6, C1) ----', '/* ---- end W20 ---- */')
+    assert code.count('wl_j1_run(') == 2 and w23.count('if (wl_join && wl_j1_run()) { return 1; }') == 1
+    assert w23.index('if (wl_join && wl_j1_run()) { return 1; }') < w23.index('wlscan_chmask = wlscan_mask_eff(')
+    assert 'wl_j1_run' in w20 and w20.index('static int\nwl_j1_run(void)') < w20.index('/* ---- W25: the scan service for iOS')
+    assert code.count('WLWMI_CMD_SET_CURRENT_COUNTRY') == 1 and 'WLWMI_CMD_SET_CURRENT_COUNTRY' in j1
+    assert j1.count('wl23_words(') == 1 and j1.count('wl_ce_wait(') == 1 and 'wl_ce_send' not in j1 and 'wlwmi_encode' not in j1
+    for word in ('START_SCAN', 'STOP_SCAN', 'CHAN_LIST', 'wl_pwr', 'wl_mwr', 'wl_win', 'wl_soc', 'IODelay'):
+        assert word not in strip_comments(j1), 'J1 does more than set the country: ' + word
+    assert 'wl_ce_wait(WL23_W_REG, 3000, "J1 cc answer")' in j1
+    assert code.count('wl_wmi.reg = ') == 1 and 'if (wl_join) { wl_wmi.reg = &wl_reg; }' in drv
+    assert code.count('wlscan_regdrop = ') == 2 and 'bzero(&wl_reg, sizeof(wl_reg)); wlscan_regdrop = 0;' in drv and \
+        'wlscan_regdrop = wlreg_dropset(&wl_reg);' in j1
+    assert HEADER.count('wlscan_regdrop =') == 0 and HEADER.count('wlscan_regdrop') == 3
+    assert HEADER.count('if (wmi->reg && *id == WLWMI_EV_REG_CHAN_LIST_CC_EXT) { wlreg_parse(wmi->reg, p, len - 4); return 0; }') == 1
+    assert 'case WL23_W_REG: return wl_reg.have || wl_reg.failed;' in drv
+    for var in ('wl_join', 'wl_cc'):
+        assert not re.search(r'\b%s\s*(=[^=]|\+\+|--|[-+|&^]=)' % var, drv), var + ' written'
+    # the scan stays passive whatever the answer says: no flag word, dwell or power word depends on the regulatory record
+    assert '#define WLSCAN_FLAGS (WLWMI_SCAN_FLAG_PASSIVE | WLWMI_SCAN_CHAN_STAT_EVENT)' in HEADER
+    for fn in ('wlreg_parse', 'wlreg_allows', 'wlreg_dropset', 'wlreg_bad'):
+        body = between(HEADER, '\n' + fn + '(', '\n}\n')
+        assert not re.search(r'wlscan_chmask\s*=|WLSCAN_FLAGS|wlce_put32|wlwmi_put_tlv', body), fn
+    print('J1 static: one SET_CURRENT_COUNTRY from wl_j1_run only, reached only with fuxiwlanjoin set, before the scan list is '
+          'fixed; one bounded wait; the CC_EXT parser hooked only with the knob; the drop set written only by the W20 reset and '
+          'J1; the knob variables only read; the scan flags stay passive')
 
 
 def static_split():
@@ -2395,6 +2433,41 @@ C2CH_MUTANTS = [
 ]
 
 
+C2J1_MUTANTS = [
+    ('h', '#define WLWMI_CMD_SET_CURRENT_COUNTRY 0x3a001u', '#define WLWMI_CMD_SET_CURRENT_COUNTRY 0x3a002u', 'wrong command id'),
+    ('h', '#define WLWMI_TAG_SET_CURRENT_COUNTRY 0x25fu', '#define WLWMI_TAG_SET_CURRENT_COUNTRY 0x25eu', 'wrong command tag'),
+    ('h', '#define WLREG_FIXED_BYTES 312u', '#define WLREG_FIXED_BYTES 316u', 'fixed part taken as 316 bytes'),
+    ('h', 'n2 = wlce_get32(f + 48), n5 = wlce_get32(f + 52)', 'n2 = wlce_get32(f + 52), n5 = wlce_get32(f + 48)', 'num_2g / num_5g swapped'),
+    ('h', 'tmp[i].start = (uint16_t)(fq & 0xffffu); tmp[i].end = (uint16_t)(fq >> 16);',
+     'tmp[i].start = (uint16_t)(fq >> 16); tmp[i].end = (uint16_t)(fq & 0xffffu);', 'rule start / end swapped'),
+    ('h', 'if (r->want && alpha2 != r->want) { r->stale++; return; }', '', 'an answer for another country taken'),
+    ('h', 'if (n2 > WLREG_MAX_RULES || n5 > WLREG_MAX_RULES) { wlreg_bad(r, "J1 cc rules overrun"); return; }',
+     'if (n2 + n5 > 2 * WLREG_MAX_RULES) { wlreg_bad(r, "J1 cc rules overrun"); return; }', 'more than 10 rules a band taken'),
+    ('h', 'if (u->flags & (WLREG_FLAG_DISABLED | WLREG_FLAG_NO_20MHZ)) { continue; }', 'if (u->flags & WLREG_FLAG_NO_20MHZ) { continue; }',
+     'DISABLED rule used'),
+    ('h', 'if (u->flags & (WLREG_FLAG_DISABLED | WLREG_FLAG_NO_20MHZ)) { continue; }', 'if (u->flags & WLREG_FLAG_DISABLED) { continue; }',
+     'NO_20MHZ rule used'),
+    ('h', '(uint32_t)u->start + 10u <= mhz && mhz + 10u <= (uint32_t)u->end', '(uint32_t)u->start <= mhz && mhz <= (uint32_t)u->end',
+     'centre only, the channel edges unchecked'),
+    ('h', 'if (u->bw >= 20u && ', 'if (', 'a rule narrower than 20 MHz used'),
+    ('h', '\tif (i < 64u && ((wlscan_regdrop >> i) & 1u)) { return true; }\n', '', 'the answer never cuts the list'),
+    ('h', 'if (phy != 0) { r->other_phy++; return; }', '', 'an answer of phy 1 taken'),
+    ('h', 'it.tlen < nr * WLREG_RULE_BYTES', 'it.tlen < nr', 'a short rules array read past'),
+    ('d', 'if (wl_join && wl_j1_run()) { return 1; }', 'if (wl_join) { (void)wl_j1_run(); }', 'a J1 failure does not stop the scan'),
+    ('d', 'w[0] = (wl20_bits & WL20_PDEVCAP) ? wl_wmi.pdev_id : 0u;', 'w[0] = 0u;', 'pdev not as W23 names it'),
+    ('d', 'if (wl_ce_wait(WL23_W_REG, 3000, "J1 cc answer")) { return 1; }', 'if (wl_ce_wait(WL23_W_REG, 30, "J1 cc answer")) { return 1; }',
+     'the answer awaited 30 ms'),
+    ('d', 'case WL23_W_REG: return wl_reg.have || wl_reg.failed;', 'case WL23_W_REG: return wl_reg.have;', 'a bad answer waits out the timeout'),
+    ('d', 'wlscan_regdrop = wlreg_dropset(&wl_reg);', 'wlscan_regdrop = 0;', 'the drop set never applied'),
+    ('d', '\tbzero(&wl_reg, sizeof(wl_reg)); wlscan_regdrop = 0;\n', '\tbzero(&wl_reg, sizeof(wl_reg));\n', 'the drop set kept across boots'),
+    ('d', 'wl_reg.want = wl_cc;', 'wl_reg.want = 0;', 'never armed'),
+    ('d', 'wl_reg.have = wl_reg.failed = false;', 'wl_reg.failed = false;', 'the boot record taken as the answer'),
+    ('d', 'if (wl_reg.status) {', 'if (0) {', 'a refusal taken as an answer'),
+    ('d', 'if (wl_reg.failed) { return wl_w11_fail(wl_reg.why ? wl_reg.why : "J1 cc answer"); }', '', 'a bad answer ignored'),
+    ('d', 'if (!kept) { return wl_w11_fail("J1 channel list empty"); }', '', 'an empty regulatory list not refused by J1'),
+]
+
+
 def mutants(table=None, mode='c2d'):
     """Every C2d (C2e) mutant is caught (static check or the model's C2d (C2e) scenarios); run in parallel."""
     table = C2D_MUTANTS if table is None else table
@@ -2872,6 +2945,9 @@ def l19_checks(model, c2dump, c2cdump='', c2ddump=''):
                 'SERVICE_READY_EXT_EVENT', 'PDEV_SET_HW_MODE_CMD', 'MAC_PHY_CAPABILITIES', 'HW_MODE_CAPABILITIES',
                 'SOC_MAC_PHY_HW_MODE_CAPS', 'SERVICE_AVAILABLE_EVENT', 'SERVICE_READY_EXT2_EVENT'):
         pairs['WLWMI_TAG_' + tag] = 'WMI_TAG_' + tag
+    # J1: the regulatory command and the two regulatory tags
+    pairs.update({'WLWMI_CMD_SET_CURRENT_COUNTRY': 'WMI_SET_CURRENT_COUNTRY_CMDID',
+                  'WLWMI_TAG_SET_CURRENT_COUNTRY': 'WMI_TAG_SET_CURRENT_COUNTRY_CMD', 'WLREG_TAG_CC_EXT': 'WMI_TAG_REG_CHAN_LIST_CC_EXT_EVENT'})
     for ours, theirs in pairs.items():
         assert header_define(ours) == vals[theirs], (ours, hex(header_define(ours)), theirs, hex(vals[theirs]))
     # Wire struct sizes, nested structs and array sizes resolved from the headers (ETH_ALEN is 6).
@@ -3913,6 +3989,51 @@ int e2e2_ios_finish(bool stale) {
 '''
 
 
+def l19_j1():
+    """J1: SET_CURRENT_COUNTRY, the CC_EXT fixed part, the rule struct, its masks and flags, derived from L19 again (the ids
+    and tags are compared in l19_checks)."""
+    if not (L19 / 'wmi.h').exists():
+        print(f'J1 L19 re-derivation SKIPPED: no Linux ath12k v6.19 tree at {L19} (set ATH12K_SRC)')
+        return
+    wmi_h = l19_text('wmi.h')
+
+    def fields(name):
+        body = re.search(r'struct\s+' + name + r'\s*\{(.*?)\}\s*__packed;', wmi_h, re.S)[1]
+        out = []
+        for decl in body.split(';'):
+            decl = ' '.join(decl.split())
+            if not decl:
+                continue
+            m = re.fullmatch(r'__le32 (\w+)(?:\[(\w+)\])?', decl)
+            assert m, (name, decl)
+            out.append((m[1], int(re.search(r'#define ' + m[2] + r'\s+(\d+)', wmi_h)[1]) if m[2] else 1))
+        return out
+    off, at = 0, {}
+    for k, n in fields('wmi_reg_chan_list_cc_ext_event'):
+        at[k] = off
+        off += 4 * n
+    assert off == header_define('WLREG_FIXED_BYTES'), off
+    assert (at['status_code'], at['phy_id'], at['alpha2'], at['dfs_region'], at['num_2g_reg_rules'], at['num_5g_reg_rules']) == \
+        (0, 4, 8, 24, 48, 52), at
+    assert [k for k, _ in fields('wmi_set_current_country_cmd')] == ['tlv_header', 'pdev_id', 'new_alpha2']
+    rule = [k for k, _ in fields('ath12k_wmi_reg_rule_ext_params')]
+    assert rule == ['tlv_header', 'freq_info', 'bw_pwr_info', 'flag_info', 'psd_power_info'] and 4 * len(rule) == header_define('WLREG_RULE_BYTES')
+    assert int(re.search(r'#define MAX_REG_RULES\s+(\d+)', wmi_h)[1]) == header_define('WLREG_MAX_RULES')
+    for ours, theirs in (('WLREG_FLAG_DISABLED', 'REGULATORY_CHAN_DISABLED'), ('WLREG_FLAG_NO_IR', 'REGULATORY_CHAN_NO_IR'),
+                         ('WLREG_FLAG_RADAR', 'REGULATORY_CHAN_RADAR'), ('WLREG_FLAG_NO_20MHZ', 'REGULATORY_CHAN_NO_20MHZ')):
+        assert header_define(ours) == 1 << int(re.search(r'#define ' + theirs + r'\s+BIT\((\d+)\)', wmi_h)[1]), ours
+    masks = {k: int(re.search(r'#define ' + k + r'\s+(0x[0-9a-fA-F]+)', wmi_h)[1], 16)
+             for k in ('REG_RULE_START_FREQ', 'REG_RULE_END_FREQ', 'REG_RULE_MAX_BW', 'REG_RULE_REG_PWR', 'REG_RULE_FLAGS')}
+    assert masks == {'REG_RULE_START_FREQ': 0xffff, 'REG_RULE_END_FREQ': 0xffff0000, 'REG_RULE_MAX_BW': 0xffff,
+                     'REG_RULE_REG_PWR': 0xff0000, 'REG_RULE_FLAGS': 0xffff}, masks
+    st = re.search(r'WMI_REG_SET_CC_STATUS_PASS = 0,(.*?)\};', wmi_h, re.S)[1]
+    assert [x.split('=')[0].strip() for x in st.split(',') if x.strip()] == ['WMI_REG_CURRENT_ALPHA2_NOT_FOUND', 'WMI_REG_INIT_ALPHA2_NOT_FOUND',
+                                                                             'WMI_REG_SET_CC_CHANGE_NOT_ALLOWED', 'WMI_REG_SET_CC_STATUS_NO_MEMORY',
+                                                                             'WMI_REG_SET_CC_STATUS_FAIL']
+    print('J1 L19: the SET_CURRENT_COUNTRY words, the CC_EXT fixed part (312 bytes; status, phy, alpha2, dfs_region, num_2g, num_5g '
+          'at 0 / 4 / 8 / 24 / 48 / 52), the 20-byte rule, its masks, MAX_REG_RULES, four rule flags and the status names match')
+
+
 def nocache_model(tmp, inc=None):
     """The long W25 runs (4100 scans, 250 with late credits) need every request to scan: the model built with the result cache
     switched off (-DWL25_CACHE_MS=0u), its c3nocache scenarios. Returns the stderr of a failed run, else ''."""
@@ -4240,16 +4361,18 @@ def main():
     l19_c2e(c2edump)
     l19_c2f(c2fdump)
     l19_c2g()
+    l19_j1()
     vendor_c2h()
     mutants()
     mutants(C2E_MUTANTS, 'c2e')
     mutants(C2F_MUTANTS, 'c2f')
     mutants(C2H_MUTANTS, 'c2h')
     mutants(C2CH_MUTANTS, 'c2ch')
+    mutants(C2J1_MUTANTS, 'c2j1')
     dash_check()
     print('W20 (fuxiwlanqrtr=6) CE/HTC/WMI, W23 (fuxiwlanqrtr=7) passive scan, C2c (W26), C2d (W27), C2e (W28), C2f (W29), '
           'C2h (W30), CH1 (fuxiwlanch, with its bit 26 split and bits 27 / 28 DBS scan policy) and W25 (fuxiwlanqrtr=8) scan '
-          'service host tests passed')
+          'service and J1 (fuxiwlanjoin=1) regulatory rung host tests passed')
 
 
 if __name__ == '__main__':

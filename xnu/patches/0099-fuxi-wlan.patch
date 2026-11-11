@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,10254 @@
+@@ -0,0 +1,10334 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -1280,7 +1280,7 @@
 +static unsigned wl_dw, wl_par; /* C-P knobs (default 0): fuxiwlandw one passive dwell 50..200 ms for every scan request; fuxiwlanpar bits 0x1 BEI on the IPCR data TREs, 0x2 event ring contexts msivec 1 / 2 and ring 1 moderation 1 ms, 0x4 MHI ctrl/data limit registers at 36 bits, 0x8 INIT flags2 as the BSD reference host builds it */
 +static unsigned wl_adw; /* C-D knob fuxiwlanad (default 0): 0x1 one WMI SCAN_ADAPTIVE_DWELL_CONFIG (0x3007) with enable 0 and no parameter element, after the vdev setup and before the first START_SCAN; 0x2 dwell mode STATIC (scan_ctrl_flags bits 23:21 = 4) in every W25 scan request; PASSIVE stays forced */
 +static unsigned wl_cyc, wl_cr, wl_pft, wl_pcie; /* C-H knobs (default 0), reference host differences: fuxiwlancyc 0x1 WLAN_EN low 150 ms and high 60 ms in the power cycle, 0x2 100 ms before PERST high; fuxiwlancr N asks RECV_ALLOC N for the WMI service in place of all READY credits; fuxiwlanpft 1 sets the CE1 / CE2 destination ring consumer prefetch timer (R0 + 0x40, bits 2:0) to 1 after ring setup; fuxiwlanpcie 1 prints the endpoint PCIe capability words, read only */
-+static unsigned wl_join; /* J knob fuxiwlanjoin (default 0): the join rung. 0 none; 1 the regulatory rung (set the current country, read the channel list event; nothing goes on the air). Rung 1 has no code yet: an accepted fuxiwlanjoin=1 changes nothing but the J knobs line. Higher rungs are refused in this build. */
++static unsigned wl_join; /* J knob fuxiwlanjoin (default 0): the join rung. 0 none; 1 the regulatory rung (set the current country, read the channel list event; nothing goes on the air). Rung 1 is wl_j1_run: one SET_CURRENT_COUNTRY before the channel list, the CC_EXT answer parsed, the passive list cut to what it allows. Higher rungs are refused in this build. */
 +static uint32_t wl_cc; /* J knob fuxiwlancc (default 0): the country of the join rung as the WMI alpha2 word, first letter in bits 7:0 ("IL" = 0x4c49 = 19529). Every nonzero fuxiwlanjoin needs it. */
 +/* J knobs (begin): pure, no I/O; tools/test-fuxi-wlan-join.py compiles exactly this region. */
 +#define WL_JOIN_MAX 1 /* the highest join rung this build accepts */
@@ -6004,6 +6004,7 @@
 + * wl23_scan_id: the id of the scan a containment STOP_SCAN names (C2 0xa000,
 + * C3 the service's scan in flight). */
 +static struct wlscan wl_scan;
++static struct wlreg wl_reg;   /* J1: the regulatory answer (fuxiwlanjoin=1; wl_wmi.reg points here only then) */
 +static bool wl23_scan_sent, wl23_htt_seen, wl23_guard_bad;
 +static uint32_t wl23_scan_id = WLWMI_SCAN_ID;   /* the id of the scan START_SCAN last named (CH1 split: 0xa000, then 0xa001) */
 +static unsigned wl23_lines, wl23_pdev, wl23_htt_major, wl23_htt_minor, wl23_rssi_conv;
@@ -6327,7 +6328,7 @@
 +}
 +
 +enum { WL20_W_CTL, WL20_W_TX, WL20_W_CREDITS, WL20_W_SVC, WL20_W_AVAIL, WL20_W_EXT, WL20_W_EXT2, WL20_W_READY, WL20_W_NONE,
-+    WL23_W_HTT, WL23_W_STARTED, WL23_W_STATS };
++    WL23_W_HTT, WL23_W_STARTED, WL23_W_STATS, WL23_W_REG };
 +
 +static bool
 +wl_ce_done(unsigned what)
@@ -6344,6 +6345,7 @@
 +	case WL23_W_HTT: return wl23_htt_seen;
 +	case WL23_W_STARTED: return wl_scan.started || wl_scan.start_failed;
 +	case WL23_W_STATS: return wl_stats.have;
++	case WL23_W_REG: return wl_reg.have || wl_reg.failed;
 +	default: return false;
 +	}
 +}
@@ -6410,6 +6412,14 @@
 +		return 0;
 +	}
 +	if (wl_wmi.stats && wlstats_known(id)) { return 0; }
++	if (wl_wmi.reg && id == WLWMI_EV_REG_CHAN_LIST_CC_EXT) {   /* J1: parsed above; one line each, at most 8 */
++		if (wl_reg.events <= 8u) {
++			printf("FUXI WLAN: J1 cc event %u bytes %u fixed %u array %u phy %u status %u alpha2 0x%x rules 2g %u 5g %u (bad %u, stale %u)\n",
++			    wl_reg.events, wl_reg.ev_len, wl_reg.ev_fixed, wl_reg.ev_arr, wl_reg.ev_phy, wl_reg.ev_status, wl_reg.ev_alpha2,
++			    wl_reg.ev_n2, wl_reg.ev_n5, wl_reg.bad, wl_reg.stale);
++		}
++		return 0;
++	}
 +	if (!wlwmi_known(id)) {
 +		/* C2: L19 moves its MGMT_RX noise floor on 0x402b (wmi.c:9740-9796,
 +		 * 7183-7187); C2 keeps -95, counts it and logs the first past the cap. */
@@ -8231,6 +8241,73 @@
 +	}
 +}
 +
++/* ---- J1: the regulatory rung (fuxiwlanjoin=1), before the channel list ----
++ * One SET_CURRENT_COUNTRY with the fuxiwlancc country (pdev as W23 names it),
++ * one CC_EXT answer awaited for 3 s (L19 waits 3 s too, but goes on after a
++ * timeout; here a timeout contains, like every wait of this driver), then the
++ * entries the answer does not allow leave the passive list (wlscan_regdrop),
++ * so SCAN_CHAN_LIST, every START_SCAN and the iOS list all follow. Nothing
++ * here transmits: the scan stays passive on every channel. */
++static const char *
++wl_j1_status(uint32_t s)
++{
++	switch (s) {
++	case 0: return "pass";
++	case 1: return "current alpha2 not found";
++	case 2: return "init alpha2 not found";
++	case 3: return "change not allowed";
++	case 4: return "no memory";
++	case 5: return "fail";
++	default: return "unknown";
++	}
++}
++
++/* The alpha2 word as two letters, "??" unless two capitals. */
++static void
++wl_j1_text(uint32_t a, char out[3])
++{
++	const uint32_t x = a & 0xffu, y = (a >> 8) & 0xffu;
++	const bool ok = x >= 'A' && x <= 'Z' && y >= 'A' && y <= 'Z';
++	out[0] = ok ? (char)x : '?'; out[1] = ok ? (char)y : '?'; out[2] = 0;
++}
++
++static int
++wl_j1_run(void)
++{
++	char bc[3], cc[3];
++	uint32_t w[2];
++	wl_j1_text(wl_reg.alpha2, bc);
++	printf("FUXI WLAN: J1 cc boot events %u (phy0 %u, other-phy %u, bad %u) alpha2 %s status %u rules 2g %u 5g %u dfs-region %u\n",
++	    wl_reg.events, wl_reg.phy0, wl_reg.other_phy, wl_reg.bad, wl_reg.have ? bc : "--", wl_reg.status, wl_reg.n2, wl_reg.n5,
++	    wl_reg.dfs_region);
++	wl_reg.want = wl_cc;
++	wl_reg.have = wl_reg.failed = false;
++	wl_reg.why = NULL;
++	w[0] = (wl20_bits & WL20_PDEVCAP) ? wl_wmi.pdev_id : 0u;
++	w[1] = wl_cc;
++	wl_j1_text(wl_cc, cc);
++	if (wl23_words(WLWMI_CMD_SET_CURRENT_COUNTRY, WLWMI_TAG_SET_CURRENT_COUNTRY, w, 2, "WMI SET_CURRENT_COUNTRY")) { return 1; }
++	printf("FUXI WLAN: J1 set current country %s sent (0x3a001, pdev %u, 12 bytes)\n", cc, w[0]);
++	if (wl_ce_wait(WL23_W_REG, 3000, "J1 cc answer")) { return 1; }
++	if (wl_reg.failed) { return wl_w11_fail(wl_reg.why ? wl_reg.why : "J1 cc answer"); }
++	if (wl_reg.status) {
++		printf("FUXI WLAN: J1 cc %s status %u (%s)\n", cc, wl_reg.status, wl_j1_status(wl_reg.status));
++		return wl_w11_fail("J1 cc status");
++	}
++	printf("FUXI WLAN: J1 cc %s status 0 phy 0 rules 2g %u 5g %u dfs-region %u after %u ms (stale %u)\n", cc, wl_reg.n2, wl_reg.n5,
++	    wl_reg.dfs_region, wl_ce_waited, wl_reg.stale);
++	for (uint32_t i = 0; i < wl_reg.n2 + wl_reg.n5 && i < 16u; i++) {
++		const struct wlreg_rule *u = &wl_reg.rule[i];
++		printf("FUXI WLAN: J1 rule %s %u-%u MHz bw %u pwr %u flags 0x%x\n", i < wl_reg.n2 ? "2g" : "5g", (unsigned)u->start,
++		    (unsigned)u->end, (unsigned)u->bw, (unsigned)u->pwr, (unsigned)u->flags);
++	}
++	wlscan_regdrop = wlreg_dropset(&wl_reg);
++	const uint32_t kept = wlscan_kept(0), kept24 = wlscan_kept24(0);
++	printf("FUXI WLAN: J1 channel list %u of %u (2.4 GHz %u, 5 GHz %u, passive all)\n", kept, WLSCAN_NCHAN, kept24, kept - kept24);
++	if (!kept) { return wl_w11_fail("J1 channel list empty"); }   /* with the CH1 mask on top, W23 refuses an empty list itself */
++	return 0;
++}
++
 +/* ---- W25: the scan service for iOS (fuxiwlanqrtr=8, C3) ----
 + * W23 sets up the channel list and the station vdev exactly as for qrtr 7;
 + * then, instead of its one scan, this radio-lane thread serves the scan
@@ -8975,7 +9052,7 @@
 +	wl25_part_pend[0] = wl25_part_pend[1] = wl25_start_late_pend = false; bzero(&wl25_w, sizeof(wl25_w));
 +	wl25_tr_pend[0] = wl25_tr_pend[1] = false;   /* W25e */
 +	for (uint32_t i = 0; i < n && i < WLSCAN_NCHAN; i++) { list[i] = (uint16_t)wlscan_chan(i); low += list[i] < 3000u; }
-+	/* The channels W23 gave the firmware: C2 records no regulatory event to intersect with (CC_EXT is logged only). */
++	/* The channels W23 gave the firmware: with fuxiwlanjoin=1 already cut to what the J1 regulatory answer allows; otherwise C2 records no regulatory event to intersect with (CC_EXT is logged only). */
 +	fuxi_wifi_radio_ready(list, n);
 +	wl25_on = true;
 +	wl25_t0 = wl25_ms();
@@ -9021,6 +9098,7 @@
 +wl_w23_run(void)
 +{
 +	static uint8_t cmd[WLCE_BUF];
++	if (wl_join && wl_j1_run()) { return 1; }   /* J1: the country first, before any channel list */
 +	/* CH1: one filtered list for SCAN_CHAN_LIST, START_SCAN (array, n, max time) and every count below; w20 0x10 drops the 5 GHz entries */
 +	wlscan_chmask = wlscan_mask_eff(wl23_chmask, !!(wl20_bits & WL20_BAND24));
 +	uint32_t len = 0, n = wlscan_kept(wlscan_chmask), max_ms = wlscan_max_time(n);
@@ -9328,6 +9406,8 @@
 +	wl12_stage = WL20_CE;
 +	wl_ce_started = true; wl_ce_waited = wl_ce_logged = 0;
 +	bzero(&wl_htc, sizeof(wl_htc)); bzero(&wl_wmi, sizeof(wl_wmi)); bzero(&wl30_reo, sizeof(wl30_reo));
++	bzero(&wl_reg, sizeof(wl_reg)); wlscan_regdrop = 0;
++	if (wl_join) { wl_wmi.reg = &wl_reg; }   /* J1: CC_EXT events are parsed from here on, unarmed until wl_j1_run */
 +	wl23_scan_sent = wl23_guard_bad = false; /* C2: no STOP_SCAN in containment unless W23 sent START_SCAN */
 +	wl23_rssi_conv = 0; wl23_scan_id = WLWMI_SCAN_ID; wl25_on = false;
 +	if (wl_pcie) { wl_ce_pcie(); }
@@ -10286,7 +10366,7 @@
 +#endif /* FUXI */
 --- a/bsd/dev/fuxi_wlan_ce.h
 +++ b/bsd/dev/fuxi_wlan_ce.h
-@@ -0,0 +1,4631 @@
+@@ -0,0 +1,4748 @@
 +/*
 + * FUXI WLAN W20/W21/W22 (fuxiwlanqrtr=6, C1): WCN7850 copy engines on SRNG
 + * rings, HTC and WMI init to WMI READY, polled. W23/W24 (fuxiwlanqrtr=7, C2):
@@ -11212,6 +11292,19 @@
 +#define WLWMI_EV_REG_CHAN_LIST_CC_EXT 0x3a003u
 +#define WLWMI_TAG_ARRAY_UINT32 0x10u
 +#define WLWMI_TAG_ARRAY_STRUCT 0x12u
++/* J1 (fuxiwlanjoin=1), the regulatory rung: L19 wmi.h:300 (group 0x3a), 695 (SET_CURRENT_COUNTRY = group << 12 | 1),
++ * 1833 / 2008 (tags), 4355-4357 (MAX_REG_RULES 10), 4363-4367 (the command), 4415-4425 (rule flags), 4439-4489 (the event
++ * fixed part, 78 words, and the 20-byte rule). */
++#define WLWMI_CMD_SET_CURRENT_COUNTRY 0x3a001u
++#define WLWMI_TAG_SET_CURRENT_COUNTRY 0x25fu
++#define WLREG_TAG_CC_EXT 0x3aau
++#define WLREG_FIXED_BYTES 312u
++#define WLREG_RULE_BYTES 20u
++#define WLREG_MAX_RULES 10u
++#define WLREG_FLAG_DISABLED 0x1u
++#define WLREG_FLAG_NO_IR 0x2u
++#define WLREG_FLAG_RADAR 0x8u
++#define WLREG_FLAG_NO_20MHZ 0x800u
 +#define WLWMI_TAG_SERVICE_READY_EVENT 0x20u
 +#define WLWMI_TAG_READY_EVENT 0x23u
 +#define WLWMI_TAG_INIT_CMD 0x4au
@@ -11272,6 +11365,7 @@
 +
 +struct wlscan;                      /* C2 scan state, below */
 +struct wlstats;                     /* C2b pdev stats answer, below */
++struct wlreg;                       /* J1 regulatory answer, below */
 +
 +struct wlwmi {
 +	uint32_t svc_base[WLWMI_SVC_BM_WORDS], svc_seg[4], svc_ext2[WLWMI_EXT2_WORDS];
@@ -11299,6 +11393,9 @@
 +	 * out: the id stays an unknown event). */
 +	uint32_t phy_pdev[2], phy_pdev_bands[2], phy_pdevs;
 +	struct wlstats *stats;
++	/* J1: the regulatory answer the CC_EXT events feed (NULL unless
++	 * fuxiwlanjoin is set: the id then stays an unknown event, logged only). */
++	struct wlreg *reg;
 +};
 +
 +static inline int
@@ -11546,6 +11643,7 @@
 +static inline int wlscan_rx(struct wlwmi *wmi, uint32_t id, const uint8_t *p, uint32_t len);
 +static inline bool wlstats_known(uint32_t id);
 +static inline void wlstats_parse(struct wlstats *st, const uint8_t *p, uint32_t len);
++static inline void wlreg_parse(struct wlreg *r, const uint8_t *p, uint32_t len);
 +
 +/* One WMI event (wmi.c:9798-9960). In the C2 scan stage SCAN, CHAN_INFO and
 + * MGMT_RX go to the scan parser (wmi.c:9838-9856); once C2b asked for pdev
@@ -11561,6 +11659,7 @@
 +	const uint8_t *p = msg + 4;
 +	if (wmi->scan && wlscan_known(*id)) { return wlscan_rx(wmi, *id, p, len - 4); }
 +	if (wmi->stats && wlstats_known(*id)) { wlstats_parse(wmi->stats, p, len - 4); return 0; }
++	if (wmi->reg && *id == WLWMI_EV_REG_CHAN_LIST_CC_EXT) { wlreg_parse(wmi->reg, p, len - 4); return 0; }   /* J1: never fatal */
 +	switch (*id) {
 +	case WLWMI_EV_SERVICE_READY: return wlwmi_parse_service_ready(wmi, p, len - 4);
 +	case WLWMI_EV_SERVICE_AVAILABLE: return wlwmi_parse_available(wmi, p, len - 4);
@@ -11856,6 +11955,9 @@
 +#define WLSCAN_CH_IGNDUTY (WLSCAN_CH_24 << 3)
 +_Static_assert(WLSCAN_NCHAN == WLSCAN_NCHAN_24 + WLSCAN_CH_5G_BITS, "CH1: one mask bit per 5 GHz entry");
 +static uint32_t wlscan_chmask;
++/* J1: bit F set = entry F of the full list is not allowed by the regulatory answer; 0 unless the join rung filled it. */
++static uint64_t wlscan_regdrop;
++_Static_assert(WLSCAN_NCHAN <= 64u, "J1: one regdrop bit per entry");
 +
 +static inline uint32_t
 +wlscan_chan_full(uint32_t i)
@@ -11869,10 +11971,11 @@
 +	return i < WLSCAN_NCHAN ? mhz[i] : 0u;
 +}
 +
-+/* Does MASK drop entry I of the full list? */
++/* Does MASK (or the J1 regulatory answer) drop entry I of the full list? */
 +static inline bool
 +wlscan_dropped(uint32_t mask, uint32_t i)
 +{
++	if (i < 64u && ((wlscan_regdrop >> i) & 1u)) { return true; }
 +	return i < WLSCAN_NCHAN_24 ? (mask & WLSCAN_CH_24) != 0 : ((mask >> (i - WLSCAN_NCHAN_24)) & 1u) != 0;
 +}
 +
@@ -11888,7 +11991,9 @@
 +static inline uint32_t
 +wlscan_kept24(uint32_t mask)
 +{
-+	return (mask & WLSCAN_CH_24) ? 0u : WLSCAN_NCHAN_24;
++	uint32_t n = 0;
++	for (uint32_t i = 0; i < WLSCAN_NCHAN_24; i++) { n += wlscan_dropped(mask, i) ? 0u : 1u; }
++	return n;
 +}
 +
 +/* The mask a scan really uses: the knob, plus every 5 GHz entry when w20 0x10 (BAND24) is set. */
@@ -11927,6 +12032,98 @@
 +{
 +	for (uint32_t i = 0; i < n && i < WLSCAN_NCHAN; i++) { if (wlscan_chan(i) == mhz) { return true; } }
 +	return false;
++}
++
++/* ---- J1: the regulatory answer (fuxiwlanjoin=1), pure ----
++ * REG_CHAN_LIST_CC_EXT (L19 wmi.c:5975-6170): a fixed TLV 0x3aa (status 0,
++ * phy 4, alpha2 8, dfs_region 24, num_2g 48, num_5g 52; its own length is
++ * used, at least 312 bytes, so a longer fixed part is stepped over), then
++ * one array of 20-byte rules (header, freq_info, bw_pwr_info, flag_info,
++ * psd_power_info; wmi.c:5916-5957, 6159-6163): the 2 GHz rules, then the
++ * 5 GHz ones. Anything after those rules (6 GHz and the rest) is not read.
++ * L19 drops more than 10 rules a band and an event of a phy other than 0
++ * on a single pdev chip; so does this parser. Unarmed (want 0: the events
++ * before the host asks) a bad event is only counted; armed, it fails the
++ * rung. An armed answer for another country is stale: counted, not taken. */
++struct wlreg_rule { uint16_t start, end, bw, flags; uint8_t pwr; };
++struct wlreg {
++	uint32_t events, phy0, other_phy, bad, stale;
++	uint32_t ev_len, ev_fixed, ev_arr, ev_phy, ev_status, ev_alpha2, ev_n2, ev_n5;   /* the last event, for its line */
++	uint32_t want;                                    /* the alpha2 word asked for; 0 = not armed */
++	uint32_t status, alpha2, dfs_region, n2, n5;      /* the record taken */
++	struct wlreg_rule rule[2 * WLREG_MAX_RULES];      /* n2 2 GHz rules, then n5 5 GHz rules */
++	const char *why;
++	bool have, failed;
++};
++
++static inline void
++wlreg_bad(struct wlreg *r, const char *why)
++{
++	r->bad++;
++	if (r->want) { r->failed = true; r->why = why; }
++}
++
++static inline void
++wlreg_parse(struct wlreg *r, const uint8_t *p, uint32_t len)
++{
++	struct wlwmi_it it;
++	struct wlreg_rule tmp[2 * WLREG_MAX_RULES];
++	r->events++;
++	r->ev_len = len; r->ev_fixed = r->ev_arr = r->ev_phy = r->ev_status = r->ev_alpha2 = r->ev_n2 = r->ev_n5 = 0;
++	wlwmi_it_init(&it, p, len);
++	if (wlwmi_next(&it) != 1 || it.tag != WLREG_TAG_CC_EXT || it.tlen < WLREG_FIXED_BYTES) { wlreg_bad(r, "J1 cc event has no fixed part"); return; }
++	const uint8_t *f = it.v;
++	const uint32_t status = wlce_get32(f), phy = wlce_get32(f + 4), alpha2 = wlce_get32(f + 8) & 0xffffu;
++	const uint32_t dfs = wlce_get32(f + 24), n2 = wlce_get32(f + 48), n5 = wlce_get32(f + 52);
++	r->ev_fixed = it.tlen; r->ev_phy = phy; r->ev_status = status; r->ev_alpha2 = alpha2; r->ev_n2 = n2; r->ev_n5 = n5;
++	if (phy != 0) { r->other_phy++; return; }
++	if (status != 0) {   /* an answer that refuses: no rules to read */
++		r->status = status; r->alpha2 = alpha2; r->dfs_region = dfs; r->n2 = r->n5 = 0;
++		r->phy0++; r->have = true;
++		return;
++	}
++	if (r->want && alpha2 != r->want) { r->stale++; return; }
++	if (n2 > WLREG_MAX_RULES || n5 > WLREG_MAX_RULES) { wlreg_bad(r, "J1 cc rules overrun"); return; }
++	const uint32_t nr = n2 + n5;
++	if (nr) {
++		if (wlwmi_next(&it) != 1 || it.tag != WLWMI_TAG_ARRAY_STRUCT || it.tlen < nr * WLREG_RULE_BYTES) {
++			wlreg_bad(r, "J1 cc rules array short");
++			return;
++		}
++		r->ev_arr = it.tlen;
++	}
++	for (uint32_t i = 0; i < nr; i++) {
++		const uint8_t *e = it.v + WLREG_RULE_BYTES * i;
++		const uint32_t fq = wlce_get32(e + 4), bp = wlce_get32(e + 8), fl = wlce_get32(e + 12);
++		tmp[i].start = (uint16_t)(fq & 0xffffu); tmp[i].end = (uint16_t)(fq >> 16);
++		tmp[i].bw = (uint16_t)(bp & 0xffffu); tmp[i].pwr = (uint8_t)((bp >> 16) & 0xffu); tmp[i].flags = (uint16_t)(fl & 0xffffu);
++	}
++	r->status = 0; r->alpha2 = alpha2; r->dfs_region = dfs; r->n2 = n2; r->n5 = n5;
++	for (uint32_t i = 0; i < nr; i++) { r->rule[i] = tmp[i]; }
++	r->phy0++; r->have = true;
++}
++
++/* Does the record allow a 20 MHz channel centred on MHZ? Some rule that is
++ * not disabled and not NO_20MHZ, at least 20 MHz wide, must hold the whole
++ * channel. NO_IR and RADAR are reported only: every scan here is passive. */
++static inline bool
++wlreg_allows(const struct wlreg *r, uint32_t mhz)
++{
++	for (uint32_t i = 0; i < r->n2 + r->n5 && i < 2 * WLREG_MAX_RULES; i++) {
++		const struct wlreg_rule *u = &r->rule[i];
++		if (u->flags & (WLREG_FLAG_DISABLED | WLREG_FLAG_NO_20MHZ)) { continue; }
++		if (u->bw >= 20u && (uint32_t)u->start + 10u <= mhz && mhz + 10u <= (uint32_t)u->end) { return true; }
++	}
++	return false;
++}
++
++/* The entries of the full list the record does not allow (wlscan_regdrop). */
++static inline uint64_t
++wlreg_dropset(const struct wlreg *r)
++{
++	uint64_t d = 0;
++	for (uint32_t f = 0; f < WLSCAN_NCHAN; f++) { if (!wlreg_allows(r, wlscan_chan_full(f))) { d |= (uint64_t)1 << f; } }
++	return d;
 +}
 +
 +static inline uint32_t

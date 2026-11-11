@@ -203,6 +203,10 @@ static void absolutetime_to_nanoseconds(uint64_t t, uint64_t *ns) { *ns = t; }
 #define H_CACHE_MS 30000ull
 #endif
 
+/* J1 (fuxiwlanjoin / fuxiwlancc): the knob gate is outside the production excerpt; off here unless a J1 scenario sets them */
+static unsigned wl_join;
+static uint32_t wl_cc;
+
 #include "fuxi-wlan-ce-prod.inc"
 
 /* ---- model state ---- */
@@ -353,6 +357,13 @@ struct cfg {
 	/* W25e: START_SCAN number c3_silent_scan (0: none) is heard for c3_silent_n channels (each a FOREIGN_CHANNEL, its CHAN_INFO pair and its
 	 * frames) and then never again: no COMPLETED, nothing at all, as the phone's firmware before its thread assert */
 	unsigned c3_silent_scan, c3_silent_n;
+	/* J1: how the firmware answers SET_CURRENT_COUNTRY (0 the IL-like rules below; 1 never; 2 status reg_status; 3 eleven 2 GHz
+	 * rules; 4 a rules array shorter than the counts; 5 a US answer first, the right one 1200 ms later; 6 only the US answer;
+	 * 7 a phy 1 answer with every rule disabled first, then the right one; 8 every rule disabled; 9 2.4 GHz 2402-2472 only up
+	 * to channel 11), reg_fixed_extra / reg_tail the longer fixed part and the bytes after the rules a newer firmware sends;
+	 * reg_boot: READY is followed by a 756-byte boot answer (alpha2 "00") instead of the 44-byte one */
+	unsigned reg_mode, reg_status, reg_fixed_extra, reg_tail;
+	bool reg_boot;
 };
 static struct cfg C;
 static unsigned restores;
@@ -383,6 +394,8 @@ static unsigned fw_c2_step, fw_chan_seen, fw_chan_cmds, fw_scan_cmds, fw_stop_cm
 static uint32_t fw_scan_id = 0xa000, fw_stop_id = ~0u;
 static unsigned fw_scan_done_q = ~0u;
 static unsigned fw_stats_req;
+static unsigned fw_reg_cmds;          /* J1: SET_CURRENT_COUNTRY commands seen */
+static uint8_t fw_reg_last[16];       /* J1: the last one as it came, WMI header included */
 static uint64_t fw_stats_at;
 static uint32_t fw_stats_pdev = 1;  /* the pdev the last REQUEST_STATS named; UPDATE_STATS carries it back */
 static uint32_t fw_cmd_log[64];
@@ -852,6 +865,8 @@ static uint32_t m_chan_no(uint32_t mhz) { return mhz < 3000 ? (mhz - 2407) / 5 :
  * description: bit k (0..24) drops the k-th 5 GHz entry in list order (m_chan(13 + k)), bit 25 drops the 13 2.4 GHz
  * entries. m_kidx(I) = the full-list index of the I-th kept channel (38 past the end); mask 0 = the whole list. */
 static uint32_t m_chmask;
+/* J1: the full-list entries the firmware expects the host to have dropped after its regulatory answer (bit F = entry F) */
+static uint64_t m_regdrop;
 /* The scan_ctrl_flags_ext word (START_SCAN word 35) the firmware expects in every START_SCAN: 0 unless a scenario asks for a DBS scan
  * policy. Written down here from the vendor header (wmi_unified.h:6470-6478: policy in bits 0-1, 1 = FORCE_NONDBS, 2 = IGNORE_DUTY). */
 static uint32_t m_ext;
@@ -860,12 +875,51 @@ m_kidx(unsigned i)
 {
 	unsigned k = 0;
 	for (unsigned f = 0; f < 38; f++) {
-		bool dropped = f < 13 ? ((m_chmask >> 25) & 1u) : ((m_chmask >> (f - 13)) & 1u);
+		bool dropped = (f < 13 ? ((m_chmask >> 25) & 1u) : ((m_chmask >> (f - 13)) & 1u)) || ((m_regdrop >> f) & 1u);
 		if (!dropped && k++ == i) { return f; }
 	}
 	return 38;
 }
 static uint32_t m_chan_k(unsigned i) { unsigned f = m_kidx(i); return f < 38 ? m_chan(f) : 0u; }
+
+/* J1: REG_CHAN_LIST_CC_EXT written down here again from L19 wmi.h:4439-4489 (a 0x3aa fixed TLV of 78 words: status word 0,
+ * phy 1, alpha2 2, dfs_region 6, num_2g 12, num_5g 13), then an ARRAY_STRUCT of rules {header, start | end << 16, max bw |
+ * power << 16, flags, psd}. RULES[i] = {start, end, bw, flags}. arr_len < 0: the array as long as the rules. */
+static const uint32_t m_il_rules[4][4] = {{2402, 2482, 40, 0}, {5170, 5250, 80, 0}, {5250, 5330, 80, 8}, {5490, 5730, 160, 8}};
+static void
+m_reg_event(uint32_t status, uint32_t phy, uint32_t alpha2, uint32_t n2, uint32_t n5, const uint32_t (*rules)[4], unsigned nrules,
+    uint32_t fixed_extra, int arr_len, uint32_t tail)
+{
+	m_reset();
+	m_tlv(0x3aa, 312 + fixed_extra);
+	const uint32_t base = ml;
+	m_zero(312 + fixed_extra);
+	p32(mb + base, status); p32(mb + base + 4, phy); p32(mb + base + 8, alpha2); p32(mb + base + 24, 3);
+	p32(mb + base + 48, n2); p32(mb + base + 52, n5);
+	m_tlv(0x12, arr_len >= 0 ? (uint32_t)arr_len : 20u * nrules);
+	for (unsigned i = 0; i < nrules; i++) {
+		m_u32(0x3abu << 16 | 16u); m_u32(rules[i][0] | rules[i][1] << 16); m_u32(rules[i][2] | 23u << 16); m_u32(rules[i][3]); m_u32(0);
+	}
+	m_zero(tail);
+}
+/* J1: the model's own reading of a rule set: a 20 MHz channel is allowed when a rule that is not DISABLED (bit 0) and not
+ * NO_20MHZ (bit 11, wmi.h:4415-4425) and at least 20 MHz wide holds it from centre - 10 to centre + 10 */
+static bool
+m_reg_allows(const uint32_t (*rules)[4], unsigned n, uint32_t mhz)
+{
+	for (unsigned i = 0; i < n; i++) {
+		if ((rules[i][3] & (1u | 1u << 11)) || rules[i][2] < 20) { continue; }
+		if (mhz >= rules[i][0] + 10 && mhz + 10 <= rules[i][1]) { return true; }
+	}
+	return false;
+}
+static uint64_t
+m_reg_drop(const uint32_t (*rules)[4], unsigned n)
+{
+	uint64_t d = 0;
+	for (unsigned f = 0; f < 38; f++) { if (!m_reg_allows(rules, n, m_chan(f))) { d |= 1ull << f; } }
+	return d;
+}
 
 /* a credit report in a trailer-only HTC message, DELAY ms later */
 static void
@@ -2211,6 +2265,46 @@ fw_stats_cmd(const uint8_t *pl, uint32_t plen, unsigned need)
 	fw_stats_answer(need);
 }
 
+/* J1 SET_CURRENT_COUNTRY (L19 wmi.h:4363-4367: {tag 0x25f, 8 bytes: pdev, alpha2}): only with the join rung, once, after INIT and
+ * before the HTT version exchange, the two PDEV_SET_PARAM and the channel list; answered as C.reg_mode says. */
+static void
+fw_reg_cmd(const uint8_t *pl, uint32_t plen, unsigned need)
+{
+	static const uint32_t many[11][4] = {{2402, 2482, 40, 0}, {2402, 2482, 40, 0}, {2402, 2482, 40, 0}, {2402, 2482, 40, 0},
+	    {2402, 2482, 40, 0}, {2402, 2482, 40, 0}, {2402, 2482, 40, 0}, {2402, 2482, 40, 0}, {2402, 2482, 40, 0}, {2402, 2482, 40, 0},
+	    {2402, 2482, 40, 0}};
+	static const uint32_t off[4][4] = {{2402, 2482, 40, 1}, {5170, 5250, 80, 1}, {5250, 5330, 80, 9}, {5490, 5730, 160, 9}};
+	static const uint32_t ch11[4][4] = {{2402, 2472, 40, 0}, {5170, 5250, 80, 0}, {5250, 5330, 80, 8}, {5490, 5730, 160, 8}};
+	CHECK(wl_join == 1 && wl_w23, "SET_CURRENT_COUNTRY without the join rung");
+	CHECK(fw_reg_cmds == 0, "a second SET_CURRENT_COUNTRY");
+	CHECK(fw_init_ok == 1 && fw_c2_step == 0 && !fw_chan_cmds && !fw_scan_cmds && fw_htt_req == 0 && !fw_pset_n,
+	    "SET_CURRENT_COUNTRY after the HTT version exchange, a PDEV_SET_PARAM, the channel list or a scan");
+	CHECK(plen == 16 && g32(pl + 4) == (0x25fu << 16 | 8u) && g32(pl + 8) == C.exp_pdev && g32(pl + 12) == wl_cc,
+	    "SET_CURRENT_COUNTRY is not {tag 0x25f, 8 bytes, pdev, alpha2}");
+	memcpy(fw_reg_last, pl, 16);
+	fw_reg_cmds++;
+	const uint32_t a = wl_cc;
+	switch (C.reg_mode) {
+	case 0: m_reg_event(0, 0, a, 1, 3, m_il_rules, 4, C.reg_fixed_extra, -1, C.reg_tail); wmi_out(0x3a003, need, 5); break;
+	case 1: fw_refund(need, 1); break;
+	case 2: m_reg_event(C.reg_status, 0, a, 0, 0, NULL, 0, 0, 0, 0); wmi_out(0x3a003, need, 5); break;
+	case 3: m_reg_event(0, 0, a, 11, 0, many, 11, 0, -1, 0); wmi_out(0x3a003, need, 5); break;
+	case 4: m_reg_event(0, 0, a, 1, 3, m_il_rules, 4, 0, 60, 0); wmi_out(0x3a003, need, 5); break;
+	case 5:
+		m_reg_event(0, 0, 0x5355u, 1, 3, m_il_rules, 4, 0, -1, 0); wmi_out(0x3a003, 0, 3);
+		m_reg_event(0, 0, a, 1, 3, m_il_rules, 4, 0, -1, 0); wmi_out(0x3a003, need, 1200);
+		break;
+	case 6: m_reg_event(0, 0, 0x5355u, 1, 3, m_il_rules, 4, 0, -1, 0); wmi_out(0x3a003, need, 5); break;
+	case 7:
+		m_reg_event(0, 1, a, 1, 3, off, 4, 0, -1, 0); wmi_out(0x3a003, 0, 3);
+		m_reg_event(0, 0, a, 1, 3, m_il_rules, 4, 0, -1, 0); wmi_out(0x3a003, need, 6);
+		break;
+	case 8: m_reg_event(0, 0, a, 1, 3, off, 4, 0, -1, 0); wmi_out(0x3a003, need, 5); break;
+	case 9: m_reg_event(0, 0, a, 1, 3, ch11, 4, 0, -1, 0); wmi_out(0x3a003, need, 5); break;
+	default: CHECK(false, "reg_mode");
+	}
+}
+
 /* C2f (W29): the mac-start pdev params, DFS offload, LRO, idle-PS and the vdev encap/decap, each checked word by word
  * against L19 (mac.c:9363-9469, 9782-9827) and in its place: PMF_QOS, DYNAMIC_BW, ARP_AC_OVERRIDE, DFS, the two PPDU
  * stats and MESH_MCAST after the HTT version exchange and before the chain mask and the channel list; LRO and idle-PS
@@ -2358,7 +2452,11 @@ fw_rx(unsigned ce, uint32_t eid, const uint8_t *d, uint32_t len)
 		if (C.ready_mac) { memcpy(mb + ml, mac, 6); }
 		m_zero(8); m_u32(C.ready_status); m_u32(0); m_u32(0); m_u32(16); m_zero(12);
 		wmi_out(0x2, C.refund_in_ready ? (unsigned)need : 0u, 3);
-		m_reset(); m_tlv(0x3aa, 40); m_zero(40);
+		if (C.reg_boot) {   /* J1: the boot answer in the shape the phone sends: 756 bytes, one 2.4 GHz rule (unlike the answer) plus 416 bytes the parser does not read */
+			m_reg_event(0, 0, 0x3030u, 1, 0, m_il_rules, 1, 0, 436, 416);
+		} else {
+			m_reset(); m_tlv(0x3aa, 40); m_zero(40);
+		}
 		wmi_out(0x3a003, 0, 4);
 		if (C.big_event) {  /* one transfer of exactly 2048 bytes (the DEST_CTRL max): an unknown event, logged only */
 			m_reset(); m_zero(2048u - 8u - 4u);
@@ -2388,6 +2486,8 @@ fw_rx(unsigned ce, uint32_t eid, const uint8_t *d, uint32_t len)
 		fw_c2_cmd(id, pl, plen, (unsigned)need);
 	} else if (id == 0x16001) {
 		fw_stats_cmd(pl, plen, (unsigned)need);
+	} else if (id == 0x3a001) {
+		fw_reg_cmd(pl, plen, (unsigned)need);
 	} else {
 		CHECK(id == 0x7ff0, "unexpected WMI command");
 		fw_echoes++;
@@ -3085,6 +3185,8 @@ reset(void)
 	wl23_lines = wl23_pdev = wl23_htt_major = wl23_htt_minor = wl23_rssi_conv = 0; wl23_guard_bad = false;
 	fw_c2_step = fw_chan_seen = fw_chan_cmds = fw_scan_cmds = fw_stop_cmds = fw_htt_req = 0; fw_stop_pdev = ~0u;
 	n_beacons = 0; wl23_chmask = 0; wlscan_chmask = 0; m_chmask = 0; m_ext = 0;  /* CH1 */
+	wl_join = 0; wl_cc = 0; m_regdrop = 0; wlscan_regdrop = 0; memset(&wl_reg, 0, sizeof(wl_reg)); fw_reg_cmds = 0;  /* J1 */
+	memset(fw_reg_last, 0, sizeof(fw_reg_last));
 	fw_scan_id = 0xa000; fw_stop_id = ~0u; fw_scan_done_q = ~0u; wl23_scan_id = WLWMI_SCAN_ID;  /* CH1 split */
 	memset(&wl_stats, 0, sizeof(wl_stats)); wl23_ci_lines = wl23_ci_drop = 0; fw_stats_req = 0; fw_stats_at = 0; fw_stats_pdev = 1;
 	/* C3 */
@@ -9413,6 +9515,243 @@ s_ext_scan(void)
 	     "with the split both scans carry the word, also with a mask, one band empty, a small WMI message and a failed first scan");
 }
 
+/* ---- J1 (fuxiwlanjoin=1): the regulatory rung ---- */
+static void
+j1_parse_case(struct wlreg *r, uint32_t want)
+{
+	memset(r, 0, sizeof(*r));
+	r->want = want;
+	wlreg_parse(r, mb, ml);
+}
+
+static void
+s_j1_pure(void)
+{
+	struct wlreg r;
+	const uint32_t il = 0x4c49;
+	/* exact fixed part, armed: the record, the rules and the drop set the model reads from the same rules */
+	m_reg_event(0, 0, il, 1, 3, m_il_rules, 4, 0, -1, 0);
+	CHECK(ml == 4 + 312 + 4 + 80, "J1 event length");
+	j1_parse_case(&r, il);
+	CHECK(r.have && !r.failed && r.events == 1 && r.phy0 == 1 && r.bad == 0 && r.status == 0 && r.alpha2 == il && r.dfs_region == 3 &&
+	    r.n2 == 1 && r.n5 == 3 && r.ev_fixed == 312 && r.ev_arr == 80 && r.ev_len == 400, "J1 IL record");
+	CHECK(r.rule[0].start == 2402 && r.rule[0].end == 2482 && r.rule[0].bw == 40 && r.rule[0].pwr == 23 && r.rule[0].flags == 0 &&
+	    r.rule[3].start == 5490 && r.rule[3].end == 5730 && r.rule[3].bw == 160 && r.rule[3].flags == 8, "J1 IL rules");
+	CHECK(wlreg_dropset(&r) == m_reg_drop(m_il_rules, 4) && m_reg_drop(m_il_rules, 4) == 0x1full << 33, "J1 IL drops 5745..5825");
+	for (unsigned f = 0; f < 38; f++) { CHECK(wlreg_allows(&r, m_chan(f)) == m_reg_allows(m_il_rules, 4, m_chan(f)), "J1 allows, per channel"); }
+	/* a longer fixed part and bytes after the rules (the 756-byte shape): the same record */
+	m_reg_event(0, 0, il, 1, 3, m_il_rules, 4, 0, 436, 356);
+	CHECK(ml == 756, "J1 756-byte shape");
+	j1_parse_case(&r, il);
+	CHECK(r.have && r.n2 == 1 && r.n5 == 3 && r.ev_arr == 436 && wlreg_dropset(&r) == 0x1full << 33, "J1 756-byte answer");
+	m_reg_event(0, 0, il, 1, 3, m_il_rules, 4, 16, -1, 0);
+	j1_parse_case(&r, il);
+	CHECK(r.have && r.ev_fixed == 328 && r.rule[2].start == 5250 && wlreg_dropset(&r) == 0x1full << 33, "J1 longer fixed part stepped over");
+	/* bad events: armed they fail, unarmed they are only counted */
+	m_reg_event(0, 0, il, 1, 3, m_il_rules, 4, 0, -1, 0); ml = 4 + 100;
+	j1_parse_case(&r, il);
+	CHECK(!r.have && r.failed && r.bad == 1 && !strcmp(r.why, "J1 cc event has no fixed part"), "J1 truncated, armed");
+	j1_parse_case(&r, 0);
+	CHECK(!r.have && !r.failed && r.bad == 1, "J1 truncated, unarmed");
+	m_reg_event(0, 0, il, 1, 3, m_il_rules, 4, 0, -1, 0); p32(mb, 0x3abu << 16 | 312u);
+	j1_parse_case(&r, il);
+	CHECK(r.failed && !strcmp(r.why, "J1 cc event has no fixed part"), "J1 wrong fixed tag");
+	m_reset(); m_tlv(0x3aa, 40); m_zero(40);
+	j1_parse_case(&r, il);
+	CHECK(r.failed && r.bad == 1, "J1 the 44-byte legacy event is bad");
+	m_reg_event(0, 0, il, 11, 0, m_il_rules, 0, 0, 220, 220);
+	j1_parse_case(&r, il);
+	CHECK(r.failed && !strcmp(r.why, "J1 cc rules overrun"), "J1 11 rules");
+	m_reg_event(0, 0, il, 0, 11, m_il_rules, 0, 0, 220, 220);
+	j1_parse_case(&r, il);
+	CHECK(r.failed && !strcmp(r.why, "J1 cc rules overrun"), "J1 11 5 GHz rules");
+	m_reg_event(0, 0, il, 1, 3, m_il_rules, 4, 0, 79, 0);
+	j1_parse_case(&r, il);
+	CHECK(r.failed && !strcmp(r.why, "J1 cc rules array short"), "J1 array one byte short");
+	m_reg_event(0, 0, il, 1, 3, m_il_rules, 4, 0, -1, 0); p32(mb + 4 + 312, 0x10u << 16 | 80u);
+	j1_parse_case(&r, il);
+	CHECK(r.failed && !strcmp(r.why, "J1 cc rules array short"), "J1 rules array of the wrong tag");
+	/* phy 1, a refusal, another country */
+	m_reg_event(0, 1, il, 1, 3, m_il_rules, 4, 0, -1, 0);
+	j1_parse_case(&r, il);
+	CHECK(!r.have && !r.failed && r.other_phy == 1 && r.phy0 == 0, "J1 phy 1 ignored");
+	m_reg_event(3, 0, il, 0, 0, NULL, 0, 0, 0, 0);
+	j1_parse_case(&r, il);
+	CHECK(r.have && !r.failed && r.status == 3 && r.n2 == 0 && r.n5 == 0, "J1 status 3");
+	m_reg_event(0, 0, 0x5355u, 1, 3, m_il_rules, 4, 0, -1, 0);
+	j1_parse_case(&r, il);
+	CHECK(!r.have && !r.failed && r.stale == 1, "J1 another country, armed: stale");
+	j1_parse_case(&r, 0);
+	CHECK(r.have && r.alpha2 == 0x5355u && r.stale == 0, "J1 another country, unarmed: the boot record");
+	/* no rules at all: every channel dropped */
+	m_reg_event(0, 0, il, 0, 0, NULL, 0, 0, 0, 0);
+	j1_parse_case(&r, il);
+	CHECK(r.have && r.n2 == 0 && wlreg_dropset(&r) == (1ull << 38) - 1, "J1 no rules drops all 38");
+	/* edges, flags and widths */
+	static const uint32_t edge[6][4] = {{2402, 2472, 40, 0}, {5170, 5249, 80, 0}, {5250, 5290, 80, 1}, {5290, 5330, 80, 0x800},
+	    {5490, 5530, 10, 0}, {5530, 5730, 160, 0x2 | 0x8 | 0x10 | 0x80 | 0x100 | 0x200}};
+	m_reg_event(0, 0, il, 1, 5, edge, 6, 0, -1, 0);
+	j1_parse_case(&r, il);
+	CHECK(r.have && r.n2 == 1 && r.n5 == 5, "J1 edge record");
+	CHECK(wlreg_allows(&r, 2462) && !wlreg_allows(&r, 2467) && !wlreg_allows(&r, 2472), "J1 2402-2472: channels 1 to 11");
+	CHECK(wlreg_allows(&r, 5180) && wlreg_allows(&r, 5220) && !wlreg_allows(&r, 5240), "J1 5170-5249: 5240 needs 5250");
+	CHECK(!wlreg_allows(&r, 5260) && !wlreg_allows(&r, 5280) && !wlreg_allows(&r, 5300), "J1 DISABLED and NO_20MHZ rules");
+	CHECK(!wlreg_allows(&r, 5500) && !wlreg_allows(&r, 5520), "J1 a 10 MHz rule allows no 20 MHz channel");
+	CHECK(wlreg_allows(&r, 5540) && wlreg_allows(&r, 5720) && !wlreg_allows(&r, 5745), "J1 NO_IR / RADAR / NO_HT40 / NO_80 / NO_160 / INDOOR keep it");
+	CHECK(wlreg_dropset(&r) == m_reg_drop(edge, 6), "J1 edge drop set against the model's reading");
+	/* the scan list helpers follow wlscan_regdrop */
+	wlscan_chmask = 0; wlscan_regdrop = 0x1full << 33;
+	CHECK(wlscan_kept(0) == 33 && wlscan_kept24(0) == 13 && wlscan_chan(32) == 5720 && wlscan_chan(33) == 0, "J1 list of 33");
+	CHECK(wlscan_kept(WLSCAN_CH_ALL5) == 13 && wlscan_kept(WLSCAN_CH_24) == 20 && wlscan_kept24(WLSCAN_CH_24) == 0, "J1 with the mask");
+	wlscan_regdrop = (1ull << 11) | (1ull << 12);
+	CHECK(wlscan_kept(0) == 36 && wlscan_kept24(0) == 11 && wlscan_chan(10) == 2462 && wlscan_chan(11) == 5180, "J1 list without 12 and 13");
+	wlscan_regdrop = 0;
+	CHECK(wlscan_kept(0) == 38 && wlscan_kept24(0) == 13 && wlscan_kept24(WLSCAN_CH_24) == 0, "J1 nothing dropped");
+	puts("J1 pure: SET_CURRENT_COUNTRY wire form, CC_EXT parse (312 and longer fixed parts, the 756-byte shape, truncated, wrong tags, "
+	     "11 rules, short array, phy 1, status, stale), rule edges and flags against the model's reading, list helpers");
+}
+
+static void
+j1_setup(unsigned mode, uint64_t drop, unsigned n)
+{
+	c2_reset();
+	wl_join = 1; wl_cc = 0x4c49;
+	C.reg_mode = mode;
+	m_regdrop = drop; C.exp_n = n;
+}
+
+/* a J1 failure before any channel list: contained, no scan command */
+static void
+j1_fails(unsigned mode, const char *line)
+{
+	j1_setup(mode, 0, 38);
+	CHECK(run() == 1, "J1 failure ran");
+	expect(line);
+	CHECK(fw_reg_cmds == 1 && fw_chan_cmds == 0 && fw_scan_cmds == 0 && fw_htt_req == 0 && fw_c2_step == 0, "J1 commands after a failure");
+	expect_not("W23 chan list");
+	contained_and_freed();
+}
+
+static void
+s_j1_scan(void)
+{
+	static const uint8_t golden[16] = {0x01, 0xa0, 0x03, 0x00, 0x08, 0x00, 0x5f, 0x02, 0, 0, 0, 0, 0x49, 0x4c, 0, 0};
+	/* knob off: no country command, the boot event logged only as before */
+	c2_reset();
+	CHECK(run() == 0, "J1 knob off failed");
+	CHECK(fw_reg_cmds == 0 && fw_chan_seen == 38, "J1 knob off");
+	expect("FUXI WLAN: W22 wmi event 0x3a003 bytes 44 (logged only)\n");
+	expect_not("J1 ");
+	contained_and_freed();
+
+	/* IL: 33 channels, 5745..5825 gone; the boot event (44 bytes, bad) only counted */
+	j1_setup(0, 0x1full << 33, 33);
+	happy_frames();
+	CHECK(run() == 0, "J1 IL scan failed");
+	CHECK(fw_reg_cmds == 1 && !memcmp(fw_reg_last + 4, golden + 4, 12) && (g32(fw_reg_last) & 0xffffffu) == 0x3a001u,
+	    "J1 SET_CURRENT_COUNTRY bytes");
+	static const char *const lil[] = {
+		"FUXI WLAN: J1 cc event 1 bytes 44 fixed 0 array 0 phy 0 status 0 alpha2 0x0 rules 2g 0 5g 0 (bad 1, stale 0)\n",
+		"FUXI WLAN: J1 cc boot events 1 (phy0 0, other-phy 0, bad 1) alpha2 -- status 0 rules 2g 0 5g 0 dfs-region 0\n",
+		"FUXI WLAN: J1 set current country IL sent (0x3a001, pdev 0, 12 bytes)\n",
+		"FUXI WLAN: J1 cc event 2 bytes 400 fixed 312 array 80 phy 0 status 0 alpha2 0x4c49 rules 2g 1 5g 3 (bad 1, stale 0)\n",
+		"FUXI WLAN: J1 cc IL status 0 phy 0 rules 2g 1 5g 3 dfs-region 3 after ",
+		"FUXI WLAN: J1 rule 2g 2402-2482 MHz bw 40 pwr 23 flags 0x0\n",
+		"FUXI WLAN: J1 rule 5g 5170-5250 MHz bw 80 pwr 23 flags 0x0\n",
+		"FUXI WLAN: J1 rule 5g 5250-5330 MHz bw 80 pwr 23 flags 0x8\n",
+		"FUXI WLAN: J1 rule 5g 5490-5730 MHz bw 160 pwr 23 flags 0x8\n",
+		"FUXI WLAN: J1 channel list 33 of 38 (2.4 GHz 13, 5 GHz 20, passive all)\n",
+		"FUXI WLAN: W23 chan list 33 passive (2.4 GHz 13, 5 GHz 20, dfs 16) pdev 0 commands 1 bytes 948\n",
+		"FUXI WLAN: W23 scan start id 0xa000 vdev 0 channels 33 passive dwell 150 ms max 7425 ms events 0x5f flags 0x11\n",
+		" ms (foreign 33 chan-info 33)\n",
+	};
+	expect_order(lil, sizeof(lil) / sizeof(lil[0]));
+	expect_not("freq 5745"); expect_not("freq 5765"); expect_not("freq 5825"); expect_not("wmi event 0x3a003");
+	CHECK(count_text("W23 scan foreign freq") == 33 && wl_scan.nchan == 33 && fw_chan_seen == 33 && fw_scan_cmds == 1 && fw_c2_step == 8,
+	    "J1 33 channels scanned");
+	contained_and_freed();
+
+	/* a reboot with the knob off after a J1 boot: W20 clears what J1 left */
+	{
+		const uint64_t left = wlscan_regdrop;
+		CHECK(left == 0x1full << 33, "J1 left its drop set");
+		c2_reset();
+		wlscan_regdrop = left;
+		CHECK(run() == 0 && fw_chan_seen == 38, "J1 drop set kept across boots");
+		contained_and_freed();
+	}
+
+	/* the phone's boot answer (756 bytes, alpha2 00): taken as the boot record, then the IL answer */
+	j1_setup(0, 0x1full << 33, 33);
+	C.reg_boot = true; C.reg_fixed_extra = 16; C.reg_tail = 340;
+	CHECK(run() == 0, "J1 with the boot answer failed");
+	expect("FUXI WLAN: J1 cc event 1 bytes 756 fixed 312 array 436 phy 0 status 0 alpha2 0x3030 rules 2g 1 5g 0 (bad 0, stale 0)\n");
+	expect("FUXI WLAN: J1 cc boot events 1 (phy0 1, other-phy 0, bad 0) alpha2 ?? status 0 rules 2g 1 5g 0 dfs-region 3\n");
+	expect("FUXI WLAN: J1 cc event 2 bytes 756 fixed 328 array 80 phy 0 status 0 alpha2 0x4c49 rules 2g 1 5g 3 (bad 0, stale 0)\n");
+	expect("FUXI WLAN: J1 channel list 33 of 38 (2.4 GHz 13, 5 GHz 20, passive all)\n");
+	CHECK(fw_chan_seen == 33, "J1 boot answer then IL");
+	contained_and_freed();
+
+	/* pdev as W23 names it (w20 PDEVCAP) */
+	j1_setup(0, 0x1full << 33, 33);
+	wl20_bits = WL20_PDEVCAP; C.exp_pdev = 1;
+	CHECK(run() == 0, "J1 pdev 1 failed");
+	expect("FUXI WLAN: J1 set current country IL sent (0x3a001, pdev 1, 12 bytes)\n");
+	contained_and_freed();
+
+	/* channels 1 to 11 only */
+	j1_setup(9, m_reg_drop((const uint32_t (*)[4])(const uint32_t[4][4]){{2402, 2472, 40, 0}, {5170, 5250, 80, 0}, {5250, 5330, 80, 8},
+	    {5490, 5730, 160, 8}}, 4), 31);
+	CHECK(m_regdrop == ((1ull << 11) | (1ull << 12) | 0x1full << 33), "J1 2402-2472 drop set");
+	CHECK(run() == 0, "J1 1 to 11 failed");
+	expect("FUXI WLAN: J1 channel list 31 of 38 (2.4 GHz 11, 5 GHz 20, passive all)\n");
+	expect("FUXI WLAN: W23 chan list 31 passive (2.4 GHz 11, 5 GHz 20, dfs 16) pdev 0 commands 1 bytes 892\n");
+	expect_not("freq 2467"); expect_not("freq 2472");
+	CHECK(count_text("W23 scan foreign freq") == 31, "J1 31 channels scanned");
+	contained_and_freed();
+
+	/* together with the CH1 mask 57344 (5600/5620/5640): 30 channels */
+	j1_setup(0, 0x1full << 33, 30);
+	wl23_chmask = 57344; m_chmask = 57344;
+	CHECK(run() == 0, "J1 with the mask failed");
+	expect("FUXI WLAN: W23 chan mask 0xe000: 30 channels kept (2.4 GHz 13, 5 GHz 17)\n");
+	expect("FUXI WLAN: W23 chan list 30 passive (2.4 GHz 13, 5 GHz 17, dfs 13) pdev 0 commands 1 bytes 864\n");
+	contained_and_freed();
+
+	/* a US answer first (stale), the IL one 1200 ms later */
+	j1_setup(5, 0x1full << 33, 33);
+	CHECK(run() == 0, "J1 stale then right failed");
+	expect("alpha2 0x5355 rules 2g 1 5g 3 (bad 1, stale 1)\n");
+	expect("(stale 1)\n");
+	CHECK(fw_chan_seen == 33, "J1 stale then right: 33");
+	contained_and_freed();
+
+	/* a phy 1 answer (every rule disabled) first: ignored */
+	j1_setup(7, 0x1full << 33, 33);
+	CHECK(run() == 0, "J1 phy 1 then phy 0 failed");
+	expect("phy 1 status 0 alpha2 0x4c49");
+	CHECK(fw_chan_seen == 33, "J1 phy 1 ignored: 33");
+	contained_and_freed();
+
+	/* the failures: each before any channel list */
+	j1_fails(1, "FUXI WLAN: W22 timeout J1 cc answer (3000 ms)");
+	j1_fails(6, "FUXI WLAN: W22 timeout J1 cc answer (3000 ms)");
+	j1_fails(3, "FUXI WLAN: W22 failure: J1 cc rules overrun; contain, no retry\n");
+	j1_fails(4, "FUXI WLAN: W22 failure: J1 cc rules array short; contain, no retry\n");
+	j1_fails(8, "FUXI WLAN: W22 failure: J1 channel list empty; contain, no retry\n");
+	j1_setup(2, 0, 38);
+	C.reg_status = 3;
+	CHECK(run() == 1, "J1 status 3 ran");
+	expect("FUXI WLAN: J1 cc IL status 3 (change not allowed)\n");
+	expect("FUXI WLAN: W22 failure: J1 cc status; contain, no retry\n");
+	CHECK(fw_chan_cmds == 0 && fw_scan_cmds == 0, "J1 status: no scan command");
+	contained_and_freed();
+	reset();
+	puts("J1 scan: knob off unchanged; IL keeps 33 channels (golden command bytes, boot event counted); a reboot clears the cut; the "
+	     "756-byte boot answer; pdev 1; channels 1 to 11; with the CH1 mask; stale and phy 1 answers skipped; timeout, overrun, short "
+	     "array, empty list and status 3 contain before any channel list");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -9438,6 +9777,12 @@ main(int argc, char **argv)
 		s_c2h_pure(); s_c2h_ccstale(); s_c2h_ipadis(); s_c2h_fse(); s_c2h_mgmtreo(); s_c2h_all();
 		reset();
 		puts("C2h model: all scenarios passed");
+		return 0;
+	}
+	if (argc == 2 && !strcmp(argv[1], "c2j1")) {  /* the J1 scenarios alone (the mutant runs of tools/test-fuxi-wlan-ce.py) */
+		s_j1_pure(); s_j1_scan();
+		reset();
+		puts("J1 model: all scenarios passed");
 		return 0;
 	}
 	if (argc == 2 && !strcmp(argv[1], "c2ch")) {  /* the CH1 scenarios alone (the mutant runs of tools/test-fuxi-wlan-ce.py) */
@@ -9588,6 +9933,8 @@ main(int argc, char **argv)
 	s_w25d_stale();
 	s_w25e_trace();
 #endif
+	s_j1_pure();
+	s_j1_scan();
 	reset();
 	puts("W20 model: all scenarios passed");
 	return 0;

@@ -923,6 +923,19 @@ wlhtc_take_credits(struct wlhtc *htc, uint32_t eid, uint32_t total)
 #define WLWMI_EV_REG_CHAN_LIST_CC_EXT 0x3a003u
 #define WLWMI_TAG_ARRAY_UINT32 0x10u
 #define WLWMI_TAG_ARRAY_STRUCT 0x12u
+/* J1 (fuxiwlanjoin=1), the regulatory rung: L19 wmi.h:300 (group 0x3a), 695 (SET_CURRENT_COUNTRY = group << 12 | 1),
+ * 1833 / 2008 (tags), 4355-4357 (MAX_REG_RULES 10), 4363-4367 (the command), 4415-4425 (rule flags), 4439-4489 (the event
+ * fixed part, 78 words, and the 20-byte rule). */
+#define WLWMI_CMD_SET_CURRENT_COUNTRY 0x3a001u
+#define WLWMI_TAG_SET_CURRENT_COUNTRY 0x25fu
+#define WLREG_TAG_CC_EXT 0x3aau
+#define WLREG_FIXED_BYTES 312u
+#define WLREG_RULE_BYTES 20u
+#define WLREG_MAX_RULES 10u
+#define WLREG_FLAG_DISABLED 0x1u
+#define WLREG_FLAG_NO_IR 0x2u
+#define WLREG_FLAG_RADAR 0x8u
+#define WLREG_FLAG_NO_20MHZ 0x800u
 #define WLWMI_TAG_SERVICE_READY_EVENT 0x20u
 #define WLWMI_TAG_READY_EVENT 0x23u
 #define WLWMI_TAG_INIT_CMD 0x4au
@@ -983,6 +996,7 @@ _Static_assert(WLWMI_RC_WORDS * 4 == WLWMI_RSRC_BYTES && WLWMI_RC_FLAG1 == 44 &&
 
 struct wlscan;                      /* C2 scan state, below */
 struct wlstats;                     /* C2b pdev stats answer, below */
+struct wlreg;                       /* J1 regulatory answer, below */
 
 struct wlwmi {
 	uint32_t svc_base[WLWMI_SVC_BM_WORDS], svc_seg[4], svc_ext2[WLWMI_EXT2_WORDS];
@@ -1010,6 +1024,9 @@ struct wlwmi {
 	 * out: the id stays an unknown event). */
 	uint32_t phy_pdev[2], phy_pdev_bands[2], phy_pdevs;
 	struct wlstats *stats;
+	/* J1: the regulatory answer the CC_EXT events feed (NULL unless
+	 * fuxiwlanjoin is set: the id then stays an unknown event, logged only). */
+	struct wlreg *reg;
 };
 
 static inline int
@@ -1257,6 +1274,7 @@ static inline bool wlscan_known(uint32_t id);
 static inline int wlscan_rx(struct wlwmi *wmi, uint32_t id, const uint8_t *p, uint32_t len);
 static inline bool wlstats_known(uint32_t id);
 static inline void wlstats_parse(struct wlstats *st, const uint8_t *p, uint32_t len);
+static inline void wlreg_parse(struct wlreg *r, const uint8_t *p, uint32_t len);
 
 /* One WMI event (wmi.c:9798-9960). In the C2 scan stage SCAN, CHAN_INFO and
  * MGMT_RX go to the scan parser (wmi.c:9838-9856); once C2b asked for pdev
@@ -1272,6 +1290,7 @@ wlwmi_rx(struct wlwmi *wmi, const uint8_t *msg, uint32_t len, uint32_t *id)
 	const uint8_t *p = msg + 4;
 	if (wmi->scan && wlscan_known(*id)) { return wlscan_rx(wmi, *id, p, len - 4); }
 	if (wmi->stats && wlstats_known(*id)) { wlstats_parse(wmi->stats, p, len - 4); return 0; }
+	if (wmi->reg && *id == WLWMI_EV_REG_CHAN_LIST_CC_EXT) { wlreg_parse(wmi->reg, p, len - 4); return 0; }   /* J1: never fatal */
 	switch (*id) {
 	case WLWMI_EV_SERVICE_READY: return wlwmi_parse_service_ready(wmi, p, len - 4);
 	case WLWMI_EV_SERVICE_AVAILABLE: return wlwmi_parse_available(wmi, p, len - 4);
@@ -1567,6 +1586,9 @@ _Static_assert(WLWMI_CI_WORDS * 4 == WLWMI_CHAN_INFO_BYTES && WLWMI_CI_CMD_FLAGS
 #define WLSCAN_CH_IGNDUTY (WLSCAN_CH_24 << 3)
 _Static_assert(WLSCAN_NCHAN == WLSCAN_NCHAN_24 + WLSCAN_CH_5G_BITS, "CH1: one mask bit per 5 GHz entry");
 static uint32_t wlscan_chmask;
+/* J1: bit F set = entry F of the full list is not allowed by the regulatory answer; 0 unless the join rung filled it. */
+static uint64_t wlscan_regdrop;
+_Static_assert(WLSCAN_NCHAN <= 64u, "J1: one regdrop bit per entry");
 
 static inline uint32_t
 wlscan_chan_full(uint32_t i)
@@ -1580,10 +1602,11 @@ wlscan_chan_full(uint32_t i)
 	return i < WLSCAN_NCHAN ? mhz[i] : 0u;
 }
 
-/* Does MASK drop entry I of the full list? */
+/* Does MASK (or the J1 regulatory answer) drop entry I of the full list? */
 static inline bool
 wlscan_dropped(uint32_t mask, uint32_t i)
 {
+	if (i < 64u && ((wlscan_regdrop >> i) & 1u)) { return true; }
 	return i < WLSCAN_NCHAN_24 ? (mask & WLSCAN_CH_24) != 0 : ((mask >> (i - WLSCAN_NCHAN_24)) & 1u) != 0;
 }
 
@@ -1599,7 +1622,9 @@ wlscan_kept(uint32_t mask)
 static inline uint32_t
 wlscan_kept24(uint32_t mask)
 {
-	return (mask & WLSCAN_CH_24) ? 0u : WLSCAN_NCHAN_24;
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < WLSCAN_NCHAN_24; i++) { n += wlscan_dropped(mask, i) ? 0u : 1u; }
+	return n;
 }
 
 /* The mask a scan really uses: the knob, plus every 5 GHz entry when w20 0x10 (BAND24) is set. */
@@ -1638,6 +1663,98 @@ wlscan_listed(uint32_t mhz, uint32_t n)
 {
 	for (uint32_t i = 0; i < n && i < WLSCAN_NCHAN; i++) { if (wlscan_chan(i) == mhz) { return true; } }
 	return false;
+}
+
+/* ---- J1: the regulatory answer (fuxiwlanjoin=1), pure ----
+ * REG_CHAN_LIST_CC_EXT (L19 wmi.c:5975-6170): a fixed TLV 0x3aa (status 0,
+ * phy 4, alpha2 8, dfs_region 24, num_2g 48, num_5g 52; its own length is
+ * used, at least 312 bytes, so a longer fixed part is stepped over), then
+ * one array of 20-byte rules (header, freq_info, bw_pwr_info, flag_info,
+ * psd_power_info; wmi.c:5916-5957, 6159-6163): the 2 GHz rules, then the
+ * 5 GHz ones. Anything after those rules (6 GHz and the rest) is not read.
+ * L19 drops more than 10 rules a band and an event of a phy other than 0
+ * on a single pdev chip; so does this parser. Unarmed (want 0: the events
+ * before the host asks) a bad event is only counted; armed, it fails the
+ * rung. An armed answer for another country is stale: counted, not taken. */
+struct wlreg_rule { uint16_t start, end, bw, flags; uint8_t pwr; };
+struct wlreg {
+	uint32_t events, phy0, other_phy, bad, stale;
+	uint32_t ev_len, ev_fixed, ev_arr, ev_phy, ev_status, ev_alpha2, ev_n2, ev_n5;   /* the last event, for its line */
+	uint32_t want;                                    /* the alpha2 word asked for; 0 = not armed */
+	uint32_t status, alpha2, dfs_region, n2, n5;      /* the record taken */
+	struct wlreg_rule rule[2 * WLREG_MAX_RULES];      /* n2 2 GHz rules, then n5 5 GHz rules */
+	const char *why;
+	bool have, failed;
+};
+
+static inline void
+wlreg_bad(struct wlreg *r, const char *why)
+{
+	r->bad++;
+	if (r->want) { r->failed = true; r->why = why; }
+}
+
+static inline void
+wlreg_parse(struct wlreg *r, const uint8_t *p, uint32_t len)
+{
+	struct wlwmi_it it;
+	struct wlreg_rule tmp[2 * WLREG_MAX_RULES];
+	r->events++;
+	r->ev_len = len; r->ev_fixed = r->ev_arr = r->ev_phy = r->ev_status = r->ev_alpha2 = r->ev_n2 = r->ev_n5 = 0;
+	wlwmi_it_init(&it, p, len);
+	if (wlwmi_next(&it) != 1 || it.tag != WLREG_TAG_CC_EXT || it.tlen < WLREG_FIXED_BYTES) { wlreg_bad(r, "J1 cc event has no fixed part"); return; }
+	const uint8_t *f = it.v;
+	const uint32_t status = wlce_get32(f), phy = wlce_get32(f + 4), alpha2 = wlce_get32(f + 8) & 0xffffu;
+	const uint32_t dfs = wlce_get32(f + 24), n2 = wlce_get32(f + 48), n5 = wlce_get32(f + 52);
+	r->ev_fixed = it.tlen; r->ev_phy = phy; r->ev_status = status; r->ev_alpha2 = alpha2; r->ev_n2 = n2; r->ev_n5 = n5;
+	if (phy != 0) { r->other_phy++; return; }
+	if (status != 0) {   /* an answer that refuses: no rules to read */
+		r->status = status; r->alpha2 = alpha2; r->dfs_region = dfs; r->n2 = r->n5 = 0;
+		r->phy0++; r->have = true;
+		return;
+	}
+	if (r->want && alpha2 != r->want) { r->stale++; return; }
+	if (n2 > WLREG_MAX_RULES || n5 > WLREG_MAX_RULES) { wlreg_bad(r, "J1 cc rules overrun"); return; }
+	const uint32_t nr = n2 + n5;
+	if (nr) {
+		if (wlwmi_next(&it) != 1 || it.tag != WLWMI_TAG_ARRAY_STRUCT || it.tlen < nr * WLREG_RULE_BYTES) {
+			wlreg_bad(r, "J1 cc rules array short");
+			return;
+		}
+		r->ev_arr = it.tlen;
+	}
+	for (uint32_t i = 0; i < nr; i++) {
+		const uint8_t *e = it.v + WLREG_RULE_BYTES * i;
+		const uint32_t fq = wlce_get32(e + 4), bp = wlce_get32(e + 8), fl = wlce_get32(e + 12);
+		tmp[i].start = (uint16_t)(fq & 0xffffu); tmp[i].end = (uint16_t)(fq >> 16);
+		tmp[i].bw = (uint16_t)(bp & 0xffffu); tmp[i].pwr = (uint8_t)((bp >> 16) & 0xffu); tmp[i].flags = (uint16_t)(fl & 0xffffu);
+	}
+	r->status = 0; r->alpha2 = alpha2; r->dfs_region = dfs; r->n2 = n2; r->n5 = n5;
+	for (uint32_t i = 0; i < nr; i++) { r->rule[i] = tmp[i]; }
+	r->phy0++; r->have = true;
+}
+
+/* Does the record allow a 20 MHz channel centred on MHZ? Some rule that is
+ * not disabled and not NO_20MHZ, at least 20 MHz wide, must hold the whole
+ * channel. NO_IR and RADAR are reported only: every scan here is passive. */
+static inline bool
+wlreg_allows(const struct wlreg *r, uint32_t mhz)
+{
+	for (uint32_t i = 0; i < r->n2 + r->n5 && i < 2 * WLREG_MAX_RULES; i++) {
+		const struct wlreg_rule *u = &r->rule[i];
+		if (u->flags & (WLREG_FLAG_DISABLED | WLREG_FLAG_NO_20MHZ)) { continue; }
+		if (u->bw >= 20u && (uint32_t)u->start + 10u <= mhz && mhz + 10u <= (uint32_t)u->end) { return true; }
+	}
+	return false;
+}
+
+/* The entries of the full list the record does not allow (wlscan_regdrop). */
+static inline uint64_t
+wlreg_dropset(const struct wlreg *r)
+{
+	uint64_t d = 0;
+	for (uint32_t f = 0; f < WLSCAN_NCHAN; f++) { if (!wlreg_allows(r, wlscan_chan_full(f))) { d |= (uint64_t)1 << f; } }
+	return d;
 }
 
 static inline uint32_t

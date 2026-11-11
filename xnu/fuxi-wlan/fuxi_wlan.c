@@ -1248,7 +1248,7 @@ static unsigned wl_ces; /* C-S knob fuxiwlances (default 0): 0x1 STATUS TP write
 static unsigned wl_dw, wl_par; /* C-P knobs (default 0): fuxiwlandw one passive dwell 50..200 ms for every scan request; fuxiwlanpar bits 0x1 BEI on the IPCR data TREs, 0x2 event ring contexts msivec 1 / 2 and ring 1 moderation 1 ms, 0x4 MHI ctrl/data limit registers at 36 bits, 0x8 INIT flags2 as the BSD reference host builds it */
 static unsigned wl_adw; /* C-D knob fuxiwlanad (default 0): 0x1 one WMI SCAN_ADAPTIVE_DWELL_CONFIG (0x3007) with enable 0 and no parameter element, after the vdev setup and before the first START_SCAN; 0x2 dwell mode STATIC (scan_ctrl_flags bits 23:21 = 4) in every W25 scan request; PASSIVE stays forced */
 static unsigned wl_cyc, wl_cr, wl_pft, wl_pcie; /* C-H knobs (default 0), reference host differences: fuxiwlancyc 0x1 WLAN_EN low 150 ms and high 60 ms in the power cycle, 0x2 100 ms before PERST high; fuxiwlancr N asks RECV_ALLOC N for the WMI service in place of all READY credits; fuxiwlanpft 1 sets the CE1 / CE2 destination ring consumer prefetch timer (R0 + 0x40, bits 2:0) to 1 after ring setup; fuxiwlanpcie 1 prints the endpoint PCIe capability words, read only */
-static unsigned wl_join; /* J knob fuxiwlanjoin (default 0): the join rung. 0 none; 1 the regulatory rung (set the current country, read the channel list event; nothing goes on the air). Rung 1 has no code yet: an accepted fuxiwlanjoin=1 changes nothing but the J knobs line. Higher rungs are refused in this build. */
+static unsigned wl_join; /* J knob fuxiwlanjoin (default 0): the join rung. 0 none; 1 the regulatory rung (set the current country, read the channel list event; nothing goes on the air). Rung 1 is wl_j1_run: one SET_CURRENT_COUNTRY before the channel list, the CC_EXT answer parsed, the passive list cut to what it allows. Higher rungs are refused in this build. */
 static uint32_t wl_cc; /* J knob fuxiwlancc (default 0): the country of the join rung as the WMI alpha2 word, first letter in bits 7:0 ("IL" = 0x4c49 = 19529). Every nonzero fuxiwlanjoin needs it. */
 /* J knobs (begin): pure, no I/O; tools/test-fuxi-wlan-join.py compiles exactly this region. */
 #define WL_JOIN_MAX 1 /* the highest join rung this build accepts */
@@ -5972,6 +5972,7 @@ static unsigned wl_ce_waited, wl_ce_need_eid, wl_ce_need_len, wl_ce_tx_pipe, wl_
  * wl23_scan_id: the id of the scan a containment STOP_SCAN names (C2 0xa000,
  * C3 the service's scan in flight). */
 static struct wlscan wl_scan;
+static struct wlreg wl_reg;   /* J1: the regulatory answer (fuxiwlanjoin=1; wl_wmi.reg points here only then) */
 static bool wl23_scan_sent, wl23_htt_seen, wl23_guard_bad;
 static uint32_t wl23_scan_id = WLWMI_SCAN_ID;   /* the id of the scan START_SCAN last named (CH1 split: 0xa000, then 0xa001) */
 static unsigned wl23_lines, wl23_pdev, wl23_htt_major, wl23_htt_minor, wl23_rssi_conv;
@@ -6295,7 +6296,7 @@ wl_ce_init_rings(void)
 }
 
 enum { WL20_W_CTL, WL20_W_TX, WL20_W_CREDITS, WL20_W_SVC, WL20_W_AVAIL, WL20_W_EXT, WL20_W_EXT2, WL20_W_READY, WL20_W_NONE,
-    WL23_W_HTT, WL23_W_STARTED, WL23_W_STATS };
+    WL23_W_HTT, WL23_W_STARTED, WL23_W_STATS, WL23_W_REG };
 
 static bool
 wl_ce_done(unsigned what)
@@ -6312,6 +6313,7 @@ wl_ce_done(unsigned what)
 	case WL23_W_HTT: return wl23_htt_seen;
 	case WL23_W_STARTED: return wl_scan.started || wl_scan.start_failed;
 	case WL23_W_STATS: return wl_stats.have;
+	case WL23_W_REG: return wl_reg.have || wl_reg.failed;
 	default: return false;
 	}
 }
@@ -6378,6 +6380,14 @@ wl_ce_wmi_rx(void *ctx, const uint8_t *msg, uint32_t len)
 		return 0;
 	}
 	if (wl_wmi.stats && wlstats_known(id)) { return 0; }
+	if (wl_wmi.reg && id == WLWMI_EV_REG_CHAN_LIST_CC_EXT) {   /* J1: parsed above; one line each, at most 8 */
+		if (wl_reg.events <= 8u) {
+			printf("FUXI WLAN: J1 cc event %u bytes %u fixed %u array %u phy %u status %u alpha2 0x%x rules 2g %u 5g %u (bad %u, stale %u)\n",
+			    wl_reg.events, wl_reg.ev_len, wl_reg.ev_fixed, wl_reg.ev_arr, wl_reg.ev_phy, wl_reg.ev_status, wl_reg.ev_alpha2,
+			    wl_reg.ev_n2, wl_reg.ev_n5, wl_reg.bad, wl_reg.stale);
+		}
+		return 0;
+	}
 	if (!wlwmi_known(id)) {
 		/* C2: L19 moves its MGMT_RX noise floor on 0x402b (wmi.c:9740-9796,
 		 * 7183-7187); C2 keeps -95, counts it and logs the first past the cap. */
@@ -8199,6 +8209,73 @@ wl30_counts(void)
 	}
 }
 
+/* ---- J1: the regulatory rung (fuxiwlanjoin=1), before the channel list ----
+ * One SET_CURRENT_COUNTRY with the fuxiwlancc country (pdev as W23 names it),
+ * one CC_EXT answer awaited for 3 s (L19 waits 3 s too, but goes on after a
+ * timeout; here a timeout contains, like every wait of this driver), then the
+ * entries the answer does not allow leave the passive list (wlscan_regdrop),
+ * so SCAN_CHAN_LIST, every START_SCAN and the iOS list all follow. Nothing
+ * here transmits: the scan stays passive on every channel. */
+static const char *
+wl_j1_status(uint32_t s)
+{
+	switch (s) {
+	case 0: return "pass";
+	case 1: return "current alpha2 not found";
+	case 2: return "init alpha2 not found";
+	case 3: return "change not allowed";
+	case 4: return "no memory";
+	case 5: return "fail";
+	default: return "unknown";
+	}
+}
+
+/* The alpha2 word as two letters, "??" unless two capitals. */
+static void
+wl_j1_text(uint32_t a, char out[3])
+{
+	const uint32_t x = a & 0xffu, y = (a >> 8) & 0xffu;
+	const bool ok = x >= 'A' && x <= 'Z' && y >= 'A' && y <= 'Z';
+	out[0] = ok ? (char)x : '?'; out[1] = ok ? (char)y : '?'; out[2] = 0;
+}
+
+static int
+wl_j1_run(void)
+{
+	char bc[3], cc[3];
+	uint32_t w[2];
+	wl_j1_text(wl_reg.alpha2, bc);
+	printf("FUXI WLAN: J1 cc boot events %u (phy0 %u, other-phy %u, bad %u) alpha2 %s status %u rules 2g %u 5g %u dfs-region %u\n",
+	    wl_reg.events, wl_reg.phy0, wl_reg.other_phy, wl_reg.bad, wl_reg.have ? bc : "--", wl_reg.status, wl_reg.n2, wl_reg.n5,
+	    wl_reg.dfs_region);
+	wl_reg.want = wl_cc;
+	wl_reg.have = wl_reg.failed = false;
+	wl_reg.why = NULL;
+	w[0] = (wl20_bits & WL20_PDEVCAP) ? wl_wmi.pdev_id : 0u;
+	w[1] = wl_cc;
+	wl_j1_text(wl_cc, cc);
+	if (wl23_words(WLWMI_CMD_SET_CURRENT_COUNTRY, WLWMI_TAG_SET_CURRENT_COUNTRY, w, 2, "WMI SET_CURRENT_COUNTRY")) { return 1; }
+	printf("FUXI WLAN: J1 set current country %s sent (0x3a001, pdev %u, 12 bytes)\n", cc, w[0]);
+	if (wl_ce_wait(WL23_W_REG, 3000, "J1 cc answer")) { return 1; }
+	if (wl_reg.failed) { return wl_w11_fail(wl_reg.why ? wl_reg.why : "J1 cc answer"); }
+	if (wl_reg.status) {
+		printf("FUXI WLAN: J1 cc %s status %u (%s)\n", cc, wl_reg.status, wl_j1_status(wl_reg.status));
+		return wl_w11_fail("J1 cc status");
+	}
+	printf("FUXI WLAN: J1 cc %s status 0 phy 0 rules 2g %u 5g %u dfs-region %u after %u ms (stale %u)\n", cc, wl_reg.n2, wl_reg.n5,
+	    wl_reg.dfs_region, wl_ce_waited, wl_reg.stale);
+	for (uint32_t i = 0; i < wl_reg.n2 + wl_reg.n5 && i < 16u; i++) {
+		const struct wlreg_rule *u = &wl_reg.rule[i];
+		printf("FUXI WLAN: J1 rule %s %u-%u MHz bw %u pwr %u flags 0x%x\n", i < wl_reg.n2 ? "2g" : "5g", (unsigned)u->start,
+		    (unsigned)u->end, (unsigned)u->bw, (unsigned)u->pwr, (unsigned)u->flags);
+	}
+	wlscan_regdrop = wlreg_dropset(&wl_reg);
+	const uint32_t kept = wlscan_kept(0), kept24 = wlscan_kept24(0);
+	printf("FUXI WLAN: J1 channel list %u of %u (2.4 GHz %u, 5 GHz %u, passive all)\n", kept, WLSCAN_NCHAN, kept24, kept - kept24);
+	if (!kept) { return wl_w11_fail("J1 channel list empty"); }   /* with the CH1 mask on top, W23 refuses an empty list itself */
+	return 0;
+}
+
 /* ---- W25: the scan service for iOS (fuxiwlanqrtr=8, C3) ----
  * W23 sets up the channel list and the station vdev exactly as for qrtr 7;
  * then, instead of its one scan, this radio-lane thread serves the scan
@@ -8943,7 +9020,7 @@ wl_w25_run(uint32_t n)
 	wl25_part_pend[0] = wl25_part_pend[1] = wl25_start_late_pend = false; bzero(&wl25_w, sizeof(wl25_w));
 	wl25_tr_pend[0] = wl25_tr_pend[1] = false;   /* W25e */
 	for (uint32_t i = 0; i < n && i < WLSCAN_NCHAN; i++) { list[i] = (uint16_t)wlscan_chan(i); low += list[i] < 3000u; }
-	/* The channels W23 gave the firmware: C2 records no regulatory event to intersect with (CC_EXT is logged only). */
+	/* The channels W23 gave the firmware: with fuxiwlanjoin=1 already cut to what the J1 regulatory answer allows; otherwise C2 records no regulatory event to intersect with (CC_EXT is logged only). */
 	fuxi_wifi_radio_ready(list, n);
 	wl25_on = true;
 	wl25_t0 = wl25_ms();
@@ -8989,6 +9066,7 @@ static int
 wl_w23_run(void)
 {
 	static uint8_t cmd[WLCE_BUF];
+	if (wl_join && wl_j1_run()) { return 1; }   /* J1: the country first, before any channel list */
 	/* CH1: one filtered list for SCAN_CHAN_LIST, START_SCAN (array, n, max time) and every count below; w20 0x10 drops the 5 GHz entries */
 	wlscan_chmask = wlscan_mask_eff(wl23_chmask, !!(wl20_bits & WL20_BAND24));
 	uint32_t len = 0, n = wlscan_kept(wlscan_chmask), max_ms = wlscan_max_time(n);
@@ -9296,6 +9374,8 @@ wl_w20_run(void)
 	wl12_stage = WL20_CE;
 	wl_ce_started = true; wl_ce_waited = wl_ce_logged = 0;
 	bzero(&wl_htc, sizeof(wl_htc)); bzero(&wl_wmi, sizeof(wl_wmi)); bzero(&wl30_reo, sizeof(wl30_reo));
+	bzero(&wl_reg, sizeof(wl_reg)); wlscan_regdrop = 0;
+	if (wl_join) { wl_wmi.reg = &wl_reg; }   /* J1: CC_EXT events are parsed from here on, unarmed until wl_j1_run */
 	wl23_scan_sent = wl23_guard_bad = false; /* C2: no STOP_SCAN in containment unless W23 sent START_SCAN */
 	wl23_rssi_conv = 0; wl23_scan_id = WLWMI_SCAN_ID; wl25_on = false;
 	if (wl_pcie) { wl_ce_pcie(); }
